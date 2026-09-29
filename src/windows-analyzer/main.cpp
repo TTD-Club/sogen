@@ -16,6 +16,8 @@
 #include "jsonl_reporter.hpp"
 #include "stdout_file_reporter.hpp"
 #include "tenet_tracer.hpp"
+#include "ttd_trace.hpp"
+#include "ttd_string_scan.hpp"
 
 #include <utils/finally.hpp>
 #include <utils/interupt_handler.hpp>
@@ -58,6 +60,17 @@ namespace sogen
             bool log_executable_access{false};
             bool log_foreign_module_access{false};
             bool tenet_trace{false};
+            std::filesystem::path ttd_record{};
+            std::filesystem::path ttd_replay{};
+            uint64_t ttd_seek{};
+            uint64_t ttd_checkpoint_interval{500000};
+            bool ttd_no_checkpoints{false};
+            bool ttd_no_read_trace{false};
+            bool ttd_no_write_trace{false};
+            bool ttd_no_execute_trace{false};
+            std::optional<uint64_t> ttd_read{};
+            std::filesystem::path ttd_strings{};
+            size_t ttd_min_string_length{6};
             bool prepend_call_count{false};
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
             bool pause_before_start{false};
@@ -399,6 +412,7 @@ namespace sogen
                 return false;
             };
 
+            std::optional<ttd::recorder> ttd_recorder{};
             try
             {
                 if (options.use_gdb)
@@ -430,7 +444,81 @@ namespace sogen
                         debugger::enter_breakpoint(win_emu, win_emu.mod_manager.executable->entry_point);
                     }
 #endif
-                    win_emu.start();
+                    if (!options.ttd_record.empty())
+                    {
+                        const uint64_t access_mask = (options.ttd_no_read_trace ? 0 : 1) | (options.ttd_no_write_trace ? 0 : 2) |
+                                                     (options.ttd_no_execute_trace ? 0 : 4);
+                        ttd_recorder.emplace(win_emu, options.ttd_record, access_mask);
+                    }
+                    if (!options.ttd_strings.empty())
+                    {
+                        ttd::string_scanner scanner(win_emu, options.ttd_min_string_length);
+                        scanner.scan_initial_memory();
+                        win_emu.start();
+                        scanner.finish();
+                        scanner.save(options.ttd_strings);
+                        win_emu.log.log("TTD recovered %zu strings to %s\n", scanner.count(), options.ttd_strings.string().c_str());
+                        do_post_emulation_work(c);
+                        c.emit_summary<run_finished_event>([&](auto& event) {
+                            event.success = true;
+                            event.exit_status = win_emu.process.exit_status;
+                        });
+                        flush_reporters(c);
+                        return true;
+                    }
+                    if (!options.ttd_replay.empty())
+                    {
+                        const auto checkpoint_step = win_emu.get_executed_instructions();
+                        if (options.ttd_seek > checkpoint_step)
+                        {
+                            win_emu.start(static_cast<size_t>(options.ttd_seek - checkpoint_step));
+                        }
+                        if (win_emu.get_executed_instructions() != options.ttd_seek)
+                        {
+                            return emit_failure("TTD replay stopped before requested position");
+                        }
+                        win_emu.log.log("TTD checkpoint %llx:0\n", static_cast<unsigned long long>(checkpoint_step));
+                        win_emu.log.log("TTD position %llx:0 RIP %llx\n", static_cast<unsigned long long>(options.ttd_seek),
+                                        static_cast<unsigned long long>(win_emu.emu().read_instruction_pointer()));
+                        if (options.ttd_read)
+                        {
+                            const auto value = win_emu.emu().read_memory<uint64_t>(*options.ttd_read);
+                            win_emu.log.log("TTD memory %llx = %llx\n", static_cast<unsigned long long>(*options.ttd_read),
+                                            static_cast<unsigned long long>(value));
+                        }
+                        do_post_emulation_work(c);
+                        c.emit_summary<run_finished_event>([&](auto& event) {
+                            event.success = true;
+                            event.exit_status = std::nullopt;
+                        });
+                        flush_reporters(c);
+                        return true;
+                    }
+                    if (ttd_recorder && !options.ttd_no_checkpoints)
+                    {
+                        while (!win_emu.process.exit_status && !signals_received)
+                        {
+                            const auto before = win_emu.get_executed_instructions();
+                            win_emu.start(static_cast<size_t>(options.ttd_checkpoint_interval));
+                            if (win_emu.process.exit_status || signals_received)
+                            {
+                                break;
+                            }
+                            if (win_emu.get_executed_instructions() - before != options.ttd_checkpoint_interval)
+                            {
+                                break;
+                            }
+                            ttd_recorder->checkpoint();
+                        }
+                    }
+                    else
+                    {
+                        win_emu.start();
+                    }
+                    if (ttd_recorder)
+                    {
+                        ttd_recorder->finish();
+                    }
                 }
 
                 if (signals_received > 0)
@@ -615,6 +703,13 @@ namespace sogen
 
             const auto concise_logging = options.concise_logging;
             const auto win_emu = setup_emulator(options, args);
+            std::optional<ttd::trace> replay_trace{};
+            if (!options.ttd_replay.empty())
+            {
+                replay_trace.emplace(options.ttd_replay);
+                const auto checkpoint = replay_trace->checkpoint_for_step(options.ttd_seek);
+                snapshot::load_emulator_snapshot(*win_emu, checkpoint.snapshot);
+            }
             apply_registry_files(*win_emu, options);
             context.win_emu = win_emu.get();
 
@@ -892,6 +987,34 @@ namespace sogen
                 "Very concise logging");
             app.add_flag("-x,--exec", options.log_executable_access, "Log r/w access to executable memory");
             app.add_flag("-t,--tenet-trace", options.tenet_trace, "Enable Tenet tracer");
+            app.add_option("--ttd-record", options.ttd_record, "Record a checkpointed TTD trace");
+            app.add_option("--ttd-replay", options.ttd_replay, "Restore a TTD trace snapshot");
+            app.add_option("--ttd-seek", options.ttd_seek, "Replay through this instruction position");
+            app.add_option("--ttd-checkpoint-interval", options.ttd_checkpoint_interval, "Instructions between recording checkpoints")
+                ->capture_default_str();
+            app.add_flag("--ttd-no-checkpoints", options.ttd_no_checkpoints, "Record only the initial snapshot (baseline comparison)");
+            app.add_flag("--ttd-no-read-trace", options.ttd_no_read_trace, "Disable memory-read event recording");
+            app.add_flag("--ttd-no-write-trace", options.ttd_no_write_trace, "Disable memory-write event recording");
+            app.add_flag("--ttd-no-execute-trace", options.ttd_no_execute_trace, "Disable instruction-execute event recording");
+            app.add_option("--ttd-read", options.ttd_read, "Read eight guest bytes at the replay position");
+            app.add_option("--ttd-strings", options.ttd_strings, "Recover strings during deterministic replay into a TSV file");
+            app.add_option("--ttd-min-string-length", options.ttd_min_string_length, "Minimum recovered string length")
+                ->capture_default_str();
+            std::filesystem::path ttd_query{};
+            std::filesystem::path ttd_selfmod{};
+            uint64_t ttd_address{}, ttd_size{1}, ttd_from{}, ttd_to{UINT64_MAX};
+            bool ttd_next_write{}, ttd_prev_write{};
+            std::string ttd_access{"write"};
+            app.add_option("--ttd-query", ttd_query, "Query memory accesses in a TTD trace");
+            app.add_option("--ttd-selfmod", ttd_selfmod, "Find executed bytes written earlier in a TTD trace");
+            app.add_option("--ttd-access", ttd_access, "Access type: read, write, execute, or all")
+                ->check(CLI::IsMember({"read", "write", "execute", "all"}));
+            app.add_option("--ttd-address", ttd_address, "First address for TTD write query");
+            app.add_option("--ttd-size", ttd_size, "Byte length for TTD write query");
+            app.add_option("--ttd-from", ttd_from, "First instruction position for TTD write query");
+            app.add_option("--ttd-to", ttd_to, "Last instruction position for TTD write query");
+            app.add_flag("--ttd-next-access,--ttd-next-write", ttd_next_write, "Find the next matching access after --ttd-from");
+            app.add_flag("--ttd-prev-access,--ttd-prev-write", ttd_prev_write, "Find the previous matching access before --ttd-from");
             app.add_flag("--first-exec", options.log_first_section_execution, "Print first executions of sections");
             app.add_flag("--inst-summary", options.instruction_summary, "Print a summary of executed instructions of the analyzed modules");
             app.add_flag("--skip-syscalls", options.skip_syscalls, "Skip the logging of regular syscalls");
@@ -947,6 +1070,109 @@ namespace sogen
 
             try
             {
+                if (!ttd_selfmod.empty())
+                {
+                    ttd::trace trace(ttd_selfmod);
+                    for (const auto& hit : trace.self_modifying_code())
+                    {
+                        printf("address=%llx size=%llu write=%llx:0 write_ip=%llx execute=%llx:0 execute_ip=%llx count=%llu\n",
+                               static_cast<unsigned long long>(hit.address), static_cast<unsigned long long>(hit.size),
+                               static_cast<unsigned long long>(hit.write_step), static_cast<unsigned long long>(hit.write_ip),
+                               static_cast<unsigned long long>(hit.execute_step), static_cast<unsigned long long>(hit.execute_ip),
+                               static_cast<unsigned long long>(hit.executions));
+                    }
+                    return 0;
+                }
+                if (!ttd_query.empty())
+                {
+                    ttd::trace trace(ttd_query);
+                    const uint64_t kind_mask = ttd_access == "read" ? 1 : ttd_access == "write" ? 2 : ttd_access == "execute" ? 4 : 7;
+                    if (ttd_next_write && ttd_prev_write)
+                    {
+                        throw std::runtime_error("Choose only one TTD access direction");
+                    }
+                    std::vector<ttd::access_event> writes{};
+                    if (ttd_next_write)
+                    {
+                        if (auto event = trace.next_access(ttd_address, ttd_size, ttd_from, kind_mask))
+                        {
+                            writes.push_back(*event);
+                        }
+                    }
+                    else if (ttd_prev_write)
+                    {
+                        if (auto event = trace.previous_access(ttd_address, ttd_size, ttd_from, kind_mask))
+                        {
+                            writes.push_back(*event);
+                        }
+                    }
+                    else
+                    {
+                        writes = trace.accesses(ttd_address, ttd_size, ttd_from, ttd_to, kind_mask);
+                    }
+                    for (const auto& write : writes)
+                    {
+                        printf("%llx:0 ip=%llx address=%llx size=%llu%s%s", static_cast<unsigned long long>(write.step),
+                               static_cast<unsigned long long>(write.ip), static_cast<unsigned long long>(write.address),
+                               static_cast<unsigned long long>(write.size), ttd_access == "write" ? "" : " kind=",
+                               ttd_access == "write"                   ? ""
+                               : write.kind == ttd::access_kind::read  ? "read"
+                               : write.kind == ttd::access_kind::write ? "write"
+                                                                       : "execute");
+                        if (trace.has_instruction_bytes() && write.kind == ttd::access_kind::execute && write.size <= 15)
+                        {
+                            printf(" bytes=");
+                            for (size_t i = 0; i < write.size; ++i)
+                            {
+                                printf("%02x", write.instruction_bytes[i]);
+                            }
+                        }
+                        printf("\n");
+                    }
+                    return 0;
+                }
+                if ((!options.ttd_record.empty() || !options.ttd_replay.empty()) && options.vcpu_count != 1)
+                {
+                    throw std::runtime_error("TTD POC requires --vcpus 1");
+                }
+                if (!options.ttd_record.empty() && !options.ttd_replay.empty())
+                {
+                    throw std::runtime_error("TTD record and replay cannot be combined");
+                }
+                if ((!options.ttd_record.empty() || !options.ttd_replay.empty()) &&
+                    (options.use_gdb || !options.dump.empty() || !options.minidump_path.empty()))
+                {
+                    throw std::runtime_error("TTD POC requires a fresh application run without GDB or snapshot input");
+                }
+                if (options.ttd_replay.empty() && (options.ttd_seek || options.ttd_read))
+                {
+                    throw std::runtime_error("TTD seek and memory inspection require --ttd-replay");
+                }
+                if (!options.ttd_strings.empty() && (options.ttd_replay.empty() || options.ttd_seek))
+                {
+                    throw std::runtime_error("TTD string recovery requires --ttd-replay from position zero");
+                }
+                if (!options.ttd_record.empty() && !options.ttd_no_checkpoints && !options.ttd_checkpoint_interval)
+                {
+                    throw std::runtime_error("TTD checkpoint interval must be positive");
+                }
+                if ((options.ttd_no_read_trace || options.ttd_no_write_trace || options.ttd_no_execute_trace) && options.ttd_record.empty())
+                {
+                    throw std::runtime_error("TTD trace toggles require --ttd-record");
+                }
+                if ((!options.ttd_record.empty() || !options.ttd_replay.empty()) && options.disable_instruction_precision)
+                {
+                    throw std::runtime_error("TTD POC requires instruction precision");
+                }
+                if ((!options.ttd_record.empty() || !options.ttd_replay.empty()) && !backend_name.empty() && backend_name != "unicorn")
+                {
+                    throw std::runtime_error("TTD POC supports only the Unicorn backend");
+                }
+                if (!options.ttd_record.empty() || !options.ttd_replay.empty())
+                {
+                    options.backend = backend_type::unicorn;
+                    options.reproducible = true;
+                }
                 if (options.use_gdb && options.vcpu_count > 1)
                 {
                     throw std::runtime_error("GDB debugging requires --vcpus 1");

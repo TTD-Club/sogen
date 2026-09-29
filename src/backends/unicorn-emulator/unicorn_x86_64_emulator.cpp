@@ -631,6 +631,39 @@ namespace sogen::unicorn
                 return container->as_opaque_hook();
             }
 
+            emulator_hook* hook_memory_read_metadata(const uint64_t address, const uint64_t size,
+                                                     memory_write_metadata_callback callback) override
+            {
+                auto read_wrapper = [c = std::move(callback), this](uc_engine*, const uc_mem_type type, const uint64_t addr,
+                                                                    const int length, const uint64_t) {
+                    if (map_memory_operation(type) == memory_operation::read && length > 0)
+                    {
+                        c(*this, addr, static_cast<size_t>(length));
+                    }
+                };
+                function_wrapper<void, uc_engine*, uc_mem_type, uint64_t, int, int64_t> wrapper(std::move(read_wrapper));
+                unicorn_hook hook{*this};
+                uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_MEM_READ_AFTER, wrapper.get_function(), wrapper.get_user_data(),
+                                address, calc_end_address(address, size)));
+                auto* container = this->create_hook_container();
+                container->add(std::move(wrapper), std::move(hook));
+                return container->as_opaque_hook();
+            }
+
+            emulator_hook* hook_memory_execution_metadata(memory_execution_metadata_callback callback) override
+            {
+                auto exec_wrapper = [c = std::move(callback), this](uc_engine*, const uint64_t addr, const uint32_t size) {
+                    c(*this, addr, size);
+                };
+                function_wrapper<void, uc_engine*, uint64_t, uint32_t> wrapper(std::move(exec_wrapper));
+                unicorn_hook hook{*this};
+                uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_CODE, wrapper.get_function(), wrapper.get_user_data(), 0,
+                                std::numeric_limits<uint64_t>::max()));
+                auto* container = this->create_hook_container();
+                container->add(std::move(wrapper), std::move(hook));
+                return container->as_opaque_hook();
+            }
+
             emulator_hook* hook_memory_write(const uint64_t address, const uint64_t size, memory_access_hook_callback callback) override
             {
                 auto write_wrapper = [c = std::move(callback), this](uc_engine*, const uc_mem_type type, const uint64_t addr,
@@ -649,6 +682,25 @@ namespace sogen::unicorn
                 uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_MEM_WRITE, wrapper.get_function(), wrapper.get_user_data(), address,
                                 calc_end_address(address, size)));
 
+                auto* container = this->create_hook_container();
+                container->add(std::move(wrapper), std::move(hook));
+                return container->as_opaque_hook();
+            }
+
+            emulator_hook* hook_memory_write_metadata(const uint64_t address, const uint64_t size,
+                                                      memory_write_metadata_callback callback) override
+            {
+                auto write_wrapper = [c = std::move(callback), this](uc_engine*, const uc_mem_type type, const uint64_t addr,
+                                                                     const int length, const uint64_t) {
+                    if (map_memory_operation(type) == memory_operation::write && length > 0)
+                    {
+                        c(*this, addr, static_cast<size_t>(length));
+                    }
+                };
+                function_wrapper<void, uc_engine*, uc_mem_type, uint64_t, int, int64_t> wrapper(std::move(write_wrapper));
+                unicorn_hook hook{*this};
+                uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_MEM_WRITE, wrapper.get_function(), wrapper.get_user_data(), address,
+                                calc_end_address(address, size)));
                 auto* container = this->create_hook_container();
                 container->add(std::move(wrapper), std::move(hook));
                 return container->as_opaque_hook();
