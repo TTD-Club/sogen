@@ -11,6 +11,7 @@ Use an ordinary Sogen Windows emulation root and a Windows PE:
 ```sh
 analyzer --ttd-record sample.sogttd --ttd-checkpoint-interval 500000 -e root c:/sample.exe
 analyzer --ttd-record writes-only.sogttd --ttd-no-read-trace --ttd-no-execute-trace -e root c:/sample.exe
+analyzer --ttd-replay writes-only.sogttd --ttd-scan-selfmod -e root c:/sample.exe
 analyzer --ttd-query sample.sogttd --ttd-address 0x401000 --ttd-size 0x100
 analyzer --ttd-query sample.sogttd --ttd-access read --ttd-address 0x401000 --ttd-size 0x100
 analyzer --ttd-query sample.sogttd --ttd-access execute --ttd-address 0x401000 --ttd-size 0x100
@@ -68,6 +69,15 @@ with `--ttd-dump-address` and `--ttd-dump-size` to capture the relevant guest
 region. The output is raw mapped memory, with unmapped pages zero-filled; it
 is not a reconstructed on-disk PE with repaired imports or sections. The dump
 still needs the original application and emulation root used for recording.
+
+For a write-only trace, `--ttd-scan-selfmod` reexecutes from the initial
+snapshot, compares each observed write with its recorded position, instruction
+pointer, address, and size, and checks the byte range of each executed
+instruction against earlier writes. It prints the first overlap only after
+the complete replay verifies. A replay divergence is an error, not evidence
+that no written code executed. Execute-address queries and instruction-byte
+analysis still require execute recording; this scan does not build a
+persistent execute index.
 
 `--ttd-strings` restores the initial snapshot and deterministically replays
 the application. It scans committed memory at the initial position and scans
@@ -172,7 +182,8 @@ omits its events and page index entries; queries for that kind return no
 results. On `test/ttd_xor_string_sample.c`, a write-only recording completed
 2,214,469 instructions and contained 289,135 write events, zero read events,
 and zero execute events. Write and execute events are both needed for the
-self-modifying-code query.
+self-modifying-code query on a stored trace. A write-only trace can instead
+use `--ttd-scan-selfmod` if deterministic replay succeeds.
 The same PE with only write tracing disabled produced 550,117 reads,
 2,214,453 executes, and zero writes.
 

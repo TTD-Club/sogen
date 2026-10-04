@@ -63,6 +63,7 @@ namespace sogen
             bool tenet_trace{false};
             std::filesystem::path ttd_record{};
             std::filesystem::path ttd_replay{};
+            bool ttd_scan_selfmod{false};
             uint64_t ttd_seek{};
             uint64_t ttd_checkpoint_interval{500000};
             uint64_t ttd_max_instructions{};
@@ -473,6 +474,46 @@ namespace sogen
                     }
                     if (!options.ttd_replay.empty())
                     {
+                        if (options.ttd_scan_selfmod)
+                        {
+                            ttd::trace replay_trace(options.ttd_replay);
+                            ttd::replay_selfmod_scanner scanner(win_emu, replay_trace);
+                            for (const auto& checkpoint : replay_trace.checkpoints())
+                            {
+                                const auto before = win_emu.get_executed_instructions();
+                                win_emu.start(static_cast<size_t>(checkpoint.step - before));
+                                if (win_emu.get_executed_instructions() != checkpoint.step)
+                                {
+                                    scanner.finish();
+                                    return emit_failure("TTD replay stopped before recorded checkpoint");
+                                }
+                            }
+                            const auto before = win_emu.get_executed_instructions();
+                            win_emu.start(static_cast<size_t>(replay_trace.metadata().instruction_count - before));
+                            scanner.finish();
+                            if (win_emu.get_executed_instructions() != replay_trace.metadata().instruction_count)
+                            {
+                                return emit_failure("TTD replay stopped before recorded instruction count");
+                            }
+                            if (const auto& hit = scanner.first_hit())
+                            {
+                                printf("address=%llx size=%llu write=%llx:0 write_ip=%llx execute=%llx:0 execute_ip=%llx\n",
+                                       static_cast<unsigned long long>(hit->address), static_cast<unsigned long long>(hit->size),
+                                       static_cast<unsigned long long>(hit->write_step), static_cast<unsigned long long>(hit->write_ip),
+                                       static_cast<unsigned long long>(hit->execute_step),
+                                       static_cast<unsigned long long>(hit->execute_ip));
+                            }
+                            printf("TTD replay verified %llu writes across %llu instructions\n",
+                                   static_cast<unsigned long long>(scanner.verified_writes()),
+                                   static_cast<unsigned long long>(win_emu.get_executed_instructions()));
+                            do_post_emulation_work(c);
+                            c.emit_summary<run_finished_event>([&](auto& event) {
+                                event.success = true;
+                                event.exit_status = std::nullopt;
+                            });
+                            flush_reporters(c);
+                            return true;
+                        }
                         const auto checkpoint_step = win_emu.get_executed_instructions();
                         if (options.ttd_seek > checkpoint_step)
                         {
@@ -1051,6 +1092,8 @@ namespace sogen
             app.add_flag("-t,--tenet-trace", options.tenet_trace, "Enable Tenet tracer");
             app.add_option("--ttd-record", options.ttd_record, "Record a checkpointed TTD trace");
             app.add_option("--ttd-replay", options.ttd_replay, "Restore a TTD trace snapshot");
+            app.add_flag("--ttd-scan-selfmod", options.ttd_scan_selfmod,
+                         "Replay write-only TTD trace to find the first written-then-executed instruction");
             app.add_option("--ttd-seek", options.ttd_seek, "Replay through this instruction position");
             app.add_option("--ttd-checkpoint-interval", options.ttd_checkpoint_interval, "Instructions between recording checkpoints")
                 ->capture_default_str();
@@ -1243,6 +1286,10 @@ namespace sogen
                                                    options.ttd_dump_address || options.ttd_dump_size))
                 {
                     throw std::runtime_error("TTD seek and memory inspection require --ttd-replay");
+                }
+                if (options.ttd_scan_selfmod && (options.ttd_replay.empty() || options.ttd_seek))
+                {
+                    throw std::runtime_error("TTD self-modifying-code replay scan requires --ttd-replay from position zero");
                 }
                 if (options.ttd_dump_address.has_value() != options.ttd_dump_size.has_value() ||
                     (options.ttd_dump_address && options.ttd_dump_image.empty()))

@@ -7,6 +7,8 @@
 #include <fstream>
 #include <optional>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <windows_emulator.hpp>
@@ -121,6 +123,11 @@ namespace sogen::ttd
             return header_;
         }
 
+        std::span<const checkpoint_entry> checkpoints() const
+        {
+            return checkpoints_;
+        }
+
         bool has_instruction_bytes() const
         {
             return !legacy_ && !v3_;
@@ -149,5 +156,32 @@ namespace sogen::ttd
         bool legacy_{};
         bool v3_{};
         uint64_t event_size_{};
+    };
+
+    class replay_selfmod_scanner
+    {
+      public:
+        replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes);
+        void finish();
+
+        const std::optional<self_modifying_hit>& first_hit() const
+        {
+            return first_hit_;
+        }
+
+        uint64_t verified_writes() const
+        {
+            return next_write_;
+        }
+
+      private:
+        windows_emulator& emu_;
+        trace& recorded_writes_;
+        std::unordered_map<uint64_t, std::array<uint64_t, 4096>> writers_{};
+        scoped_hook write_hook_{};
+        scoped_hook execute_hook_{};
+        std::optional<self_modifying_hit> first_hit_{};
+        std::optional<std::string> error_{};
+        uint64_t next_write_{};
     };
 }

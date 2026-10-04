@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -513,5 +514,83 @@ namespace sogen::ttd
             result.push_back({address, hit.execution.size, write.step, write.ip, hit.execution.step, hit.execution.ip, hit.count});
         }
         return result;
+    }
+
+    replay_selfmod_scanner::replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes)
+        : emu_(emu),
+          recorded_writes_(recorded_writes)
+    {
+        auto& cpu = emu_.emu();
+        write_hook_ = scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
+            if (next_write_ >= recorded_writes_.metadata().write_count)
+            {
+                error_ = "TTD replay produced an unrecorded memory write";
+                emu_.stop();
+                return;
+            }
+            const auto expected = recorded_writes_.event_at(next_write_);
+            const auto step = emu_.get_executed_instructions();
+            const auto ip = emu_.emu().read_instruction_pointer();
+            if (expected.kind != access_kind::write || expected.step != step || expected.ip != ip || expected.address != address ||
+                expected.size != size)
+            {
+                std::ostringstream message;
+                message << "TTD replay memory write diverged at event " << next_write_ << ": expected step=" << expected.step
+                        << " ip=" << std::hex << expected.ip << " address=" << expected.address << std::dec << " size=" << expected.size
+                        << ", observed step=" << step << " ip=" << std::hex << ip << " address=" << address << std::dec << " size=" << size;
+                error_ = message.str();
+                emu_.stop();
+                return;
+            }
+            if (size)
+            {
+                const auto last = address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
+                for (uint64_t byte = address; byte <= last; ++byte)
+                {
+                    writers_[byte / page_size][byte % page_size] = next_write_ + 1;
+                    if (byte == UINT64_MAX)
+                    {
+                        break;
+                    }
+                }
+            }
+            ++next_write_;
+        }));
+        execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
+            if (error_ || first_hit_ || !size)
+            {
+                return;
+            }
+            const auto last = address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
+            for (uint64_t byte = address; byte <= last; ++byte)
+            {
+                const auto page = writers_.find(byte / page_size);
+                if (page != writers_.end() && page->second[byte % page_size])
+                {
+                    const auto writer = recorded_writes_.event_at(page->second[byte % page_size] - 1);
+                    first_hit_ = self_modifying_hit{
+                        address, size, writer.step, writer.ip, emu_.get_executed_instructions(), emu_.emu().read_instruction_pointer(), 1};
+                    return;
+                }
+                if (byte == UINT64_MAX)
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    void replay_selfmod_scanner::finish()
+    {
+        write_hook_.remove();
+        execute_hook_.remove();
+        if (error_)
+        {
+            throw std::runtime_error(*error_);
+        }
+        if (next_write_ != recorded_writes_.metadata().write_count)
+        {
+            throw std::runtime_error("TTD replay ended before all recorded writes occurred");
+        }
     }
 }
