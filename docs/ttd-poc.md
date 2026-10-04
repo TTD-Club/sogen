@@ -21,6 +21,7 @@ analyzer --ttd-selfmod sample.sogttd
 analyzer --ttd-record packed.sogttd --ttd-max-instructions 12000000 --ttd-no-read-trace -e root c:/sample.exe
 analyzer --ttd-first-selfmod packed.sogttd --ttd-address 0x140001000 --ttd-size 0x11000
 analyzer --ttd-replay packed.sogttd --ttd-seek 9343590 --ttd-dump-image unpacked.mem -e root c:/sample.exe
+analyzer --ttd-replay dll.sogttd --ttd-seek 8493589 --ttd-dump-image unpacked-dll.mem --ttd-dump-address 0x104a70000 --ttd-dump-size 0x4c000 -e root c:/loader.exe
 analyzer --ttd-replay sample.sogttd --ttd-strings strings.tsv -e root c:/sample.exe
 python3 tools/ttd_taint.py sample.sogttd --taint input:0x140002000:35 --register rax
 ```
@@ -62,6 +63,9 @@ the range to its expected unpacked section. Replay to one step before that
 execution and dump the mapped executable with `--ttd-dump-image`. The output
 is a raw image at its guest base address, with unmapped pages zero-filled;
 it is not a reconstructed on-disk PE with repaired imports or sections.
+For a loaded DLL or another guest region, supply both `--ttd-dump-address`
+and `--ttd-dump-size` with its actual mapped base and image size. The dump
+still needs the original application and emulation root used for recording.
 
 `--ttd-strings` restores the initial snapshot and deterministically replays
 the application. It scans committed memory at the initial position and scans
@@ -218,21 +222,34 @@ was inspected statically. Its extracted payload matched that hash and was a
 
 ## Packed sample pilot
 
-Two x64 PE files from a user-provided Malpedia sample archive passed `upx -t`.
-They were emulated in separate, network-disabled Docker runs with bounded
-instruction counts, one vCPU, and read tracing disabled. The archive's family
-labels were not independently verified. The raw binaries, roots, traces, and
-dumps were kept outside the Git repository.
+Seven x64 PE files from a user-provided Malpedia sample archive passed
+`upx -t`. Five were executables; two were DLLs loaded by a benign x64
+`LoadLibraryA` harness. They were emulated in separate, network-disabled
+Docker runs with bounded instruction counts, one vCPU, and read tracing
+disabled. The archive's family labels were not independently verified. The
+raw binaries, roots, traces, and dumps were kept outside the Git repository.
 
 | Archive family | Input SHA-256 | First write-to-execute address | Write step | Execute step | Dump SHA-256 |
 | --- | --- | --- | --- | --- | --- |
 | `win.brbbot` | `a7e036dc7ca28573d34f34b200b1b13343f017ce13d9bb5a6cce4395f39c92bb` | `0x140003f94` | `0x749937` | `0x8e9267` | `bbef309c1cda9d3c13df1d55fe68fe64a553b50d3433b048cd8fa4d4e8c1082c` |
 | `win.reynolds` | `6bd8a0291b268d32422139387864f15924e1db05dbef8cc75a6677f8263fa11d` | `0x1400094fc` | `0x96e658` | `0xd680e8` | `3b381e4ca1ae18d7005a1fa101e0a56f075d4dfb54140ea6c2ec282b89bb4a91` |
+| `win.valley_rat` | `fc97ad46767a45f4e59923f96d15ec5b680a33f580af7cc4e320fb9963933f26` | `0x1400235f8` | `0xac190b` | `0x204a084` | `eff91e554544d9f12ea4c227f00ecc8e20bf3b0aefeb947581eacb58971268a2` |
+| `win.blackbyte` | `796531b6bc24d389750d5db0dc3596456b7f050d3bac280f31563ae362e9f120` | `0x14003f1b8` | `0x19dba96` | `0x3c15c1a` | `47d94dbe0ac78be2b7abbd3c2f7983c2a7b47dc25ac815431b2f116fec4ef32d` |
+| `win.catb` DLL | `3661ff2a050ad47fdc451aed18b88444646bb3eb6387b07f4e47d0306aac6642` | `0x104a71784` | `0x471325` | `0x819a16` | `7f505a8802164862b19517929b7a48442df16299c6fb45058d80a3d2669516ee` |
+| `win.kimsuky` DLL | `0a4f2cff4d4613c08b39c9f18253af0fd356697368eecddf7c0fa560386377e6` | `0x104a99948` | `0x6bc76c` | `0xe3d20f` | `88120c251dbcc4a3a5383fdc0a912dc0888e2e3c5513d837e7e3cd937594ac35` |
 
-For both traces, replay to `execute step - 1` reported RIP at the detected
-address. The input `UPX0` section has zero raw bytes, while the memory dumps
-contain 49,966 and 118,232 nonzero `UPX0` bytes respectively. These results
-demonstrate unpacked code in memory at the transition. They do not establish
-that either program completed its payload, or that the raw dumps are runnable
-PE files. The first trace stopped later at an unsupported `NtFlushKey` syscall;
-the second stopped after 15,799,462 instructions, before its 20 million cap.
+For all six hits, replay to `execute step - 1` reported RIP at the detected
+address and dumped the mapped image without missing pages. Offline `upx -d`
+produced a reference executable or DLL for each sample: its entry-point RVA
+equaled the detected RVA, and its first 16 instruction bytes matched the
+memory dump. The input `UPX0` sections have zero raw bytes, while the dumps
+contain restored code. DLLs were mapped at `0x104a70000`, not their preferred
+base of `0x180000000`, and were dumped using the explicit range options.
+
+The seventh sample, `win.waterminer`
+(`db4f825732f27f1163367226c7d565714455f3f51c1cdbd858ed4a0b2335515b`),
+stopped at 4,515,906 instructions before its packed entry point. Its loader
+searched for `cpu_tromp_SSE2.dll` and reached `NtRaiseHardError`; this is an
+emulation coverage limit, not an unpacking result. These tests cover one
+packer family only. None of the raw dumps was rebuilt and verified as a
+runnable PE, and no payload completion is claimed.

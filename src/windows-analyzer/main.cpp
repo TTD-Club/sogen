@@ -67,6 +67,8 @@ namespace sogen
             uint64_t ttd_checkpoint_interval{500000};
             uint64_t ttd_max_instructions{};
             std::filesystem::path ttd_dump_image{};
+            std::optional<uint64_t> ttd_dump_address{};
+            std::optional<uint64_t> ttd_dump_size{};
             bool ttd_no_checkpoints{false};
             bool ttd_no_read_trace{false};
             bool ttd_no_write_trace{false};
@@ -492,7 +494,9 @@ namespace sogen
                         if (!options.ttd_dump_image.empty())
                         {
                             const auto& image = *win_emu.mod_manager.executable;
-                            if (!image.size_of_image || image.size_of_image > 512ull * 1024 * 1024)
+                            const auto dump_address = options.ttd_dump_address.value_or(image.image_base);
+                            const auto dump_size = options.ttd_dump_size.value_or(image.size_of_image);
+                            if (!dump_size || dump_size > 512ull * 1024 * 1024 || dump_address > UINT64_MAX - dump_size)
                             {
                                 throw std::runtime_error("TTD image dump size is invalid or exceeds 512 MiB");
                             }
@@ -503,11 +507,11 @@ namespace sogen
                             }
                             std::array<char, 4096> page{};
                             uint64_t missing_pages = 0;
-                            for (uint64_t offset = 0; offset < image.size_of_image; offset += page.size())
+                            for (uint64_t offset = 0; offset < dump_size; offset += page.size())
                             {
                                 page.fill(0);
-                                const auto length = static_cast<size_t>(std::min<uint64_t>(page.size(), image.size_of_image - offset));
-                                if (!win_emu.emu().try_read_memory(image.image_base + offset, page.data(), length))
+                                const auto length = static_cast<size_t>(std::min<uint64_t>(page.size(), dump_size - offset));
+                                if (!win_emu.emu().try_read_memory(dump_address + offset, page.data(), length))
                                 {
                                     ++missing_pages;
                                 }
@@ -518,9 +522,8 @@ namespace sogen
                                 throw std::runtime_error("Writing TTD image dump failed");
                             }
                             win_emu.log.log("TTD image dump %s base=%llx size=%llx missing_pages=%llu\n",
-                                            options.ttd_dump_image.string().c_str(), static_cast<unsigned long long>(image.image_base),
-                                            static_cast<unsigned long long>(image.size_of_image),
-                                            static_cast<unsigned long long>(missing_pages));
+                                            options.ttd_dump_image.string().c_str(), static_cast<unsigned long long>(dump_address),
+                                            static_cast<unsigned long long>(dump_size), static_cast<unsigned long long>(missing_pages));
                         }
                         do_post_emulation_work(c);
                         c.emit_summary<run_finished_event>([&](auto& event) {
@@ -1053,6 +1056,8 @@ namespace sogen
                 ->capture_default_str();
             app.add_option("--ttd-max-instructions", options.ttd_max_instructions, "Stop recording after this many instructions");
             app.add_option("--ttd-dump-image", options.ttd_dump_image, "Dump mapped executable image at replay position");
+            app.add_option("--ttd-dump-address", options.ttd_dump_address, "Guest base address for a replay memory dump");
+            app.add_option("--ttd-dump-size", options.ttd_dump_size, "Guest byte length for a replay memory dump");
             app.add_flag("--ttd-no-checkpoints", options.ttd_no_checkpoints, "Record only the initial snapshot (baseline comparison)");
             app.add_flag("--ttd-no-read-trace", options.ttd_no_read_trace, "Disable memory-read event recording");
             app.add_flag("--ttd-no-write-trace", options.ttd_no_write_trace, "Disable memory-write event recording");
@@ -1231,9 +1236,15 @@ namespace sogen
                 {
                     throw std::runtime_error("TTD POC requires a fresh application run without GDB or snapshot input");
                 }
-                if (options.ttd_replay.empty() && (options.ttd_seek || options.ttd_read || !options.ttd_dump_image.empty()))
+                if (options.ttd_replay.empty() && (options.ttd_seek || options.ttd_read || !options.ttd_dump_image.empty() ||
+                                                   options.ttd_dump_address || options.ttd_dump_size))
                 {
                     throw std::runtime_error("TTD seek and memory inspection require --ttd-replay");
+                }
+                if (options.ttd_dump_address.has_value() != options.ttd_dump_size.has_value() ||
+                    (options.ttd_dump_address && options.ttd_dump_image.empty()))
+                {
+                    throw std::runtime_error("TTD dump range requires --ttd-dump-image, --ttd-dump-address, and --ttd-dump-size");
                 }
                 if (options.ttd_record.empty() && options.ttd_max_instructions)
                 {
