@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <queue>
 #include <sstream>
 #include <set>
 #include <stdexcept>
@@ -79,6 +80,7 @@ namespace sogen::ttd
 
     recorder::recorder(windows_emulator& emu, const std::filesystem::path& path, const uint64_t access_mask)
         : emu_(emu),
+          path_(path),
           file_(path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc)
     {
         if (!file_)
@@ -169,20 +171,7 @@ namespace sogen::ttd
         read_hook_.remove();
         execute_hook_.remove();
         header_.instruction_count = emu_.get_executed_instructions();
-        // Build the searchable index after tracing, away from the hot hooks.
-        std::vector<index_entry> index{};
-        file_.flush();
-        file_.seekg(static_cast<std::streamoff>(sizeof(header) + header_.snapshot_size));
-        for (uint64_t number = 0; number < header_.write_count; ++number)
-        {
-            const auto event = read_object<access_event>(file_);
-            const auto last = event.address + std::min<uint64_t>(event.size - 1, UINT64_MAX - event.address);
-            for (auto page = event.address / page_size; page <= last / page_size; ++page)
-            {
-                index.push_back({page, number, event.kind});
-            }
-        }
-        std::sort(index.begin(), index.end(), [](const auto& a, const auto& b) {
+        const auto index_less = [](const index_entry& a, const index_entry& b) {
             if (a.page != b.page)
             {
                 return a.page < b.page;
@@ -192,7 +181,68 @@ namespace sogen::ttd
                 return a.kind < b.kind;
             }
             return a.event_number < b.event_number;
-        });
+        };
+        constexpr size_t index_chunk_limit = 4'000'000;
+        std::vector<index_entry> index{};
+        index.reserve(index_chunk_limit);
+
+        struct index_runs
+        {
+            std::vector<std::filesystem::path> paths{};
+            std::vector<uint64_t> counts{};
+
+            ~index_runs()
+            {
+                for (const auto& path : paths)
+                {
+                    std::error_code error;
+                    std::filesystem::remove(path, error);
+                }
+            }
+        } runs;
+
+        const auto flush_index_run = [&] {
+            std::sort(index.begin(), index.end(), index_less);
+            const auto path = std::filesystem::path(path_.string() + ".index-run-" + std::to_string(runs.paths.size()));
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            if (!output)
+            {
+                throw std::runtime_error("Cannot create TTD index run: " + path.string());
+            }
+            runs.paths.push_back(path);
+            runs.counts.push_back(index.size());
+            output.write(reinterpret_cast<const char*>(index.data()), static_cast<std::streamsize>(index.size() * sizeof(index_entry)));
+            if (!output)
+            {
+                throw std::runtime_error("Cannot write TTD index run");
+            }
+            index.clear();
+        };
+        uint64_t index_count = 0;
+        file_.flush();
+        file_.seekg(static_cast<std::streamoff>(sizeof(header) + header_.snapshot_size));
+        for (uint64_t number = 0; number < header_.write_count; ++number)
+        {
+            const auto event = read_object<access_event>(file_);
+            const auto last = event.address + std::min<uint64_t>(event.size - 1, UINT64_MAX - event.address);
+            for (auto page = event.address / page_size; page <= last / page_size; ++page)
+            {
+                index.push_back({page, number, event.kind});
+                ++index_count;
+                if (index.size() == index_chunk_limit)
+                {
+                    flush_index_run();
+                }
+            }
+        }
+        if (runs.paths.empty())
+        {
+            std::sort(index.begin(), index.end(), index_less);
+        }
+        else if (!index.empty())
+        {
+            flush_index_run();
+        }
         file_.clear();
         file_.seekp(0, std::ios::end);
         std::vector<checkpoint_entry> table{};
@@ -215,10 +265,74 @@ namespace sogen::ttd
             write_object(file_, entry);
         }
         header_.index_offset = static_cast<uint64_t>(file_.tellp());
-        header_.index_count = index.size();
-        for (const auto& entry : index)
+        header_.index_count = index_count;
+        if (runs.paths.empty())
         {
-            write_object(file_, entry);
+            for (const auto& entry : index)
+            {
+                write_object(file_, entry);
+            }
+        }
+        else
+        {
+            struct run_reader
+            {
+                std::ifstream file{};
+                uint64_t remaining{};
+                std::array<index_entry, 4096> buffer{};
+                size_t next{};
+                size_t available{};
+
+                std::optional<index_entry> read()
+                {
+                    if (next == available)
+                    {
+                        if (!remaining)
+                        {
+                            return std::nullopt;
+                        }
+                        available = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
+                        file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(available * sizeof(index_entry)));
+                        if (!file)
+                        {
+                            throw std::runtime_error("Truncated TTD index run");
+                        }
+                        remaining -= available;
+                        next = 0;
+                    }
+                    return buffer[next++];
+                }
+            };
+
+            struct merge_item
+            {
+                index_entry entry{};
+                size_t run{};
+            };
+
+            const auto greater = [&](const merge_item& a, const merge_item& b) { return index_less(b.entry, a.entry); };
+            std::priority_queue<merge_item, std::vector<merge_item>, decltype(greater)> queue(greater);
+            std::vector<run_reader> readers(runs.paths.size());
+            for (size_t i = 0; i < readers.size(); ++i)
+            {
+                readers[i].file.open(runs.paths[i], std::ios::binary);
+                if (!readers[i].file)
+                {
+                    throw std::runtime_error("Cannot read TTD index run");
+                }
+                readers[i].remaining = runs.counts[i];
+                queue.push({*readers[i].read(), i});
+            }
+            while (!queue.empty())
+            {
+                const auto item = queue.top();
+                queue.pop();
+                write_object(file_, item.entry);
+                if (const auto next = readers[item.run].read())
+                {
+                    queue.push({*next, item.run});
+                }
+            }
         }
         file_.seekp(0);
         write_object(file_, header_);
@@ -230,7 +344,7 @@ namespace sogen::ttd
         finished_ = true;
     }
 
-    trace::trace(const std::filesystem::path& path)
+    trace::trace(const std::filesystem::path& path, const bool load_index)
         : file_(path, std::ios::binary)
     {
         if (!file_)
@@ -313,6 +427,19 @@ namespace sogen::ttd
             checkpoints_.push_back(entry);
             previous_step = entry.step;
         }
+        if (load_index)
+        {
+            load_page_index();
+        }
+    }
+
+    void trace::load_page_index()
+    {
+        if (page_index_loaded_)
+        {
+            return;
+        }
+        file_.clear();
         file_.seekg(static_cast<std::streamoff>(header_.index_offset));
         for (uint64_t i = 0; i < header_.index_count; ++i)
         {
@@ -338,6 +465,7 @@ namespace sogen::ttd
             }
             return a.event_number < b.event_number;
         });
+        page_index_loaded_ = true;
     }
 
     checkpoint_state trace::checkpoint_for_step(uint64_t step)
@@ -396,6 +524,7 @@ namespace sogen::ttd
         {
             return result;
         }
+        load_page_index();
         const auto last = address + std::min(size - 1, UINT64_MAX - address);
         std::set<uint64_t> numbers{};
         for (auto page = address / page_size; page <= last / page_size; ++page)

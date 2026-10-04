@@ -103,6 +103,7 @@ namespace sogen::ttd
 
       private:
         windows_emulator& emu_;
+        std::filesystem::path path_;
         std::fstream file_;
         header header_{};
         std::vector<checkpoint_state> checkpoints_{};
@@ -116,7 +117,7 @@ namespace sogen::ttd
     class trace
     {
       public:
-        explicit trace(const std::filesystem::path& path);
+        explicit trace(const std::filesystem::path& path, bool load_index = true);
 
         const header& metadata() const
         {
@@ -153,9 +154,11 @@ namespace sogen::ttd
         std::vector<std::byte> snapshot_{};
         std::vector<checkpoint_entry> checkpoints_{};
         std::vector<index_entry> page_index_{};
+        bool page_index_loaded_{};
         bool legacy_{};
         bool v3_{};
         uint64_t event_size_{};
+        void load_page_index();
     };
 
     class replay_selfmod_scanner

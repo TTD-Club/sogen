@@ -155,8 +155,10 @@ The index is sorted by 4 KiB page, access kind, and event number. It includes
 every page touched by an access. The hot hooks append only events; index
 construction scans the event stream after emulation completes. Readers
 validate offsets and event numbers before using them. The event stream and
-index may grow large; this version buffers compressed checkpoint snapshots
-and the index in memory until recording finishes.
+index may grow large; index construction sorts bounded chunks on disk and
+merges them into the trace. Write-only replay scans skip loading the page
+index. Address queries still load the index into memory. Compressed checkpoint
+snapshots remain buffered until recording finishes.
 
 ## Larger-program check
 

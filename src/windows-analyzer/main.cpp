@@ -476,7 +476,7 @@ namespace sogen
                     {
                         if (options.ttd_scan_selfmod)
                         {
-                            ttd::trace replay_trace(options.ttd_replay);
+                            ttd::trace replay_trace(options.ttd_replay, false);
                             win_emu.setup_process_if_necessary();
                             ttd::replay_selfmod_scanner scanner(win_emu, replay_trace);
                             for (const auto& checkpoint : replay_trace.checkpoints())
@@ -810,7 +810,7 @@ namespace sogen
             std::optional<ttd::trace> replay_trace{};
             if (!options.ttd_replay.empty())
             {
-                replay_trace.emplace(options.ttd_replay);
+                replay_trace.emplace(options.ttd_replay, !options.ttd_scan_selfmod);
                 if (!options.ttd_scan_selfmod)
                 {
                     const auto checkpoint = replay_trace->checkpoint_for_step(options.ttd_seek);
