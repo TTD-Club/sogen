@@ -19,6 +19,7 @@ analyzer --ttd-query sample.sogttd --ttd-access all --ttd-address 0x401000 --ttd
 analyzer --ttd-replay sample.sogttd --ttd-seek 1000 --ttd-read 0x401000 -e root c:/sample.exe
 analyzer --ttd-selfmod sample.sogttd
 analyzer --ttd-record packed.sogttd --ttd-max-instructions 12000000 --ttd-no-read-trace -e root c:/sample.exe
+analyzer --ttd-first-selfmod packed.sogttd
 analyzer --ttd-first-selfmod packed.sogttd --ttd-address 0x140001000 --ttd-size 0x11000
 analyzer --ttd-replay packed.sogttd --ttd-seek 9343590 --ttd-dump-image unpacked.mem -e root c:/sample.exe
 analyzer --ttd-replay dll.sogttd --ttd-seek 8493589 --ttd-dump-image unpacked-dll.mem --ttd-dump-address 0x104a70000 --ttd-dump-size 0x4c000 -e root c:/loader.exe
@@ -57,14 +58,15 @@ positions plus an execution count. This is a write-before-execute finding;
 loader relocations or legitimate generated code can also produce hits. It does
 not determine whether the bytes differ from the original image.
 
-`--ttd-first-selfmod` selects the earliest hit by execution step within the
-given address range, regardless of address sort order. For a packed PE, set
-the range to its expected unpacked section. Replay to one step before that
-execution and dump the mapped executable with `--ttd-dump-image`. The output
-is a raw image at its guest base address, with unmapped pages zero-filled;
-it is not a reconstructed on-disk PE with repaired imports or sections.
-For a loaded DLL or another guest region, supply both `--ttd-dump-address`
-and `--ttd-dump-size` with its actual mapped base and image size. The dump
+`--ttd-first-selfmod` selects the earliest hit by execution step across the
+entire recorded address space by default, including allocated regions outside
+the original image. `--ttd-address` and `--ttd-size` optionally restrict the
+reported instruction start address. The earliest hit can still be a packer
+stub or legitimate generated code rather than an unpacked payload entry.
+Replay to one step before the selected execution and use `--ttd-dump-image`
+with `--ttd-dump-address` and `--ttd-dump-size` to capture the relevant guest
+region. The output is raw mapped memory, with unmapped pages zero-filled; it
+is not a reconstructed on-disk PE with repaired imports or sections. The dump
 still needs the original application and emulation root used for recording.
 
 `--ttd-strings` restores the initial snapshot and deterministically replays

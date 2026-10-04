@@ -1074,11 +1074,13 @@ namespace sogen
             std::string ttd_access{"write"};
             app.add_option("--ttd-query", ttd_query, "Query memory accesses in a TTD trace");
             app.add_option("--ttd-selfmod", ttd_selfmod, "Find executed bytes written earlier in a TTD trace");
-            app.add_option("--ttd-first-selfmod", ttd_first_selfmod, "Find first written-then-executed instruction in address range");
+            app.add_option("--ttd-first-selfmod", ttd_first_selfmod,
+                           "Find first written-then-executed instruction anywhere, or in an optional address range");
             app.add_option("--ttd-access", ttd_access, "Access type: read, write, execute, or all")
                 ->check(CLI::IsMember({"read", "write", "execute", "all"}));
-            app.add_option("--ttd-address", ttd_address, "First address for TTD write query");
-            app.add_option("--ttd-size", ttd_size, "Byte length for TTD write query");
+            auto* ttd_address_option =
+                app.add_option("--ttd-address", ttd_address, "First address for TTD write query or self-modifying-code filter");
+            auto* ttd_size_option = app.add_option("--ttd-size", ttd_size, "Byte length for TTD write query or self-modifying-code filter");
             app.add_option("--ttd-from", ttd_from, "First instruction position for TTD write query");
             app.add_option("--ttd-to", ttd_to, "Last instruction position for TTD write query");
             app.add_flag("--ttd-next-access,--ttd-next-write", ttd_next_write, "Find the next matching access after --ttd-from");
@@ -1142,9 +1144,10 @@ namespace sogen
                 {
                     ttd::trace trace(ttd_first_selfmod);
                     std::optional<ttd::self_modifying_hit> first{};
+                    const bool filter_address = ttd_address_option->count() || ttd_size_option->count();
                     for (const auto& hit : trace.self_modifying_code())
                     {
-                        if (hit.address < ttd_address || hit.address - ttd_address >= ttd_size)
+                        if (filter_address && (hit.address < ttd_address || hit.address - ttd_address >= ttd_size))
                         {
                             continue;
                         }
