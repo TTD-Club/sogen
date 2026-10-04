@@ -70,14 +70,20 @@ region. The output is raw mapped memory, with unmapped pages zero-filled; it
 is not a reconstructed on-disk PE with repaired imports or sections. The dump
 still needs the original application and emulation root used for recording.
 
-For a write-only trace, `--ttd-scan-selfmod` reexecutes from the initial
-snapshot, compares each observed write with its recorded position, instruction
+For a write-only trace, `--ttd-scan-selfmod` starts a fresh emulation and
+compares each observed write with its recorded position, instruction
 pointer, address, and size, and checks the byte range of each executed
 instruction against earlier writes. It prints the first overlap only after
 the complete replay verifies. A replay divergence is an error, not evidence
 that no written code executed. Execute-address queries and instruction-byte
 analysis still require execute recording; this scan does not build a
 persistent execute index.
+
+Add `--ttd-dump-image first-hit.mem` to capture the original image at the
+first write-before-execute hit. `--ttd-dump-address` and `--ttd-dump-size`
+select a different range, such as an allocated code region. This capture is
+taken before the matched instruction executes and saved only after the full
+replay verifies. The scan capture limit is 64 MiB.
 
 The scan starts a fresh emulation of the recorded application rather than
 restoring the initial snapshot. Give it a fresh, writable copy of the same

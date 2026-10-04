@@ -164,8 +164,18 @@ namespace sogen::ttd
     class replay_selfmod_scanner
     {
       public:
-        replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes);
+        replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes, uint64_t capture_address = 0, size_t capture_size = 0);
         void finish();
+
+        const std::vector<uint8_t>& captured_memory() const
+        {
+            return captured_memory_;
+        }
+
+        uint64_t missing_capture_pages() const
+        {
+            return missing_capture_pages_;
+        }
 
         const std::optional<self_modifying_hit>& first_hit() const
         {
@@ -186,5 +196,9 @@ namespace sogen::ttd
         std::optional<self_modifying_hit> first_hit_{};
         std::optional<std::string> error_{};
         uint64_t next_write_{};
+        uint64_t capture_address_{};
+        size_t capture_size_{};
+        std::vector<uint8_t> captured_memory_{};
+        uint64_t missing_capture_pages_{};
     };
 }

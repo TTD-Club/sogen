@@ -645,9 +645,12 @@ namespace sogen::ttd
         return result;
     }
 
-    replay_selfmod_scanner::replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes)
+    replay_selfmod_scanner::replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes, const uint64_t capture_address,
+                                                   const size_t capture_size)
         : emu_(emu),
-          recorded_writes_(recorded_writes)
+          recorded_writes_(recorded_writes),
+          capture_address_(capture_address),
+          capture_size_(capture_size)
     {
         auto& cpu = emu_.emu();
         write_hook_ = scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
@@ -699,6 +702,19 @@ namespace sogen::ttd
                     const auto writer = recorded_writes_.event_at(page->second[byte % page_size] - 1);
                     first_hit_ = self_modifying_hit{
                         address, size, writer.step, writer.ip, emu_.get_executed_instructions(), emu_.emu().read_instruction_pointer(), 1};
+                    if (capture_size_)
+                    {
+                        captured_memory_.resize(capture_size_);
+                        for (size_t offset = 0; offset < capture_size_; offset += page_size)
+                        {
+                            const auto length = std::min<size_t>(page_size, capture_size_ - offset);
+                            if (!emu_.emu().try_read_memory(capture_address_ + offset, captured_memory_.data() + offset, length))
+                            {
+                                std::fill_n(captured_memory_.data() + offset, length, 0);
+                                ++missing_capture_pages_;
+                            }
+                        }
+                    }
                     return;
                 }
                 if (byte == UINT64_MAX)

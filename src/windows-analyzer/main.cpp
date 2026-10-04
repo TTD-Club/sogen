@@ -478,7 +478,21 @@ namespace sogen
                         {
                             ttd::trace replay_trace(options.ttd_replay, false);
                             win_emu.setup_process_if_necessary();
-                            ttd::replay_selfmod_scanner scanner(win_emu, replay_trace);
+                            uint64_t capture_address = 0;
+                            size_t capture_size = 0;
+                            if (!options.ttd_dump_image.empty())
+                            {
+                                const auto& image = *win_emu.mod_manager.executable;
+                                capture_address = options.ttd_dump_address.value_or(image.image_base);
+                                const auto requested_size = options.ttd_dump_size.value_or(image.size_of_image);
+                                if (!requested_size || requested_size > 64ull * 1024 * 1024 ||
+                                    capture_address > UINT64_MAX - requested_size)
+                                {
+                                    throw std::runtime_error("TTD first-hit dump size is invalid or exceeds 64 MiB");
+                                }
+                                capture_size = static_cast<size_t>(requested_size);
+                            }
+                            ttd::replay_selfmod_scanner scanner(win_emu, replay_trace, capture_address, capture_size);
                             for (const auto& checkpoint : replay_trace.checkpoints())
                             {
                                 const auto before = win_emu.get_executed_instructions();
@@ -498,6 +512,24 @@ namespace sogen
                             }
                             if (const auto& hit = scanner.first_hit())
                             {
+                                if (capture_size)
+                                {
+                                    std::ofstream dump(options.ttd_dump_image, std::ios::binary | std::ios::trunc);
+                                    if (!dump)
+                                    {
+                                        throw std::runtime_error("Cannot open TTD first-hit dump");
+                                    }
+                                    const auto& data = scanner.captured_memory();
+                                    dump.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+                                    if (!dump)
+                                    {
+                                        throw std::runtime_error("Writing TTD first-hit dump failed");
+                                    }
+                                    printf("TTD first-hit dump %s base=%llx size=%llx missing_pages=%llu\n",
+                                           options.ttd_dump_image.string().c_str(), static_cast<unsigned long long>(capture_address),
+                                           static_cast<unsigned long long>(capture_size),
+                                           static_cast<unsigned long long>(scanner.missing_capture_pages()));
+                                }
                                 printf("address=%llx size=%llu write=%llx:0 write_ip=%llx execute=%llx:0 execute_ip=%llx\n",
                                        static_cast<unsigned long long>(hit->address), static_cast<unsigned long long>(hit->size),
                                        static_cast<unsigned long long>(hit->write_step), static_cast<unsigned long long>(hit->write_ip),
@@ -810,7 +842,7 @@ namespace sogen
             std::optional<ttd::trace> replay_trace{};
             if (!options.ttd_replay.empty())
             {
-                replay_trace.emplace(options.ttd_replay, !options.ttd_scan_selfmod);
+                replay_trace.emplace(options.ttd_replay, false);
                 if (!options.ttd_scan_selfmod)
                 {
                     const auto checkpoint = replay_trace->checkpoint_for_step(options.ttd_seek);
