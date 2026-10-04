@@ -29,6 +29,7 @@
 #ifndef _WIN32
 #include <csignal>
 #endif
+#include <fstream>
 
 namespace sogen
 {
@@ -64,6 +65,8 @@ namespace sogen
             std::filesystem::path ttd_replay{};
             uint64_t ttd_seek{};
             uint64_t ttd_checkpoint_interval{500000};
+            uint64_t ttd_max_instructions{};
+            std::filesystem::path ttd_dump_image{};
             bool ttd_no_checkpoints{false};
             bool ttd_no_read_trace{false};
             bool ttd_no_write_trace{false};
@@ -486,6 +489,39 @@ namespace sogen
                             win_emu.log.log("TTD memory %llx = %llx\n", static_cast<unsigned long long>(*options.ttd_read),
                                             static_cast<unsigned long long>(value));
                         }
+                        if (!options.ttd_dump_image.empty())
+                        {
+                            const auto& image = *win_emu.mod_manager.executable;
+                            if (!image.size_of_image || image.size_of_image > 512ull * 1024 * 1024)
+                            {
+                                throw std::runtime_error("TTD image dump size is invalid or exceeds 512 MiB");
+                            }
+                            std::ofstream dump(options.ttd_dump_image, std::ios::binary | std::ios::trunc);
+                            if (!dump)
+                            {
+                                throw std::runtime_error("Cannot open TTD image dump");
+                            }
+                            std::array<char, 4096> page{};
+                            uint64_t missing_pages = 0;
+                            for (uint64_t offset = 0; offset < image.size_of_image; offset += page.size())
+                            {
+                                page.fill(0);
+                                const auto length = static_cast<size_t>(std::min<uint64_t>(page.size(), image.size_of_image - offset));
+                                if (!win_emu.emu().try_read_memory(image.image_base + offset, page.data(), length))
+                                {
+                                    ++missing_pages;
+                                }
+                                dump.write(page.data(), static_cast<std::streamsize>(length));
+                            }
+                            if (!dump)
+                            {
+                                throw std::runtime_error("Writing TTD image dump failed");
+                            }
+                            win_emu.log.log("TTD image dump %s base=%llx size=%llx missing_pages=%llu\n",
+                                            options.ttd_dump_image.string().c_str(), static_cast<unsigned long long>(image.image_base),
+                                            static_cast<unsigned long long>(image.size_of_image),
+                                            static_cast<unsigned long long>(missing_pages));
+                        }
                         do_post_emulation_work(c);
                         c.emit_summary<run_finished_event>([&](auto& event) {
                             event.success = true;
@@ -499,25 +535,37 @@ namespace sogen
                         while (!win_emu.process.exit_status && !signals_received)
                         {
                             const auto before = win_emu.get_executed_instructions();
-                            win_emu.start(static_cast<size_t>(options.ttd_checkpoint_interval));
+                            if (options.ttd_max_instructions && before >= options.ttd_max_instructions)
+                            {
+                                break;
+                            }
+                            const auto budget = options.ttd_max_instructions
+                                                    ? std::min(options.ttd_checkpoint_interval, options.ttd_max_instructions - before)
+                                                    : options.ttd_checkpoint_interval;
+                            win_emu.start(static_cast<size_t>(budget));
                             if (win_emu.process.exit_status || signals_received)
                             {
                                 break;
                             }
-                            if (win_emu.get_executed_instructions() - before != options.ttd_checkpoint_interval)
+                            if (win_emu.get_executed_instructions() - before != budget)
                             {
                                 break;
                             }
-                            ttd_recorder->checkpoint();
+                            if (!options.ttd_max_instructions || win_emu.get_executed_instructions() < options.ttd_max_instructions)
+                            {
+                                ttd_recorder->checkpoint();
+                            }
                         }
                     }
                     else
                     {
-                        win_emu.start();
+                        win_emu.start(ttd_recorder && options.ttd_max_instructions ? static_cast<size_t>(options.ttd_max_instructions) : 0);
                     }
                     if (ttd_recorder)
                     {
                         ttd_recorder->finish();
+                        win_emu.log.log("TTD recorded %llu instructions\n",
+                                        static_cast<unsigned long long>(win_emu.get_executed_instructions()));
                     }
                 }
 
@@ -552,6 +600,17 @@ namespace sogen
             exit_status = win_emu.process.exit_status;
             if (!exit_status.has_value())
             {
+                if (!options.ttd_record.empty() && options.ttd_max_instructions &&
+                    win_emu.get_executed_instructions() >= options.ttd_max_instructions)
+                {
+                    do_post_emulation_work(c);
+                    c.emit_summary<run_finished_event>([&](auto& event) {
+                        event.success = true;
+                        event.exit_status = std::nullopt;
+                    });
+                    flush_reporters(c);
+                    return true;
+                }
                 return emit_failure("Emulation terminated without status");
             }
 
@@ -992,6 +1051,8 @@ namespace sogen
             app.add_option("--ttd-seek", options.ttd_seek, "Replay through this instruction position");
             app.add_option("--ttd-checkpoint-interval", options.ttd_checkpoint_interval, "Instructions between recording checkpoints")
                 ->capture_default_str();
+            app.add_option("--ttd-max-instructions", options.ttd_max_instructions, "Stop recording after this many instructions");
+            app.add_option("--ttd-dump-image", options.ttd_dump_image, "Dump mapped executable image at replay position");
             app.add_flag("--ttd-no-checkpoints", options.ttd_no_checkpoints, "Record only the initial snapshot (baseline comparison)");
             app.add_flag("--ttd-no-read-trace", options.ttd_no_read_trace, "Disable memory-read event recording");
             app.add_flag("--ttd-no-write-trace", options.ttd_no_write_trace, "Disable memory-write event recording");
@@ -1002,11 +1063,13 @@ namespace sogen
                 ->capture_default_str();
             std::filesystem::path ttd_query{};
             std::filesystem::path ttd_selfmod{};
+            std::filesystem::path ttd_first_selfmod{};
             uint64_t ttd_address{}, ttd_size{1}, ttd_from{}, ttd_to{UINT64_MAX};
             bool ttd_next_write{}, ttd_prev_write{};
             std::string ttd_access{"write"};
             app.add_option("--ttd-query", ttd_query, "Query memory accesses in a TTD trace");
             app.add_option("--ttd-selfmod", ttd_selfmod, "Find executed bytes written earlier in a TTD trace");
+            app.add_option("--ttd-first-selfmod", ttd_first_selfmod, "Find first written-then-executed instruction in address range");
             app.add_option("--ttd-access", ttd_access, "Access type: read, write, execute, or all")
                 ->check(CLI::IsMember({"read", "write", "execute", "all"}));
             app.add_option("--ttd-address", ttd_address, "First address for TTD write query");
@@ -1070,6 +1133,30 @@ namespace sogen
 
             try
             {
+                if (!ttd_first_selfmod.empty())
+                {
+                    ttd::trace trace(ttd_first_selfmod);
+                    std::optional<ttd::self_modifying_hit> first{};
+                    for (const auto& hit : trace.self_modifying_code())
+                    {
+                        if (hit.address < ttd_address || hit.address - ttd_address >= ttd_size)
+                        {
+                            continue;
+                        }
+                        if (!first || hit.execute_step < first->execute_step)
+                        {
+                            first = hit;
+                        }
+                    }
+                    if (first)
+                    {
+                        printf("address=%llx size=%llu write=%llx:0 write_ip=%llx execute=%llx:0 execute_ip=%llx\n",
+                               static_cast<unsigned long long>(first->address), static_cast<unsigned long long>(first->size),
+                               static_cast<unsigned long long>(first->write_step), static_cast<unsigned long long>(first->write_ip),
+                               static_cast<unsigned long long>(first->execute_step), static_cast<unsigned long long>(first->execute_ip));
+                    }
+                    return first ? 0 : 2;
+                }
                 if (!ttd_selfmod.empty())
                 {
                     ttd::trace trace(ttd_selfmod);
@@ -1144,9 +1231,13 @@ namespace sogen
                 {
                     throw std::runtime_error("TTD POC requires a fresh application run without GDB or snapshot input");
                 }
-                if (options.ttd_replay.empty() && (options.ttd_seek || options.ttd_read))
+                if (options.ttd_replay.empty() && (options.ttd_seek || options.ttd_read || !options.ttd_dump_image.empty()))
                 {
                     throw std::runtime_error("TTD seek and memory inspection require --ttd-replay");
+                }
+                if (options.ttd_record.empty() && options.ttd_max_instructions)
+                {
+                    throw std::runtime_error("TTD instruction limit requires --ttd-record");
                 }
                 if (!options.ttd_strings.empty() && (options.ttd_replay.empty() || options.ttd_seek))
                 {

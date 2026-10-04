@@ -90,15 +90,24 @@ def main() -> None:
             (3, 0x5000, 0x5000, 3, 4),
             (4, 0x7002, 0x6000, 1, 2),
             (5, 0x6001, 0x6001, 1, 4),
+            (6, 0x7003, 0x4000, 1, 2),
+            (7, 0x4000, 0x4000, 1, 4),
         ]
         end = 64 + 40 * len(code_events)
         with modified.open("wb") as file:
-            file.write(struct.pack("<8s7Q", b"SOGTTD3\0", 0, 5, len(code_events), 0, end, end, 0))
+            file.write(struct.pack("<8s7Q", b"SOGTTD3\0", 0, 7, len(code_events), 0, end, end, 0))
             for event in code_events:
                 file.write(struct.pack("<5Q", *event))
         found = subprocess.run([str(analyzer), "--ttd-selfmod", str(modified)],
                                text=True, capture_output=True, check=True).stdout.splitlines()
-        assert found == ["address=5000 size=3 write=2:0 write_ip=7001 execute=3:0 execute_ip=5000 count=1"]
+        assert found == [
+            "address=4000 size=1 write=6:0 write_ip=7003 execute=7:0 execute_ip=4000 count=1",
+            "address=5000 size=3 write=2:0 write_ip=7001 execute=3:0 execute_ip=5000 count=1",
+        ]
+        first = subprocess.run([str(analyzer), "--ttd-first-selfmod", str(modified),
+                                "--ttd-address", "0x4000", "--ttd-size", "0x2000"],
+                               text=True, capture_output=True, check=True).stdout.splitlines()
+        assert first == ["address=5000 size=3 write=2:0 write_ip=7001 execute=3:0 execute_ip=5000"]
 
 
 if __name__ == "__main__":

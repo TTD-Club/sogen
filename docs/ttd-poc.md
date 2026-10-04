@@ -18,6 +18,9 @@ analyzer --ttd-query sample.sogttd --ttd-address 0x401000 --ttd-size 0x100 --ttd
 analyzer --ttd-query sample.sogttd --ttd-access all --ttd-address 0x401000 --ttd-from 1000 --ttd-next-access
 analyzer --ttd-replay sample.sogttd --ttd-seek 1000 --ttd-read 0x401000 -e root c:/sample.exe
 analyzer --ttd-selfmod sample.sogttd
+analyzer --ttd-record packed.sogttd --ttd-max-instructions 12000000 --ttd-no-read-trace -e root c:/sample.exe
+analyzer --ttd-first-selfmod packed.sogttd --ttd-address 0x140001000 --ttd-size 0x11000
+analyzer --ttd-replay packed.sogttd --ttd-seek 9343590 --ttd-dump-image unpacked.mem -e root c:/sample.exe
 analyzer --ttd-replay sample.sogttd --ttd-strings strings.tsv -e root c:/sample.exe
 python3 tools/ttd_taint.py sample.sogttd --taint input:0x140002000:35 --register rax
 ```
@@ -38,6 +41,8 @@ them. Recording is suitable for an isolated, self-contained sample.
 `--ttd-no-checkpoints` keeps just the initial snapshot for comparison. The
 default interval is 500,000 instructions. Checkpoints are taken only between
 instruction-budgeted `start()` calls, when emulator state is quiescent.
+`--ttd-max-instructions` bounds recording and finalizes the trace at the limit.
+A guest failure before the limit can also leave a finalized trace.
 
 `--ttd-access` accepts `read`, `write` (the default), `execute`, or `all`.
 The directional query flags also use that access filter.
@@ -50,6 +55,13 @@ grouped by executed address, with the first matching writer and execution
 positions plus an execution count. This is a write-before-execute finding;
 loader relocations or legitimate generated code can also produce hits. It does
 not determine whether the bytes differ from the original image.
+
+`--ttd-first-selfmod` selects the earliest hit by execution step within the
+given address range, regardless of address sort order. For a packed PE, set
+the range to its expected unpacked section. Replay to one step before that
+execution and dump the mapped executable with `--ttd-dump-image`. The output
+is a raw image at its guest base address, with unmapped pages zero-filled;
+it is not a reconstructed on-disk PE with repaired imports or sections.
 
 `--ttd-strings` restores the initial snapshot and deterministically replays
 the application. It scans committed memory at the initial position and scans
@@ -202,5 +214,25 @@ query on a real packer, but the program itself is a benign test fixture.
 A public ZIP named for SHA-256
 `1d4322dbad293847de14eca09bee5056eaede7ce178490e101642bf1f5875e37`
 was inspected statically. Its extracted payload matched that hash and was a
-32-bit .NET PE, so it was not used for a Sogen x64 runtime claim. No real
-malware execution is included in these results.
+32-bit .NET PE, so it was not used for a Sogen x64 runtime claim.
+
+## Packed sample pilot
+
+Two x64 PE files from a user-provided Malpedia sample archive passed `upx -t`.
+They were emulated in separate, network-disabled Docker runs with bounded
+instruction counts, one vCPU, and read tracing disabled. The archive's family
+labels were not independently verified. The raw binaries, roots, traces, and
+dumps were kept outside the Git repository.
+
+| Archive family | Input SHA-256 | First write-to-execute address | Write step | Execute step | Dump SHA-256 |
+| --- | --- | --- | --- | --- | --- |
+| `win.brbbot` | `a7e036dc7ca28573d34f34b200b1b13343f017ce13d9bb5a6cce4395f39c92bb` | `0x140003f94` | `0x749937` | `0x8e9267` | `bbef309c1cda9d3c13df1d55fe68fe64a553b50d3433b048cd8fa4d4e8c1082c` |
+| `win.reynolds` | `6bd8a0291b268d32422139387864f15924e1db05dbef8cc75a6677f8263fa11d` | `0x1400094fc` | `0x96e658` | `0xd680e8` | `3b381e4ca1ae18d7005a1fa101e0a56f075d4dfb54140ea6c2ec282b89bb4a91` |
+
+For both traces, replay to `execute step - 1` reported RIP at the detected
+address. The input `UPX0` section has zero raw bytes, while the memory dumps
+contain 49,966 and 118,232 nonzero `UPX0` bytes respectively. These results
+demonstrate unpacked code in memory at the transition. They do not establish
+that either program completed its payload, or that the raw dumps are runnable
+PE files. The first trace stopped later at an unsupported `NtFlushKey` syscall;
+the second stopped after 15,799,462 instructions, before its 20 million cap.
