@@ -79,6 +79,16 @@ that no written code executed. Execute-address queries and instruction-byte
 analysis still require execute recording; this scan does not build a
 persistent execute index.
 
+The scan starts a fresh emulation of the recorded application rather than
+restoring the initial snapshot. Give it a fresh, writable copy of the same
+emulation root and guest files used for recording. Guest file creation can
+change a branch: replaying a trace recorded with a writable root against a
+read-only root diverged at `NtCreateFile` in one packed sample. A separate
+sample diverged after restoring the initial snapshot even though its
+serialized bytes round-tripped unchanged; fresh setup verified its full
+340,386,267-instruction run. Snapshot-based seeks still need independent
+determinism validation before relying on them for long traces.
+
 `--ttd-strings` restores the initial snapshot and deterministically replays
 the application. It scans committed memory at the initial position and scans
 around each guest write after its instruction completes. It emits a TSV with
