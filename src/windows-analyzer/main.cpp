@@ -70,6 +70,7 @@ namespace sogen
             std::filesystem::path ttd_dump_image{};
             std::optional<uint64_t> ttd_dump_address{};
             std::optional<uint64_t> ttd_dump_size{};
+            size_t ttd_dump_wave{1};
             bool ttd_no_checkpoints{false};
             bool ttd_no_read_trace{false};
             bool ttd_no_write_trace{false};
@@ -492,7 +493,8 @@ namespace sogen
                                 }
                                 capture_size = static_cast<size_t>(requested_size);
                             }
-                            ttd::replay_selfmod_scanner scanner(win_emu, replay_trace, capture_address, capture_size);
+                            ttd::replay_selfmod_scanner scanner(win_emu, replay_trace, capture_address, capture_size,
+                                                                options.ttd_dump_wave);
                             for (const auto& checkpoint : replay_trace.checkpoints())
                             {
                                 const auto before = win_emu.get_executed_instructions();
@@ -510,7 +512,7 @@ namespace sogen
                             {
                                 return emit_failure("TTD replay stopped before recorded instruction count");
                             }
-                            if (const auto& hit = scanner.first_hit())
+                            if (!scanner.captured_memory().empty())
                             {
                                 if (capture_size)
                                 {
@@ -525,16 +527,24 @@ namespace sogen
                                     {
                                         throw std::runtime_error("Writing TTD first-hit dump failed");
                                     }
-                                    printf("TTD first-hit dump %s base=%llx size=%llx missing_pages=%llu\n",
+                                    printf("TTD wave %zu dump %s base=%llx size=%llx missing_pages=%llu\n", options.ttd_dump_wave,
                                            options.ttd_dump_image.string().c_str(), static_cast<unsigned long long>(capture_address),
                                            static_cast<unsigned long long>(capture_size),
                                            static_cast<unsigned long long>(scanner.missing_capture_pages()));
                                 }
-                                printf("address=%llx size=%llu write=%llx:0 write_ip=%llx execute=%llx:0 execute_ip=%llx\n",
-                                       static_cast<unsigned long long>(hit->address), static_cast<unsigned long long>(hit->size),
-                                       static_cast<unsigned long long>(hit->write_step), static_cast<unsigned long long>(hit->write_ip),
-                                       static_cast<unsigned long long>(hit->execute_step),
-                                       static_cast<unsigned long long>(hit->execute_ip));
+                            }
+                            for (size_t index = 0; index < scanner.hits().size(); ++index)
+                            {
+                                const auto& hit = scanner.hits()[index];
+                                printf("address=%llx size=%llu write=%llx:0 write_ip=%llx execute=%llx:0 execute_ip=%llx wave=%zu\n",
+                                       static_cast<unsigned long long>(hit.address), static_cast<unsigned long long>(hit.size),
+                                       static_cast<unsigned long long>(hit.write_step), static_cast<unsigned long long>(hit.write_ip),
+                                       static_cast<unsigned long long>(hit.execute_step), static_cast<unsigned long long>(hit.execute_ip),
+                                       index + 1);
+                            }
+                            if (scanner.hits().size() == 256)
+                            {
+                                printf("TTD self-modifying-code report reached its 256-wave limit\n");
                             }
                             printf("TTD replay verified %llu writes across %llu instructions\n",
                                    static_cast<unsigned long long>(scanner.verified_writes()),
@@ -1129,7 +1139,7 @@ namespace sogen
             app.add_option("--ttd-record", options.ttd_record, "Record a checkpointed TTD trace");
             app.add_option("--ttd-replay", options.ttd_replay, "Restore a TTD trace snapshot");
             app.add_flag("--ttd-scan-selfmod", options.ttd_scan_selfmod,
-                         "Replay write-only TTD trace to find the first written-then-executed instruction");
+                         "Replay write-only TTD trace to find written-then-executed code waves");
             app.add_option("--ttd-seek", options.ttd_seek, "Replay through this instruction position");
             app.add_option("--ttd-checkpoint-interval", options.ttd_checkpoint_interval, "Instructions between recording checkpoints")
                 ->capture_default_str();
@@ -1137,6 +1147,8 @@ namespace sogen
             app.add_option("--ttd-dump-image", options.ttd_dump_image, "Dump mapped executable image at replay position");
             app.add_option("--ttd-dump-address", options.ttd_dump_address, "Guest base address for a replay memory dump");
             app.add_option("--ttd-dump-size", options.ttd_dump_size, "Guest byte length for a replay memory dump");
+            app.add_option("--ttd-dump-wave", options.ttd_dump_wave, "Code-write wave to capture during a replay scan")
+                ->capture_default_str();
             app.add_flag("--ttd-no-checkpoints", options.ttd_no_checkpoints, "Record only the initial snapshot (baseline comparison)");
             app.add_flag("--ttd-no-read-trace", options.ttd_no_read_trace, "Disable memory-read event recording");
             app.add_flag("--ttd-no-write-trace", options.ttd_no_write_trace, "Disable memory-write event recording");
@@ -1326,6 +1338,11 @@ namespace sogen
                 if (options.ttd_scan_selfmod && (options.ttd_replay.empty() || options.ttd_seek))
                 {
                     throw std::runtime_error("TTD self-modifying-code replay scan requires --ttd-replay from position zero");
+                }
+                if (!options.ttd_dump_wave || options.ttd_dump_wave > 256 ||
+                    (options.ttd_dump_wave != 1 && (!options.ttd_scan_selfmod || options.ttd_dump_image.empty())))
+                {
+                    throw std::runtime_error("TTD dump wave must be 1-256 and requires a replay scan with a dump path");
                 }
                 if (options.ttd_dump_address.has_value() != options.ttd_dump_size.has_value() ||
                     (options.ttd_dump_address && options.ttd_dump_image.empty()))

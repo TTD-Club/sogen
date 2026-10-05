@@ -164,8 +164,15 @@ namespace sogen::ttd
     class replay_selfmod_scanner
     {
       public:
-        replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes, uint64_t capture_address = 0, size_t capture_size = 0);
+        replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes, uint64_t capture_address = 0, size_t capture_size = 0,
+                               size_t capture_wave = 1);
+        ~replay_selfmod_scanner();
         void finish();
+
+        const std::vector<self_modifying_hit>& hits() const
+        {
+            return hits_;
+        }
 
         const std::vector<uint8_t>& captured_memory() const
         {
@@ -191,13 +198,17 @@ namespace sogen::ttd
         windows_emulator& emu_;
         trace& recorded_writes_;
         std::unordered_map<uint64_t, std::array<uint64_t, 4096>> writers_{};
+        std::unordered_map<uint64_t, uint64_t> page_latest_write_{};
         scoped_hook write_hook_{};
         scoped_hook execute_hook_{};
         std::optional<self_modifying_hit> first_hit_{};
+        std::vector<self_modifying_hit> hits_{};
+        std::unordered_map<uint64_t, uint64_t> reported_page_writes_{};
         std::optional<std::string> error_{};
         uint64_t next_write_{};
         uint64_t capture_address_{};
         size_t capture_size_{};
+        size_t capture_wave_{1};
         std::vector<uint8_t> captured_memory_{};
         uint64_t missing_capture_pages_{};
     };

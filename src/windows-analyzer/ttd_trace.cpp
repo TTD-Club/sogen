@@ -646,13 +646,36 @@ namespace sogen::ttd
     }
 
     replay_selfmod_scanner::replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes, const uint64_t capture_address,
-                                                   const size_t capture_size)
+                                                   const size_t capture_size, const size_t capture_wave)
         : emu_(emu),
           recorded_writes_(recorded_writes),
           capture_address_(capture_address),
-          capture_size_(capture_size)
+          capture_size_(capture_size),
+          capture_wave_(capture_wave)
     {
         auto& cpu = emu_.emu();
+        emu_.memory.set_mapping_change_callback([this](const uint64_t address, const size_t size) {
+            if (!size)
+            {
+                return;
+            }
+            const auto last = address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
+            const auto first_page = address / page_size;
+            const auto last_page = last / page_size;
+            for (auto it = writers_.begin(); it != writers_.end();)
+            {
+                if (it->first >= first_page && it->first <= last_page)
+                {
+                    page_latest_write_.erase(it->first);
+                    reported_page_writes_.erase(it->first);
+                    it = writers_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        });
         write_hook_ = scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
             if (next_write_ >= recorded_writes_.metadata().write_count)
             {
@@ -680,6 +703,7 @@ namespace sogen::ttd
                 for (uint64_t byte = address; byte <= last; ++byte)
                 {
                     writers_[byte / page_size][byte % page_size] = next_write_ + 1;
+                    page_latest_write_[byte / page_size] = next_write_ + 1;
                     if (byte == UINT64_MAX)
                     {
                         break;
@@ -689,7 +713,7 @@ namespace sogen::ttd
             ++next_write_;
         }));
         execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
-            if (error_ || first_hit_ || !size)
+            if (error_ || !size)
             {
                 return;
             }
@@ -699,10 +723,21 @@ namespace sogen::ttd
                 const auto page = writers_.find(byte / page_size);
                 if (page != writers_.end() && page->second[byte % page_size])
                 {
-                    const auto writer = recorded_writes_.event_at(page->second[byte % page_size] - 1);
-                    first_hit_ = self_modifying_hit{
+                    const auto writer_number = page->second[byte % page_size];
+                    const auto reported = reported_page_writes_.find(byte / page_size);
+                    if (reported != reported_page_writes_.end() && reported->second >= writer_number)
+                    {
+                        continue;
+                    }
+                    reported_page_writes_[byte / page_size] = page_latest_write_[byte / page_size];
+                    const auto writer = recorded_writes_.event_at(writer_number - 1);
+                    const auto hit = self_modifying_hit{
                         address, size, writer.step, writer.ip, emu_.get_executed_instructions(), emu_.emu().read_instruction_pointer(), 1};
-                    if (capture_size_)
+                    if (!first_hit_)
+                    {
+                        first_hit_ = hit;
+                    }
+                    if (hits_.size() + 1 == capture_wave_ && capture_size_)
                     {
                         captured_memory_.resize(capture_size_);
                         for (size_t offset = 0; offset < capture_size_; offset += page_size)
@@ -715,6 +750,10 @@ namespace sogen::ttd
                             }
                         }
                     }
+                    if (hits_.size() < 256)
+                    {
+                        hits_.push_back(hit);
+                    }
                     return;
                 }
                 if (byte == UINT64_MAX)
@@ -725,8 +764,14 @@ namespace sogen::ttd
         }));
     }
 
+    replay_selfmod_scanner::~replay_selfmod_scanner()
+    {
+        emu_.memory.set_mapping_change_callback({});
+    }
+
     void replay_selfmod_scanner::finish()
     {
+        emu_.memory.set_mapping_change_callback({});
         write_hook_.remove();
         execute_hook_.remove();
         if (error_)

@@ -1315,16 +1315,28 @@ namespace sogen
     void memory_manager::map_mmio(const uint64_t address, const size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb)
     {
         this->memory_->map_mmio(address, size, std::move(read_cb), std::move(write_cb));
+        if (mapping_change_callback_)
+        {
+            mapping_change_callback_(address, size);
+        }
     }
 
     void memory_manager::map_memory(const uint64_t address, const size_t size, const memory_permission permissions)
     {
         this->memory_->map_memory(address, size, permissions);
+        if (mapping_change_callback_)
+        {
+            mapping_change_callback_(address, size);
+        }
     }
 
     void memory_manager::map_host_memory(const uint64_t address, const size_t size, void* host_pointer, const memory_permission permissions)
     {
         this->memory_->map_host_memory(address, size, host_pointer, permissions);
+        if (mapping_change_callback_)
+        {
+            mapping_change_callback_(address, size);
+        }
     }
 
     bool memory_manager::host_memory_aliasing_is_coherent() const
@@ -1340,6 +1352,10 @@ namespace sogen
     void memory_manager::unmap_memory(const uint64_t address, const size_t size)
     {
         this->memory_->unmap_memory(address, size);
+        if (mapping_change_callback_)
+        {
+            mapping_change_callback_(address, size);
+        }
     }
 
     void memory_manager::apply_memory_protection(const uint64_t address, const size_t size, const memory_permission permissions)
