@@ -18,6 +18,7 @@
 #include "tenet_tracer.hpp"
 #include "ttd_trace.hpp"
 #include "ttd_string_scan.hpp"
+#include "ttd_buffer_scan.hpp"
 
 #include <utils/finally.hpp>
 #include <utils/interupt_handler.hpp>
@@ -77,6 +78,7 @@ namespace sogen
             bool ttd_no_execute_trace{false};
             std::optional<uint64_t> ttd_read{};
             std::filesystem::path ttd_strings{};
+            std::filesystem::path ttd_buffers{};
             size_t ttd_min_string_length{6};
             bool prepend_call_count{false};
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
@@ -475,6 +477,39 @@ namespace sogen
                     }
                     if (!options.ttd_replay.empty())
                     {
+                        if (!options.ttd_buffers.empty())
+                        {
+                            ttd::trace buffer_trace(options.ttd_replay, false);
+                            win_emu.setup_process_if_necessary();
+                            ttd::buffer_scanner scanner(win_emu, buffer_trace);
+                            for (const auto& checkpoint : buffer_trace.checkpoints())
+                            {
+                                const auto before = win_emu.get_executed_instructions();
+                                win_emu.start(static_cast<size_t>(checkpoint.step - before));
+                                if (win_emu.get_executed_instructions() != checkpoint.step)
+                                {
+                                    return emit_failure("TTD buffer replay stopped before recorded checkpoint");
+                                }
+                            }
+                            const auto before = win_emu.get_executed_instructions();
+                            win_emu.start(static_cast<size_t>(buffer_trace.metadata().instruction_count - before));
+                            if (win_emu.get_executed_instructions() != buffer_trace.metadata().instruction_count)
+                            {
+                                return emit_failure("TTD buffer replay stopped before recorded instruction count");
+                            }
+                            scanner.finish();
+                            scanner.save(options.ttd_buffers);
+                            printf("TTD buffer scan verified %llu writes; recovered %zu candidates to %s; skipped %llu unreadable bytes\n",
+                                   static_cast<unsigned long long>(scanner.verified_writes()), scanner.count(),
+                                   options.ttd_buffers.string().c_str(), static_cast<unsigned long long>(scanner.skipped_bytes()));
+                            do_post_emulation_work(c);
+                            c.emit_summary<run_finished_event>([&](auto& event) {
+                                event.success = true;
+                                event.exit_status = std::nullopt;
+                            });
+                            flush_reporters(c);
+                            return true;
+                        }
                         if (options.ttd_scan_selfmod)
                         {
                             ttd::trace replay_trace(options.ttd_replay, false);
@@ -853,7 +888,7 @@ namespace sogen
             if (!options.ttd_replay.empty())
             {
                 replay_trace.emplace(options.ttd_replay, false);
-                if (!options.ttd_scan_selfmod)
+                if (!options.ttd_scan_selfmod && options.ttd_buffers.empty())
                 {
                     const auto checkpoint = replay_trace->checkpoint_for_step(options.ttd_seek);
                     snapshot::load_emulator_snapshot(*win_emu, checkpoint.snapshot);
@@ -1155,6 +1190,7 @@ namespace sogen
             app.add_flag("--ttd-no-execute-trace", options.ttd_no_execute_trace, "Disable instruction-execute event recording");
             app.add_option("--ttd-read", options.ttd_read, "Read eight guest bytes at the replay position");
             app.add_option("--ttd-strings", options.ttd_strings, "Recover strings during deterministic replay into a TSV file");
+            app.add_option("--ttd-buffers", options.ttd_buffers, "Recover written buffers during deterministic replay into a TSV file");
             app.add_option("--ttd-min-string-length", options.ttd_min_string_length, "Minimum recovered string length")
                 ->capture_default_str();
             std::filesystem::path ttd_query{};
@@ -1356,6 +1392,11 @@ namespace sogen
                 if (!options.ttd_strings.empty() && (options.ttd_replay.empty() || options.ttd_seek))
                 {
                     throw std::runtime_error("TTD string recovery requires --ttd-replay from position zero");
+                }
+                if (!options.ttd_buffers.empty() &&
+                    (options.ttd_replay.empty() || options.ttd_seek || options.ttd_scan_selfmod || !options.ttd_strings.empty()))
+                {
+                    throw std::runtime_error("TTD buffer recovery requires a dedicated --ttd-replay from position zero");
                 }
                 if (!options.ttd_record.empty() && !options.ttd_no_checkpoints && !options.ttd_checkpoint_interval)
                 {
