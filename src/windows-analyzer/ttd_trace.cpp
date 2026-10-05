@@ -517,6 +517,64 @@ namespace sogen::ttd
         return read_object<access_event>(file_);
     }
 
+    std::optional<uint64_t> trace::latest_write_to_byte(const uint64_t page, const uint64_t address, const uint64_t first_number,
+                                                        const uint64_t last_number)
+    {
+        if (first_number > last_number || !header_.index_count)
+        {
+            return std::nullopt;
+        }
+        const auto entry_size = legacy_ ? sizeof(old_index_entry) : sizeof(index_entry);
+        const auto entry_at = [&](const uint64_t number) {
+            file_.clear();
+            file_.seekg(static_cast<std::streamoff>(header_.index_offset + number * entry_size));
+            if (legacy_)
+            {
+                const auto old = read_object<old_index_entry>(file_);
+                return index_entry{old.page, old.event_number, access_kind::write};
+            }
+            return read_object<index_entry>(file_);
+        };
+        const auto less_than_key = [](const index_entry& entry, const uint64_t key_page, const access_kind key_kind,
+                                      const uint64_t key_number) {
+            return entry.page < key_page ||
+                   (entry.page == key_page && (entry.kind < key_kind || (entry.kind == key_kind && entry.event_number < key_number)));
+        };
+        const auto lower_bound_on_disk = [&](const uint64_t number) {
+            uint64_t low = 0;
+            uint64_t high = header_.index_count;
+            while (low < high)
+            {
+                const auto middle = low + (high - low) / 2;
+                if (less_than_key(entry_at(middle), page, access_kind::write, number))
+                {
+                    low = middle + 1;
+                }
+                else
+                {
+                    high = middle;
+                }
+            }
+            return low;
+        };
+        const auto first = lower_bound_on_disk(first_number);
+        auto end = last_number == UINT64_MAX ? header_.index_count : lower_bound_on_disk(last_number + 1);
+        while (end > first)
+        {
+            const auto entry = entry_at(--end);
+            if (entry.page != page || entry.kind != access_kind::write || entry.event_number >= header_.write_count)
+            {
+                continue;
+            }
+            const auto event = event_at(entry.event_number);
+            if (event.kind == access_kind::write && event.address <= address && address - event.address < event.size)
+            {
+                return entry.event_number;
+            }
+        }
+        return std::nullopt;
+    }
+
     std::vector<access_event> trace::accesses(uint64_t address, uint64_t size, uint64_t first_step, uint64_t last_step, uint64_t kind_mask)
     {
         std::vector<access_event> result{};
@@ -702,7 +760,12 @@ namespace sogen::ttd
                 const auto last = address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
                 for (uint64_t byte = address; byte <= last; ++byte)
                 {
-                    writers_[byte / page_size][byte % page_size] = next_write_ + 1;
+                    auto [it, inserted] = writers_.try_emplace(byte / page_size);
+                    if (inserted)
+                    {
+                        it->second.first_number = next_write_;
+                    }
+                    it->second.bytes[(byte % page_size) / 64] |= uint64_t{1} << (byte % 64);
                     page_latest_write_[byte / page_size] = next_write_ + 1;
                     if (byte == UINT64_MAX)
                     {
@@ -713,7 +776,7 @@ namespace sogen::ttd
             ++next_write_;
         }));
         execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
-            if (error_ || !size)
+            if (error_ || !size || hits_.size() >= 256)
             {
                 return;
             }
@@ -721,16 +784,22 @@ namespace sogen::ttd
             for (uint64_t byte = address; byte <= last; ++byte)
             {
                 const auto page = writers_.find(byte / page_size);
-                if (page != writers_.end() && page->second[byte % page_size])
+                if (page != writers_.end() && (page->second.bytes[(byte % page_size) / 64] & (uint64_t{1} << (byte % 64))))
                 {
-                    const auto writer_number = page->second[byte % page_size];
                     const auto reported = reported_page_writes_.find(byte / page_size);
-                    if (reported != reported_page_writes_.end() && reported->second >= writer_number)
+                    const auto latest = page_latest_write_.at(byte / page_size);
+                    if (reported != reported_page_writes_.end() && reported->second >= latest)
                     {
                         continue;
                     }
-                    reported_page_writes_[byte / page_size] = page_latest_write_[byte / page_size];
-                    const auto writer = recorded_writes_.event_at(writer_number - 1);
+                    const auto first_number = reported == reported_page_writes_.end() ? page->second.first_number : reported->second;
+                    const auto writer_number = recorded_writes_.latest_write_to_byte(byte / page_size, byte, first_number, next_write_ - 1);
+                    if (!writer_number)
+                    {
+                        continue;
+                    }
+                    reported_page_writes_[byte / page_size] = latest;
+                    const auto writer = recorded_writes_.event_at(*writer_number);
                     const auto hit = self_modifying_hit{
                         address, size, writer.step, writer.ip, emu_.get_executed_instructions(), emu_.emu().read_instruction_pointer(), 1};
                     if (!first_hit_)

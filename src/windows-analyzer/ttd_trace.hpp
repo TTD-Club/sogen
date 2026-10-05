@@ -146,6 +146,7 @@ namespace sogen::ttd
         std::optional<access_event> previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = 7);
         std::vector<self_modifying_hit> self_modifying_code();
         access_event event_at(uint64_t number);
+        std::optional<uint64_t> latest_write_to_byte(uint64_t page, uint64_t address, uint64_t first_number, uint64_t last_number);
 
       private:
         std::ifstream file_;
@@ -197,7 +198,14 @@ namespace sogen::ttd
       private:
         windows_emulator& emu_;
         trace& recorded_writes_;
-        std::unordered_map<uint64_t, std::array<uint64_t, 4096>> writers_{};
+
+        struct written_page
+        {
+            std::array<uint64_t, 64> bytes{};
+            uint64_t first_number{};
+        };
+
+        std::unordered_map<uint64_t, written_page> writers_{};
         std::unordered_map<uint64_t, uint64_t> page_latest_write_{};
         scoped_hook write_hook_{};
         scoped_hook execute_hook_{};
