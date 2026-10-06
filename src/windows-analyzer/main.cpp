@@ -487,7 +487,7 @@ namespace sogen
                     }
                     if (!options.ttd_strings.empty())
                     {
-                        ttd::trace string_trace(options.ttd_replay, false);
+                        ttd::trace string_trace(options.ttd_replay);
                         ttd::replay_verifier verifier(win_emu, string_trace, win_emu.get_executed_instructions());
                         ttd::string_scanner scanner(win_emu, options.ttd_min_string_length);
                         scanner.scan_initial_memory();
@@ -512,7 +512,7 @@ namespace sogen
                     {
                         if (!options.ttd_buffers.empty())
                         {
-                            ttd::trace buffer_trace(options.ttd_replay, false);
+                            ttd::trace buffer_trace(options.ttd_replay);
                             win_emu.setup_process_if_necessary();
                             ttd::buffer_scanner scanner(win_emu, buffer_trace);
                             for (const auto& checkpoint : buffer_trace.checkpoints())
@@ -545,7 +545,7 @@ namespace sogen
                         }
                         if (options.ttd_scan_selfmod)
                         {
-                            ttd::trace replay_trace(options.ttd_replay, false);
+                            ttd::trace replay_trace(options.ttd_replay);
                             win_emu.setup_process_if_necessary();
                             uint64_t capture_address = 0;
                             size_t capture_size = 0;
@@ -627,7 +627,7 @@ namespace sogen
                         }
                         if (options.ttd_verify_checkpoints)
                         {
-                            ttd::trace verify_trace(options.ttd_replay, false);
+                            ttd::trace verify_trace(options.ttd_replay);
                             size_t mismatches = 0;
                             for (const auto& target : verify_trace.checkpoints())
                             {
@@ -673,7 +673,7 @@ namespace sogen
                             return true;
                         }
                         const auto checkpoint_step = win_emu.get_executed_instructions();
-                        ttd::trace seek_trace(options.ttd_replay, false);
+                        ttd::trace seek_trace(options.ttd_replay);
                         ttd::replay_verifier verifier(win_emu, seek_trace, checkpoint_step);
                         if (options.ttd_seek > checkpoint_step)
                         {
@@ -974,7 +974,7 @@ namespace sogen
             std::optional<ttd::trace> replay_trace{};
             if (!options.ttd_replay.empty())
             {
-                replay_trace.emplace(options.ttd_replay, false);
+                replay_trace.emplace(options.ttd_replay);
                 if (!options.ttd_scan_selfmod && options.ttd_buffers.empty())
                 {
                     const auto checkpoint = replay_trace->checkpoint_for_step(options.ttd_seek);

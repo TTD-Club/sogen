@@ -194,9 +194,12 @@ every page touched by an access. The hot hooks append only events; index
 construction scans the event stream after emulation completes. Readers
 validate offsets and event numbers before using them. The event stream and
 index may grow large; index construction sorts bounded chunks on disk and
-merges them into the trace. Write-only replay scans skip loading the page
-index. Address queries still load the index into memory. Compressed checkpoint
-snapshots remain buffered until recording finishes.
+merges them into the trace. Address queries binary-search the index on disk:
+each (page, kind) group is bounded by event number (event numbers grow with
+step), and next/previous queries stop at the first overlapping event, so a
+query reads only the entries in its page and step range. The index must be
+sorted, as every recorder version writes it. Compressed checkpoint snapshots
+remain buffered until recording finishes.
 
 ### Positions and steps
 

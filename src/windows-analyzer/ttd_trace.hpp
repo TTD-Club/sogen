@@ -143,7 +143,7 @@ namespace sogen::ttd
     class trace
     {
       public:
-        explicit trace(const std::filesystem::path& path, bool load_index = true);
+        explicit trace(const std::filesystem::path& path);
 
         const header& metadata() const
         {
@@ -183,13 +183,17 @@ namespace sogen::ttd
         uint64_t header_size_{sizeof(header)};
         std::vector<std::byte> snapshot_{};
         std::vector<checkpoint_entry> checkpoints_{};
-        std::vector<index_entry> page_index_{};
-        bool page_index_loaded_{};
         bool legacy_{};
         bool v3_{};
         uint64_t event_size_{};
         std::optional<uint64_t> access_mask_{};
-        void load_page_index();
+
+        index_entry index_at(uint64_t position);
+        uint64_t index_lower_bound(uint64_t page, access_kind kind, uint64_t event_number);
+        uint64_t first_event_at_or_after(uint64_t step);
+
+        template <typename Callback>
+        void for_each_index_group(uint64_t first_page, uint64_t last_page, uint64_t kind_mask, const Callback& callback);
     };
 
     class event_reader

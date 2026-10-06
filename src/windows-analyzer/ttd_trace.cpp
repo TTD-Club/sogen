@@ -9,7 +9,6 @@
 #include <map>
 #include <queue>
 #include <sstream>
-#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -377,7 +376,7 @@ namespace sogen::ttd
         }
     }
 
-    trace::trace(const std::filesystem::path& path, const bool load_index)
+    trace::trace(const std::filesystem::path& path)
         : file_(path, std::ios::binary)
     {
         if (!file_)
@@ -486,45 +485,72 @@ namespace sogen::ttd
             checkpoints_.push_back(entry);
             previous_step = entry.step;
         }
-        if (load_index)
-        {
-            load_page_index();
-        }
     }
 
-    void trace::load_page_index()
+    index_entry trace::index_at(const uint64_t position)
     {
-        if (page_index_loaded_)
-        {
-            return;
-        }
         file_.clear();
-        file_.seekg(static_cast<std::streamoff>(header_.index_offset));
-        for (uint64_t i = 0; i < header_.index_count; ++i)
+        const auto entry_size = legacy_ ? sizeof(old_index_entry) : sizeof(index_entry);
+        file_.seekg(static_cast<std::streamoff>(header_.index_offset + position * entry_size));
+        auto entry = legacy_ ? [&] {
+            const auto old = read_object<old_index_entry>(file_);
+            return index_entry{.page = old.page, .event_number = old.event_number, .kind = access_kind::write};
+        }()
+                             : read_object<index_entry>(file_);
+        if (entry.event_number >= header_.event_count)
         {
-            const auto entry = legacy_ ? [&] {
-                const auto old = read_object<old_index_entry>(file_);
-                return index_entry{old.page, old.event_number, access_kind::write};
-            }()
-                                       : read_object<index_entry>(file_);
-            if (entry.event_number >= header_.event_count)
-            {
-                throw std::runtime_error("Invalid TTD index entry");
-            }
-            page_index_.push_back(entry);
+            throw std::runtime_error("Invalid TTD index entry");
         }
-        std::sort(page_index_.begin(), page_index_.end(), [](const auto& a, const auto& b) {
-            if (a.page != b.page)
+        return entry;
+    }
+
+    uint64_t trace::index_lower_bound(const uint64_t page, const access_kind kind, const uint64_t event_number)
+    {
+        const auto less_than_key = [&](const index_entry& entry) {
+            return entry.page < page ||
+                   (entry.page == page && (entry.kind < kind || (entry.kind == kind && entry.event_number < event_number)));
+        };
+        uint64_t low = 0;
+        uint64_t high = header_.index_count;
+        while (low < high)
+        {
+            const auto middle = low + (high - low) / 2;
+            if (less_than_key(index_at(middle)))
             {
-                return a.page < b.page;
+                low = middle + 1;
             }
-            if (a.kind != b.kind)
+            else
             {
-                return a.kind < b.kind;
+                high = middle;
             }
-            return a.event_number < b.event_number;
-        });
-        page_index_loaded_ = true;
+        }
+        return low;
+    }
+
+    uint64_t trace::first_event_at_or_after(const uint64_t step)
+    {
+        return step ? first_event_after(step - 1) : 0;
+    }
+
+    template <typename Callback>
+    void trace::for_each_index_group(const uint64_t first_page, const uint64_t last_page, const uint64_t kind_mask,
+                                     const Callback& callback)
+    {
+        auto position = index_lower_bound(first_page, access_kind::read, 0);
+        while (position < header_.index_count)
+        {
+            const auto entry = index_at(position);
+            if (entry.page > last_page)
+            {
+                break;
+            }
+            const auto group_end = index_lower_bound(entry.page, entry.kind, UINT64_MAX);
+            if (kind_mask & static_cast<uint64_t>(entry.kind))
+            {
+                callback(entry.page, entry.kind, position, group_end);
+            }
+            position = group_end;
+        }
     }
 
     checkpoint_state trace::checkpoint_for_step(uint64_t step)
@@ -796,48 +822,11 @@ namespace sogen::ttd
         {
             return std::nullopt;
         }
-        const auto entry_size = legacy_ ? sizeof(old_index_entry) : sizeof(index_entry);
-        const auto entry_at = [&](const uint64_t number) {
-            file_.clear();
-            file_.seekg(static_cast<std::streamoff>(header_.index_offset + number * entry_size));
-            if (legacy_)
-            {
-                const auto old = read_object<old_index_entry>(file_);
-                return index_entry{old.page, old.event_number, access_kind::write};
-            }
-            return read_object<index_entry>(file_);
-        };
-        const auto less_than_key = [](const index_entry& entry, const uint64_t key_page, const access_kind key_kind,
-                                      const uint64_t key_number) {
-            return entry.page < key_page ||
-                   (entry.page == key_page && (entry.kind < key_kind || (entry.kind == key_kind && entry.event_number < key_number)));
-        };
-        const auto lower_bound_on_disk = [&](const uint64_t number) {
-            uint64_t low = 0;
-            uint64_t high = header_.index_count;
-            while (low < high)
-            {
-                const auto middle = low + (high - low) / 2;
-                if (less_than_key(entry_at(middle), page, access_kind::write, number))
-                {
-                    low = middle + 1;
-                }
-                else
-                {
-                    high = middle;
-                }
-            }
-            return low;
-        };
-        const auto first = lower_bound_on_disk(first_number);
-        auto end = last_number == UINT64_MAX ? header_.index_count : lower_bound_on_disk(last_number + 1);
+        const auto first = index_lower_bound(page, access_kind::write, first_number);
+        auto end = index_lower_bound(page, access_kind::write, last_number == UINT64_MAX ? UINT64_MAX : last_number + 1);
         while (end > first)
         {
-            const auto entry = entry_at(--end);
-            if (entry.page != page || entry.kind != access_kind::write || entry.event_number >= header_.event_count)
-            {
-                continue;
-            }
+            const auto entry = index_at(--end);
             const auto event = event_at(entry.event_number);
             if (event.kind == access_kind::write && event.address <= address && address - event.address < event.size)
             {
@@ -854,22 +843,25 @@ namespace sogen::ttd
         {
             return result;
         }
-        load_page_index();
         const auto last = address + std::min(size - 1, UINT64_MAX - address);
-        std::set<uint64_t> numbers{};
-        auto it = std::ranges::lower_bound(page_index_, address / page_size, {}, &index_entry::page);
-        for (; it != page_index_.end() && it->page <= last / page_size; ++it)
-        {
-            if (kind_mask & static_cast<uint64_t>(it->kind))
-            {
-                numbers.insert(it->event_number);
-            }
-        }
+        const auto first_number = first_event_at_or_after(first_step);
+        const auto end_number = last_step == UINT64_MAX ? header_.event_count : first_event_after(last_step);
+        std::vector<uint64_t> numbers{};
+        for_each_index_group(address / page_size, last / page_size, kind_mask,
+                             [&](const uint64_t page, const access_kind kind, const uint64_t, const uint64_t) {
+                                 const auto end = index_lower_bound(page, kind, end_number);
+                                 for (auto position = index_lower_bound(page, kind, first_number); position < end; ++position)
+                                 {
+                                     numbers.push_back(index_at(position).event_number);
+                                 }
+                             });
+        std::ranges::sort(numbers);
+        const auto duplicates = std::ranges::unique(numbers);
+        numbers.erase(duplicates.begin(), duplicates.end());
         for (const auto number : numbers)
         {
             const auto event = event_at(number);
-            if (event.step >= first_step && event.step <= last_step && (kind_mask & static_cast<uint64_t>(event.kind)) &&
-                overlaps(event.address, event.size, address, size))
+            if ((kind_mask & static_cast<uint64_t>(event.kind)) && overlaps(event.address, event.size, address, size))
             {
                 result.push_back(event);
             }
@@ -879,30 +871,64 @@ namespace sogen::ttd
 
     std::optional<access_event> trace::next_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask)
     {
-        if (step == UINT64_MAX)
+        if (!size || step == UINT64_MAX)
         {
             return std::nullopt;
         }
-        const auto events = accesses(address, size, step + 1, UINT64_MAX, kind_mask);
-        if (events.empty())
-        {
-            return std::nullopt;
-        }
-        return events.front();
+        const auto last = address + std::min(size - 1, UINT64_MAX - address);
+        const auto first_number = first_event_after(step);
+        std::optional<access_event> best{};
+        uint64_t best_number = UINT64_MAX;
+        for_each_index_group(address / page_size, last / page_size, kind_mask,
+                             [&](const uint64_t page, const access_kind kind, const uint64_t, const uint64_t group_end) {
+                                 for (auto position = index_lower_bound(page, kind, first_number); position < group_end; ++position)
+                                 {
+                                     const auto number = index_at(position).event_number;
+                                     if (number >= best_number)
+                                     {
+                                         return;
+                                     }
+                                     const auto event = event_at(number);
+                                     if (overlaps(event.address, event.size, address, size))
+                                     {
+                                         best = event;
+                                         best_number = number;
+                                         return;
+                                     }
+                                 }
+                             });
+        return best;
     }
 
     std::optional<access_event> trace::previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask)
     {
-        if (!step)
+        if (!size || !step)
         {
             return std::nullopt;
         }
-        const auto events = accesses(address, size, 0, step - 1, kind_mask);
-        if (events.empty())
-        {
-            return std::nullopt;
-        }
-        return events.back();
+        const auto last = address + std::min(size - 1, UINT64_MAX - address);
+        const auto end_number = first_event_after(step - 1);
+        std::optional<access_event> best{};
+        std::optional<uint64_t> best_number{};
+        for_each_index_group(address / page_size, last / page_size, kind_mask,
+                             [&](const uint64_t page, const access_kind kind, const uint64_t group_begin, const uint64_t) {
+                                 for (auto position = index_lower_bound(page, kind, end_number); position > group_begin;)
+                                 {
+                                     const auto number = index_at(--position).event_number;
+                                     if (best_number && number <= *best_number)
+                                     {
+                                         return;
+                                     }
+                                     const auto event = event_at(number);
+                                     if (overlaps(event.address, event.size, address, size))
+                                     {
+                                         best = event;
+                                         best_number = number;
+                                         return;
+                                     }
+                                 }
+                             });
+        return best;
     }
 
     std::vector<self_modifying_hit> trace::self_modifying_code()
