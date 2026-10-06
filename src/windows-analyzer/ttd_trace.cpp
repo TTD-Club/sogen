@@ -140,6 +140,12 @@ namespace sogen::ttd
                 append_event(access_kind::execute, address, size);
             }));
         }
+        if (access_mask & static_cast<uint64_t>(access_kind::host_write))
+        {
+            host_write_hook_ = scoped_hook(cpu, cpu.hook_host_memory_write([this](cpu_interface&, uint64_t address, size_t size) {
+                append_event(access_kind::host_write, address, size);
+            }));
+        }
     }
 
     void recorder::append_event(access_kind kind, uint64_t address, size_t size)
@@ -197,6 +203,7 @@ namespace sogen::ttd
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();
+        host_write_hook_.remove();
         header_.instruction_count = emu_.get_executed_instructions();
         const auto index_less = [](const index_entry& a, const index_entry& b) {
             if (a.page != b.page)
@@ -710,6 +717,12 @@ namespace sogen::ttd
                 verify(access_kind::execute, address, size);
             }));
         }
+        if (access_mask_ & static_cast<uint64_t>(access_kind::host_write))
+        {
+            host_write_hook_ = scoped_hook(cpu, cpu.hook_host_memory_write([this](cpu_interface&, uint64_t address, size_t size) {
+                verify(access_kind::host_write, address, size);
+            }));
+        }
     }
 
     void replay_verifier::verify(const access_kind kind, const uint64_t address, const size_t size)
@@ -732,11 +745,8 @@ namespace sogen::ttd
             return;
         }
         const auto describe = [](std::ostream& stream, const access_event& event) {
-            stream << (event.kind == access_kind::read    ? "read"
-                       : event.kind == access_kind::write ? "write"
-                                                          : "execute")
-                   << " step=" << std::hex << event.step << " ip=" << event.ip << " address=" << event.address << std::dec
-                   << " size=" << event.size;
+            stream << access_kind_name(event.kind) << " step=" << std::hex << event.step << " ip=" << event.ip
+                   << " address=" << event.address << std::dec << " size=" << event.size;
         };
         std::ostringstream message;
         message << "TTD replay diverged from the recording";
@@ -760,6 +770,7 @@ namespace sogen::ttd
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();
+        host_write_hook_.remove();
         if (error_)
         {
             throw std::runtime_error(*error_);
@@ -842,22 +853,13 @@ namespace sogen::ttd
         load_page_index();
         const auto last = address + std::min(size - 1, UINT64_MAX - address);
         std::set<uint64_t> numbers{};
-        for (auto page = address / page_size; page <= last / page_size; ++page)
+        auto it = std::lower_bound(page_index_.begin(), page_index_.end(), address / page_size,
+                                   [](const index_entry& entry, const uint64_t page) { return entry.page < page; });
+        for (; it != page_index_.end() && it->page <= last / page_size; ++it)
         {
-            for (const auto kind : {access_kind::read, access_kind::write, access_kind::execute})
+            if (kind_mask & static_cast<uint64_t>(it->kind))
             {
-                if (!(kind_mask & static_cast<uint64_t>(kind)))
-                {
-                    continue;
-                }
-                const auto key = index_entry{page, 0, kind};
-                auto it = std::lower_bound(page_index_.begin(), page_index_.end(), key, [](const auto& a, const auto& b) {
-                    return a.page < b.page || (a.page == b.page && a.kind < b.kind);
-                });
-                while (it != page_index_.end() && it->page == page && it->kind == kind)
-                {
-                    numbers.insert((it++)->event_number);
-                }
+                numbers.insert(it->event_number);
             }
         }
         for (const auto number : numbers)

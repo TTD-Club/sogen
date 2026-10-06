@@ -50,8 +50,17 @@ instruction-budgeted `start()` calls, when emulator state is quiescent.
 `--ttd-max-instructions` bounds recording and finalizes the trace at the limit.
 A guest failure before the limit can also leave a finalized trace.
 
-`--ttd-access` accepts `read`, `write` (the default), `execute`, or `all`.
-The directional query flags also use that access filter.
+`--ttd-access` accepts `read`, `write` (the default), `host-write`, `execute`,
+or `all`. The directional query flags also use that access filter.
+
+Host writes are guest-memory writes made by Sogen itself rather than by a guest
+instruction: syscall output buffers, loader and section mappings, exception and
+APC frames. They are recorded whenever write tracing is on, with the step and
+RIP at the time of the write (for a syscall, the instruction after `syscall`),
+and `write` queries list them with `kind=host-write`. Only their range is
+recorded, not their bytes. Writes through host-mapped guest memory and MMIO
+regions are not reported. The self-modifying-code analyses consider guest
+writes only, so code mapped by the loader is not reported as written code.
 
 ## Post-recording analyses
 
@@ -133,6 +142,8 @@ MOVZX/MOVSX, LEA, basic arithmetic/bitwise operations, PUSH/POP, and MOVS.
 It prints tainted memory writes, a bounded count of unsupported tainted
 flows, and an optional register's last read/write. `--through-step` limits
 analysis to a position. Read, write, and execute recording must all be on.
+Host writes in a v5 trace clear taint from the bytes they overwrite; they are
+not yet taint sources.
 For `test/ttd_xor_string_sample.c`, tainting the 35 encoded bytes at
 `0x140002000` produced 34 tainted output-byte writes beginning at
 `0x140005000`, with zero reported unsupported tainted flows through position
@@ -155,8 +166,8 @@ marks a recording that was never finalized.
 The header is followed by the initial Sogen `SNAP` snapshot, 56-byte access events
 (`step, ip, address, size, kind, instruction_bytes[16]`), checkpoint snapshots, 24-byte checkpoint
 table entries (`step, offset, size`), and 24-byte index entries
-(`page, event_number, kind`). Kind is 1 for read, 2 for write, and 4 for
-execute. Execute events contain the instruction bytes as they existed just
+(`page, event_number, kind`). Kind is 1 for read, 2 for write, 4 for
+execute, and 8 for a host write (v5 only). Execute events contain the instruction bytes as they existed just
 before execution, using `size` bytes up to the x86 maximum of 15. Other
 events have zeroed instruction-byte fields. Versions 1 and 2 remain readable
 as write-only traces; version 3 remains readable without instruction bytes;

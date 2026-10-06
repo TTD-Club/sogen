@@ -120,6 +120,11 @@ namespace sogen::unicorn
             std::vector<hook_entry> hooks_;
         };
 
+        struct host_write_hook : hook_object
+        {
+            memory_write_metadata_callback callback{};
+        };
+
         struct mmio_callbacks
         {
             using read_wrapper = function_wrapper<uint64_t, uc_engine*, uint64_t, unsigned>;
@@ -410,12 +415,28 @@ namespace sogen::unicorn
 
             bool try_write_memory(const uint64_t address, const void* data, const size_t size) override
             {
-                return uc_mem_write(*this, address, data, size) == UC_ERR_OK;
+                if (uc_mem_write(*this, address, data, size) != UC_ERR_OK)
+                {
+                    return false;
+                }
+                this->notify_host_write(address, size);
+                return true;
             }
 
             void write_memory(const uint64_t address, const void* data, const size_t size) override
             {
                 uce(uc_mem_write(*this, address, data, size));
+                this->notify_host_write(address, size);
+            }
+
+            emulator_hook* hook_host_memory_write(memory_write_metadata_callback callback) override
+            {
+                auto hook = std::make_unique<host_write_hook>();
+                hook->callback = std::move(callback);
+                auto* result = hook.get();
+                this->host_write_hooks_.push_back(result);
+                this->hooks_.push_back(std::move(hook));
+                return result->as_opaque_hook();
             }
 
             void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
@@ -714,8 +735,21 @@ namespace sogen::unicorn
                 return ptr;
             }
 
+            void notify_host_write(const uint64_t address, const size_t size)
+            {
+                if (!size)
+                {
+                    return;
+                }
+                for (auto* hook : this->host_write_hooks_)
+                {
+                    hook->callback(*this, address, size);
+                }
+            }
+
             void delete_hook(emulator_hook* hook) override
             {
+                std::erase_if(this->host_write_hooks_, [&](host_write_hook* entry) { return entry->as_opaque_hook() == hook; });
                 const auto entry = std::ranges::find_if(
                     this->hooks_, [&](const std::unique_ptr<hook_object>& hook_ptr) { return hook_ptr->as_opaque_hook() == hook; });
 
@@ -803,6 +837,7 @@ namespace sogen::unicorn
             uc_engine* uc_{};
             std::optional<uint64_t> violation_ip_{};
             std::vector<std::unique_ptr<hook_object>> hooks_{};
+            std::vector<host_write_hook*> host_write_hooks_{};
             std::unordered_map<uint64_t, mmio_callbacks> mmio_{};
 
             static uint64_t calc_end_address(const uint64_t address, uint64_t size)

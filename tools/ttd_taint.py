@@ -17,6 +17,7 @@ from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 HEADER = struct.Struct("<8s7Q")
 HEADER_SIZES = {b"SOGTTD4\0": HEADER.size, b"SOGTTD5\0": HEADER.size + 8}
 EVENT = struct.Struct("<5Q16s")
+HOST_WRITE = 8
 GPRS = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp")
 
 
@@ -226,17 +227,23 @@ def main():
     decoder.detail = True
     current = None
     accesses = []
+
+    def flush():
+        if current:
+            replay.process(current, accesses, decoder)
+        for access in accesses:
+            if access[4] == HOST_WRITE:
+                replay.write_mem(access, [], access[0], access[1])
+
     for event in events(args.trace):
         if args.through_step is not None and event[0] > args.through_step:
             break
         if event[4] == 4:
-            if current:
-                replay.process(current, accesses, decoder)
+            flush()
             current, accesses = event, []
-        elif current:
+        else:
             accesses.append(event)
-    if current:
-        replay.process(current, accesses, decoder)
+    flush()
     print(f"tainted_memory_writes={replay.hits} unsupported_tainted_flows={replay.gaps}")
     if args.register:
         location = reg_slice(args.register)

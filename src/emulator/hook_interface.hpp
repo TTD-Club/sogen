@@ -113,6 +113,13 @@ namespace sogen
             return hook_memory_execution([callback = std::move(callback)](cpu_interface& cpu, uint64_t addr) { callback(cpu, addr, 1); });
         }
 
+        // Reports writes made through the memory interface (syscall handlers, loaders, exception dispatch), which
+        // bypass the guest memory hooks above.
+        virtual emulator_hook* hook_host_memory_write(memory_write_metadata_callback /*callback*/)
+        {
+            throw std::runtime_error("This backend cannot report host memory writes");
+        }
+
         virtual emulator_hook* hook_instruction(int instruction_type, instruction_hook_callback callback) = 0;
 
         virtual emulator_hook* hook_interrupt(interrupt_hook_callback callback) = 0;

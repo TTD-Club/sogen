@@ -78,6 +78,15 @@ def main() -> None:
         assert result.returncode != 0
         assert "TTD replay diverged from the recording" in result.stdout + result.stderr
 
+        # VirtualQuery's output is written by the emulated NtQueryVirtualMemory, not by a guest store.
+        info = int(re.search(r"ttd-info ([0-9A-Fa-f]+)", recording).group(1), 16)
+        output = run("--ttd-query", trace, "--ttd-address", hex(info), "--ttd-size", "48")
+        host_writes = re.findall(r"^([0-9a-f]+):0 ip=[0-9a-f]+ address=[0-9a-f]+ size=\d+ kind=host-write$", output, re.M)
+        assert host_writes, output
+        host_step = int(host_writes[0], 16)
+        assert host_step > read_step
+        run("--ttd-replay", trace, "--ttd-seek", hex(host_step), *emulator_args, sample)
+
 
 if __name__ == "__main__":
     main()

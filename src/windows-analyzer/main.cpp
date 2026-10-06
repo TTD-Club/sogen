@@ -455,8 +455,11 @@ namespace sogen
 #endif
                     if (!options.ttd_record.empty())
                     {
-                        const uint64_t access_mask = (options.ttd_no_read_trace ? 0 : 1) | (options.ttd_no_write_trace ? 0 : 2) |
-                                                     (options.ttd_no_execute_trace ? 0 : 4);
+                        const auto writes =
+                            static_cast<uint64_t>(ttd::access_kind::write) | static_cast<uint64_t>(ttd::access_kind::host_write);
+                        const auto access_mask = (options.ttd_no_read_trace ? 0 : static_cast<uint64_t>(ttd::access_kind::read)) |
+                                                 (options.ttd_no_write_trace ? 0 : writes) |
+                                                 (options.ttd_no_execute_trace ? 0 : static_cast<uint64_t>(ttd::access_kind::execute));
                         ttd_recorder.emplace(win_emu, options.ttd_record, access_mask);
                     }
                     if (!options.ttd_strings.empty())
@@ -1208,8 +1211,8 @@ namespace sogen
             app.add_option("--ttd-selfmod", ttd_selfmod, "Find executed bytes written earlier in a TTD trace");
             app.add_option("--ttd-first-selfmod", ttd_first_selfmod,
                            "Find first written-then-executed instruction anywhere, or in an optional address range");
-            app.add_option("--ttd-access", ttd_access, "Access type: read, write, execute, or all")
-                ->check(CLI::IsMember({"read", "write", "execute", "all"}));
+            app.add_option("--ttd-access", ttd_access, "Access type: read, write (guest and host), host-write, execute, or all")
+                ->check(CLI::IsMember({"read", "write", "host-write", "execute", "all"}));
             auto* ttd_address_option =
                 app.add_option("--ttd-address", ttd_address, "First address for TTD write query or self-modifying-code filter");
             auto* ttd_size_option = app.add_option("--ttd-size", ttd_size, "Byte length for TTD write query or self-modifying-code filter");
@@ -1313,7 +1316,12 @@ namespace sogen
                 if (!ttd_query.empty())
                 {
                     ttd::trace trace(ttd_query);
-                    const uint64_t kind_mask = ttd_access == "read" ? 1 : ttd_access == "write" ? 2 : ttd_access == "execute" ? 4 : 7;
+                    const auto kind_mask = ttd_access == "read"         ? static_cast<uint64_t>(ttd::access_kind::read)
+                                           : ttd_access == "write"      ? static_cast<uint64_t>(ttd::access_kind::write) |
+                                                                              static_cast<uint64_t>(ttd::access_kind::host_write)
+                                           : ttd_access == "host-write" ? static_cast<uint64_t>(ttd::access_kind::host_write)
+                                           : ttd_access == "execute"    ? static_cast<uint64_t>(ttd::access_kind::execute)
+                                                                        : ttd::all_access_kinds;
                     if (ttd_next_write && ttd_prev_write)
                     {
                         throw std::runtime_error("Choose only one TTD access direction");
@@ -1339,13 +1347,11 @@ namespace sogen
                     }
                     for (const auto& write : writes)
                     {
+                        const auto print_kind = ttd_access != "write" || write.kind != ttd::access_kind::write;
                         printf("%llx:0 ip=%llx address=%llx size=%llu%s%s", static_cast<unsigned long long>(write.step),
                                static_cast<unsigned long long>(write.ip), static_cast<unsigned long long>(write.address),
-                               static_cast<unsigned long long>(write.size), ttd_access == "write" ? "" : " kind=",
-                               ttd_access == "write"                   ? ""
-                               : write.kind == ttd::access_kind::read  ? "read"
-                               : write.kind == ttd::access_kind::write ? "write"
-                                                                       : "execute");
+                               static_cast<unsigned long long>(write.size), print_kind ? " kind=" : "",
+                               print_kind ? ttd::access_kind_name(write.kind) : "");
                         if (trace.has_instruction_bytes() && write.kind == ttd::access_kind::execute && write.size <= 15)
                         {
                             printf(" bytes=");

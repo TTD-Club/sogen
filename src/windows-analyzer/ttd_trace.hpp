@@ -17,15 +17,32 @@
 namespace sogen::ttd
 {
     // Version 4 adds the instruction bytes observed immediately before execution; version 5 adds the recorded
-    // access kinds to the header.
+    // access kinds to the header and host writes.
     enum class access_kind : uint64_t
     {
         read = 1,
         write = 2,
-        execute = 4
+        execute = 4,
+        host_write = 8,
     };
 
-    constexpr uint64_t all_access_kinds = 7;
+    constexpr uint64_t all_access_kinds = 15;
+
+    constexpr const char* access_kind_name(const access_kind kind)
+    {
+        switch (kind)
+        {
+        case access_kind::read:
+            return "read";
+        case access_kind::write:
+            return "write";
+        case access_kind::execute:
+            return "execute";
+        case access_kind::host_write:
+            return "host-write";
+        }
+        return "unknown";
+    }
 
     struct header
     {
@@ -118,6 +135,7 @@ namespace sogen::ttd
         scoped_hook write_hook_{};
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};
+        scoped_hook host_write_hook_{};
         void append_event(access_kind kind, uint64_t address, size_t size);
         bool finished_{};
     };
@@ -149,9 +167,9 @@ namespace sogen::ttd
 
         checkpoint_state checkpoint_for_step(uint64_t step);
         std::vector<access_event> accesses(uint64_t address, uint64_t size, uint64_t first_step = 0, uint64_t last_step = UINT64_MAX,
-                                           uint64_t kind_mask = 7);
-        std::optional<access_event> next_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = 7);
-        std::optional<access_event> previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = 7);
+                                           uint64_t kind_mask = all_access_kinds);
+        std::optional<access_event> next_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = all_access_kinds);
+        std::optional<access_event> previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = all_access_kinds);
         std::vector<self_modifying_hit> self_modifying_code();
         access_event event_at(uint64_t number);
         size_t read_events(uint64_t first_number, std::span<access_event> output);
@@ -214,6 +232,7 @@ namespace sogen::ttd
         scoped_hook write_hook_{};
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};
+        scoped_hook host_write_hook_{};
         std::optional<std::string> error_{};
         uint64_t verified_events_{};
         void verify(access_kind kind, uint64_t address, size_t size);

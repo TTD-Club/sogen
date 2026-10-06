@@ -42,6 +42,31 @@ def main():
                               text=True, capture_output=True, check=True)
         assert "tainted_memory_writes=0" in late.stdout
 
+        overwritten = pathlib.Path(directory) / "overwritten.sogttd"
+        reload = bytes.fromhex("a00030000000000000")  # movabs al, byte ptr [0x3000]
+        spill = bytes.fromhex("a20040000000000000")  # movabs byte ptr [0x4000], al
+        events = [
+            (1, 0x1000, 0x1000, len(load), 4, load),
+            (1, 0x1000, 0x2000, 1, 1, b""),
+            (2, 0x1009, 0x1009, len(store), 4, store),
+            (2, 0x1009, 0x3000, 1, 2, b""),
+            (2, 0x1009, 0x3000, 1, 8, b""),
+            (3, 0x1012, 0x1012, len(reload), 4, reload),
+            (3, 0x1012, 0x3000, 1, 1, b""),
+            (4, 0x101b, 0x101b, len(spill), 4, spill),
+            (4, 0x101b, 0x4000, 1, 2, b""),
+        ]
+        end = 72 + 56 * len(events)
+        with overwritten.open("wb") as file:
+            file.write(struct.pack("<8s8Q", b"SOGTTD5\0", 0, 4, len(events), 0, end, end, 0, 15))
+            for step, ip, address, size, kind, code in events:
+                file.write(struct.pack("<5Q16s", step, ip, address, size, kind, code))
+        result = subprocess.run([sys.executable, str(taint_tool), str(overwritten), "--taint", "input:0x2000:1"],
+                                text=True, capture_output=True, check=True)
+        assert "memory=3000" in result.stdout
+        assert "memory=4000" not in result.stdout
+        assert "tainted_memory_writes=1" in result.stdout
+
 
 if __name__ == "__main__":
     main()
