@@ -31,11 +31,33 @@
 #include <csignal>
 #endif
 #include <fstream>
+#include <sstream>
 
 namespace sogen
 {
     namespace
     {
+        uint64_t ttd_query_kinds(const std::string_view access)
+        {
+            if (access == "read")
+            {
+                return static_cast<uint64_t>(ttd::access_kind::read);
+            }
+            if (access == "write")
+            {
+                return static_cast<uint64_t>(ttd::access_kind::write) | static_cast<uint64_t>(ttd::access_kind::host_write);
+            }
+            if (access == "host-write")
+            {
+                return static_cast<uint64_t>(ttd::access_kind::host_write);
+            }
+            if (access == "execute")
+            {
+                return static_cast<uint64_t>(ttd::access_kind::execute);
+            }
+            return ttd::all_access_kinds;
+        }
+
         std::filesystem::path get_current_binary_dir()
         {
 #ifdef _WIN32
@@ -607,10 +629,9 @@ namespace sogen
                                         static_cast<unsigned long long>(verifier.verified_events()));
                         if (const auto reached = win_emu.get_executed_instructions(); reached != options.ttd_seek)
                         {
-                            char message[160]{};
-                            snprintf(message, sizeof(message), "TTD replay reached position %llx instead of %llx",
-                                     static_cast<unsigned long long>(reached), static_cast<unsigned long long>(options.ttd_seek));
-                            return emit_failure(message);
+                            std::ostringstream message;
+                            message << "TTD replay reached position " << std::hex << reached << " instead of " << options.ttd_seek;
+                            return emit_failure(message.str());
                         }
                         win_emu.log.log("TTD checkpoint %llx:0\n", static_cast<unsigned long long>(checkpoint_step));
                         win_emu.log.log("TTD position %llx:0 RIP %llx\n", static_cast<unsigned long long>(options.ttd_seek),
@@ -1319,12 +1340,7 @@ namespace sogen
                 if (!ttd_query.empty())
                 {
                     ttd::trace trace(ttd_query);
-                    const auto kind_mask = ttd_access == "read"         ? static_cast<uint64_t>(ttd::access_kind::read)
-                                           : ttd_access == "write"      ? static_cast<uint64_t>(ttd::access_kind::write) |
-                                                                              static_cast<uint64_t>(ttd::access_kind::host_write)
-                                           : ttd_access == "host-write" ? static_cast<uint64_t>(ttd::access_kind::host_write)
-                                           : ttd_access == "execute"    ? static_cast<uint64_t>(ttd::access_kind::execute)
-                                                                        : ttd::all_access_kinds;
+                    const auto kind_mask = ttd_query_kinds(ttd_access);
                     if (ttd_next_write && ttd_prev_write)
                     {
                         throw std::runtime_error("Choose only one TTD access direction");

@@ -607,13 +607,13 @@ namespace sogen::ttd
             {
                 write_event old{};
                 memcpy(&old, entry, sizeof(old));
-                output[i] = {old.step, old.ip, old.address, old.size, access_kind::write};
+                output[i] = {.step = old.step, .ip = old.ip, .address = old.address, .size = old.size, .kind = access_kind::write};
             }
             else
             {
                 v3_access_event old{};
                 memcpy(&old, entry, sizeof(old));
-                output[i] = {old.step, old.ip, old.address, old.size, old.kind};
+                output[i] = {.step = old.step, .ip = old.ip, .address = old.address, .size = old.size, .kind = old.kind};
             }
         }
         return count;
@@ -731,7 +731,11 @@ namespace sogen::ttd
         {
             return;
         }
-        access_event observed{emu_.get_executed_instructions(), emu_.emu().read_instruction_pointer(), address, size, kind};
+        access_event observed{.step = emu_.get_executed_instructions(),
+                              .ip = emu_.emu().read_instruction_pointer(),
+                              .address = address,
+                              .size = size,
+                              .kind = kind};
         if (kind == access_kind::execute && trace_.has_instruction_bytes() && size <= 15)
         {
             emu_.emu().try_read_memory(address, observed.instruction_bytes.data(), size);
@@ -853,8 +857,7 @@ namespace sogen::ttd
         load_page_index();
         const auto last = address + std::min(size - 1, UINT64_MAX - address);
         std::set<uint64_t> numbers{};
-        auto it = std::lower_bound(page_index_.begin(), page_index_.end(), address / page_size,
-                                   [](const index_entry& entry, const uint64_t page) { return entry.page < page; });
+        auto it = std::ranges::lower_bound(page_index_, address / page_size, {}, &index_entry::page);
         for (; it != page_index_.end() && it->page <= last / page_size; ++it)
         {
             if (kind_mask & static_cast<uint64_t>(it->kind))

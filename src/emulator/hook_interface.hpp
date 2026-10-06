@@ -115,6 +115,7 @@ namespace sogen
 
         // Reports writes made through the memory interface (syscall handlers, loaders, exception dispatch), which
         // bypass the guest memory hooks above.
+        // NOLINTNEXTLINE(performance-unnecessary-value-param)
         virtual emulator_hook* hook_host_memory_write(memory_write_metadata_callback /*callback*/)
         {
             throw std::runtime_error("This backend cannot report host memory writes");
