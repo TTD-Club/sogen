@@ -593,10 +593,15 @@ namespace sogen
                             return true;
                         }
                         const auto checkpoint_step = win_emu.get_executed_instructions();
+                        ttd::trace seek_trace(options.ttd_replay, false);
+                        ttd::replay_verifier verifier(win_emu, seek_trace, checkpoint_step);
                         if (options.ttd_seek > checkpoint_step)
                         {
                             win_emu.start(static_cast<size_t>(options.ttd_seek - checkpoint_step));
                         }
+                        verifier.finish();
+                        win_emu.log.log("TTD replay verified %llu recorded events\n",
+                                        static_cast<unsigned long long>(verifier.verified_events()));
                         if (win_emu.get_executed_instructions() != options.ttd_seek)
                         {
                             return emit_failure("TTD replay stopped before requested position");

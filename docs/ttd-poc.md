@@ -30,7 +30,10 @@ python3 tools/ttd_taint.py sample.sogttd --taint input:0x140002000:35 --register
 
 The application and root for replay must match the recording. `--ttd-seek N`
 restores the nearest checkpoint at or before `N` and executes the remaining
-instructions. Running
+instructions. While it does, every access of a recorded kind is compared with
+the trace (kind, step, instruction pointer, address, size, and instruction
+bytes for executes); a mismatch, or a recorded event at or before `N` that
+never occurs, fails the seek with the first differing event. Running
 the same command with `N-1` implements reverse instruction step. The CLI
 prints the resulting instruction pointer. Positions are represented as
 `N:0`, corresponding to Binary Ninja's `(sequence, step)` pair.
@@ -70,7 +73,7 @@ region. The output is raw mapped memory, with unmapped pages zero-filled; it
 is not a reconstructed on-disk PE with repaired imports or sections. The dump
 still needs the original application and emulation root used for recording.
 
-For a write-only trace, `--ttd-scan-selfmod` starts a fresh emulation and
+For a trace with write events, `--ttd-scan-selfmod` starts a fresh emulation and
 compares each observed write with its recorded position, instruction
 pointer, address, and size, and checks the byte range of each executed
 instruction against earlier writes. It prints the first overlap only after
@@ -140,19 +143,24 @@ thread-specific register state, MMIO, and data from the initial snapshot other
 than selected source ranges are not fully modeled. A gap means the reported
 taint flow may be incomplete.
 
-## Format v4
+## Format v5
 
-All fields are little-endian. The header is `SOGTTD4\0` plus seven `uint64_t`
-values: initial snapshot size, instruction count, access-event count,
-checkpoint count, checkpoint-table offset, index offset, and index count.
-It is followed by the initial Sogen `SNAP` snapshot, 56-byte access events
+All fields are little-endian. The 72-byte header is `SOGTTD5\0` plus eight
+`uint64_t` values: initial snapshot size, instruction count, access-event count,
+checkpoint count, checkpoint-table offset, index offset, index count, and the
+recorded access kinds (a nonzero mask of the kind values below). Version 4 is
+identical except for its 64-byte `SOGTTD4\0` header without the mask; readers
+infer a v3/v4 trace's kinds by scanning its events. An index offset of zero
+marks a recording that was never finalized.
+The header is followed by the initial Sogen `SNAP` snapshot, 56-byte access events
 (`step, ip, address, size, kind, instruction_bytes[16]`), checkpoint snapshots, 24-byte checkpoint
 table entries (`step, offset, size`), and 24-byte index entries
 (`page, event_number, kind`). Kind is 1 for read, 2 for write, and 4 for
 execute. Execute events contain the instruction bytes as they existed just
 before execution, using `size` bytes up to the x86 maximum of 15. Other
 events have zeroed instruction-byte fields. Versions 1 and 2 remain readable
-as write-only traces; version 3 remains readable without instruction bytes.
+as write-only traces; version 3 remains readable without instruction bytes;
+version 4 remains readable.
 On the UPX-packed test PE, a v4 query at the unpacked entry
 `0x140001000` returned `bytes=55` (`push rbp`) at position `0x244b89`;
 the self-modifying-code pass linked it to the UPX stub write at position
@@ -227,8 +235,8 @@ results. On `test/ttd_xor_string_sample.c`, a write-only recording completed
 and zero execute events. Write and execute events are both needed for the
 self-modifying-code query on a stored trace. A write-only trace can instead
 use `--ttd-scan-selfmod` if deterministic replay succeeds. Replay scans
-(`--ttd-scan-selfmod`, `--ttd-buffers`) require a write-only trace and report
-that instead of a divergence when given one with read or execute events.
+(`--ttd-scan-selfmod`, `--ttd-buffers`) need recorded writes and skip any
+read and execute events in the trace.
 The same PE with only write tracing disabled produced 550,117 reads,
 2,214,453 executes, and zero writes.
 

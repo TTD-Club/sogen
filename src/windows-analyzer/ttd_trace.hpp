@@ -16,7 +16,8 @@
 
 namespace sogen::ttd
 {
-    // Version 4 adds the instruction bytes observed immediately before execution.
+    // Version 4 adds the instruction bytes observed immediately before execution; version 5 adds the recorded
+    // access kinds to the header.
     enum class access_kind : uint64_t
     {
         read = 1,
@@ -24,9 +25,11 @@ namespace sogen::ttd
         execute = 4
     };
 
+    constexpr uint64_t all_access_kinds = 7;
+
     struct header
     {
-        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '4', '\0'};
+        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '5', '\0'};
         uint64_t snapshot_size{};
         uint64_t instruction_count{};
         uint64_t event_count{};
@@ -34,6 +37,7 @@ namespace sogen::ttd
         uint64_t checkpoint_table_offset{};
         uint64_t index_offset{};
         uint64_t index_count{};
+        uint64_t access_mask{};
     };
 
     struct checkpoint_entry
@@ -89,7 +93,7 @@ namespace sogen::ttd
         uint64_t executions{};
     };
 
-    static_assert(sizeof(header) == 64);
+    static_assert(sizeof(header) == 72);
     static_assert(sizeof(checkpoint_entry) == 24);
     static_assert(sizeof(write_event) == 32);
     static_assert(sizeof(access_event) == 56);
@@ -98,7 +102,7 @@ namespace sogen::ttd
     class recorder
     {
       public:
-        recorder(windows_emulator& emu, const std::filesystem::path& path, uint64_t access_mask = 7);
+        recorder(windows_emulator& emu, const std::filesystem::path& path, uint64_t access_mask = all_access_kinds);
         ~recorder();
         recorder(const recorder&) = delete;
         recorder& operator=(const recorder&) = delete;
@@ -150,6 +154,9 @@ namespace sogen::ttd
         std::optional<access_event> previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = 7);
         std::vector<self_modifying_hit> self_modifying_code();
         access_event event_at(uint64_t number);
+        size_t read_events(uint64_t first_number, std::span<access_event> output);
+        uint64_t first_event_after(uint64_t step);
+        uint64_t access_mask();
         std::optional<uint64_t> latest_write_to_byte(uint64_t page, uint64_t address, uint64_t first_number, uint64_t last_number);
 
       private:
@@ -163,7 +170,53 @@ namespace sogen::ttd
         bool legacy_{};
         bool v3_{};
         uint64_t event_size_{};
+        std::optional<uint64_t> access_mask_{};
         void load_page_index();
+    };
+
+    class event_reader
+    {
+      public:
+        explicit event_reader(trace& recorded, uint64_t first_number = 0);
+        std::optional<access_event> next(uint64_t kind_mask = all_access_kinds);
+
+        uint64_t last_number() const
+        {
+            return last_number_;
+        }
+
+      private:
+        trace& trace_;
+        std::vector<access_event> buffer_{};
+        uint64_t buffer_first_{};
+        size_t position_{};
+        uint64_t last_number_{};
+    };
+
+    class replay_verifier
+    {
+      public:
+        replay_verifier(windows_emulator& emu, trace& recorded, uint64_t from_step);
+        replay_verifier(const replay_verifier&) = delete;
+        replay_verifier& operator=(const replay_verifier&) = delete;
+        void finish();
+
+        uint64_t verified_events() const
+        {
+            return verified_events_;
+        }
+
+      private:
+        windows_emulator& emu_;
+        trace& trace_;
+        event_reader reader_;
+        uint64_t access_mask_{};
+        scoped_hook write_hook_{};
+        scoped_hook read_hook_{};
+        scoped_hook execute_hook_{};
+        std::optional<std::string> error_{};
+        uint64_t verified_events_{};
+        void verify(access_kind kind, uint64_t address, size_t size);
     };
 
     class replay_selfmod_scanner
@@ -196,12 +249,13 @@ namespace sogen::ttd
 
         uint64_t verified_writes() const
         {
-            return next_write_;
+            return verified_writes_;
         }
 
       private:
         windows_emulator& emu_;
         trace& recorded_writes_;
+        event_reader expected_writes_;
 
         struct written_page
         {
@@ -217,7 +271,8 @@ namespace sogen::ttd
         std::vector<self_modifying_hit> hits_{};
         std::unordered_map<uint64_t, uint64_t> reported_page_writes_{};
         std::optional<std::string> error_{};
-        uint64_t next_write_{};
+        uint64_t verified_writes_{};
+        uint64_t last_write_number_{};
         uint64_t capture_address_{};
         size_t capture_size_{};
         size_t capture_wave_{1};

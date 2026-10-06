@@ -135,8 +135,13 @@ namespace sogen::ttd
 
     buffer_scanner::buffer_scanner(windows_emulator& emu, trace& recorded_writes)
         : emu_(emu),
-          trace_(recorded_writes)
+          trace_(recorded_writes),
+          expected_writes_(recorded_writes)
     {
+        if (!(trace_.access_mask() & static_cast<uint64_t>(access_kind::write)))
+        {
+            throw std::runtime_error("TTD buffer scan requires a trace recorded with write events");
+        }
         auto& cpu = emu_.emu();
         emu_.memory.set_mapping_change_callback([this](const uint64_t address, const size_t size) {
             if (!size)
@@ -184,29 +189,27 @@ namespace sogen::ttd
             }
         });
         write_hook_ = scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-            if (next_write_ >= trace_.metadata().event_count)
+            if (error_ || !size)
+            {
+                return;
+            }
+            const auto expected = expected_writes_.next(static_cast<uint64_t>(access_kind::write));
+            if (!expected)
             {
                 error_ = "TTD buffer scan produced an unrecorded write";
                 emu_.stop();
                 return;
             }
-            const auto expected = trace_.event_at(next_write_);
-            if (expected.kind != access_kind::write)
-            {
-                error_ = "TTD buffer scan requires a write-only trace; record with --ttd-no-read-trace --ttd-no-execute-trace";
-                emu_.stop();
-                return;
-            }
             const auto step = emu_.get_executed_instructions();
             const auto ip = emu_.emu().read_instruction_pointer();
-            if (expected.step != step || expected.ip != ip || expected.address != address || expected.size != size)
+            if (expected->step != step || expected->ip != ip || expected->address != address || expected->size != size)
             {
-                error_ = "TTD buffer scan replay diverged at write event " + std::to_string(next_write_);
+                error_ = "TTD buffer scan replay diverged at write event " + std::to_string(expected_writes_.last_number());
                 emu_.stop();
                 return;
             }
             pending_.push_back({address, size, step, ip});
-            ++next_write_;
+            ++verified_writes_;
         }));
         execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
             flush_pending();
@@ -527,7 +530,7 @@ namespace sogen::ttd
         {
             throw std::runtime_error(*error_);
         }
-        if (next_write_ != trace_.metadata().event_count)
+        if (expected_writes_.next(static_cast<uint64_t>(access_kind::write)))
         {
             throw std::runtime_error("TTD buffer scan ended before all recorded writes occurred");
         }

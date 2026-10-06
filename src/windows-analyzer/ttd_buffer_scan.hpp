@@ -41,7 +41,7 @@ namespace sogen::ttd
 
         uint64_t verified_writes() const
         {
-            return next_write_;
+            return verified_writes_;
         }
 
         uint64_t skipped_bytes() const
@@ -77,13 +77,14 @@ namespace sogen::ttd
 
         windows_emulator& emu_;
         trace& trace_;
+        event_reader expected_writes_;
         std::map<uint64_t, region> active_{};
         std::vector<pending_write> pending_{};
         std::vector<recovered_buffer> results_{};
         std::optional<std::string> error_{};
         scoped_hook write_hook_{};
         scoped_hook execute_hook_{};
-        uint64_t next_write_{};
+        uint64_t verified_writes_{};
         uint64_t skipped_bytes_{};
         size_t retained_bytes_{};
         bool finished_{};

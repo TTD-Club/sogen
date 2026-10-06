@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Experimental byte-taint propagation over a Sogen v4 access trace.
+"""Experimental byte-taint propagation over a Sogen v4 or v5 access trace.
 
 Requires capstone 5. This is a bounded x64 data-flow prototype: unsupported
 instructions are reported as gaps when they consume tainted data.
@@ -15,6 +15,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
 HEADER = struct.Struct("<8s7Q")
+HEADER_SIZES = {b"SOGTTD4\0": HEADER.size, b"SOGTTD5\0": HEADER.size + 8}
 EVENT = struct.Struct("<5Q16s")
 GPRS = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp")
 
@@ -196,9 +197,9 @@ def events(path):
     with open(path, "rb") as file:
         with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
             magic, snapshot_size, _, count, _, _, _, _ = HEADER.unpack_from(data)
-            if magic != b"SOGTTD4\0":
-                raise ValueError("taint replay requires a v4 trace with instruction bytes")
-            start = HEADER.size + snapshot_size
+            if magic not in HEADER_SIZES:
+                raise ValueError("taint replay requires a v4 or v5 trace with instruction bytes")
+            start = HEADER_SIZES[magic] + snapshot_size
             if start + count * EVENT.size > len(data):
                 raise ValueError("truncated event stream")
             for offset in range(start, start + count * EVENT.size, EVENT.size):

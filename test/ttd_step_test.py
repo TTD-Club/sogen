@@ -6,6 +6,7 @@ guest path such as c:/ttd-step-sample.exe when EMULATOR_ARGS selects a root with
 
 import pathlib
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,24 @@ def main() -> None:
         rip, value = seek(write_step)
         assert rip != write_ip
         assert value == NEW_VALUE
+
+        data = bytearray(pathlib.Path(trace).read_bytes())
+        magic, snapshot_size, _, event_count = struct.unpack_from("<8s3Q", data)
+        assert magic == b"SOGTTD5\0"
+        start = 72 + snapshot_size
+        for offset in range(start, start + event_count * 56, 56):
+            step, _, event_address, _, kind = struct.unpack_from("<5Q", data, offset)
+            if step == write_step and kind == 2 and event_address == address:
+                struct.pack_into("<Q", data, offset + 16, address + 8)
+                break
+        else:
+            raise AssertionError("recorded store not found in the event stream")
+        tampered = pathlib.Path(directory) / "tampered.sogttd"
+        tampered.write_bytes(data)
+        result = subprocess.run([str(analyzer), "--ttd-replay", str(tampered), "--ttd-seek", hex(write_step), *emulator_args,
+                                 sample], text=True, capture_output=True, cwd=analyzer.parent)
+        assert result.returncode != 0
+        assert "TTD replay diverged from the recording" in result.stdout + result.stderr
 
 
 if __name__ == "__main__":
