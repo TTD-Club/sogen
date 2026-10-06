@@ -605,9 +605,12 @@ namespace sogen
                         verifier.finish();
                         win_emu.log.log("TTD replay verified %llu recorded events\n",
                                         static_cast<unsigned long long>(verifier.verified_events()));
-                        if (win_emu.get_executed_instructions() != options.ttd_seek)
+                        if (const auto reached = win_emu.get_executed_instructions(); reached != options.ttd_seek)
                         {
-                            return emit_failure("TTD replay stopped before requested position");
+                            char message[160]{};
+                            snprintf(message, sizeof(message), "TTD replay reached position %llx instead of %llx",
+                                     static_cast<unsigned long long>(reached), static_cast<unsigned long long>(options.ttd_seek));
+                            return emit_failure(message);
                         }
                         win_emu.log.log("TTD checkpoint %llx:0\n", static_cast<unsigned long long>(checkpoint_step));
                         win_emu.log.log("TTD position %llx:0 RIP %llx\n", static_cast<unsigned long long>(options.ttd_seek),
@@ -677,7 +680,7 @@ namespace sogen
                             {
                                 break;
                             }
-                            if (win_emu.get_executed_instructions() - before != budget)
+                            if (win_emu.get_executed_instructions() - before < budget)
                             {
                                 break;
                             }
