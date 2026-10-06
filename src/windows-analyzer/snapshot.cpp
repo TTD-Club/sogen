@@ -53,12 +53,6 @@ namespace sogen
                 return utils::compression::zstd::compress(serializer.get_buffer());
             }
 
-            std::vector<std::byte> get_decompressed_emulator_state(const std::span<const std::byte> snapshot)
-            {
-                const auto data = validate_header(snapshot);
-                return utils::compression::zstd::decompress(data);
-            }
-
             std::string get_main_executable_name(const windows_emulator& win_emu)
             {
                 const auto* exe = win_emu.mod_manager.executable;
@@ -86,6 +80,12 @@ namespace sogen
             return snapshot;
         }
 
+        std::vector<std::byte> get_emulator_state(const std::span<const std::byte> snapshot)
+        {
+            const auto data = validate_header(snapshot);
+            return utils::compression::zstd::decompress(data);
+        }
+
         std::filesystem::path write_emulator_snapshot(const windows_emulator& win_emu, const bool log)
         {
             std::filesystem::path snapshot_file = get_main_executable_name(win_emu) + "-" + std::to_string(time(nullptr)) + ".snap";
@@ -106,7 +106,7 @@ namespace sogen
 
         void load_emulator_snapshot(windows_emulator& win_emu, const std::span<const std::byte> snapshot)
         {
-            const auto data = get_decompressed_emulator_state(snapshot);
+            const auto data = get_emulator_state(snapshot);
 
             utils::buffer_deserializer deserializer{data};
             win_emu.deserialize(deserializer);

@@ -61,8 +61,13 @@ def main() -> None:
         assert value == NEW_VALUE
 
         data = bytearray(pathlib.Path(trace).read_bytes())
-        magic, snapshot_size, _, event_count = struct.unpack_from("<8s3Q", data)
+        magic, snapshot_size, _, event_count, checkpoint_count = struct.unpack_from("<8s4Q", data)
         assert magic == b"SOGTTD5\0"
+        assert checkpoint_count > 0
+
+        # Replaying each checkpoint interval from the previous checkpoint must reach exactly the recorded state.
+        verified = run("--ttd-replay", trace, "--ttd-verify-checkpoints", *emulator_args, sample)
+        assert verified.count(" matches ") == checkpoint_count, verified
         start = 72 + snapshot_size
         for offset in range(start, start + event_count * 56, 56):
             step, _, event_address, _, kind = struct.unpack_from("<5Q", data, offset)

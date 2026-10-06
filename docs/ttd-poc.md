@@ -33,7 +33,9 @@ restores the nearest checkpoint at or before `N` and executes the remaining
 instructions. While it does, every access of a recorded kind is compared with
 the trace (kind, step, instruction pointer, address, size, and instruction
 bytes for executes); a mismatch, or a recorded event at or before `N` that
-never occurs, fails the seek with the first differing event. Running
+never occurs, fails the seek with the first differing event. Only event
+metadata is compared, not written values, so a replay that writes different
+data to the same places still verifies. Running
 the same command with `N-1` implements reverse instruction step. The CLI
 prints the resulting instruction pointer. Positions are represented as
 `N:0`, corresponding to Binary Ninja's `(sequence, step)` pair.
@@ -49,6 +51,16 @@ default interval is 500,000 instructions. Checkpoints are taken only between
 instruction-budgeted `start()` calls, when emulator state is quiescent.
 `--ttd-max-instructions` bounds recording and finalizes the trace at the limit.
 A guest failure before the limit can also leave a finalized trace.
+
+`--ttd-replay T --ttd-verify-checkpoints` checks replay determinism, including
+written values: for every checkpoint it restores the previous checkpoint (or
+the initial snapshot), replays the interval with event verification, and
+compares the complete serialized emulator state with the recorded checkpoint,
+printing `matches` or the first differing state offset. All checkpoints of
+`ttd-step-sample` match. A 40M-instruction write-only recording of
+`test-sample` matched in 74 of 78 intervals; the other four differed in a few
+guest bytes last written from live inputs (DNS lookups over ALPC, socket
+`NtDeviceIoControlFile` results, and values derived from them).
 
 `--ttd-access` accepts `read`, `write` (the default), `host-write`, `execute`,
 or `all`. The directional query flags also use that access filter.

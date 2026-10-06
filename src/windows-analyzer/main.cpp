@@ -87,6 +87,7 @@ namespace sogen
             std::filesystem::path ttd_record{};
             std::filesystem::path ttd_replay{};
             bool ttd_scan_selfmod{false};
+            bool ttd_verify_checkpoints{false};
             uint64_t ttd_seek{};
             uint64_t ttd_checkpoint_interval{500000};
             uint64_t ttd_max_instructions{};
@@ -609,6 +610,53 @@ namespace sogen
                             printf("TTD replay verified %llu writes across %llu instructions\n",
                                    static_cast<unsigned long long>(scanner.verified_writes()),
                                    static_cast<unsigned long long>(win_emu.get_executed_instructions()));
+                            do_post_emulation_work(c);
+                            c.emit_summary<run_finished_event>([&](auto& event) {
+                                event.success = true;
+                                event.exit_status = std::nullopt;
+                            });
+                            flush_reporters(c);
+                            return true;
+                        }
+                        if (options.ttd_verify_checkpoints)
+                        {
+                            ttd::trace verify_trace(options.ttd_replay, false);
+                            size_t mismatches = 0;
+                            for (const auto& target : verify_trace.checkpoints())
+                            {
+                                const auto origin = verify_trace.checkpoint_for_step(target.step - 1);
+                                snapshot::load_emulator_snapshot(win_emu, origin.snapshot);
+                                ttd::replay_verifier verifier(win_emu, verify_trace, origin.step);
+                                win_emu.start(static_cast<size_t>(target.step - origin.step));
+                                verifier.finish();
+                                if (win_emu.get_executed_instructions() != target.step)
+                                {
+                                    std::ostringstream message;
+                                    message << "TTD replay from checkpoint " << std::hex << origin.step << " reached position "
+                                            << win_emu.get_executed_instructions() << " instead of " << target.step;
+                                    return emit_failure(message.str());
+                                }
+                                utils::buffer_serializer serializer{};
+                                win_emu.serialize(serializer);
+                                const auto& observed = serializer.get_buffer();
+                                const auto expected = snapshot::get_emulator_state(verify_trace.checkpoint_for_step(target.step).snapshot);
+                                const auto [observed_end, expected_end] = std::ranges::mismatch(observed, expected);
+                                if (observed_end == observed.end() && expected_end == expected.end())
+                                {
+                                    printf("TTD checkpoint %llx:0 matches (%llu events verified)\n",
+                                           static_cast<unsigned long long>(target.step),
+                                           static_cast<unsigned long long>(verifier.verified_events()));
+                                    continue;
+                                }
+                                ++mismatches;
+                                printf("TTD checkpoint %llx:0 differs at state offset %llx (replayed %zu bytes, recorded %zu bytes)\n",
+                                       static_cast<unsigned long long>(target.step),
+                                       static_cast<unsigned long long>(observed_end - observed.begin()), observed.size(), expected.size());
+                            }
+                            if (mismatches)
+                            {
+                                return emit_failure(std::to_string(mismatches) + " TTD checkpoints differ from their replay");
+                            }
                             do_post_emulation_work(c);
                             c.emit_summary<run_finished_event>([&](auto& event) {
                                 event.success = true;
@@ -1205,8 +1253,9 @@ namespace sogen
             app.add_flag("-t,--tenet-trace", options.tenet_trace, "Enable Tenet tracer");
             app.add_option("--ttd-record", options.ttd_record, "Record a checkpointed TTD trace");
             app.add_option("--ttd-replay", options.ttd_replay, "Restore a TTD trace snapshot");
-            app.add_flag("--ttd-scan-selfmod", options.ttd_scan_selfmod,
-                         "Replay write-only TTD trace to find written-then-executed code waves");
+            app.add_flag("--ttd-scan-selfmod", options.ttd_scan_selfmod, "Replay a TTD trace to find written-then-executed code waves");
+            app.add_flag("--ttd-verify-checkpoints", options.ttd_verify_checkpoints,
+                         "Replay each TTD checkpoint interval and compare the reached state with the next checkpoint");
             app.add_option("--ttd-seek", options.ttd_seek, "Replay through this instruction position");
             app.add_option("--ttd-checkpoint-interval", options.ttd_checkpoint_interval, "Instructions between recording checkpoints")
                 ->capture_default_str();
@@ -1404,6 +1453,12 @@ namespace sogen
                 if (options.ttd_scan_selfmod && (options.ttd_replay.empty() || options.ttd_seek))
                 {
                     throw std::runtime_error("TTD self-modifying-code replay scan requires --ttd-replay from position zero");
+                }
+                if (options.ttd_verify_checkpoints &&
+                    (options.ttd_replay.empty() || options.ttd_seek || options.ttd_scan_selfmod || !options.ttd_buffers.empty() ||
+                     !options.ttd_strings.empty() || options.ttd_read || !options.ttd_dump_image.empty()))
+                {
+                    throw std::runtime_error("TTD checkpoint verification requires --ttd-replay and no other TTD replay mode");
                 }
                 if (!options.ttd_dump_wave || options.ttd_dump_wave > 256 ||
                     (options.ttd_dump_wave != 1 && (!options.ttd_scan_selfmod || options.ttd_dump_image.empty())))
