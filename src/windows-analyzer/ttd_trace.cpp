@@ -158,8 +158,23 @@ namespace sogen::ttd
         {
             throw std::runtime_error("Cannot read executed instruction bytes");
         }
-        write_object(file_, event);
+        pending_events_.push_back(event);
         ++header_.event_count;
+        if (pending_events_.size() == pending_event_limit)
+        {
+            flush_events();
+        }
+    }
+
+    void recorder::flush_events()
+    {
+        file_.write(reinterpret_cast<const char*>(pending_events_.data()),
+                    static_cast<std::streamsize>(pending_events_.size() * sizeof(access_event)));
+        if (!file_)
+        {
+            throw std::runtime_error("TTD trace write failed");
+        }
+        pending_events_.clear();
     }
 
     recorder::~recorder()
@@ -252,22 +267,34 @@ namespace sogen::ttd
             index.clear();
         };
         uint64_t index_count = 0;
+        flush_events();
         file_.flush();
         file_.seekg(static_cast<std::streamoff>(sizeof(header) + header_.snapshot_size));
-        for (uint64_t number = 0; number < header_.event_count; ++number)
+        pending_events_.resize(pending_event_limit);
+        for (uint64_t first = 0; first < header_.event_count; first += pending_events_.size())
         {
-            const auto event = read_object<access_event>(file_);
-            const auto last = event.address + std::min<uint64_t>(event.size - 1, UINT64_MAX - event.address);
-            for (auto page = event.address / page_size; page <= last / page_size; ++page)
+            const auto count = static_cast<size_t>(std::min<uint64_t>(pending_events_.size(), header_.event_count - first));
+            file_.read(reinterpret_cast<char*>(pending_events_.data()), static_cast<std::streamsize>(count * sizeof(access_event)));
+            if (!file_)
             {
-                index.push_back({page, number, event.kind});
-                ++index_count;
-                if (index.size() == index_chunk_limit)
+                throw std::runtime_error("Truncated TTD trace");
+            }
+            for (size_t i = 0; i < count; ++i)
+            {
+                const auto& event = pending_events_[i];
+                const auto last = event.address + std::min<uint64_t>(event.size - 1, UINT64_MAX - event.address);
+                for (auto page = event.address / page_size; page <= last / page_size; ++page)
                 {
-                    flush_index_run();
+                    index.push_back({page, first + i, event.kind});
+                    ++index_count;
+                    if (index.size() == index_chunk_limit)
+                    {
+                        flush_index_run();
+                    }
                 }
             }
         }
+        pending_events_ = {};
         if (runs.paths.empty())
         {
             std::sort(index.begin(), index.end(), index_less);

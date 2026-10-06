@@ -136,7 +136,10 @@ namespace sogen::ttd
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};
         scoped_hook host_write_hook_{};
+        static constexpr size_t pending_event_limit = 16384;
+        std::vector<access_event> pending_events_{};
         void append_event(access_kind kind, uint64_t address, size_t size);
+        void flush_events();
         bool finished_{};
     };
 
