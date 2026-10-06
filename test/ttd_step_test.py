@@ -1,4 +1,8 @@
-"""Record ttd-step-sample and check the step definition from docs/ttd-poc.md against a real trace."""
+"""Record ttd-step-sample and check the step definition from docs/ttd-poc.md against a real trace.
+
+Usage: ttd_step_test.py ANALYZER SAMPLE [EMULATOR_ARGS...]; SAMPLE is passed to the analyzer as given, so it is a
+guest path such as c:/ttd-step-sample.exe when EMULATOR_ARGS selects a root with -e.
+"""
 
 import pathlib
 import re
@@ -12,7 +16,7 @@ NEW_VALUE = 0x2222222222222222
 
 def main() -> None:
     analyzer = pathlib.Path(sys.argv[1]).resolve()
-    sample = pathlib.Path(sys.argv[2]).resolve()
+    sample = sys.argv[2]
     emulator_args = sys.argv[3:]
 
     def run(*args: str) -> str:
@@ -23,7 +27,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         trace = str(pathlib.Path(directory) / "step.sogttd")
-        recording = run("--ttd-record", trace, "--ttd-checkpoint-interval", "100000", *emulator_args, str(sample))
+        recording = run("--ttd-record", trace, "--ttd-checkpoint-interval", "100000", *emulator_args, sample)
         address = int(re.search(r"ttd-value ([0-9A-Fa-f]+)", recording).group(1), 16)
 
         def query(access: str, start: int, size: int) -> list[tuple[int, int]]:
@@ -44,7 +48,7 @@ def main() -> None:
 
         def seek(position: int) -> tuple[int, int]:
             output = run("--ttd-replay", trace, "--ttd-seek", hex(position), "--ttd-read", hex(address), *emulator_args,
-                         str(sample))
+                         sample)
             rip = int(re.search(r"TTD position [0-9a-f]+:0 RIP ([0-9a-f]+)", output).group(1), 16)
             value = int(re.search(r"TTD memory [0-9a-f]+ = ([0-9a-f]+)", output).group(1), 16)
             return rip, value

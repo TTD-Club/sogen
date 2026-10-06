@@ -812,6 +812,44 @@ jobs:
           EMULATOR_ROOT: ${{github.workspace}}/build/release/artifacts/root
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
 
+  ttd-test:
+    name: TTD Test
+    runs-on: windows-latest
+    needs: [create-emulation-root, build]
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            test
+            tools
+
+      - name: Download Artifacts
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: Windows x86_64 Release Artifacts
+          path: build/release/artifacts
+
+      - name: Download Emulation Root
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: Windows 2025 Emulation Root
+          path: build/release/artifacts/root
+
+      - name: Copy TTD Sample
+        run: cp build/release/artifacts/ttd-step-sample.exe build/release/artifacts/root/filesys/c/
+
+      - name: Install Capstone
+        run: python -m pip install "capstone>=5,<6"
+
+      - name: Trace Format Tests
+        run: |
+          python test/ttd_trace_query_test.py build/release/artifacts/analyzer.exe
+          python test/ttd_taint_test.py build/release/artifacts/analyzer.exe
+
+      - name: Recorded Trace Tests
+        run: python test/ttd_step_test.py build/release/artifacts/analyzer.exe c:/ttd-step-sample.exe -e root
+
   smoke-test-kvm:
     name: Smoke Test KVM x86_64
     runs-on: ubuntu-24.04
@@ -1349,6 +1387,7 @@ jobs:
         build-isolate,
         test,
         win-test,
+        ttd-test,
         verify-formatting,
         workflow_metadata,
       ]
