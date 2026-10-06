@@ -1414,6 +1414,19 @@ namespace sogen
                 }
             }
 
+            // Recomputed after the switch: an idle switch under relative time advances the counter without executing.
+            if (use_count)
+            {
+                const auto current_instructions = this->executed_instructions_;
+
+                if (current_instructions >= target_instructions)
+                {
+                    break;
+                }
+
+                count = static_cast<size_t>(target_instructions - current_instructions);
+            }
+
             // Guest code executes with the kernel lock released; hook callbacks
             // (syscalls, exceptions, exec hooks) re-acquire it on VM exit.
             lock.unlock();
@@ -1425,16 +1438,9 @@ namespace sogen
                 break;
             }
 
-            if (use_count)
+            if (use_count && this->executed_instructions_ >= target_instructions)
             {
-                const auto current_instructions = this->executed_instructions_;
-
-                if (current_instructions >= target_instructions)
-                {
-                    break;
-                }
-
-                count = static_cast<size_t>(target_instructions - current_instructions);
+                break;
             }
         }
 
