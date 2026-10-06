@@ -1,6 +1,8 @@
 #include "ttd_trace.hpp"
 #include "snapshot.hpp"
 
+#include <utils/finally.hpp>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -96,7 +98,8 @@ namespace sogen::ttd
     recorder::recorder(windows_emulator& emu, const std::filesystem::path& path, const uint64_t access_mask)
         : emu_(emu),
           path_(path),
-          file_(path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc)
+          file_(path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc),
+          checkpoint_path_(path.string() + ".checkpoints")
     {
         if (!(access_mask & all_access_kinds))
         {
@@ -204,7 +207,22 @@ namespace sogen::ttd
         {
             throw std::runtime_error("TTD checkpoints must have increasing instruction positions");
         }
-        checkpoints_.push_back({step, snapshot::create_emulator_snapshot(emu_)});
+        if (!checkpoint_file_.is_open())
+        {
+            checkpoint_file_.open(checkpoint_path_, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
+            if (!checkpoint_file_)
+            {
+                throw std::runtime_error("Cannot create TTD checkpoint file: " + checkpoint_path_.string());
+            }
+        }
+        const auto snapshot = snapshot::create_emulator_snapshot(emu_);
+        const auto offset = static_cast<uint64_t>(checkpoint_file_.tellp());
+        checkpoint_file_.write(reinterpret_cast<const char*>(snapshot.data()), static_cast<std::streamsize>(snapshot.size()));
+        if (!checkpoint_file_)
+        {
+            throw std::runtime_error("Cannot write TTD checkpoint");
+        }
+        checkpoints_.push_back({.step = step, .offset = offset, .size = snapshot.size()});
     }
 
     void recorder::finish()
@@ -214,6 +232,11 @@ namespace sogen::ttd
             return;
         }
         finished_ = true;
+        const auto remove_checkpoint_file = utils::finally([this] {
+            checkpoint_file_.close();
+            std::error_code error;
+            std::filesystem::remove(checkpoint_path_, error);
+        });
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();
@@ -305,23 +328,26 @@ namespace sogen::ttd
         }
         file_.clear();
         file_.seekp(0, std::ios::end);
-        std::vector<checkpoint_entry> table{};
-        table.reserve(checkpoints_.size());
-        for (const auto& checkpoint : checkpoints_)
+        const auto checkpoint_base = static_cast<uint64_t>(file_.tellp());
+        if (checkpoint_file_.is_open())
         {
-            const auto offset = static_cast<uint64_t>(file_.tellp());
-            file_.write(reinterpret_cast<const char*>(checkpoint.snapshot.data()),
-                        static_cast<std::streamsize>(checkpoint.snapshot.size()));
-            if (!file_)
+            checkpoint_file_.flush();
+            checkpoint_file_.seekg(0);
+            std::vector<char> buffer(1 << 20);
+            while (checkpoint_file_.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || checkpoint_file_.gcount())
             {
-                throw std::runtime_error("Cannot write TTD checkpoint");
+                file_.write(buffer.data(), checkpoint_file_.gcount());
+                if (!file_)
+                {
+                    throw std::runtime_error("Cannot write TTD checkpoint");
+                }
             }
-            table.push_back({checkpoint.step, offset, checkpoint.snapshot.size()});
         }
-        header_.checkpoint_count = table.size();
+        header_.checkpoint_count = checkpoints_.size();
         header_.checkpoint_table_offset = static_cast<uint64_t>(file_.tellp());
-        for (const auto& entry : table)
+        for (auto entry : checkpoints_)
         {
+            entry.offset += checkpoint_base;
             write_object(file_, entry);
         }
         header_.index_offset = static_cast<uint64_t>(file_.tellp());

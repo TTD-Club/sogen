@@ -131,7 +131,9 @@ namespace sogen::ttd
         std::filesystem::path path_;
         std::fstream file_;
         header header_{};
-        std::vector<checkpoint_state> checkpoints_{};
+        std::filesystem::path checkpoint_path_;
+        std::fstream checkpoint_file_;
+        std::vector<checkpoint_entry> checkpoints_{};
         scoped_hook write_hook_{};
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};

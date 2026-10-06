@@ -199,7 +199,9 @@ each (page, kind) group is bounded by event number (event numbers grow with
 step), and next/previous queries stop at the first overlapping event, so a
 query reads only the entries in its page and step range. The index must be
 sorted, as every recorder version writes it. Compressed checkpoint snapshots
-remain buffered until recording finishes.
+are spooled to `<trace>.checkpoints` as they are taken and copied into the
+trace when recording finishes, so recorder memory does not grow with the
+number of checkpoints.
 
 ### Positions and steps
 
