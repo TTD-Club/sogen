@@ -29,7 +29,7 @@ namespace sogen::ttd
         char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '4', '\0'};
         uint64_t snapshot_size{};
         uint64_t instruction_count{};
-        uint64_t write_count{};
+        uint64_t event_count{};
         uint64_t checkpoint_count{};
         uint64_t checkpoint_table_offset{};
         uint64_t index_offset{};
@@ -51,7 +51,7 @@ namespace sogen::ttd
 
     struct write_event
     {
-        uint64_t step{}; // 1-based instruction position; state after this instruction
+        uint64_t step{};
         uint64_t ip{};
         uint64_t address{};
         uint64_t size{};
@@ -59,6 +59,10 @@ namespace sogen::ttd
 
     struct access_event
     {
+        // Emulator instruction counter while the access happens, i.e. the 1-based number of the instruction performing
+        // it. The execute event fires before that instruction runs, but the emulator's counting hook is registered
+        // first, so it carries the same step as the instruction's reads and writes. Seeking to position N yields the
+        // state after instruction N.
         uint64_t step{};
         uint64_t ip{};
         uint64_t address{};

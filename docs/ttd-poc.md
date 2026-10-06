@@ -166,6 +166,31 @@ merges them into the trace. Write-only replay scans skip loading the page
 index. Address queries still load the index into memory. Compressed checkpoint
 snapshots remain buffered until recording finishes.
 
+### Positions and steps
+
+An event's `step` is Sogen's instruction counter while the access happens:
+the 1-based number of the instruction performing it. Its execute event and its
+memory reads and writes therefore share one step, even though Unicorn reports
+the execute event before the instruction runs (Sogen's counting hook is
+registered before the recorder's). Position `N` is the state after instruction
+`N`: a write with step `N` is visible when seeking to `N` and not at `N-1`, and
+seeking to `N-1` reports RIP at the writing instruction.
+`test/ttd_step_test.py` checks this on a recording of
+`src/samples/ttd-step-sample`.
+
+The counter can advance without an instruction completing. When a thread's
+time slice ends (every `0x20000` of its instructions), Sogen's counting hook
+stops the CPU, which skips the recorder's hook and the instruction itself; the
+instruction is counted again when the thread resumes. A faulting instruction
+also has an execute event without completing. Such positions are still
+deterministic for seek, but `instruction_count` is not the number of execute
+events. A recording of `ttd-step-sample` had 3,660,773 instructions and 27
+positions without an execute event (`0x20000`, `0x40096`, `0x60096`, ...);
+seeking to `0x1ffff` and `0x20000` reported the same RIP, so the state does
+not change at such a position. The header's access-event count covers
+all kinds, not only writes (the C++ field was renamed from `write_count` to
+`event_count`; the layout is unchanged).
+
 ## Larger-program check
 
 `test/ttd_large_sample.c` performs 200,000 loop iterations with repeated
@@ -201,7 +226,9 @@ results. On `test/ttd_xor_string_sample.c`, a write-only recording completed
 2,214,469 instructions and contained 289,135 write events, zero read events,
 and zero execute events. Write and execute events are both needed for the
 self-modifying-code query on a stored trace. A write-only trace can instead
-use `--ttd-scan-selfmod` if deterministic replay succeeds.
+use `--ttd-scan-selfmod` if deterministic replay succeeds. Replay scans
+(`--ttd-scan-selfmod`, `--ttd-buffers`) require a write-only trace and report
+that instead of a divergence when given one with read or execute events.
 The same PE with only write tracing disabled produced 550,117 reads,
 2,214,453 executes, and zero writes.
 

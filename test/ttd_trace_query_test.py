@@ -130,6 +130,15 @@ def main() -> None:
                                     text=True, capture_output=True, check=True).stdout.splitlines()
         assert heap_first == ["address=70000000 size=2 write=1:0 write_ip=401000 execute=2:0 execute_ip=70000000"]
 
+        # The recorder writes this header before the first event and only fills in the offsets when it finishes.
+        interrupted = pathlib.Path(directory) / "interrupted.sogttd"
+        with interrupted.open("wb") as file:
+            file.write(struct.pack("<8s7Q", b"SOGTTD4\0", 0, 0, 0, 0, 0, 0, 0))
+            file.write(struct.pack("<5Q16s", 1, 0x401000, 0x401000, 3, 4, b""))
+        result = subprocess.run([str(analyzer), "--ttd-query", str(interrupted)], text=True, capture_output=True)
+        assert result.returncode != 0
+        assert "TTD trace was not finalized" in result.stdout
+
 
 if __name__ == "__main__":
     main()

@@ -165,9 +165,9 @@ namespace sogen::ttd
                     removed.writes = value.writes;
                     emit(std::move(removed));
                     std::fill(value.known.begin() + static_cast<ptrdiff_t>(clear_begin),
-                              value.known.begin() + static_cast<ptrdiff_t>(clear_end), 0);
+                              value.known.begin() + static_cast<ptrdiff_t>(clear_end), uint8_t{0});
                     std::fill(value.executed.begin() + static_cast<ptrdiff_t>(clear_begin),
-                              value.executed.begin() + static_cast<ptrdiff_t>(clear_end), 0);
+                              value.executed.begin() + static_cast<ptrdiff_t>(clear_end), uint8_t{0});
                     if (std::none_of(value.known.begin(), value.known.end(), [](uint8_t byte) { return byte != 0; }))
                     {
                         it = active_.erase(it);
@@ -184,17 +184,22 @@ namespace sogen::ttd
             }
         });
         write_hook_ = scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-            if (next_write_ >= trace_.metadata().write_count)
+            if (next_write_ >= trace_.metadata().event_count)
             {
                 error_ = "TTD buffer scan produced an unrecorded write";
                 emu_.stop();
                 return;
             }
             const auto expected = trace_.event_at(next_write_);
+            if (expected.kind != access_kind::write)
+            {
+                error_ = "TTD buffer scan requires a write-only trace; record with --ttd-no-read-trace --ttd-no-execute-trace";
+                emu_.stop();
+                return;
+            }
             const auto step = emu_.get_executed_instructions();
             const auto ip = emu_.emu().read_instruction_pointer();
-            if (expected.kind != access_kind::write || expected.step != step || expected.ip != ip || expected.address != address ||
-                expected.size != size)
+            if (expected.step != step || expected.ip != ip || expected.address != address || expected.size != size)
             {
                 error_ = "TTD buffer scan replay diverged at write event " + std::to_string(next_write_);
                 emu_.stop();
@@ -321,8 +326,8 @@ namespace sogen::ttd
                 current.executed.resize(current.bytes.size());
                 const auto offset = static_cast<size_t>(write.address - combined_begin);
                 std::copy(bytes.begin(), bytes.end(), current.bytes.begin() + static_cast<ptrdiff_t>(offset));
-                std::fill_n(current.known.begin() + static_cast<ptrdiff_t>(offset), bytes.size(), 1);
-                std::fill_n(current.executed.begin() + static_cast<ptrdiff_t>(offset), bytes.size(), 0);
+                std::fill_n(current.known.begin() + static_cast<ptrdiff_t>(offset), bytes.size(), uint8_t{1});
+                std::fill_n(current.executed.begin() + static_cast<ptrdiff_t>(offset), bytes.size(), uint8_t{0});
                 current.last_step = write.step;
                 current.writer_ip = write.ip;
                 ++current.writes;
@@ -338,7 +343,7 @@ namespace sogen::ttd
         value.base = write.address;
         value.bytes.assign(bytes.begin(), bytes.end());
         value.known.assign(bytes.size(), 1);
-        value.executed.assign(bytes.size(), 0);
+        value.executed.assign(bytes.size(), uint8_t{0});
         value.first_step = value.last_step = write.step;
         value.writer_ip = write.ip;
         value.writes = 1;
@@ -522,7 +527,7 @@ namespace sogen::ttd
         {
             throw std::runtime_error(*error_);
         }
-        if (next_write_ != trace_.metadata().write_count)
+        if (next_write_ != trace_.metadata().event_count)
         {
             throw std::runtime_error("TTD buffer scan ended before all recorded writes occurred");
         }

@@ -72,6 +72,9 @@ namespace sogen::ttd
             return object;
         }
 
+        constexpr auto write_only_trace_required =
+            "TTD replay scans require a write-only trace; record with --ttd-no-read-trace --ttd-no-execute-trace";
+
         bool overlaps(uint64_t a, uint64_t as, uint64_t b, uint64_t bs)
         {
             return as && bs && a <= b + std::min(bs - 1, UINT64_MAX - b) && b <= a + std::min(as - 1, UINT64_MAX - a);
@@ -133,7 +136,7 @@ namespace sogen::ttd
             throw std::runtime_error("Cannot read executed instruction bytes");
         }
         write_object(file_, event);
-        ++header_.write_count;
+        ++header_.event_count;
     }
 
     recorder::~recorder()
@@ -142,8 +145,13 @@ namespace sogen::ttd
         {
             finish();
         }
+        catch (const std::exception& e)
+        {
+            emu_.log.error("TTD trace %s was not finalized: %s\n", path_.string().c_str(), e.what());
+        }
         catch (...)
         {
+            emu_.log.error("TTD trace %s was not finalized\n", path_.string().c_str());
         }
     }
 
@@ -167,6 +175,7 @@ namespace sogen::ttd
         {
             return;
         }
+        finished_ = true;
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();
@@ -221,7 +230,7 @@ namespace sogen::ttd
         uint64_t index_count = 0;
         file_.flush();
         file_.seekg(static_cast<std::streamoff>(sizeof(header) + header_.snapshot_size));
-        for (uint64_t number = 0; number < header_.write_count; ++number)
+        for (uint64_t number = 0; number < header_.event_count; ++number)
         {
             const auto event = read_object<access_event>(file_);
             const auto last = event.address + std::min<uint64_t>(event.size - 1, UINT64_MAX - event.address);
@@ -341,7 +350,6 @@ namespace sogen::ttd
         {
             throw std::runtime_error("Cannot finalize TTD trace");
         }
-        finished_ = true;
     }
 
     trace::trace(const std::filesystem::path& path, const bool load_index)
@@ -366,7 +374,7 @@ namespace sogen::ttd
             header_size_ = sizeof(v1_header);
             header_.snapshot_size = old.snapshot_size;
             header_.instruction_count = old.instruction_count;
-            header_.write_count = old.write_count;
+            header_.event_count = old.write_count;
             header_.checkpoint_table_offset = old.index_offset;
             header_.index_offset = old.index_offset;
             header_.index_count = old.index_count;
@@ -389,6 +397,10 @@ namespace sogen::ttd
         {
             throw std::runtime_error("Unsupported TTD trace format");
         }
+        if (!header_.index_offset)
+        {
+            throw std::runtime_error("TTD trace was not finalized; the recording was interrupted");
+        }
         event_size_ = legacy_ ? sizeof(write_event) : v3_ ? sizeof(v3_access_event) : sizeof(access_event);
         file_.seekg(0, std::ios::end);
         const auto length = static_cast<uint64_t>(file_.tellg());
@@ -397,8 +409,8 @@ namespace sogen::ttd
             throw std::runtime_error("Invalid TTD trace snapshot size");
         }
         const auto event_start = header_size_ + header_.snapshot_size;
-        if (header_.write_count > (UINT64_MAX - event_start) / event_size_ ||
-            header_.checkpoint_table_offset < event_start + header_.write_count * event_size_ ||
+        if (header_.event_count > (UINT64_MAX - event_start) / event_size_ ||
+            header_.checkpoint_table_offset < event_start + header_.event_count * event_size_ ||
             header_.checkpoint_table_offset > header_.index_offset ||
             header_.checkpoint_count > (header_.index_offset - header_.checkpoint_table_offset) / sizeof(checkpoint_entry) ||
             header_.index_offset > length ||
@@ -419,7 +431,7 @@ namespace sogen::ttd
         {
             const auto entry = read_object<checkpoint_entry>(file_);
             if (!entry.step || entry.step <= previous_step || entry.step > header_.instruction_count ||
-                entry.offset < event_start + header_.write_count * event_size_ || entry.offset > header_.checkpoint_table_offset ||
+                entry.offset < event_start + header_.event_count * event_size_ || entry.offset > header_.checkpoint_table_offset ||
                 entry.size > header_.checkpoint_table_offset - entry.offset)
             {
                 throw std::runtime_error("Invalid TTD checkpoint entry");
@@ -448,7 +460,7 @@ namespace sogen::ttd
                 return index_entry{old.page, old.event_number, access_kind::write};
             }()
                                        : read_object<index_entry>(file_);
-            if (entry.event_number >= header_.write_count)
+            if (entry.event_number >= header_.event_count)
             {
                 throw std::runtime_error("Invalid TTD index entry");
             }
@@ -494,7 +506,7 @@ namespace sogen::ttd
 
     access_event trace::event_at(const uint64_t number)
     {
-        if (number >= header_.write_count)
+        if (number >= header_.event_count)
         {
             throw std::out_of_range("TTD event is beyond end of trace");
         }
@@ -562,7 +574,7 @@ namespace sogen::ttd
         while (end > first)
         {
             const auto entry = entry_at(--end);
-            if (entry.page != page || entry.kind != access_kind::write || entry.event_number >= header_.write_count)
+            if (entry.page != page || entry.kind != access_kind::write || entry.event_number >= header_.event_count)
             {
                 continue;
             }
@@ -656,7 +668,7 @@ namespace sogen::ttd
         };
 
         std::map<uint64_t, pending_hit> hits{};
-        for (uint64_t number = 0; number < header_.write_count; ++number)
+        for (uint64_t number = 0; number < header_.event_count; ++number)
         {
             const auto event = event_at(number);
             if (!event.size)
@@ -735,17 +747,22 @@ namespace sogen::ttd
             }
         });
         write_hook_ = scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-            if (next_write_ >= recorded_writes_.metadata().write_count)
+            if (next_write_ >= recorded_writes_.metadata().event_count)
             {
                 error_ = "TTD replay produced an unrecorded memory write";
                 emu_.stop();
                 return;
             }
             const auto expected = recorded_writes_.event_at(next_write_);
+            if (expected.kind != access_kind::write)
+            {
+                error_ = write_only_trace_required;
+                emu_.stop();
+                return;
+            }
             const auto step = emu_.get_executed_instructions();
             const auto ip = emu_.emu().read_instruction_pointer();
-            if (expected.kind != access_kind::write || expected.step != step || expected.ip != ip || expected.address != address ||
-                expected.size != size)
+            if (expected.step != step || expected.ip != ip || expected.address != address || expected.size != size)
             {
                 std::ostringstream message;
                 message << "TTD replay memory write diverged at event " << next_write_ << ": expected step=" << expected.step
@@ -814,7 +831,7 @@ namespace sogen::ttd
                             const auto length = std::min<size_t>(page_size, capture_size_ - offset);
                             if (!emu_.emu().try_read_memory(capture_address_ + offset, captured_memory_.data() + offset, length))
                             {
-                                std::fill_n(captured_memory_.data() + offset, length, 0);
+                                std::fill_n(captured_memory_.data() + offset, length, uint8_t{0});
                                 ++missing_capture_pages_;
                             }
                         }
@@ -847,7 +864,7 @@ namespace sogen::ttd
         {
             throw std::runtime_error(*error_);
         }
-        if (next_write_ != recorded_writes_.metadata().write_count)
+        if (next_write_ != recorded_writes_.metadata().event_count)
         {
             throw std::runtime_error("TTD replay ended before all recorded writes occurred");
         }
