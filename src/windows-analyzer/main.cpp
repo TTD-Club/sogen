@@ -487,9 +487,16 @@ namespace sogen
                     }
                     if (!options.ttd_strings.empty())
                     {
+                        ttd::trace string_trace(options.ttd_replay, false);
+                        ttd::replay_verifier verifier(win_emu, string_trace, win_emu.get_executed_instructions());
                         ttd::string_scanner scanner(win_emu, options.ttd_min_string_length);
                         scanner.scan_initial_memory();
-                        win_emu.start();
+                        const auto end = string_trace.metadata().instruction_count;
+                        if (end > win_emu.get_executed_instructions())
+                        {
+                            win_emu.start(static_cast<size_t>(end - win_emu.get_executed_instructions()));
+                        }
+                        verifier.finish();
                         scanner.finish();
                         scanner.save(options.ttd_strings);
                         win_emu.log.log("TTD recovered %zu strings to %s\n", scanner.count(), options.ttd_strings.string().c_str());

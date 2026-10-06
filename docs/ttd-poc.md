@@ -120,7 +120,8 @@ serialized bytes round-tripped unchanged; fresh setup verified its full
 determinism validation before relying on them for long traces.
 
 `--ttd-strings` restores the initial snapshot and deterministically replays
-the application. It scans committed memory at the initial position and scans
+the application up to the recorded instruction count, verifying every recorded
+event as a seek does. It scans committed memory at the initial position and scans
 around each guest write after its instruction completes. It emits a TSV with
 address, observed instruction position, encoding, and value. The
 heuristics currently recognize NUL-terminated printable ASCII and ASCII-range
