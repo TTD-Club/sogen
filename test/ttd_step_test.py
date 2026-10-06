@@ -92,6 +92,17 @@ def main() -> None:
         assert host_step > read_step
         run("--ttd-replay", trace, "--ttd-seek", hex(host_step), *emulator_args, sample)
 
+        # The generated function is the only code the sample writes before executing it.
+        code = int(re.search(r"ttd-code ([0-9A-Fa-f]+)", recording).group(1), 16)
+        offline = run("--ttd-first-selfmod", trace, "--ttd-address", hex(code), "--ttd-size", "0x1000")
+        hit = re.fullmatch(r"address=([0-9a-f]+) size=5 write=([0-9a-f]+):0 write_ip=[0-9a-f]+ execute=([0-9a-f]+):0 "
+                           r"execute_ip=([0-9a-f]+)\n", offline)
+        assert hit, offline
+        assert int(hit.group(1), 16) == code and int(hit.group(4), 16) == code
+        assert host_step < int(hit.group(2), 16) < int(hit.group(3), 16)
+        replayed = run("--ttd-replay", trace, "--ttd-scan-selfmod", *emulator_args, sample)
+        assert f"address={code:x} size=5 write={hit.group(2)}:0" in replayed, replayed
+
 
 if __name__ == "__main__":
     main()

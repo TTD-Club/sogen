@@ -7,6 +7,14 @@ import sys
 import tempfile
 
 
+def index_postings(events: list[tuple[int, int, int, int, int]]) -> list[tuple[int, int, int]]:
+    """Build (page, event_number, kind) index entries in the recorder's (page, kind, event_number) order."""
+    postings = {(page, number, kind)
+                for number, (_, _, address, size, kind) in enumerate(events)
+                for page in range(address // 4096, (address + size - 1) // 4096 + 1)}
+    return sorted(postings, key=lambda posting: (posting[0], posting[2], posting[1]))
+
+
 def main() -> None:
     analyzer = pathlib.Path(sys.argv[1])
     with tempfile.TemporaryDirectory() as directory:
@@ -94,10 +102,13 @@ def main() -> None:
             (7, 0x4000, 0x4000, 1, 4),
         ]
         end = 64 + 40 * len(code_events)
+        code_postings = index_postings(code_events)
         with modified.open("wb") as file:
-            file.write(struct.pack("<8s7Q", b"SOGTTD3\0", 0, 7, len(code_events), 0, end, end, 0))
+            file.write(struct.pack("<8s7Q", b"SOGTTD3\0", 0, 7, len(code_events), 0, end, end, len(code_postings)))
             for event in code_events:
                 file.write(struct.pack("<5Q", *event))
+            for posting in code_postings:
+                file.write(struct.pack("<3Q", *posting))
         found = subprocess.run([str(analyzer), "--ttd-selfmod", str(modified)],
                                text=True, capture_output=True, check=True).stdout.splitlines()
         assert found == [
@@ -122,10 +133,13 @@ def main() -> None:
             (2, 0x70000000, 0x70000000, 2, 4),
         ]
         heap_end = 64 + 40 * len(heap_events)
+        heap_postings = index_postings(heap_events)
         with heap_trace.open("wb") as file:
-            file.write(struct.pack("<8s7Q", b"SOGTTD3\0", 0, 2, len(heap_events), 0, heap_end, heap_end, 0))
+            file.write(struct.pack("<8s7Q", b"SOGTTD3\0", 0, 2, len(heap_events), 0, heap_end, heap_end, len(heap_postings)))
             for event in heap_events:
                 file.write(struct.pack("<5Q", *event))
+            for posting in heap_postings:
+                file.write(struct.pack("<3Q", *posting))
         heap_first = subprocess.run([str(analyzer), "--ttd-first-selfmod", str(heap_trace)],
                                     text=True, capture_output=True, check=True).stdout.splitlines()
         assert heap_first == ["address=70000000 size=2 write=1:0 write_ip=401000 execute=2:0 execute_ip=70000000"]

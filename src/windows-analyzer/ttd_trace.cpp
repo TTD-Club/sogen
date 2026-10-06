@@ -933,8 +933,8 @@ namespace sogen::ttd
 
     std::vector<self_modifying_hit> trace::self_modifying_code()
     {
-        using writer_page = std::array<uint64_t, page_size>;
-        std::unordered_map<uint64_t, writer_page> writers{};
+        using written_bytes = std::array<uint64_t, page_size / 64>;
+        std::unordered_map<uint64_t, written_bytes> written{};
 
         struct pending_hit
         {
@@ -943,41 +943,45 @@ namespace sogen::ttd
             uint64_t count;
         };
 
+        const auto is_written = [&](const uint64_t address) {
+            const auto page = written.find(address / page_size);
+            return page != written.end() && (page->second[(address % page_size) / 64] & (uint64_t{1} << (address % 64)));
+        };
+
         std::map<uint64_t, pending_hit> hits{};
-        for (uint64_t number = 0; number < header_.event_count; ++number)
+        event_reader reader(*this);
+        const auto kinds = static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::execute);
+        while (const auto event = reader.next(kinds))
         {
-            const auto event = event_at(number);
-            if (!event.size)
+            if (!event->size)
             {
                 continue;
             }
-            const auto last = event.address + std::min<uint64_t>(event.size ? event.size - 1 : 0, UINT64_MAX - event.address);
-            if (event.kind == access_kind::write)
+            const auto last = event->address + std::min<uint64_t>(event->size - 1, UINT64_MAX - event->address);
+            for (uint64_t address = event->address;; ++address)
             {
-                for (uint64_t address = event.address; address <= last; ++address)
+                if (event->kind == access_kind::write)
                 {
-                    writers[address / page_size][address % page_size] = number + 1;
-                    if (address == UINT64_MAX)
-                    {
-                        break;
-                    }
+                    written[address / page_size][(address % page_size) / 64] |= uint64_t{1} << (address % 64);
                 }
-            }
-            else if (event.kind == access_kind::execute)
-            {
-                for (uint64_t address = event.address; address <= last; ++address)
+                else if (is_written(address))
                 {
-                    const auto page = writers.find(address / page_size);
-                    if (page != writers.end() && page->second[address % page_size])
+                    auto [it, inserted] = hits.try_emplace(event->address, pending_hit{*event, 0, 0});
+                    if (inserted)
                     {
-                        auto [it, inserted] = hits.try_emplace(event.address, pending_hit{event, page->second[address % page_size] - 1, 0});
-                        ++it->second.count;
-                        break;
+                        const auto writer = latest_write_to_byte(address / page_size, address, 0, reader.last_number());
+                        if (!writer)
+                        {
+                            throw std::runtime_error("TTD index is missing a recorded write");
+                        }
+                        it->second.writer_number = *writer;
                     }
-                    if (address == UINT64_MAX)
-                    {
-                        break;
-                    }
+                    ++it->second.count;
+                    break;
+                }
+                if (address == last)
+                {
+                    break;
                 }
             }
         }
