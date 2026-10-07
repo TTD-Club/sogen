@@ -133,6 +133,25 @@ costs a full replay and cannot recover bytes that were never present at an
 instruction boundary, writes made outside the hooked guest CPU, nonprintable
 encodings, or strings outside the heuristic length and termination rules.
 
+`--ttd-buffers OUT.tsv` replays a trace with write events from a fresh
+setup, verifying every guest write as `--ttd-scan-selfmod` does, and groups
+guest writes into regions: writes within 16 bytes and 250,000 instructions of
+a region extend it. A region is classified when it is overwritten, unmapped,
+evicted, or the replay ends, and each contiguous run of at least 16 written
+bytes is reported with the first kind that applies: a file signature
+(`pe_image`, `elf_image`, `png_image`, `jpeg_image`, `gif_image`, `bmp_image`,
+`pdf_document`, `zip_archive`, `gzip_stream`, `sqlite_database`,
+`pem_private_key`, `pem_public_key`), `contains_executed_code`, `ascii_text`
+(at least 32 bytes, 90% printable), `utf16le_text`, `high_entropy_buffer`
+(at least 256 bytes and 7.5 bits per byte), or `buffer` (at least 512 bytes).
+Printable runs inside a region are also reported as `ascii_string` (16+
+characters) and `utf16le_string` (12+ characters), and signatures found inside
+a region as their own rows. The TSV has `address, size, first_step, last_step,
+writer_ip, writes, kind, preview, artifact`; region bytes are saved under
+`OUT.tsv.buffers/`. Limits: 256 KiB per region, 16,384 active regions, 20,000
+results, and 64 MiB of retained bytes (`skipped` in the summary line counts
+bytes that could not be read back).
+
 `test/ttd_dynamic_sample.c` constructs `SOGEN_TRANSIENT_BUFFER` in ASCII and
 UTF-16LE and then erases both buffers. It also writes a six-byte function into
 allocated executable memory, calls it, patches it, and calls it again. The
