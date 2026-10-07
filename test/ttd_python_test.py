@@ -11,6 +11,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+import ttd_format  # noqa: E402
+
 OLD_VALUE = 0x1111111111111111
 NEW_VALUE = 0x2222222222222222
 FORKED_VALUE = 0x4444444444444444
@@ -59,6 +62,12 @@ def main() -> None:
         assert history[-1].value == list(NEW_VALUE.to_bytes(8, "little"))
         first = next(trace.events(kinds=ttd.EXECUTE))
         assert first.kind == ttd.EXECUTE and first.position == 1
+
+        # tools/ttd_format.py decodes the filtered bulk blocks (mapped images) exactly like the library.
+        large = [event.data for event in trace.events(kinds=ttd.HOST_WRITE) if len(event.data) > ttd_format.INLINE_DATA_LIMIT]
+        mirrored = [event.data for event in ttd_format.Trace(cli_trace).events()
+                    if event.kind == ttd_format.HOST_WRITE and event.size > ttd_format.INLINE_DATA_LIMIT]
+        assert large and large == mirrored
 
         # Replaying a CLI recording in Python: the CPUID results and settings must match the analyzer's.
         emulator = ttd.create_emulator(sample, **settings)

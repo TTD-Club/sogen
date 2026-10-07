@@ -75,7 +75,8 @@ namespace sogen::ttd
         std::shared_ptr<std::vector<std::byte>> current_bulk_{std::make_shared<std::vector<std::byte>>()};
         // The last bulk_reference_span closed blocks, oldest first.
         std::deque<bulk_block> recent_bulk_{};
-        background_compressor bulk_compressor_{bulk_compression_level};
+        background_compressor bulk_compressor_{
+            [](const std::span<const std::byte> data) { return encode_bulk_block(data, bulk_compression_level); }};
         std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};

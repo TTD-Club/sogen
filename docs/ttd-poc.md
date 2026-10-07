@@ -75,7 +75,7 @@ The application and root for replay must match the recording. `--ttd-seek N`
 restores the nearest checkpoint at or before `N` and executes the remaining
 instructions. While it does, every access of a recorded kind is compared with
 the trace (kind, step, instruction pointer, address, size, instruction bytes
-for executes, and the bytes read or written for v7 traces); a mismatch, or a
+for executes, and the bytes read or written for v7 and v8 traces); a mismatch, or a
 recorded event at or before `N` that never occurs, fails the seek with the
 first differing event. Running
 the same command with `N-1` implements reverse instruction step. The CLI
@@ -226,7 +226,7 @@ MOVZX/MOVSX, LEA, basic arithmetic/bitwise operations, PUSH/POP, and MOVS.
 It prints tainted memory writes, a bounded count of unsupported tainted
 flows, and an optional register's last read/write. `--through-step` limits
 analysis to a position. Read, write, and execute recording must all be on.
-Host writes in a v7 trace clear taint from the bytes they overwrite; they are
+Host writes in a v7 or v8 trace clear taint from the bytes they overwrite; they are
 not yet taint sources.
 For `test/ttd_xor_string_sample.c`, tainting the 35 encoded bytes at
 `0x140002000` produced 34 tainted output-byte writes beginning at
@@ -238,10 +238,10 @@ thread-specific register state, MMIO, and data from the initial snapshot other
 than selected source ranges are not fully modeled. A gap means the reported
 taint flow may be incomplete.
 
-## Format v7
+## Format v8
 
 All fields are little-endian; `tools/ttd_format.py` is a reference reader and
-writer. The 48-byte header is `SOGTTD7\0` plus five `uint64_t` values:
+writer. The 48-byte header is `SOGTTD8\0` plus five `uint64_t` values:
 instruction count, event count, recorded access kinds (a nonzero mask of the
 kind values below), section count, and section-table offset. A section-table
 offset of zero marks a recording that was never finalized. Event chunks and
@@ -279,7 +279,16 @@ found through the section table (24-byte entries `type, offset, size`):
   holding, in recording order, the bytes of every access larger than 16 bytes
   recorded after checkpoint `i` and before checkpoint `i + 1` (or the end).
   The recorder closes the current event chunk at every checkpoint, so a chunk
-  never spans two intervals.
+  never spans two intervals. Before compression, an x86-64 filter makes the
+  32-bit displacements of `E8`/`E9` (call/jmp rel32), `FF 15`/`FF 25`
+  (call/jmp `[rip+disp32]`), and `48`/`4C` followed by `89`/`8B`/`8D` with a
+  RIP-relative ModRM (`modrm & 0xC7 == 0x05`) absolute: scanning from offset
+  0 while 8 bytes remain, a candidate whose displacement field at offset `f`
+  has a top byte of `00` or `FF` gets `(disp + f) mod 2^25`, sign-extended
+  from bit 24, and the scan continues at `f + 4`; any other candidate
+  continues at `f + 3`, and a non-candidate at the next byte. The decoder runs
+  the same scan with `disp - f`. Calls to the same target then repeat
+  byte-for-byte, which saves 9% of bulk bytes on `test-sample`.
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
@@ -316,26 +325,29 @@ blocks it refers to:
 Decoded accesses up to 16 bytes carry their data inline; larger ones carry
 their bulk offset (payload bytes 0-7) and block (bytes 8-15).
 
-Versions 1 to 4 stored fixed-size event records with full checkpoint snapshots
-and a per-event page index; they remain readable (1 and 2 as write-only
-traces, 3 without instruction bytes, 4 without access data). Development
-versions 5 and 6 were never published and are rejected.
+Version 7 is identical except that bulk blocks are stored without the x86-64
+filter; it remains readable. Versions 1 to 4 stored fixed-size event records
+with full checkpoint snapshots and a per-event page index; they remain readable
+(1 and 2 as write-only traces, 3 without instruction bytes, 4 without access
+data). Development versions 5 and 6 were never published and are rejected.
 
 A full `test-sample` recording (30.1M instructions, 40.7M events, 61
-checkpoints) is 37.5 MiB in v7; the same recording in the v4-style layout plus
-access data was 4,157 MiB (2,176 MiB of fixed-size events, 962 MiB of full
-checkpoints, 958 MiB of per-event index), and 169 MiB in v6 (fixed-width
-columns, keyframe checkpoints, uncompressed page index). Of the v7 trace,
-event chunks take 13.2 MiB (3.7 bits per instruction, including every read
-and every written value up to 16 bytes), bulk blocks 19.4 MiB (almost all image
-contents written by `NtMapViewOfSection`), checkpoints 3.6 MiB (initial state
+checkpoints) is 35.8 MiB in v8 (37.5 MiB in v7); the same recording in the
+v4-style layout plus access data was 4,157 MiB (2,176 MiB of fixed-size
+events, 962 MiB of full checkpoints, 958 MiB of per-event index), and 169 MiB
+in v6 (fixed-width columns, keyframe checkpoints, uncompressed page index). Of
+the v8 trace, event chunks take 13.2 MiB (3.7 bits per instruction, including
+every read and every written value up to 16 bytes), bulk blocks 17.6 MiB
+(59.8 MiB raw, almost all image contents written by `NtMapViewOfSection`;
+19.4 MiB without the x86-64 filter), checkpoints 3.6 MiB (initial state
 1.4 MiB, three 16-apart deltas 0.7 MiB, 57 adjacent deltas 1.6 MiB), the
 code table 1.3 MiB (243,348 instructions), and the page index 0.06 MiB.
 Without bulk data in the delta references the checkpoints took 46.4 MiB.
 Bulk blocks are compressed at zstd level 19 on a background thread (level 6
-would take 22.5 MiB). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take 0.02 s for a
-next-access lookup and about 3 s for a scan of every chunk; a late seek
-including the checkpoint delta chain takes 0.6 s.
+would take 22.5 MiB unfiltered). Recording takes 20 s (v6: 29 s, v4-style:
+61 s). Queries take 0.02 s for a next-access lookup and about 3 s for a scan
+of every chunk; a late seek including the checkpoint delta chain takes 0.7 s
+(0.6 s in v7).
 
 Because every written and read value is recorded, a range's value history is
 available offline: `--ttd-history TRACE --ttd-address A --ttd-size N`

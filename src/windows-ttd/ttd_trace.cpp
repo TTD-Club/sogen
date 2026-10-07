@@ -477,7 +477,7 @@ namespace sogen::ttd
             throw std::runtime_error("Unsupported TTD trace format");
         }
         version_ = static_cast<uint32_t>(magic[6] - '0');
-        if (version_ == 5 || version_ == 6 || version_ > 7)
+        if (version_ == 5 || version_ == 6 || version_ > 8)
         {
             throw std::runtime_error("Unsupported TTD trace format");
         }
@@ -751,7 +751,7 @@ namespace sogen::ttd
         auto block = std::make_shared<std::vector<std::byte>>();
         if (entry.size)
         {
-            *block = utils::compression::zstd::decompress(read_bytes(entry.offset, entry.size));
+            *block = decode_bulk_block(read_bytes(entry.offset, entry.size), version_ >= 8);
             if (block->empty())
             {
                 throw std::runtime_error("Cannot decompress TTD bulk block");

@@ -1,4 +1,5 @@
-"""Reader and writer for Sogen TTD traces, format v7 (see docs/ttd-poc.md). Requires the zstandard package."""
+"""Reader and writer for Sogen TTD traces, format v8 (reads v7 too; see docs/ttd-poc.md). Requires the zstandard
+package."""
 
 import struct
 
@@ -14,7 +15,8 @@ CODE = struct.Struct("<2Q16s")
 CHUNK_HEADER = struct.Struct("<9Q")
 BULK = struct.Struct("<2Q")
 BULK_REFERENCE = struct.Struct("<2Q")
-MAGIC = b"SOGTTD7\0"
+MAGIC = b"SOGTTD8\0"
+MAGIC_V7 = b"SOGTTD7\0"
 CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE = 1, 2, 3, 4, 5
 READ, WRITE, EXECUTE, HOST_WRITE = 1, 2, 4, 8
 MASK64 = (1 << 64) - 1
@@ -74,6 +76,38 @@ def _put_varint(output, value):
         output.append((value & 0x7F) | 0x80)
         value >>= 7
     output.append(value)
+
+
+def _displacement_at(data, i):
+    op = data[i]
+    if op in (0xE8, 0xE9):
+        return i + 1
+    if op == 0xFF and data[i + 1] in (0x15, 0x25):
+        return i + 2
+    if op in (0x48, 0x4C) and data[i + 1] in (0x89, 0x8B, 0x8D) and data[i + 2] & 0xC7 == 0x05:
+        return i + 3
+    return None
+
+
+def convert_displacements(data, encode):
+    """Mirror of the bulk block x86-64 filter in src/windows-ttd/ttd_chunk.cpp."""
+    data = bytearray(data)
+    i = 0
+    while i + 8 < len(data):
+        field = _displacement_at(data, i)
+        if field is None:
+            i += 1
+            continue
+        if data[field + 3] not in (0x00, 0xFF):
+            i = field + 3
+            continue
+        value = int.from_bytes(data[field:field + 4], "little")
+        value = (value + field if encode else value - field) & 0x1FFFFFF
+        if value & 0x1000000:
+            value |= 0xFE000000
+        data[field:field + 4] = value.to_bytes(4, "little")
+        i = field + 4
+    return bytes(data)
 
 
 class _Stream:
@@ -234,8 +268,9 @@ class Trace:
         with open(path, "rb") as file:
             self.bytes = file.read()
         magic, self.instruction_count, self.event_count, self.access_mask, count, table = HEADER.unpack_from(self.bytes)
-        if magic != MAGIC:
-            raise ValueError("not a v7 TTD trace")
+        if magic not in (MAGIC, MAGIC_V7):
+            raise ValueError("not a v7 or v8 TTD trace")
+        self.magic = magic
         if not table:
             raise ValueError("TTD trace was not finalized")
         self.sections = {}
@@ -255,8 +290,8 @@ class Trace:
     def bulk(self, index):
         if index not in self._bulk_cache:
             offset, size = self.bulk_table[index]
-            self._bulk_cache = {index: zstandard.ZstdDecompressor().decompress(self.bytes[offset:offset + size])
-                                if size else b""}
+            block = zstandard.ZstdDecompressor().decompress(self.bytes[offset:offset + size]) if size else b""
+            self._bulk_cache = {index: convert_displacements(block, False) if self.magic == MAGIC else block}
         return self._bulk_cache[index]
 
     def chunk_events(self, index):
@@ -332,7 +367,7 @@ def write_trace(path, events, instruction_count, access_mask=READ | WRITE | EXEC
     chunk_offset = len(body)
     body += chunk
     bulk_offset = len(body)
-    encoded_bulk = zstandard.ZstdCompressor(level=6).compress(bytes(bulk)) if bulk else b""
+    encoded_bulk = zstandard.ZstdCompressor(level=6).compress(convert_displacements(bulk, True)) if bulk else b""
     body += encoded_bulk
     kinds_by_page = _pages(events)
     chunk_table = len(body)
@@ -383,7 +418,7 @@ def replace_chunk(path, index, events):
     section_table = len(data)
     for kind, (section_offset, size) in sections.items():
         data += SECTION.pack(kind, section_offset, size)
-    data[:HEADER.size] = HEADER.pack(MAGIC, trace.instruction_count, trace.event_count, trace.access_mask, len(sections),
+    data[:HEADER.size] = HEADER.pack(trace.magic, trace.instruction_count, trace.event_count, trace.access_mask, len(sections),
                                      section_table)
     with open(path, "wb") as file:
         file.write(data)

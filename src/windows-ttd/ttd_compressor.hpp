@@ -4,22 +4,24 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace sogen::ttd
 {
-    // Compresses buffers with zstd on one worker thread, in submission order. A failed compression yields an empty
-    // result.
+    // Encodes buffers on one worker thread, in submission order. A failed encoding yields an empty result.
     class background_compressor
     {
       public:
         using result = std::pair<uint64_t, std::vector<std::byte>>;
+        using encoder = std::function<std::vector<std::byte>(std::span<const std::byte>)>;
 
-        explicit background_compressor(int level);
+        explicit background_compressor(encoder encode);
         ~background_compressor();
         background_compressor(const background_compressor&) = delete;
         background_compressor& operator=(const background_compressor&) = delete;
@@ -31,7 +33,7 @@ namespace sogen::ttd
         std::vector<result> take_finished(bool wait);
 
       private:
-        int level_{};
+        encoder encode_{};
         std::mutex mutex_{};
         std::condition_variable work_available_{};
         std::condition_variable work_done_{};

@@ -1,11 +1,9 @@
 #include "ttd_compressor.hpp"
 
-#include <utils/compression.hpp>
-
 namespace sogen::ttd
 {
-    background_compressor::background_compressor(const int level)
-        : level_(level),
+    background_compressor::background_compressor(encoder encode)
+        : encode_(std::move(encode)),
           worker_([this] { this->run(); })
     {
     }
@@ -56,7 +54,7 @@ namespace sogen::ttd
                 this->pending_.pop_front();
             }
 
-            auto compressed = utils::compression::zstd::compress(*job.second, this->level_);
+            auto compressed = this->encode_(*job.second);
             job.second.reset();
 
             {

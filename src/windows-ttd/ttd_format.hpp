@@ -52,12 +52,13 @@ namespace sogen::ttd
 
     constexpr size_t inline_data_limit = sizeof(access_event::payload);
 
-    // Version 7 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
+    // Version 8 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
     // section table points to. Unknown section types are ignored, so sections can be added without a new version.
+    // Version 7 differs only in storing bulk blocks without the x86-64 filter.
     struct file_header
     {
         // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '7', '\0'};
+        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '8', '\0'};
         uint64_t instruction_count{};
         uint64_t event_count{};
         uint64_t access_mask{};
@@ -127,7 +128,8 @@ namespace sogen::ttd
     };
 
     // Bulk block i is one zstd frame (or nothing, when size is zero) holding, in recording order, the bytes of every
-    // access larger than inline_data_limit that was recorded after checkpoint i and before checkpoint i + 1.
+    // access larger than inline_data_limit that was recorded after checkpoint i and before checkpoint i + 1, filtered
+    // as described at encode_bulk_block.
     struct bulk_entry
     {
         uint64_t offset{};

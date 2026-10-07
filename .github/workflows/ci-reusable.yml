@@ -1280,6 +1280,7 @@ jobs:
         if: ${{ startsWith(matrix.runner, 'windows') }}
         run: |
           cp build/release/artifacts/ttd-step-sample.exe build/release/artifacts/root/filesys/c/
+          python -m pip install zstandard
           python test/ttd_python_test.py build/release/artifacts/analyzer.exe c:/ttd-step-sample.exe -e ${{github.workspace}}/build/release/artifacts/root
 
       - name: Run Python Linux Unicorn Test Script

@@ -46,4 +46,10 @@ namespace sogen::ttd
     // A page block stores page deltas, chunks (as deltas while the page repeats), and kinds as three streams.
     std::vector<std::byte> encode_page_block(std::span<const page_entry> entries);
     std::vector<page_entry> decode_page_block(std::span<const std::byte> compressed, const page_block& block);
+
+    // A bulk block is a zstd frame of its bytes after an x86-64 filter that turns branch and RIP-relative
+    // displacements into absolute block offsets (`filtered`; version 7 traces store the bytes unfiltered). An empty
+    // result means compression or decompression failed.
+    std::vector<std::byte> encode_bulk_block(std::span<const std::byte> data, int level);
+    std::vector<std::byte> decode_bulk_block(std::span<const std::byte> compressed, bool filtered);
 }

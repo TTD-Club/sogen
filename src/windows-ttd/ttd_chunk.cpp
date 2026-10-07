@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 
 namespace sogen::ttd
@@ -34,6 +35,61 @@ namespace sogen::ttd
             uint64_t event_count{};
             std::array<uint64_t, stream_count> stream_sizes{};
         };
+
+        // Offset of the 32-bit displacement of a call/jmp rel32, call/jmp [rip+disp32], or 64-bit mov/lea with a
+        // RIP-relative operand starting at `i`. Only opcode bytes before the displacement are inspected.
+        std::optional<size_t> displacement_at(const std::span<const std::byte> data, const size_t i)
+        {
+            const auto at = [&](const size_t k) { return static_cast<uint8_t>(data[i + k]); };
+            const auto op = at(0);
+            if (op == 0xE8 || op == 0xE9)
+            {
+                return i + 1;
+            }
+            if (op == 0xFF && (at(1) == 0x15 || at(1) == 0x25))
+            {
+                return i + 2;
+            }
+            if ((op == 0x48 || op == 0x4C) && (at(1) == 0x89 || at(1) == 0x8B || at(1) == 0x8D) && (at(2) & 0xC7) == 0x05)
+            {
+                return i + 3;
+            }
+            return std::nullopt;
+        }
+
+        // Turns relative displacements into block offsets (or back), so repeated targets become repeated bytes. Only
+        // displacements in [-2^24, 2^24) are converted, into the same range, so the decoder finds the same ones. A
+        // rejected candidate skips to its displacement's last byte, so no later conversion changes a byte the
+        // rejection looked at.
+        void convert_displacements(const std::span<std::byte> data, const bool encode)
+        {
+            constexpr size_t lookahead = 8;
+            for (size_t i = 0; i + lookahead < data.size();)
+            {
+                const auto field = displacement_at(data, i);
+                if (!field)
+                {
+                    ++i;
+                    continue;
+                }
+                const auto high = static_cast<uint8_t>(data[*field + 3]);
+                if (high != 0x00 && high != 0xFF)
+                {
+                    i = *field + 3;
+                    continue;
+                }
+                uint32_t value{};
+                memcpy(&value, data.data() + *field, sizeof(value));
+                const auto position = static_cast<uint32_t>(*field);
+                value = (encode ? value + position : value - position) & 0x1FFFFFF;
+                if (value & 0x1000000)
+                {
+                    value |= 0xFE000000;
+                }
+                memcpy(data.data() + *field, &value, sizeof(value));
+                i = *field + sizeof(value);
+            }
+        }
 
         uint64_t zigzag(const uint64_t delta)
         {
@@ -577,5 +633,22 @@ namespace sogen::ttd
             throw std::runtime_error("Invalid TTD page index block");
         }
         return entries;
+    }
+
+    std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)
+    {
+        std::vector<std::byte> filtered(data.begin(), data.end());
+        convert_displacements(filtered, true);
+        return utils::compression::zstd::compress(filtered, level);
+    }
+
+    std::vector<std::byte> decode_bulk_block(const std::span<const std::byte> compressed, const bool filtered)
+    {
+        auto data = utils::compression::zstd::decompress(compressed);
+        if (filtered)
+        {
+            convert_displacements(data, false);
+        }
+        return data;
     }
 }

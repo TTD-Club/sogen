@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Experimental byte-taint propagation over a Sogen v4 or v7 access trace.
+"""Experimental byte-taint propagation over a Sogen v4, v7, or v8 access trace.
 
-Requires capstone 5 (and zstandard for v7 traces). This is a bounded x64
+Requires capstone 5 (and zstandard for v7 and v8 traces). This is a bounded x64
 data-flow prototype: unsupported instructions are reported as gaps when they
 consume tainted data.
 """
@@ -197,7 +197,7 @@ class TaintReplay:
 def events(path):
     with open(path, "rb") as file:
         magic = file.read(8)
-    if magic == b"SOGTTD7\0":
+    if magic in (b"SOGTTD7\0", b"SOGTTD8\0"):
         import ttd_format
 
         for event in ttd_format.Trace(path).events():
@@ -207,7 +207,7 @@ def events(path):
         with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
             magic, snapshot_size, _, count, _, _, _, _ = HEADER.unpack_from(data)
             if magic != b"SOGTTD4\0":
-                raise ValueError("taint replay requires a v4 or v7 trace with instruction bytes")
+                raise ValueError("taint replay requires a v4, v7, or v8 trace with instruction bytes")
             start = HEADER.size + snapshot_size
             if start + count * EVENT.size > len(data):
                 raise ValueError("truncated event stream")

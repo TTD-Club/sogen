@@ -6,6 +6,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+import ttd_format  # noqa: E402
+
 
 def index_postings(events: list[tuple[int, int, int, int, int]]) -> list[tuple[int, int, int]]:
     """Build (page, event_number, kind) index entries in the recorder's (page, kind, event_number) order."""
@@ -152,6 +155,21 @@ def main() -> None:
         result = subprocess.run([str(analyzer), "--ttd-query", str(interrupted)], text=True, capture_output=True)
         assert result.returncode != 0
         assert "TTD trace was not finalized" in result.stdout
+
+        # The bulk block filter must round-trip, including a rejected call whose displacement holds the start of a
+        # converted `call [rip+disp32]`.
+        filtered = pathlib.Path(directory) / "filtered.sogttd"
+        contents = [
+            bytes.fromhex("e848ff1513f8060090909090909090909090909090909090"),
+            bytes.fromhex("e810000000e9f0ffffff4c8d0dfcffffffff2500010000cc"),
+            bytes.fromhex("488b0500000080488905ffffff00909090909090e8000000"),
+        ]
+        joined = b"".join(contents)
+        assert ttd_format.convert_displacements(joined, True) != joined
+        host_writes = [(1, 0x401000, 0x10000 + 0x100 * i, len(data), ttd_format.HOST_WRITE, data)
+                       for i, data in enumerate(contents)]
+        ttd_format.write_trace(str(filtered), host_writes, instruction_count=1)
+        assert [event.data for event in ttd_format.Trace(str(filtered)).events()] == contents
 
 
 if __name__ == "__main__":
