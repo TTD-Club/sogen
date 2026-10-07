@@ -39,6 +39,7 @@ namespace sogen::ttd
 
     void string_scanner::scan_initial_memory()
     {
+        const auto step = emu_.get_executed_instructions();
         for (const auto& [base, reservation] : emu_.memory.get_reserved_regions())
         {
             (void)base;
@@ -48,7 +49,7 @@ namespace sogen::ttd
             }
             for (const auto& [address, committed] : reservation.committed_regions)
             {
-                scan_range(address, committed.length, 0);
+                scan_range(address, committed.length, step);
             }
         }
     }
@@ -190,6 +191,17 @@ namespace sogen::ttd
         {
             throw std::runtime_error("Writing TTD strings failed");
         }
+    }
+
+    std::vector<recovered_string> string_scanner::results() const
+    {
+        std::vector<recovered_string> results{};
+        for (const auto& [address, entries] : strings_)
+        {
+            (void)address;
+            results.insert(results.end(), entries.begin(), entries.end());
+        }
+        return results;
     }
 
     size_t string_scanner::count() const

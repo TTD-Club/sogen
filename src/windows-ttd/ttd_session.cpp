@@ -285,4 +285,48 @@ namespace sogen::ttd
             throw divergence_error(e.what() + difference_suffix(manifest_differences(win_emu, recorded)));
         }
     }
+
+    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach)
+    {
+        require_deterministic(win_emu);
+        check_manifest(win_emu, recorded);
+        const auto start = recorded.start_position();
+        const auto end = recorded.metadata().instruction_count;
+        snapshot::load_emulator_state(win_emu, recorded.checkpoint_for_step(start).state);
+        attach();
+        try
+        {
+            replay_verifier verifier(win_emu, recorded, start);
+            const auto run_to = [&](const uint64_t position) {
+                const auto before = win_emu.get_executed_instructions();
+                if (position > before)
+                {
+                    win_emu.start(static_cast<size_t>(position - before));
+                }
+                return win_emu.get_executed_instructions() == position;
+            };
+            auto reached = true;
+            for (const auto& checkpoint : recorded.checkpoints())
+            {
+                reached = run_to(checkpoint.step);
+                if (!reached)
+                {
+                    break;
+                }
+            }
+            reached = reached && run_to(end);
+            verifier.finish();
+            if (!reached)
+            {
+                std::ostringstream message;
+                message << "TTD replay reached position " << std::hex << win_emu.get_executed_instructions() << " instead of " << end;
+                throw divergence_error(message.str());
+            }
+            return {.checkpoint = start, .verified_events = verifier.verified_events()};
+        }
+        catch (const divergence_error& e)
+        {
+            throw divergence_error(e.what() + difference_suffix(manifest_differences(win_emu, recorded)));
+        }
+    }
 }

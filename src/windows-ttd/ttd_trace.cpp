@@ -1662,7 +1662,7 @@ namespace sogen::ttd
                                                    const size_t capture_size, const size_t capture_wave)
         : emu_(emu),
           recorded_writes_(recorded_writes),
-          expected_writes_(recorded_writes),
+          expected_writes_(recorded_writes, recorded_writes.first_event_after(emu.get_executed_instructions())),
           capture_address_(capture_address),
           capture_size_(capture_size),
           capture_wave_(capture_wave)

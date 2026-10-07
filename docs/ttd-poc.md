@@ -38,6 +38,11 @@ with ttd.Trace("sample.sogttd") as trace:
     replay.seek(store.position - 1)                 # also seeks backwards
     rip = emu.read_register(sogen.Register.rip)
 
+    # Replay scans: each replays the whole trace with verification and leaves the emulator at its end.
+    strings = replay.strings(minimum_length=6)       # RecoveredString: address, position, encoding, value
+    buffers = replay.buffers()                       # RecoveredBuffer: address, size, positions, writer_ip, data
+    waves = replay.self_modifying_waves()            # first write-then-execute hit of each wave
+
     # Fork: after a seek the emulator is an ordinary emulator. Change it and run on unverified;
     # a later seek returns to the recorded timeline.
     emu.write_memory(0x140005000, (0x4141).to_bytes(8, "little"))
@@ -60,8 +65,9 @@ with ttd.Trace("sample.sogttd") as trace:
 relative clock). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
 also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_python_test.py` covers queries,
 the manifest, replay of a CLI trace, a fork and a recorded fork (replayed in Python and the CLI), divergence and
-CPUID-mismatch errors, and replay of a Python trace in the CLI. The CLI's replay scans (`--ttd-strings`,
-`--ttd-buffers`, `--ttd-scan-selfmod`) need a trace that starts at position 0.
+CPUID-mismatch errors, the replay scans (also on a fork), and replay of a Python trace in the CLI. The Python
+scans start from the trace's initial checkpoint, so they also work on a recorded fork; the CLI's replay scans
+(`--ttd-strings`, `--ttd-buffers`, `--ttd-scan-selfmod`) need a trace that starts at position 0.
 
 ## Recording and querying
 

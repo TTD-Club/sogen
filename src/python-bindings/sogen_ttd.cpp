@@ -2,7 +2,9 @@
 
 #include "sogen_internal.hpp"
 
+#include <ttd_buffer_scan.hpp>
 #include <ttd_session.hpp>
+#include <ttd_string_scan.hpp>
 #include <ttd_trace.hpp>
 
 #include <sstream>
@@ -192,6 +194,36 @@ namespace sogen::py
                 return ttd::seek(this->emulator_->native(), this->trace_.native(), position);
             }
 
+            std::vector<ttd::recovered_string> strings(const size_t minimum_length) const
+            {
+                auto& emulator = this->emulator_->native();
+                std::optional<ttd::string_scanner> scanner{};
+                ttd::replay_to_end(emulator, this->trace_.native(), [&] {
+                    scanner.emplace(emulator, minimum_length);
+                    scanner->scan_initial_memory();
+                });
+                scanner->finish();
+                return scanner->results();
+            }
+
+            std::vector<ttd::recovered_buffer> buffers() const
+            {
+                auto& emulator = this->emulator_->native();
+                std::optional<ttd::buffer_scanner> scanner{};
+                ttd::replay_to_end(emulator, this->trace_.native(), [&] { scanner.emplace(emulator, this->trace_.native()); });
+                scanner->finish();
+                return scanner->results();
+            }
+
+            std::vector<ttd::self_modifying_hit> self_modifying_waves() const
+            {
+                auto& emulator = this->emulator_->native();
+                std::optional<ttd::replay_selfmod_scanner> scanner{};
+                ttd::replay_to_end(emulator, this->trace_.native(), [&] { scanner.emplace(emulator, this->trace_.native()); });
+                scanner->finish();
+                return scanner->hits();
+            }
+
             std::vector<std::string> manifest_differences() const
             {
                 return ttd::manifest_differences(this->emulator_->native(), this->trace_.native());
@@ -272,6 +304,25 @@ namespace sogen::py
                 .def_ro("execute_position", &ttd::self_modifying_hit::execute_step)
                 .def_ro("execute_ip", &ttd::self_modifying_hit::execute_ip)
                 .def_ro("executions", &ttd::self_modifying_hit::executions);
+
+            nb::class_<ttd::recovered_string>(m, "RecoveredString")
+                .def_ro("address", &ttd::recovered_string::address)
+                .def_ro("position", &ttd::recovered_string::step, "Position at which the string was last seen extended")
+                .def_ro("encoding", &ttd::recovered_string::encoding, "ascii or utf16le")
+                .def_ro("value", &ttd::recovered_string::value);
+
+            nb::class_<ttd::recovered_buffer>(m, "RecoveredBuffer")
+                .def_ro("address", &ttd::recovered_buffer::address)
+                .def_ro("size", &ttd::recovered_buffer::size)
+                .def_ro("first_position", &ttd::recovered_buffer::first_step)
+                .def_ro("last_position", &ttd::recovered_buffer::last_step)
+                .def_ro("writer_ip", &ttd::recovered_buffer::writer_ip)
+                .def_ro("writes", &ttd::recovered_buffer::writes)
+                .def_ro("kind", &ttd::recovered_buffer::kind)
+                .def_ro("preview", &ttd::recovered_buffer::preview)
+                .def_prop_ro("data", [](const ttd::recovered_buffer& self) {
+                    return nb::bytes(reinterpret_cast<const char*>(self.data.data()), self.data.size());
+                });
 
             nb::class_<ttd::seek_result>(m, "SeekResult")
                 .def_ro("checkpoint", &ttd::seek_result::checkpoint, "Position of the checkpoint the seek restored")
@@ -423,6 +474,15 @@ namespace sogen::py
                      "Restore the last checkpoint at or before position and replay to it, verifying every recorded event. Raises "
                      "DivergenceError where the replay diverges from the recording, and RuntimeError for a trace recorded with "
                      "another backend or other CPUID results.")
+                .def("strings", &ttd_replay::strings, nb::arg("minimum_length") = 6, nb::call_guard<nb::gil_scoped_release>(),
+                     "Replay the whole trace (verified) and return the ASCII and UTF-16LE strings that appeared in memory, "
+                     "including transient ones, ordered by address. Leaves the emulator at the end of the trace.")
+                .def("buffers", &ttd_replay::buffers, nb::call_guard<nb::gil_scoped_release>(),
+                     "Replay the whole trace (verified; needs write events) and return the buffers guest code wrote. Leaves "
+                     "the emulator at the end of the trace.")
+                .def("self_modifying_waves", &ttd_replay::self_modifying_waves, nb::call_guard<nb::gil_scoped_release>(),
+                     "Replay the whole trace (verified; needs write events) and return the first written-then-executed "
+                     "instruction of each wave (at most 256). Trace.self_modifying_code lists every hit without replaying.")
                 .def("manifest_differences", &ttd_replay::manifest_differences,
                      "After a seek: the recorded inputs outside the checkpoints (emulation_root, registry, system_dlls, "
                      "build) that differ for this emulator. A divergence error lists them too.")

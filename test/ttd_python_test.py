@@ -98,6 +98,16 @@ def main() -> None:
         assert ttd_format.Trace(cli_trace).manifest == manifest
         assert replay.manifest_differences() == []
 
+        # Replay scans: the transient string, the generated function's write-then-execute wave, and written buffers.
+        transient = [found for found in replay.strings() if "SOGEN_TTD_TRANSIENT_STRING_FOR_RECOVERY" in found.value]
+        assert any(found.position > 0 for found in transient), transient
+        assert replay.position == trace.instruction_count
+        code = int(re.search(r"ttd-code ([0-9A-Fa-f]+)", recording).group(1), 16)
+        waves = replay.self_modifying_waves()
+        assert any(wave.address == code and wave.size == 5 for wave in waves), waves
+        buffers = replay.buffers()
+        assert buffers and all(buffer.size == len(buffer.data) for buffer in buffers), buffers
+
         # Recording after a seek forks the trace: the new trace starts at the seek position and replays on its own,
         # in Python and in the CLI.
         fork_trace = str(pathlib.Path(directory) / "fork.sogttd")
@@ -129,6 +139,8 @@ def main() -> None:
             fork_replay.seek(load.position)
             assert read_u64(fork_replay.emulator, address) == FORKED_VALUE
             fork_replay.seek(fork.instruction_count)
+            assert all(found.position >= fork.start_position for found in fork_replay.strings())
+            assert all(buffer.first_position > fork.start_position for buffer in fork_replay.buffers())
             try:
                 fork_replay.seek(store.position - 1)
             except IndexError as error:

@@ -75,4 +75,9 @@ namespace sogen::ttd
     // settings this replay does not share with the recording, and refuses a trace recorded with another backend or
     // other CPUID results.
     seek_result seek(windows_emulator& win_emu, trace& recorded, uint64_t position);
+
+    // Restores the trace's initial state, calls `attach` (to hook analyses such as the replay scans onto the restored
+    // emulator), and replays the whole trace, one checkpoint interval at a time as it was recorded, verifying every
+    // recorded event. Throws like seek.
+    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach);
 }

@@ -39,6 +39,11 @@ namespace sogen::ttd
             return results_.size();
         }
 
+        const std::vector<recovered_buffer>& results() const
+        {
+            return results_;
+        }
+
         uint64_t verified_writes() const
         {
             return verified_writes_;

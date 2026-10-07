@@ -136,7 +136,7 @@ namespace sogen::ttd
     buffer_scanner::buffer_scanner(windows_emulator& emu, trace& recorded_writes)
         : emu_(emu),
           trace_(recorded_writes),
-          expected_writes_(recorded_writes)
+          expected_writes_(recorded_writes, recorded_writes.first_event_after(emu.get_executed_instructions()))
     {
         if (!(trace_.access_mask() & static_cast<uint64_t>(access_kind::write)))
         {

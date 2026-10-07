@@ -26,6 +26,8 @@ namespace sogen::ttd
         void scan_initial_memory();
         void finish();
         void save(const std::filesystem::path& path) const;
+        // Ordered by address.
+        std::vector<recovered_string> results() const;
         size_t count() const;
 
       private:
