@@ -1,7 +1,8 @@
 // Fixture for test/ttd_step_test.py: one store and one load of a known global, one syscall that writes its output
 // into a known global, code written at runtime and then executed, a ud2 that raises an exception, a string that
-// only exists transiently, and a window that briefly waits for WM_APP (test/ttd_python_test.py injects one). The
-// addresses are printed so the tests can locate the matching trace events.
+// only exists transiently, the attributes of an input file the tests create and delete (live host input), and a
+// window that briefly waits for WM_APP (test/ttd_python_test.py injects one). The addresses are printed so the tests
+// can locate the matching trace events.
 
 #include <array>
 #include <cstdint>
@@ -17,6 +18,7 @@ namespace
     volatile uint64_t ttd_value = 0x1111111111111111;
     volatile uint64_t ttd_copy = 0;
     volatile uint64_t ttd_ui_value = 0;
+    volatile DWORD ttd_input_attributes = 0;
     MEMORY_BASIC_INFORMATION ttd_info{};
 
     // mov eax, 42; ret
@@ -37,6 +39,23 @@ namespace
             return true;
         }
         return false;
+    }
+
+    // Live host input: ttd-input.txt next to the executable exists only when a test creates it.
+    void read_input_attributes()
+    {
+        std::array<char, MAX_PATH> path{};
+        const auto length = GetModuleFileNameA(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        const std::string_view module(path.data(), length);
+        const auto directory = module.substr(0, module.find_last_of('\\') + 1);
+        constexpr std::string_view input_name = "ttd-input.txt";
+        if (directory.size() + input_name.size() >= path.size())
+        {
+            return;
+        }
+        memcpy(path.data() + directory.size(), input_name.data(), input_name.size());
+        path[directory.size() + input_name.size()] = 0;
+        ttd_input_attributes = GetFileAttributesA(path.data());
     }
 
     // Window input arrives between instruction slices; each Sleep gives the emulator a chance to deliver it.
@@ -85,6 +104,7 @@ int main()
     printf("ttd-info %p\n", &ttd_info);
     printf("ttd-code %p\n", code);
     printf("ttd-ud2 %p\n", illegal);
+    printf("ttd-input %p\n", const_cast<DWORD*>(&ttd_input_attributes));
     std::array<int, 4> cpu_info{};
     __cpuid(cpu_info.data(), 1);
     printf("ttd-rdrand %d\n", (cpu_info[2] >> 30) & 1);
@@ -120,6 +140,7 @@ int main()
         character = 0;
     }
 
+    read_input_attributes();
     wait_for_window_input();
 
     return ttd_copy == 0x2222222222222222 ? 0 : 1;

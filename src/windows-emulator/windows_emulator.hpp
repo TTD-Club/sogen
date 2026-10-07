@@ -41,6 +41,9 @@ namespace sogen
         opt_func<void()> on_rdtsc{};
         opt_func<void()> on_rdtscp{};
         opt_func<continuation(uint32_t syscall_id, std::string_view syscall_name)> on_syscall{};
+        // Around the dispatch of each syscall instruction, so a tool can observe (or replace) everything its handler did.
+        utils::callback_list<void(uint32_t syscall_id)> on_syscall_enter{};
+        utils::callback_list<void(uint32_t syscall_id)> on_syscall_exit{};
         opt_func<void(std::string_view data)> on_stdout{};
         opt_func<void(std::string_view type, std::u16string_view name)> on_generic_access{};
         opt_func<void(std::string_view description)> on_generic_activity{};

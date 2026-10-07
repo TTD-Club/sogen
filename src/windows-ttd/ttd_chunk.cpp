@@ -13,6 +13,8 @@ namespace sogen::ttd
     namespace
     {
         constexpr int page_block_compression_level = 6;
+        constexpr int syscall_compression_level = 19;
+        constexpr size_t syscall_stream_count = 6;
         constexpr uint64_t no_previous_version = UINT64_MAX;
 
         constexpr uint8_t tag_kind_mask = 0x0F;
@@ -692,6 +694,123 @@ namespace sogen::ttd
             throw std::runtime_error("Invalid TTD page index block");
         }
         return entries;
+    }
+
+    std::vector<std::byte> encode_syscalls(const syscall_table& table)
+    {
+        std::array<std::vector<std::byte>, syscall_stream_count> streams{};
+        uint64_t step = 0;
+        uint64_t next_event = 0;
+        for (const auto& entry : table.entries)
+        {
+            if (entry.step < step || entry.event_number < next_event)
+            {
+                throw std::runtime_error("TTD syscalls must be in recording order");
+            }
+            put_varint(streams[0], entry.step - step);
+            put_varint(streams[1], entry.event_number - next_event);
+            put_varint(streams[2], entry.id);
+            put_varint(streams[3], entry.event_count);
+            const auto* result = reinterpret_cast<const std::byte*>(&entry.result);
+            streams[4].insert(streams[4].end(), result, result + sizeof(entry.result));
+            step = entry.step;
+            next_event = entry.event_number + entry.event_count;
+        }
+        for (const auto& [id, name] : table.names)
+        {
+            put_varint(streams[5], id);
+            put_varint(streams[5], name.size());
+            const auto* text = reinterpret_cast<const std::byte*>(name.data());
+            streams[5].insert(streams[5].end(), text, text + name.size());
+        }
+
+        const std::array<uint64_t, 2> counts{table.entries.size(), table.names.size()};
+        std::vector<std::byte> raw(reinterpret_cast<const std::byte*>(counts.data()),
+                                   reinterpret_cast<const std::byte*>(counts.data() + counts.size()));
+        for (const auto& bytes : streams)
+        {
+            const uint64_t size = bytes.size();
+            const auto* size_bytes = reinterpret_cast<const std::byte*>(&size);
+            raw.insert(raw.end(), size_bytes, size_bytes + sizeof(size));
+        }
+        for (const auto& bytes : streams)
+        {
+            raw.insert(raw.end(), bytes.begin(), bytes.end());
+        }
+        auto compressed = utils::compression::zstd::compress(raw, syscall_compression_level);
+        if (compressed.empty())
+        {
+            throw std::runtime_error("Cannot compress TTD syscalls");
+        }
+        return compressed;
+    }
+
+    syscall_table decode_syscalls(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        std::array<uint64_t, 2> counts{};
+        std::array<uint64_t, syscall_stream_count> sizes{};
+        if (raw.size() < sizeof(counts) + sizeof(sizes))
+        {
+            throw std::runtime_error("Invalid TTD syscalls");
+        }
+        memcpy(counts.data(), raw.data(), sizeof(counts));
+        memcpy(sizes.data(), raw.data() + sizeof(counts), sizeof(sizes));
+        auto rest = std::span(raw).subspan(sizeof(counts) + sizeof(sizes));
+        std::array<stream_reader, syscall_stream_count> streams{};
+        for (size_t i = 0; i < streams.size(); ++i)
+        {
+            if (sizes[i] > rest.size())
+            {
+                throw std::runtime_error("Invalid TTD syscalls");
+            }
+            streams[i] = stream_reader(rest.first(static_cast<size_t>(sizes[i])));
+            rest = rest.subspan(static_cast<size_t>(sizes[i]));
+        }
+        // Every entry takes at least one byte of the step stream and every name one of the name stream.
+        if (!rest.empty() || counts[0] > sizes[0] || counts[1] > sizes[5])
+        {
+            throw std::runtime_error("Invalid TTD syscalls");
+        }
+
+        syscall_table table{};
+        table.entries.resize(static_cast<size_t>(counts[0]));
+        uint64_t step = 0;
+        uint64_t next_event = 0;
+        for (auto& entry : table.entries)
+        {
+            const auto step_delta = streams[0].varint();
+            const auto event_gap = streams[1].varint();
+            const auto id = streams[2].varint();
+            entry.event_count = streams[3].varint();
+            if (step_delta > UINT64_MAX - step || event_gap > UINT64_MAX - next_event || id > UINT32_MAX ||
+                entry.event_count > UINT64_MAX - next_event - event_gap)
+            {
+                throw std::runtime_error("Invalid TTD syscall entry");
+            }
+            entry.step = step + step_delta;
+            entry.event_number = next_event + event_gap;
+            entry.id = static_cast<uint32_t>(id);
+            memcpy(&entry.result, streams[4].bytes(sizeof(entry.result)).data(), sizeof(entry.result));
+            step = entry.step;
+            next_event = entry.event_number + entry.event_count;
+        }
+        for (uint64_t i = 0; i < counts[1]; ++i)
+        {
+            const auto id = streams[5].varint();
+            const auto length = streams[5].varint();
+            if (id > UINT32_MAX)
+            {
+                throw std::runtime_error("Invalid TTD syscall name");
+            }
+            const auto text = streams[5].bytes(length);
+            table.names[static_cast<uint32_t>(id)] = std::string(reinterpret_cast<const char*>(text.data()), text.size());
+        }
+        if (!std::ranges::all_of(streams, [](const stream_reader& stream) { return stream.done(); }))
+        {
+            throw std::runtime_error("Invalid TTD syscalls");
+        }
+        return table;
     }
 
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)

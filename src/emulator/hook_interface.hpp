@@ -118,6 +118,13 @@ namespace sogen
             throw std::runtime_error("This backend cannot report host memory writes");
         }
 
+        // Like hook_host_memory_write, but called before each write, while the memory still holds the bytes it replaces;
+        // the write can still fail afterwards.
+        virtual emulator_hook* hook_host_memory_write_before(memory_access_data_callback /*callback*/)
+        {
+            throw std::runtime_error("This backend cannot report host memory writes");
+        }
+
         // NOLINTEND(performance-unnecessary-value-param)
 
         virtual emulator_hook* hook_instruction(int instruction_type, instruction_hook_callback callback) = 0;

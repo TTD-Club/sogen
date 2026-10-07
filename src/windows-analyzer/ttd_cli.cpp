@@ -392,7 +392,7 @@ namespace sogen::ttd
                 const auto [observed_end, expected_end] = std::ranges::mismatch(observed, expected);
                 if (observed_end == observed.end() && expected_end == expected.end())
                 {
-                    printf("TTD checkpoint %llx:0 matches (%llu events verified, %llu host writes taken from the recording)\n",
+                    printf("TTD checkpoint %llx:0 matches (%llu events verified, %llu inputs taken from the recording)\n",
                            static_cast<unsigned long long>(target.step), static_cast<unsigned long long>(verifier.verified_events()),
                            static_cast<unsigned long long>(verifier.substituted_inputs()));
                     continue;
@@ -456,7 +456,7 @@ namespace sogen::ttd
             {
                 return {.failure = e.what()};
             }
-            win_emu.log.log("TTD replay verified %llu recorded events (%llu host writes taken from the recording)\n",
+            win_emu.log.log("TTD replay verified %llu recorded events (%llu inputs taken from the recording)\n",
                             static_cast<unsigned long long>(result.verified_events),
                             static_cast<unsigned long long>(result.substituted_inputs));
             win_emu.log.log("TTD checkpoint %llx:0\n", static_cast<unsigned long long>(result.checkpoint));
@@ -484,8 +484,8 @@ namespace sogen::ttd
         app.add_flag("--ttd-verify-checkpoints", options.verify_checkpoints,
                      "Replay each TTD checkpoint interval and compare the reached state with the next checkpoint");
         app.add_flag("--ttd-strict", options.strict,
-                     "Fail a TTD replay at host writes (syscall results, network data) whose bytes differ from the recording "
-                     "instead of taking the recorded bytes");
+                     "Fail a TTD replay at syscalls and host writes (statuses, network data, files) whose results differ from "
+                     "the recording instead of taking the recorded ones");
         app.add_option("--ttd-seek", options.seek, "Replay through this instruction position");
         app.add_option("--ttd-checkpoint-interval", options.checkpoint_interval, "Instructions between recording checkpoints")
             ->capture_default_str();

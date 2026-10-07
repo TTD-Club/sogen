@@ -79,6 +79,22 @@ namespace sogen::ttd
         manifest = 6,
         // ui_input_entry array (size = entry count): host window events delivered to the guest while recording.
         ui_inputs = 7,
+        // Every dispatched syscall (see syscall_entry), encoded as described at encode_syscalls; the section size is the
+        // compressed byte count.
+        syscalls = 8,
+    };
+
+    // A syscall instruction the emulator dispatched: its handler ran after `event_number` events had been recorded,
+    // produced the next `event_count` events (its host writes, and the descriptor table reads of segment registers it
+    // loads), and left `result` in RAX. A replay checks the syscall as one unit and, unless strict, gives the guest the
+    // recorded host writes and result when the live ones differ.
+    struct syscall_entry
+    {
+        uint64_t step{};
+        uint64_t event_number{};
+        uint64_t event_count{};
+        uint64_t result{};
+        uint32_t id{};
     };
 
     // A window event the host UI delivered between instruction slices. It reached the guest after `event_number`

@@ -12,6 +12,7 @@
 #include <cstring>
 #include <future>
 #include <map>
+#include <ranges>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -72,6 +73,12 @@ namespace sogen::ttd
                 reference.insert(reference.end(), block->begin(), block->end());
             }
             return reference;
+        }
+
+        void describe_event(std::ostream& stream, const access_event& event)
+        {
+            stream << access_kind_name(event.kind) << " step=" << std::hex << event.step << " ip=" << event.ip
+                   << " address=" << event.address << std::dec << " size=" << event.size;
         }
 
         // Versions 1-4 stored every event as a fixed-size record, followed by full checkpoint snapshots and a
@@ -236,6 +243,45 @@ namespace sogen::ttd
         }
     }
 
+    syscall_observer::syscall_observer(windows_emulator& emu, callback enter, callback exit)
+        : emu_(&emu),
+          enter_(emu.callbacks.on_syscall_enter.add(std::move(enter))),
+          exit_(emu.callbacks.on_syscall_exit.add(std::move(exit)))
+    {
+    }
+
+    syscall_observer::~syscall_observer()
+    {
+        reset();
+    }
+
+    syscall_observer::syscall_observer(syscall_observer&& other) noexcept
+    {
+        *this = std::move(other);
+    }
+
+    syscall_observer& syscall_observer::operator=(syscall_observer&& other) noexcept
+    {
+        if (this != &other)
+        {
+            reset();
+            emu_ = std::exchange(other.emu_, nullptr);
+            enter_ = other.enter_;
+            exit_ = other.exit_;
+        }
+        return *this;
+    }
+
+    void syscall_observer::reset()
+    {
+        if (emu_)
+        {
+            emu_->callbacks.on_syscall_enter.remove(enter_);
+            emu_->callbacks.on_syscall_exit.remove(exit_);
+            emu_ = nullptr;
+        }
+    }
+
     recorder::recorder(windows_emulator& emu, const std::filesystem::path& path, const uint64_t access_mask, manifest_entries manifest)
         : emu_(emu),
           path_(path),
@@ -312,6 +358,37 @@ namespace sogen::ttd
                                       .lparam = event.lParam});
             });
         }
+        syscall_observer_ = syscall_observer(
+            emu_,
+            [this](uint32_t) {
+                open_syscall_ = syscall_entry{.step = emu_.get_executed_instructions(), .event_number = header_.event_count};
+            },
+            [this](const uint32_t id) { close_syscall(id); });
+    }
+
+    void recorder::close_syscall(const uint32_t id)
+    {
+        if (!open_syscall_)
+        {
+            return;
+        }
+        auto entry = *open_syscall_;
+        open_syscall_.reset();
+        entry.id = id;
+        entry.event_count = header_.event_count - entry.event_number;
+        entry.result = emu_.emu().reg<uint64_t>(x86_register::rax);
+        if (!syscalls_.names.contains(id))
+        {
+            try
+            {
+                syscalls_.names[id] = emu_.dispatcher.get_syscall_name(id);
+            }
+            catch (const std::out_of_range&)
+            {
+                // An unknown syscall: the emulator stops at it.
+            }
+        }
+        syscalls_.entries.push_back(entry);
     }
 
     recorder::~recorder()
@@ -605,6 +682,7 @@ namespace sogen::ttd
             return;
         }
         finished_ = true;
+        syscall_observer_.reset();
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();
@@ -643,6 +721,7 @@ namespace sogen::ttd
             throw std::runtime_error("Cannot compress TTD code table");
         }
         const auto manifest = encode_manifest(manifest_);
+        const auto syscalls = encode_syscalls(syscalls_);
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -652,6 +731,7 @@ namespace sogen::ttd
             section_entry{.type = section_type::bulk_table, .offset = append_to_file(bytes_of(bulk_table_)), .size = bulk_table_.size()},
             section_entry{.type = section_type::manifest, .offset = append_to_file(manifest), .size = manifest.size()},
             section_entry{.type = section_type::ui_inputs, .offset = append_to_file(bytes_of(ui_inputs_)), .size = ui_inputs_.size()},
+            section_entry{.type = section_type::syscalls, .offset = append_to_file(syscalls), .size = syscalls.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -825,6 +905,14 @@ namespace sogen::ttd
                     input = read_object<ui_input_entry>(file_);
                 }
             }
+            else if (section.type == section_type::syscalls)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                syscalls_ = decode_syscalls(read_bytes(section.offset, section.size));
+            }
         }
 
         uint64_t next_event = 0;
@@ -872,6 +960,15 @@ namespace sogen::ttd
             if (input.checkpoint >= checkpoints_.size() || input.event_number > metadata_.event_count || !ordered)
             {
                 throw std::runtime_error("Invalid TTD UI input entry");
+            }
+        }
+        for (const auto& entry : this->syscalls())
+        {
+            // decode_syscalls keeps the entries ordered and their event ranges apart.
+            if (entry.step <= checkpoints_.front().step || entry.step > metadata_.instruction_count ||
+                entry.event_number + entry.event_count > metadata_.event_count)
+            {
+                throw std::runtime_error("Invalid TTD syscall entry");
             }
         }
     }
@@ -1148,6 +1245,16 @@ namespace sogen::ttd
             return std::nullopt;
         }
         return entry->second;
+    }
+
+    std::optional<std::string_view> trace::syscall_name(const uint32_t id) const
+    {
+        if (!syscalls_)
+        {
+            return std::nullopt;
+        }
+        const auto entry = syscalls_->names.find(id);
+        return entry == syscalls_->names.end() ? std::nullopt : std::optional<std::string_view>(entry->second);
     }
 
     uint64_t trace::checkpoint_index(const uint64_t step) const
@@ -1616,6 +1723,203 @@ namespace sogen::ttd
                     verify(access_kind::host_write, address, data.size(), data);
                 }));
         }
+        if (!recorded.has_syscalls())
+        {
+            return;
+        }
+        const auto syscalls = recorded.syscalls();
+        const auto first = std::ranges::upper_bound(syscalls, from_step, {}, &syscall_entry::step);
+        syscalls_ = syscalls.subspan(static_cast<size_t>(first - syscalls.begin()));
+        if (access_mask_ & static_cast<uint64_t>(access_kind::host_write))
+        {
+            host_write_before_hook_ = scoped_hook(cpu, cpu.hook_host_memory_write_before([this](cpu_interface&, const uint64_t address,
+                                                                                                const std::span<const std::byte> data) {
+                if (!in_syscall_ || substituting_ || error_)
+                {
+                    return;
+                }
+                previous_bytes_.resize(data.size());
+                if (!emu_.emu().try_read_memory(address, previous_bytes_.data(), previous_bytes_.size()))
+                {
+                    previous_bytes_.clear();
+                }
+            }));
+        }
+        syscall_observer_ = syscall_observer(emu_, [this](const uint32_t id) { enter_syscall(id); }, [this](uint32_t) { exit_syscall(); });
+    }
+
+    void replay_verifier::diverge(const std::string& message)
+    {
+        error_ = message;
+        emu_.stop();
+    }
+
+    std::string replay_verifier::syscall_description(const syscall_entry& entry) const
+    {
+        std::ostringstream description;
+        description << "syscall " << trace_.syscall_name(entry.id).value_or("<unknown>") << " (0x" << std::hex << entry.id << ") at step "
+                    << entry.step;
+        return description.str();
+    }
+
+    void replay_verifier::enter_syscall(const uint32_t id)
+    {
+        if (error_)
+        {
+            return;
+        }
+        const auto step = emu_.get_executed_instructions();
+        const auto* expected = next_syscall_ < syscalls_.size() ? &syscalls_[next_syscall_] : nullptr;
+        if (expected && expected->step == step && expected->event_number == next_event_number() && expected->id == id)
+        {
+            in_syscall_ = true;
+            syscall_events_.clear();
+            return;
+        }
+        std::ostringstream message;
+        message << "TTD replay diverged from the recording: dispatched " << syscall_description({.step = step, .id = id}) << ", expected "
+                << (expected ? syscall_description(*expected) : "no further syscall");
+        diverge(message.str());
+    }
+
+    void replay_verifier::exit_syscall()
+    {
+        if (!in_syscall_)
+        {
+            return;
+        }
+        in_syscall_ = false;
+        const auto& expected = syscalls_[next_syscall_++];
+        if (error_)
+        {
+            return;
+        }
+        const auto first_number = next_event_number();
+        std::vector<access_event> recorded{};
+        recorded.reserve(static_cast<size_t>(expected.event_count));
+        for (uint64_t i = 0; i < expected.event_count; ++i)
+        {
+            const auto event = reader_.next(access_mask_);
+            if (!event)
+            {
+                diverge("TTD trace ends within " + syscall_description(expected));
+                return;
+            }
+            recorded.push_back(*event);
+        }
+
+        auto& cpu = emu_.emu();
+        const auto result = cpu.reg<uint64_t>(x86_register::rax);
+        std::optional<size_t> different_event{};
+        for (size_t i = 0; i < std::max(recorded.size(), syscall_events_.size()); ++i)
+        {
+            if (i >= recorded.size() || i >= syscall_events_.size() ||
+                !matches(recorded[i], syscall_events_[i].event, syscall_events_[i].data))
+            {
+                different_event = i;
+                break;
+            }
+        }
+        if (!different_event && result == expected.result)
+        {
+            verified_events_ += recorded.size();
+            return;
+        }
+
+        if (strict_)
+        {
+            std::ostringstream message;
+            message << "TTD replay diverged from the recording at event " << first_number + different_event.value_or(recorded.size())
+                    << " in " << syscall_description(expected) << ": ";
+            if (!different_event)
+            {
+                message << "it returned 0x" << std::hex << result << ", recorded 0x" << expected.result;
+            }
+            else if (const auto i = *different_event;
+                     i < recorded.size() && i < syscall_events_.size() && matches(recorded[i], syscall_events_[i].event, {}, false))
+            {
+                describe_event(message, syscall_events_[i].event);
+                message << " accessed different data";
+            }
+            else
+            {
+                message << "expected ";
+                if (i < recorded.size())
+                {
+                    describe_event(message, recorded[i]);
+                }
+                else
+                {
+                    message << "no further event";
+                }
+                message << ", observed ";
+                if (i < syscall_events_.size())
+                {
+                    describe_event(message, syscall_events_[i].event);
+                }
+                else
+                {
+                    message << "no further event";
+                }
+            }
+            diverge(message.str());
+            return;
+        }
+
+        // The guest gets what the recording gave it: the live host writes are undone, newest first, then the recorded
+        // ones are applied in order. The handler's other events are descriptor table reads, which change nothing.
+        try
+        {
+            substituting_ = true;
+            const auto restore = utils::finally([this] { substituting_ = false; });
+            for (const auto& live : std::views::reverse(syscall_events_))
+            {
+                if (live.event.kind != access_kind::host_write)
+                {
+                    continue;
+                }
+                if (live.previous.size() != live.data.size())
+                {
+                    std::ostringstream message;
+                    message << "TTD replay cannot undo a live host write to " << std::hex << live.event.address << " in "
+                            << syscall_description(expected);
+                    diverge(message.str());
+                    return;
+                }
+                cpu.write_memory(live.event.address, live.previous.data(), live.previous.size());
+            }
+            for (const auto& event : recorded)
+            {
+                if (event.kind == access_kind::host_write)
+                {
+                    const auto data = trace_.access_data(event);
+                    cpu.write_memory(event.address, data.data(), data.size());
+                }
+            }
+            cpu.reg<uint64_t>(x86_register::rax, expected.result);
+        }
+        catch (const std::exception& e)
+        {
+            diverge("TTD replay cannot apply the recorded results of " + syscall_description(expected) + ": " + e.what());
+            return;
+        }
+        ++substituted_inputs_;
+        verified_events_ += recorded.size();
+    }
+
+    bool replay_verifier::matches(const access_event& expected, const access_event& observed, const std::span<const std::byte> data,
+                                  const bool compare_data)
+    {
+        if (expected.kind != observed.kind || expected.step != observed.step || expected.ip != observed.ip ||
+            expected.address != observed.address || expected.size != observed.size)
+        {
+            return false;
+        }
+        if (observed.kind == access_kind::execute)
+        {
+            return !trace_.has_instruction_bytes() || expected.payload == observed.payload;
+        }
+        return !compare_data || !trace_.has_access_data() || std::ranges::equal(trace_.access_data(expected), data);
     }
 
     void replay_verifier::verify(const access_kind kind, const uint64_t address, const size_t size, const std::span<const std::byte> data)
@@ -1633,6 +1937,14 @@ namespace sogen::ttd
         {
             emu_.emu().try_read_memory(address, observed.payload.data(), size);
         }
+        if (in_syscall_)
+        {
+            syscall_events_.push_back({.event = observed,
+                                       .previous = kind == access_kind::host_write ? std::move(previous_bytes_) : std::vector<std::byte>{},
+                                       .data = {data.begin(), data.end()}});
+            previous_bytes_ = {};
+            return;
+        }
         const auto expected = reader_.next(access_mask_);
         const auto same_event = expected && expected->kind == observed.kind && expected->step == observed.step &&
                                 expected->ip == observed.ip && expected->address == observed.address && expected->size == observed.size;
@@ -1645,10 +1957,6 @@ namespace sogen::ttd
             ++verified_events_;
             return;
         }
-        const auto describe = [](std::ostream& stream, const access_event& event) {
-            stream << access_kind_name(event.kind) << " step=" << std::hex << event.step << " ip=" << event.ip
-                   << " address=" << event.address << std::dec << " size=" << event.size;
-        };
         if (same_event && same_instruction && kind == access_kind::host_write && !strict_)
         {
             const auto recorded = trace_.access_data(*expected);
@@ -1663,10 +1971,9 @@ namespace sogen::ttd
         {
             std::ostringstream message;
             message << "TTD replay diverged from the recording at event " << reader_.last_number() << ": ";
-            describe(message, observed);
+            describe_event(message, observed);
             message << " accessed different data";
-            error_ = message.str();
-            emu_.stop();
+            diverge(message.str());
             return;
         }
         std::ostringstream message;
@@ -1674,20 +1981,21 @@ namespace sogen::ttd
         if (expected)
         {
             message << " at event " << reader_.last_number() << ": expected ";
-            describe(message, *expected);
+            describe_event(message, *expected);
         }
         else
         {
             message << " after its last event: expected nothing";
         }
         message << ", observed ";
-        describe(message, observed);
-        error_ = message.str();
-        emu_.stop();
+        describe_event(message, observed);
+        diverge(message.str());
     }
 
     void replay_verifier::finish()
     {
+        syscall_observer_.reset();
+        host_write_before_hook_.remove();
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();

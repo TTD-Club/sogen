@@ -17,7 +17,8 @@ BULK = struct.Struct("<2Q")
 BULK_REFERENCE = struct.Struct("<2Q")
 MAGIC = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
-CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS = 1, 2, 3, 4, 5, 6, 7
+CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS, SYSCALLS = 1, 2, 3, 4, 5, 6, 7, 8
+SYSCALL_HEADER = struct.Struct("<8Q")
 # checkpoint, event_number, step, window, message, reserved, wparam, lparam
 UI_INPUT = struct.Struct("<4QII2Q")
 MANIFEST_SIZES = struct.Struct("<2I")
@@ -279,6 +280,42 @@ def decode_manifest(data):
     return manifest
 
 
+class Syscall:
+    __slots__ = ("step", "event_number", "event_count", "result", "id", "name")
+
+    def __init__(self, step, event_number, event_count, result, id, name):
+        self.step, self.event_number, self.event_count = step, event_number, event_count
+        self.result, self.id, self.name = result, id, name
+
+
+def decode_syscalls(compressed):
+    """Mirror of decode_syscalls in src/windows-ttd/ttd_chunk.cpp."""
+    raw = zstandard.ZstdDecompressor().decompress(compressed)
+    count, name_count, *sizes = SYSCALL_HEADER.unpack_from(raw)
+    offset = SYSCALL_HEADER.size
+    readers = []
+    for size in sizes:
+        readers.append(_Stream(raw[offset:offset + size]))
+        offset += size
+    assert offset == len(raw), "invalid syscalls"
+    steps, gaps, ids, event_counts, results, names = readers
+    entries, step, next_event = [], 0, 0
+    for _ in range(count):
+        step += steps.varint()
+        event_number = next_event + gaps.varint()
+        id, event_count = ids.varint(), event_counts.varint()
+        result = int.from_bytes(results.bytes(8), "little")
+        entries.append(Syscall(step, event_number, event_count, result, id, None))
+        next_event = event_number + event_count
+    known = {}
+    for _ in range(name_count):
+        id, length = names.varint(), names.varint()
+        known[id] = names.bytes(length).decode()
+    for entry in entries:
+        entry.name = known.get(entry.id)
+    return entries
+
+
 class Trace:
     def __init__(self, path):
         self.path = path
@@ -306,6 +343,8 @@ class Trace:
         self.manifest = decode_manifest(self.bytes[offset:offset + size])
         offset, size = self.sections.get(UI_INPUTS, (0, 0))
         self.ui_inputs = [UI_INPUT.unpack_from(self.bytes, offset + i * UI_INPUT.size) for i in range(size)]
+        offset, size = self.sections.get(SYSCALLS, (0, 0))
+        self.syscalls = decode_syscalls(self.bytes[offset:offset + size]) if SYSCALLS in self.sections else None
         self._bulk_cache = {}
 
     def bulk(self, index):

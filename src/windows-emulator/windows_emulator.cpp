@@ -1089,7 +1089,10 @@ namespace sogen
             const std::scoped_lock lock(this->kernel_lock_);
             auto& vcpu = this->vcpu(cpu.index());
             const scoped_dispatch dispatch(*this, vcpu);
+            const auto syscall_id = vcpu.cpu.reg<uint32_t>(x86_register::eax) & 0x3FFF;
+            this->callbacks.on_syscall_enter(syscall_id);
             this->dispatcher.dispatch(*this, vcpu);
+            this->callbacks.on_syscall_exit(syscall_id);
             return instruction_hook_continuation::skip_instruction;
         });
 

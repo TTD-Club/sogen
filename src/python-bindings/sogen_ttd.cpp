@@ -40,6 +40,24 @@ namespace sogen::py
             }
         };
 
+        struct ttd_syscall
+        {
+            uint64_t position{};
+            uint32_t id{};
+            std::optional<std::string> name{};
+            uint64_t result{};
+            uint64_t event_number{};
+            uint64_t event_count{};
+
+            std::string repr() const
+            {
+                std::ostringstream text;
+                text << std::hex << "Syscall(position=0x" << this->position << ", name=" << this->name.value_or("<unknown>")
+                     << ", result=0x" << this->result << ", event_count=" << std::dec << this->event_count << ")";
+                return text.str();
+            }
+        };
+
         struct ttd_history_entry
         {
             ttd_event event{};
@@ -325,6 +343,17 @@ namespace sogen::py
                 .def_ro("wparam", &ttd::ui_input_entry::wparam)
                 .def_ro("lparam", &ttd::ui_input_entry::lparam);
 
+            nb::class_<ttd_syscall>(m, "Syscall", "A syscall the recording dispatched")
+                .def_ro("position", &ttd_syscall::position, "Position of the syscall instruction")
+                .def_ro("id", &ttd_syscall::id)
+                .def_ro("name", &ttd_syscall::name, "As the recording emulator's ntdll or win32u exports it")
+                .def_ro("result", &ttd_syscall::result, "RAX after the handler ran (the NTSTATUS for most syscalls)")
+                .def_ro("event_number", &ttd_syscall::event_number, "Number of events recorded before its handler ran")
+                .def_ro("event_count", &ttd_syscall::event_count,
+                        "Number of events its handler produced (host writes, and descriptor table reads when it loads segment "
+                        "registers): events event_number to event_number + event_count - 1")
+                .def("__repr__", &ttd_syscall::repr);
+
             nb::class_<ttd::recovered_string>(m, "RecoveredString")
                 .def_ro("address", &ttd::recovered_string::address)
                 .def_ro("position", &ttd::recovered_string::step, "Position at which the string was last seen extended")
@@ -348,7 +377,8 @@ namespace sogen::py
                 .def_ro("checkpoint", &ttd::seek_result::checkpoint, "Position of the checkpoint the seek restored")
                 .def_ro("verified_events", &ttd::seek_result::verified_events)
                 .def_ro("substituted_inputs", &ttd::seek_result::substituted_inputs,
-                        "Host writes (syscall results, network data) whose live bytes differed and took the recorded ones");
+                        "Syscalls whose live writes or result differed (a network answer, a missing file), and host writes "
+                        "outside syscalls whose live bytes differed, that took the recorded ones");
         }
 
         void register_trace(nb::module_& m)
@@ -373,6 +403,25 @@ namespace sogen::py
                         return std::vector<ttd::ui_input_entry>(inputs.begin(), inputs.end());
                     },
                     "Host window events delivered while recording, which a replay delivers again")
+                .def_prop_ro(
+                    "syscalls",
+                    [](const ttd_trace& self) {
+                        const auto& native = self.native();
+                        std::vector<ttd_syscall> syscalls{};
+                        syscalls.reserve(native.syscalls().size());
+                        for (const auto& entry : native.syscalls())
+                        {
+                            const auto name = native.syscall_name(entry.id);
+                            syscalls.push_back({.position = entry.step,
+                                                .id = entry.id,
+                                                .name = name ? std::optional<std::string>(*name) : std::nullopt,
+                                                .result = entry.result,
+                                                .event_number = entry.event_number,
+                                                .event_count = entry.event_count});
+                        }
+                        return syscalls;
+                    },
+                    "Every syscall the recording dispatched, in order; empty for traces recorded before syscalls were recorded")
                 .def_prop_ro(
                     "start_position", [](const ttd_trace& self) { return self.native().start_position(); },
                     "Position of the initial state: 0, or the fork position of a trace recorded after a seek")

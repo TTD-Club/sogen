@@ -3,8 +3,10 @@
 #include "ttd_format.hpp"
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -59,6 +61,19 @@ namespace sogen::ttd
     // A page block stores page deltas, chunks (as deltas while the page repeats), and kinds as three streams.
     std::vector<std::byte> encode_page_block(std::span<const page_entry> entries);
     std::vector<page_entry> decode_page_block(std::span<const std::byte> compressed, const page_block& block);
+
+    struct syscall_table
+    {
+        std::vector<syscall_entry> entries{};
+        // The names of the ids that occur, as the recording emulator's ntdll and win32u export them.
+        std::map<uint32_t, std::string> names{};
+    };
+
+    // The syscalls section is a zstd frame of the entry and name counts, six stream sizes, and six streams: step deltas,
+    // event_number gaps (to the end of the previous entry's events), ids, and event counts as varints, results as
+    // little-endian uint64 values, and the names as varint id, varint length, and bytes.
+    std::vector<std::byte> encode_syscalls(const syscall_table& table);
+    syscall_table decode_syscalls(std::span<const std::byte> compressed);
 
     // A bulk block is a zstd frame of its bytes after an x86-64 filter that turns branch and RIP-relative
     // displacements into absolute block offsets (`filtered`; version 7 traces store the bytes unfiltered). An empty

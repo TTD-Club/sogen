@@ -211,6 +211,54 @@ def main() -> None:
                 raise AssertionError("A strict replay accepted a host write with other bytes")
             del emulator_for_inputs
 
+        # Every syscall is recorded with the events its handler produced and the result it returned; VirtualQuery's
+        # output is NtQueryVirtualMemory's host write. tools/ttd_format.py reads the same entries.
+        info = int(re.search(r"ttd-info ([0-9A-Fa-f]+)", recording).group(1), 16)
+        info_write = trace.accesses(info, 8, kinds=ttd.HOST_WRITE)[0]
+        syscalls = trace.syscalls
+        query = next(syscall for syscall in syscalls if syscall.position == info_write.position)
+        assert query.name == "NtQueryVirtualMemory" and query.result == 0 and query.event_count >= 1, query
+        assert trace.event(query.event_number).position == info_write.position
+        mirrored = ttd_format.Trace(cli_trace).syscalls
+        assert [(s.step, s.event_number, s.event_count, s.result, s.id, s.name) for s in mirrored] == [
+            (s.position, s.event_number, s.event_count, s.result, s.id, s.name) for s in syscalls]
+
+        # Live input that changes a syscall's outcome: ttd-input.txt exists while recording and is gone for the replay,
+        # so NtQueryAttributesFile fails and writes nothing. A strict replay names the syscall; others undo its live
+        # effects, give the guest the recorded output and status, and go on to the end.
+        input_address = int(re.search(r"ttd-input ([0-9A-Fa-f]+)", recording).group(1), 16)
+        if "emulation_root" in settings:
+            guest = pathlib.PureWindowsPath(sample)
+            input_file = pathlib.Path(settings["emulation_root"], "filesys", guest.drive.rstrip(":").lower(),
+                                      *guest.parent.parts[1:], "ttd-input.txt")
+        else:
+            input_file = pathlib.Path(sample).parent / "ttd-input.txt"
+        file_trace = str(pathlib.Path(directory) / "file.sogttd")
+        input_file.write_text("ttd")
+        try:
+            ttd.record(ttd.create_emulator(sample, headless=True, **settings), file_trace, checkpoint_interval=100000).close()
+        finally:
+            input_file.unlink()
+        with ttd.Trace(file_trace) as file_recording:
+            attributes = file_recording.accesses(input_address, 4, kinds=ttd.WRITE)[-1]
+            assert attributes.data != b"\xff\xff\xff\xff", attributes.data
+            file_query = [syscall for syscall in file_recording.syscalls
+                          if syscall.name == "NtQueryAttributesFile" and syscall.position < attributes.position][-1]
+            assert file_query.result == 0 and file_query.event_count == 1, file_query
+            try:
+                ttd.Replay(file_recording, ttd.create_emulator(sample, headless=True, **settings), strict=True).seek(
+                    attributes.position)
+            except ttd.DivergenceError as error:
+                assert "NtQueryAttributesFile" in str(error), error
+            else:
+                raise AssertionError("A strict replay accepted a syscall with another outcome")
+            file_replay = ttd.Replay(file_recording, ttd.create_emulator(sample, headless=True, **settings))
+            result = file_replay.seek(attributes.position)
+            assert result.substituted_inputs == 1, result.substituted_inputs
+            assert file_replay.emulator.read_memory(input_address, 4) == attributes.data
+            assert file_replay.strings() and file_replay.position == file_recording.instruction_count
+            del file_replay
+
         # A trace recorded with other CPUID results is refused before replaying.
         ttd_format.replace_manifest(tampered, {**manifest, "cpuid": "0"})
         with ttd.Trace(tampered) as tampered_trace:

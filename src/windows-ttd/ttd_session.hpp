@@ -70,7 +70,8 @@ namespace sogen::ttd
     {
         uint64_t checkpoint{};
         uint64_t verified_events{};
-        // Host writes whose live bytes differed from the recording and were replaced by the recorded ones.
+        // Syscalls whose live writes or result, and host writes outside syscalls whose live bytes, differed from the
+        // recording and were replaced by the recorded ones.
         uint64_t substituted_inputs{};
     };
 
@@ -78,7 +79,8 @@ namespace sogen::ttd
     // divergence_error when the replay diverges from the recording or stops before `position`, naming the manifest
     // settings this replay does not share with the recording, and refuses a trace recorded with another backend or
     // other CPUID results.
-    // Unless `strict`, host writes carrying other bytes than recorded take the recorded ones (see replay_verifier).
+    // Unless `strict`, syscalls and host writes with other results than recorded take the recorded ones (see
+    // replay_verifier).
     seek_result seek(windows_emulator& win_emu, trace& recorded, uint64_t position, bool strict = false);
 
     // Restores the trace's initial state, calls `attach` (to hook analyses such as the replay scans onto the restored

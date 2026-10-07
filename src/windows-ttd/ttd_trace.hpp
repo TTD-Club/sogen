@@ -6,6 +6,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -57,6 +58,27 @@ namespace sogen::ttd
         uint64_t execute_step{};
         uint64_t execute_ip{};
         uint64_t executions{};
+    };
+
+    // Calls `enter` and `exit` around the dispatch of each syscall instruction until destroyed or reset.
+    class syscall_observer
+    {
+      public:
+        using callback = std::function<void(uint32_t syscall_id)>;
+
+        syscall_observer() = default;
+        syscall_observer(windows_emulator& emu, callback enter, callback exit);
+        ~syscall_observer();
+        syscall_observer(const syscall_observer&) = delete;
+        syscall_observer& operator=(const syscall_observer&) = delete;
+        syscall_observer(syscall_observer&& other) noexcept;
+        syscall_observer& operator=(syscall_observer&& other) noexcept;
+        void reset();
+
+      private:
+        windows_emulator* emu_{};
+        utils::callback_id_type enter_{};
+        utils::callback_id_type exit_{};
     };
 
     class recorder
@@ -127,6 +149,12 @@ namespace sogen::ttd
         recordable_ui_backend* ui_{};
         std::vector<ui_input_entry> ui_inputs_{};
 
+        syscall_table syscalls_{};
+        // The syscall whose handler is running: its step and the event count when the handler started.
+        std::optional<syscall_entry> open_syscall_{};
+        syscall_observer syscall_observer_{};
+        void close_syscall(uint32_t id);
+
         bool caches_instructions_{};
         std::unordered_map<uint64_t, cached_instruction> instruction_cache_{};
         std::unordered_map<uint64_t, std::vector<uint64_t>> cached_instructions_by_page_{};
@@ -184,6 +212,21 @@ namespace sogen::ttd
             return ui_inputs_;
         }
 
+        // False for traces recorded before syscalls were recorded; their replays verify host writes one by one.
+        bool has_syscalls() const
+        {
+            return syscalls_.has_value();
+        }
+
+        // Every dispatched syscall in recording order (empty without has_syscalls()).
+        std::span<const syscall_entry> syscalls() const
+        {
+            return syscalls_ ? std::span<const syscall_entry>(syscalls_->entries) : std::span<const syscall_entry>{};
+        }
+
+        // The name the recording emulator gave a syscall id, or nothing when the trace does not know it.
+        std::optional<std::string_view> syscall_name(uint32_t id) const;
+
         // Index of the checkpoint at `step` (0 for the initial state); throws if no checkpoint is there.
         uint64_t checkpoint_index(uint64_t step) const;
 
@@ -236,6 +279,7 @@ namespace sogen::ttd
         std::vector<checkpoint_entry> checkpoints_{};
         manifest_entries manifest_{};
         std::vector<ui_input_entry> ui_inputs_{};
+        std::optional<syscall_table> syscalls_{};
 
         std::vector<chunk_entry> chunks_{};
         std::vector<code_entry> code_{};
@@ -309,11 +353,14 @@ namespace sogen::ttd
 
     // Checks every event a replay produces against the recording and stops the emulator at the first difference.
     //
-    // Host writes are the environment's input to the guest (syscall results, network data, file contents). Unless
-    // `strict`, a host write that matches its recorded event in position, address, and size but carries other bytes
-    // (a live network answer, a host-assigned port) is overwritten with the recorded bytes, so the replay follows the
-    // recording; substituted_inputs() counts them. Strict replays report them as divergences instead, which also
-    // exposes emulator bugs such as uninitialized host bytes copied into the guest.
+    // Syscalls and host writes are the environment's input to the guest (statuses, network data, file contents). When
+    // the trace records syscalls, each one is checked as a unit: its id, its events (host writes), and the result it
+    // leaves in RAX. Unless `strict`, a syscall whose live events or result differ (a live network answer, a file that is gone)
+    // has its live writes undone and the recorded writes and result applied, so the guest sees what it saw while
+    // recording; emulator state outside guest memory and registers keeps the live outcome. A host write outside a
+    // syscall (or in a trace without syscalls) that matches its recorded event in position, address, and size but
+    // carries other bytes takes the recorded bytes. substituted_inputs() counts both. Strict replays report them as
+    // divergences instead, which also exposes emulator bugs such as uninitialized host bytes copied into the guest.
     class replay_verifier
     {
       public:
@@ -354,7 +401,31 @@ namespace sogen::ttd
         // Set while writing recorded bytes over a host write, whose own notification is not an event.
         bool substituting_{};
         uint64_t substituted_inputs_{};
+
+        struct live_event
+        {
+            access_event event{};
+            // For a host write, the bytes it replaced; empty when they could not be read.
+            std::vector<std::byte> previous{};
+            std::vector<std::byte> data{};
+        };
+
+        // The recorded syscalls from the replay's start and the next one the replay should dispatch.
+        std::span<const syscall_entry> syscalls_{};
+        size_t next_syscall_{};
+        // While a syscall's handler runs: its events, checked when it returns.
+        bool in_syscall_{};
+        std::vector<live_event> syscall_events_{};
+        std::vector<std::byte> previous_bytes_{};
+        scoped_hook host_write_before_hook_{};
+        syscall_observer syscall_observer_{};
+
         void verify(access_kind kind, uint64_t address, size_t size, std::span<const std::byte> data = {});
+        bool matches(const access_event& expected, const access_event& observed, std::span<const std::byte> data, bool compare_data = true);
+        void enter_syscall(uint32_t id);
+        void exit_syscall();
+        void diverge(const std::string& message);
+        std::string syscall_description(const syscall_entry& entry) const;
     };
 
     class replay_selfmod_scanner

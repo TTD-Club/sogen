@@ -32,9 +32,14 @@ with ttd.Trace("sample.sogttd") as trace:
 
     print(trace.manifest)  # {'backend': ..., 'cpuid': '1', 'emulation_root': ..., 'tool': 'sogen.ttd', ...}
 
+    # Every dispatched syscall: position, id, name, result (RAX), and the events its handler produced.
+    for syscall in trace.syscalls:
+        if syscall.name == "NtCreateFile" and syscall.result != 0:
+            print(hex(syscall.position), hex(syscall.result))
+
     # Replay: every recorded event is verified on the way; ttd.DivergenceError (a RuntimeError) names the first
-    # divergence. Host writes with other live bytes take the recorded ones (result.substituted_inputs counts them)
-    # unless Replay(..., strict=True).
+    # divergence. Syscalls whose live writes or result differ (a network answer, a missing file) and host writes with
+    # other live bytes take the recorded ones (result.substituted_inputs counts them) unless Replay(..., strict=True).
     emu = ttd.create_emulator("c:/sample.exe", emulation_root="root")
     replay = ttd.Replay(trace, emu)
     replay.seek(store.position - 1)                 # also seeks backwards
@@ -70,7 +75,8 @@ gives a headless one). `Trace.ui_inputs` lists the window events a recording log
 window exists (scripted input; a recording logs it like live input). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
 also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_python_test.py` covers queries,
 the manifest, replay of a CLI trace, a fork and a recorded fork (replayed in Python and the CLI), divergence and
-CPUID-mismatch errors, the replay scans (also on a fork), and replay of a Python trace in the CLI. The Python
+CPUID-mismatch errors, the replay scans (also on a fork), the syscall list, a replay after an input file the
+recording saw was deleted, and replay of a Python trace in the CLI. The Python
 scans start from the trace's initial checkpoint, so they also work on a recorded fork; the CLI's replay scans
 (`--ttd-strings`, `--ttd-buffers`, `--ttd-scan-selfmod`) need a trace that starts at position 0.
 
@@ -124,17 +130,27 @@ normal window and replays headless; `ttd.create_emulator` shows the window
 unless `headless=True`. `ttd::require_deterministic` refuses a plain live UI
 backend.
 
-Host writes (syscall results, network data, file contents) are the
-environment's input to the guest, and the trace already stores their bytes.
-A replay therefore takes the recorded bytes when a host write matches its
-recorded event in position, address, and size but carries different data (a
-live DNS answer, a host-assigned UDP port): it writes them over the live ones
-and counts them (`host writes taken from the recording` in the CLI,
+Syscalls and host writes (statuses, network data, file contents) are the
+environment's input to the guest. The trace stores every host write's bytes
+and, for every dispatched syscall, the events its handler produced and the
+value it left in RAX (the `syscalls` section). A replay checks each syscall as
+one unit when its handler returns. If its live events or result differ from the
+recording (a live DNS answer, a host-assigned UDP port, a file that no longer
+exists), the replay undoes the handler's live host writes (newest first,
+restoring the bytes each replaced), applies the recorded ones, and sets RAX to
+the recorded result, so the guest continues with what it saw while recording.
+A host write outside a syscall (exception dispatch, window messages) that
+matches its recorded event in position, address, and size but carries
+different data takes the recorded bytes. Both count as inputs taken from the
+recording (`inputs taken from the recording` in the CLI,
 `SeekResult.substituted_inputs` in Python). `--ttd-strict` /
-`Replay(..., strict=True)` reports such writes as divergences instead, which
-is how value verification found emulator writes of uninitialized host bytes.
-A live input that changes a host write's size, a syscall's return value, or
-the guest's path still diverges; capturing return values is the next step.
+`Replay(..., strict=True)` reports them as divergences instead, naming the
+syscall, which is how value verification found emulator writes of
+uninitialized host bytes. Emulator state outside guest memory and registers
+keeps the live outcome (a handle the live call did not open, a socket's
+state), so a live input that changes later scheduling, memory mappings, or
+emulator objects the guest uses again can still diverge. Traces recorded before
+the `syscalls` section existed replay with per-write substitution only.
 
 `--ttd-no-checkpoints` keeps just the initial snapshot for comparison. The
 default interval is 500,000 instructions. Checkpoints are taken only between
@@ -150,11 +166,12 @@ printing `matches`, the first differing state offset, or the event at which
 the interval's replay diverged, and continues with the next interval. All
 checkpoints of `ttd-step-sample` match. A complete recording of `test-sample`
 with its live window (30.18M instructions, 60 checkpoints, 4 window events
-recorded) matches in all 60 intervals, taking 3 host writes from the
-recording: two DNS answers delivered over ALPC and a UDP datagram's sender
+recorded) matches in all 60 intervals, taking up to 3 inputs from the
+recording: two DNS answers delivered over ALPC (`NtAlpcSendWaitReceivePort`),
+which differ only when the live answer changes, and a UDP datagram's sender
 address, whose port the host OS assigns afresh each run
-(`afd_endpoint::ioctl_receive_datagram`). With `--ttd-strict` exactly those
-three intervals fail. Before window events were recorded and host writes
+(`NtDeviceIoControlFile`, `afd_endpoint::ioctl_receive_datagram`). With
+`--ttd-strict` exactly those intervals fail. Before window events were recorded and host writes
 substituted, 56 to 58 intervals matched: besides the live network input, a
 focus event arriving at a different moment in the replay rewrote the shared
 `USER_SERVERINFO`. Value
@@ -371,6 +388,18 @@ found through the section table (24-byte entries `type, offset, size`):
   UI pump where it has verified `event_number` events. Replays therefore stop
   at every checkpoint between the start and the target, as the recording's
   budgeted `start()` calls did, since the UI is pumped at those boundaries.
+- Syscalls (type 8, size = compressed bytes; absent in older traces): one
+  zstd frame of the entry count, the name count, six `uint64_t` stream sizes,
+  and six streams, one entry per dispatched syscall in order: varint step
+  deltas (the position of the `syscall` instruction), varint event gaps
+  (`event_number` minus the previous entry's `event_number + event_count`),
+  varint ids, varint event counts, and `uint64_t` results (RAX after the
+  handler); then the names, each a varint id, a varint length, and the bytes,
+  as the recording emulator's `ntdll`/`win32u` export them. The handler ran
+  after `event_number` events had been recorded and produced the next
+  `event_count` events: its host writes, and the descriptor-table reads Unicorn
+  reports when a handler loads segment registers (`NtCallbackReturn`). A
+  `test-sample` recording holds 4,601 syscalls in 16 KB.
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host

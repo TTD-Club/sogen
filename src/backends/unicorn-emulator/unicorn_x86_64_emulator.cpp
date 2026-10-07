@@ -123,6 +123,7 @@ namespace sogen::unicorn
         struct host_write_hook : hook_object
         {
             memory_access_data_callback callback{};
+            bool before{};
         };
 
         struct mmio_callbacks
@@ -415,24 +416,37 @@ namespace sogen::unicorn
 
             bool try_write_memory(const uint64_t address, const void* data, const size_t size) override
             {
+                this->notify_host_write(address, data, size, true);
                 if (uc_mem_write(*this, address, data, size) != UC_ERR_OK)
                 {
                     return false;
                 }
-                this->notify_host_write(address, data, size);
+                this->notify_host_write(address, data, size, false);
                 return true;
             }
 
             void write_memory(const uint64_t address, const void* data, const size_t size) override
             {
+                this->notify_host_write(address, data, size, true);
                 uce(uc_mem_write(*this, address, data, size));
-                this->notify_host_write(address, data, size);
+                this->notify_host_write(address, data, size, false);
             }
 
             emulator_hook* hook_host_memory_write(memory_access_data_callback callback) override
             {
+                return this->add_host_write_hook(std::move(callback), false);
+            }
+
+            emulator_hook* hook_host_memory_write_before(memory_access_data_callback callback) override
+            {
+                return this->add_host_write_hook(std::move(callback), true);
+            }
+
+            emulator_hook* add_host_write_hook(memory_access_data_callback callback, const bool before)
+            {
                 auto hook = std::make_unique<host_write_hook>();
                 hook->callback = std::move(callback);
+                hook->before = before;
                 auto* result = hook.get();
                 this->host_write_hooks_.push_back(result);
                 this->hooks_.push_back(std::move(hook));
@@ -735,7 +749,7 @@ namespace sogen::unicorn
                 return ptr;
             }
 
-            void notify_host_write(const uint64_t address, const void* data, const size_t size)
+            void notify_host_write(const uint64_t address, const void* data, const size_t size, const bool before)
             {
                 if (!size)
                 {
@@ -744,7 +758,10 @@ namespace sogen::unicorn
                 const std::span bytes(static_cast<const std::byte*>(data), size);
                 for (auto* hook : this->host_write_hooks_)
                 {
-                    hook->callback(*this, address, bytes);
+                    if (hook->before == before)
+                    {
+                        hook->callback(*this, address, bytes);
+                    }
                 }
             }
 
