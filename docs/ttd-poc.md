@@ -215,6 +215,9 @@ found through the section table (24-byte entries `type, offset, size`):
   `base`. The recorder uses `base = i - p`, where `p` is the largest power of
   16 dividing `i`, so restoring any checkpoint decompresses fewer than 16
   deltas per power of 16 (17 states for checkpoint 47: 47 to 32, 16, and 0).
+  When `i - base` is at most 16, the delta's reference is the base state
+  followed by bulk blocks `base` to `i - 1`, so memory filled by large host
+  writes (mapped images, file reads) is not stored again in the checkpoint.
 - Page index (type 3, size = block count): 32-byte block entries
   `first_page, entry_count, offset, size`. Each block is a zstd frame of up to
   4,096 consecutive page entries `(page, chunk, kinds)`, sorted by page and
@@ -228,12 +231,19 @@ found through the section table (24-byte entries `type, offset, size`):
   entries `address, size, bytes[16]`, one per distinct executed instruction
   (address and bytes), in order of first execution. Self-modified code gets a
   new entry for each new byte sequence at an address.
+- Bulk table (type 5, size = entry count, one per checkpoint): 16-byte entries
+  `offset, size`. Block `i` is one zstd frame (absent when `size` is zero)
+  holding, in recording order, the bytes of every access larger than 16 bytes
+  recorded after checkpoint `i` and before checkpoint `i + 1` (or the end).
+  The recorder closes the current event chunk at every checkpoint, so a chunk
+  never spans two intervals.
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
-write. An event chunk is one zstd frame holding `event_count`, seven stream
+write. An event chunk is one zstd frame holding `event_count`, eight stream
 sizes, and the streams. Each stream predicts from earlier events of the same
-chunk only, so a chunk decodes on its own given the code table:
+chunk only, so a chunk decodes on its own given the code table and the bulk
+blocks it refers to:
 
 - Tags, one byte per event: the kind (bits 0-3), an irregular-step flag (bit
   4), and bit 5, which for an execute means "a code id follows" and for a read
@@ -252,13 +262,16 @@ chunk only, so a chunk decodes on its own given the code table:
   kind by the same instruction pointer used in this chunk (or else the last
   access of the same kind).
 - Sizes: varint access sizes.
-- Data: the bytes of every read, write, and host write in event order, except
-  reads flagged as known, whose bytes equal what earlier accesses of the chunk
-  left at those addresses and are rebuilt by the decoder.
+- Data: the bytes of every read, write, and host write of at most 16 bytes in
+  event order, except reads flagged as known, whose bytes equal what earlier
+  accesses of the chunk left at those addresses and are rebuilt by the decoder.
+- Bulk references: for each access larger than 16 bytes (only host writes;
+  guest accesses are at most 8 bytes), a zigzag varint block delta from the
+  previous reference and a zigzag varint offset relative to the end of the
+  previous reference in the same block (or to 0 in another block).
 
-Decoded accesses up to 16 bytes carry their data inline; larger ones (only
-host writes; guest accesses are at most 8 bytes) refer to their offset in the
-data stream.
+Decoded accesses up to 16 bytes carry their data inline; larger ones carry
+their bulk offset (payload bytes 0-7) and block (bytes 8-15).
 
 Versions 1 to 4 stored fixed-size event records with full checkpoint snapshots
 and a per-event page index; they remain readable (1 and 2 as write-only
@@ -266,18 +279,19 @@ traces, 3 without instruction bytes, 4 without access data). Development
 versions 5 and 6 were never published and are rejected.
 
 A full `test-sample` recording (30.1M instructions, 40.7M events, 61
-checkpoints) is 83.5 MiB in v7; the same recording in the v4-style layout plus
+checkpoints) is 40.7 MiB in v7; the same recording in the v4-style layout plus
 access data was 4,157 MiB (2,176 MiB of fixed-size events, 962 MiB of full
 checkpoints, 958 MiB of per-event index), and 169 MiB in v6 (fixed-width
 columns, keyframe checkpoints, uncompressed page index). Of the v7 trace,
-event chunks take 35.7 MiB (9.9 bits per instruction, including every read
-and written value), checkpoints 46.4 MiB (initial state 1.4 MiB, three
-16-apart deltas 21 MiB, 57 adjacent deltas 24 MiB), the page index 0.06 MiB,
-and the code table 1.3 MiB (243,348 instructions). About 22 MiB of the event
-chunks are image contents written by `NtMapViewOfSection`. Recording takes
-20 s (v6: 29 s, v4-style: 61 s). Queries take 0.02 s for a next-access lookup
-and about 3 s for a scan of every chunk; a late seek including the checkpoint
-delta chain takes 0.34 s.
+event chunks take 13.2 MiB (3.7 bits per instruction, including every read
+and every written value up to 16 bytes), bulk blocks 22.5 MiB (almost all image
+contents written by `NtMapViewOfSection`), checkpoints 3.6 MiB (initial state
+1.4 MiB, three 16-apart deltas 0.7 MiB, 57 adjacent deltas 1.6 MiB), the
+code table 1.3 MiB (243,348 instructions), and the page index 0.06 MiB.
+Without bulk data in the delta references the checkpoints took 46.4 MiB.
+Recording takes 23 s (v6: 29 s, v4-style: 61 s). Queries take 0.02 s for a
+next-access lookup and about 3 s for a scan of every chunk; a late seek
+including the checkpoint delta chain takes 0.6 s.
 
 Because every written and read value is recorded, a range's value history is
 available offline: `--ttd-history TRACE --ttd-address A --ttd-size N`
@@ -292,7 +306,8 @@ On the UPX-packed test PE, a v4 query at the unpacked entry
 the self-modifying-code pass linked it to the UPX stub write at position
 `0x219cb4`.
 The recorder keeps one chunk of events (65,536), the code table, the page
-entries, and the base state of each checkpoint level in memory and writes
+entries, the base state of each checkpoint level, and the last 16 bulk
+blocks in memory and writes
 chunks and checkpoints to the trace as they are produced. Readers validate offsets, tables, and chunk contents before using
 them and keep the four most recently decoded chunks and the last restored
 checkpoint state cached. Queries bound candidate chunks by event number

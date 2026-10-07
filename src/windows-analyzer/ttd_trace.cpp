@@ -20,8 +20,33 @@ namespace sogen::ttd
     {
         constexpr uint64_t page_size = 4096;
         constexpr size_t cached_chunks = 4;
+        constexpr size_t cached_bulk_blocks = bulk_reference_span + 1;
         constexpr int checkpoint_compression_level = 3;
         constexpr int code_table_compression_level = 9;
+        constexpr int bulk_compression_level = 6;
+
+        // A checkpoint delta's zstd reference is its base state followed by the bulk blocks recorded in between. This
+        // returns that concatenation, or nothing when those blocks are empty and the base state alone is the reference.
+        std::vector<std::byte> extended_reference(const std::span<const std::byte> base, const std::span<const bulk_block> between)
+        {
+            size_t bulk_size = 0;
+            for (const auto& block : between)
+            {
+                bulk_size += block->size();
+            }
+            if (!bulk_size)
+            {
+                return {};
+            }
+            std::vector<std::byte> reference{};
+            reference.reserve(base.size() + bulk_size);
+            reference.insert(reference.end(), base.begin(), base.end());
+            for (const auto& block : between)
+            {
+                reference.insert(reference.end(), block->begin(), block->end());
+            }
+            return reference;
+        }
 
         // Versions 1-4 stored every event as a fixed-size record, followed by full checkpoint snapshots and a
         // per-event page index. They remain readable.
@@ -234,9 +259,11 @@ namespace sogen::ttd
         }
         else
         {
-            const uint64_t offset = chunk_blob_.size();
-            chunk_blob_.insert(chunk_blob_.end(), data.begin(), data.end());
+            const uint64_t offset = current_bulk_->size();
+            const uint64_t block = bulk_table_.size();
+            current_bulk_->insert(current_bulk_->end(), data.begin(), data.end());
             memcpy(event.payload.data(), &offset, sizeof(offset));
+            memcpy(event.payload.data() + sizeof(offset), &block, sizeof(block));
         }
         push_event(event);
     }
@@ -262,7 +289,9 @@ namespace sogen::ttd
         {
             return;
         }
-        const auto encoded = encode_chunk(chunk_events_, chunk_blob_, code_);
+        const auto encoded = encode_chunk(chunk_events_, code_, [this](const uint64_t block) -> bulk_block {
+            return block == bulk_table_.size() ? current_bulk_ : nullptr;
+        });
         const auto index = static_cast<uint32_t>(chunks_.size());
         chunks_.push_back({.first_event = header_.event_count - chunk_events_.size(),
                            .event_count = chunk_events_.size(),
@@ -275,8 +304,28 @@ namespace sogen::ttd
             pages_.push_back({.page = page, .chunk = index, .kinds = kinds});
         }
         chunk_events_.clear();
-        chunk_blob_.clear();
         chunk_pages_.clear();
+    }
+
+    void recorder::close_bulk_block()
+    {
+        bulk_entry entry{};
+        if (!current_bulk_->empty())
+        {
+            const auto compressed = utils::compression::zstd::compress(*current_bulk_, bulk_compression_level);
+            if (compressed.empty())
+            {
+                throw std::runtime_error("Cannot compress TTD bulk data");
+            }
+            entry = {.offset = append_to_file(compressed), .size = compressed.size()};
+        }
+        bulk_table_.push_back(entry);
+        recent_bulk_.push_back(std::move(current_bulk_));
+        if (recent_bulk_.size() > bulk_reference_span)
+        {
+            recent_bulk_.pop_front();
+        }
+        current_bulk_ = std::make_shared<std::vector<std::byte>>();
     }
 
     void recorder::write_checkpoint(const uint64_t step)
@@ -304,7 +353,15 @@ namespace sogen::ttd
             ++level;
             distance *= checkpoints_per_level;
         }
-        const auto compressed = utils::compression::zstd::compress_with_reference(*state, *base_states_[level]);
+        std::vector<bulk_block> between{};
+        if (distance <= bulk_reference_span)
+        {
+            between.assign(recent_bulk_.end() - static_cast<ptrdiff_t>(distance), recent_bulk_.end());
+        }
+        const auto& base = *base_states_[level];
+        const auto extended = extended_reference(base, between);
+        const auto compressed =
+            utils::compression::zstd::compress_with_reference(*state, extended.empty() ? std::span(base) : std::span(extended));
         if (compressed.empty())
         {
             throw std::runtime_error("Cannot compress TTD checkpoint");
@@ -335,6 +392,8 @@ namespace sogen::ttd
         {
             throw std::runtime_error("TTD checkpoints must have increasing instruction positions");
         }
+        flush_chunk();
+        close_bulk_block();
         write_checkpoint(step);
     }
 
@@ -350,7 +409,9 @@ namespace sogen::ttd
         execute_hook_.remove();
         host_write_hook_.remove();
         flush_chunk();
+        close_bulk_block();
         base_states_.clear();
+        recent_bulk_.clear();
         header_.instruction_count = emu_.get_executed_instructions();
 
         std::ranges::sort(
@@ -377,6 +438,7 @@ namespace sogen::ttd
                 .type = section_type::checkpoint_table, .offset = append_to_file(bytes_of(checkpoints_)), .size = checkpoints_.size()},
             section_entry{.type = section_type::page_index, .offset = append_to_file(bytes_of(page_blocks)), .size = page_blocks.size()},
             section_entry{.type = section_type::code_table, .offset = append_to_file(code), .size = code.size()},
+            section_entry{.type = section_type::bulk_table, .offset = append_to_file(bytes_of(bulk_table_)), .size = bulk_table_.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -512,6 +574,23 @@ namespace sogen::ttd
                 code_.resize(code.size() / sizeof(code_entry));
                 std::ranges::copy(code, reinterpret_cast<std::byte*>(code_.data()));
             }
+            else if (section.type == section_type::bulk_table)
+            {
+                if (!fits(section.offset, section.size, sizeof(bulk_entry)))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                file_.seekg(static_cast<std::streamoff>(section.offset));
+                bulk_table_.resize(static_cast<size_t>(section.size));
+                for (auto& entry : bulk_table_)
+                {
+                    entry = read_object<bulk_entry>(file_);
+                    if (!fits(entry.offset, entry.size, 1))
+                    {
+                        throw std::runtime_error("Invalid TTD bulk block entry");
+                    }
+                }
+            }
         }
 
         uint64_t next_event = 0;
@@ -533,6 +612,10 @@ namespace sogen::ttd
         if (checkpoints_.empty() || checkpoints_.front().step != 0)
         {
             throw std::runtime_error("TTD trace has no initial state");
+        }
+        if (bulk_table_.size() != checkpoints_.size())
+        {
+            throw std::runtime_error("TTD trace needs one bulk block per checkpoint interval");
         }
         for (size_t i = 0; i < checkpoints_.size(); ++i)
         {
@@ -632,7 +715,7 @@ namespace sogen::ttd
             return chunk_cache_.back().chunk;
         }
         const auto& entry = chunks_.at(index);
-        auto decoded = decode_chunk(read_bytes(entry.offset, entry.size), index, code_);
+        auto decoded = decode_chunk(read_bytes(entry.offset, entry.size), code_, [this](const uint64_t block) { return bulk(block); });
         if (decoded.events.size() != entry.event_count)
         {
             throw std::runtime_error("Invalid TTD event chunk");
@@ -643,6 +726,36 @@ namespace sogen::ttd
         }
         chunk_cache_.push_back({.index = index, .chunk = std::move(decoded)});
         return chunk_cache_.back().chunk;
+    }
+
+    bulk_block trace::bulk(const uint64_t index)
+    {
+        const auto cached = std::ranges::find(bulk_cache_, index, &cached_bulk::index);
+        if (cached != bulk_cache_.end())
+        {
+            std::rotate(cached, cached + 1, bulk_cache_.end());
+            return bulk_cache_.back().block;
+        }
+        if (index >= bulk_table_.size())
+        {
+            throw std::runtime_error("Invalid TTD bulk block reference");
+        }
+        const auto& entry = bulk_table_[static_cast<size_t>(index)];
+        auto block = std::make_shared<std::vector<std::byte>>();
+        if (entry.size)
+        {
+            *block = utils::compression::zstd::decompress(read_bytes(entry.offset, entry.size));
+            if (block->empty())
+            {
+                throw std::runtime_error("Cannot decompress TTD bulk block");
+            }
+        }
+        if (bulk_cache_.size() == cached_bulk_blocks)
+        {
+            bulk_cache_.erase(bulk_cache_.begin());
+        }
+        bulk_cache_.push_back({.index = index, .block = block});
+        return block;
     }
 
     uint32_t trace::chunk_of(const uint64_t number) const
@@ -673,10 +786,27 @@ namespace sogen::ttd
         }
         while (!chain.empty())
         {
-            const auto& entry = checkpoints_.at(static_cast<size_t>(chain.back()));
+            const auto current = chain.back();
+            const auto& entry = checkpoints_.at(static_cast<size_t>(current));
             const auto compressed = read_bytes(entry.offset, entry.size);
-            state = entry.base == no_base_checkpoint ? utils::compression::zstd::decompress(compressed)
-                                                     : utils::compression::zstd::decompress_with_reference(compressed, state);
+            if (entry.base == no_base_checkpoint)
+            {
+                state = utils::compression::zstd::decompress(compressed);
+            }
+            else
+            {
+                std::vector<bulk_block> between{};
+                if (current - entry.base <= bulk_reference_span)
+                {
+                    for (auto block = entry.base; block < current; ++block)
+                    {
+                        between.push_back(bulk(block));
+                    }
+                }
+                const auto extended = extended_reference(state, between);
+                state = utils::compression::zstd::decompress_with_reference(compressed,
+                                                                            extended.empty() ? std::span(state) : std::span(extended));
+            }
             if (state.empty())
             {
                 throw std::runtime_error("Cannot decompress TTD checkpoint");
@@ -832,12 +962,12 @@ namespace sogen::ttd
         uint64_t index{};
         memcpy(&offset, event.payload.data(), sizeof(offset));
         memcpy(&index, event.payload.data() + sizeof(offset), sizeof(index));
-        if (index >= chunks_.size())
+        const auto block = bulk(index);
+        if (offset > block->size() || event.size > block->size() - offset)
         {
             throw std::runtime_error("Invalid TTD access data reference");
         }
-        const auto& blob = chunk(static_cast<uint32_t>(index)).blob;
-        const auto begin = blob.begin() + static_cast<ptrdiff_t>(offset);
+        const auto begin = block->begin() + static_cast<ptrdiff_t>(offset);
         return {begin, begin + static_cast<ptrdiff_t>(event.size)};
     }
 

@@ -26,7 +26,8 @@ namespace sogen::ttd
         constexpr size_t address_stream = 4;
         constexpr size_t size_stream = 5;
         constexpr size_t data_stream = 6;
-        constexpr size_t stream_count = 7;
+        constexpr size_t bulk_stream = 7;
+        constexpr size_t stream_count = 8;
 
         struct chunk_header
         {
@@ -159,6 +160,20 @@ namespace sogen::ttd
             std::unordered_map<uint64_t, qword> qwords_{};
         };
 
+        struct bulk_reference
+        {
+            uint64_t offset{};
+            uint64_t block{};
+        };
+
+        bulk_reference bulk_reference_of(const access_event& event)
+        {
+            bulk_reference reference{};
+            memcpy(&reference.offset, event.payload.data(), sizeof(reference.offset));
+            memcpy(&reference.block, event.payload.data() + sizeof(reference.offset), sizeof(reference.block));
+            return reference;
+        }
+
         // Prediction state; the encoder and the decoder update it identically after every event.
         struct predictor
         {
@@ -170,6 +185,19 @@ namespace sogen::ttd
             std::array<uint64_t, 16> last_address_of_kind{};
             std::unordered_map<uint64_t, uint64_t> last_address_at{};
             known_memory memory{};
+            uint64_t bulk_block_index{};
+            uint64_t bulk_next_offset{};
+
+            uint64_t bulk_offset_base(const uint64_t block) const
+            {
+                return block == this->bulk_block_index ? this->bulk_next_offset : 0;
+            }
+
+            void remember_bulk(const bulk_reference& reference, const uint64_t size)
+            {
+                this->bulk_block_index = reference.block;
+                this->bulk_next_offset = reference.offset + size;
+            }
 
             static uint64_t site(const access_event& event)
             {
@@ -201,20 +229,39 @@ namespace sogen::ttd
                    kind == static_cast<uint8_t>(access_kind::execute) || kind == static_cast<uint8_t>(access_kind::host_write);
         }
 
-        std::span<const std::byte> event_data(const access_event& event, const std::span<const std::byte> blob)
+        // Keeps the most recently used bulk block alive while a chunk refers to it.
+        class bulk_cursor
         {
-            if (event.size <= inline_data_limit)
+          public:
+            explicit bulk_cursor(const bulk_resolver& resolve)
+                : resolve_(resolve)
             {
-                return std::as_bytes(std::span(event.payload)).first(static_cast<size_t>(event.size));
             }
-            uint64_t offset{};
-            memcpy(&offset, event.payload.data(), sizeof(offset));
-            if (offset > blob.size() || event.size > blob.size() - offset)
+
+            std::span<const std::byte> data(const bulk_reference& reference, const uint64_t size)
             {
-                throw std::runtime_error("Invalid TTD access data offset");
+                if (!this->block_ || reference.block != this->index_)
+                {
+                    this->block_ = this->resolve_(reference.block);
+                    this->index_ = reference.block;
+                    if (!this->block_)
+                    {
+                        throw std::runtime_error("Missing TTD bulk block");
+                    }
+                }
+                const auto& bytes = *this->block_;
+                if (reference.offset > bytes.size() || size > bytes.size() - reference.offset)
+                {
+                    throw std::runtime_error("Invalid TTD bulk data reference");
+                }
+                return std::span(bytes).subspan(static_cast<size_t>(reference.offset), static_cast<size_t>(size));
             }
-            return blob.subspan(static_cast<size_t>(offset), static_cast<size_t>(event.size));
-        }
+
+          private:
+            const bulk_resolver& resolve_;
+            bulk_block block_{};
+            uint64_t index_{};
+        };
     }
 
     uint64_t code_table::id_of(const access_event& execute)
@@ -238,11 +285,12 @@ namespace sogen::ttd
         return id;
     }
 
-    std::vector<std::byte> encode_chunk(const std::span<const access_event> events, const std::span<const std::byte> blob, code_table& code)
+    std::vector<std::byte> encode_chunk(const std::span<const access_event> events, code_table& code, const bulk_resolver& bulk)
     {
         std::array<std::vector<std::byte>, stream_count> streams{};
         streams[tag_stream].reserve(events.size());
         predictor state{};
+        bulk_cursor cursor(bulk);
 
         for (const auto& event : events)
         {
@@ -276,17 +324,28 @@ namespace sogen::ttd
                 put_varint(streams[ip_stream], zigzag(event.ip - state.ip));
                 put_varint(streams[address_stream], zigzag(event.address - state.address_base(event)));
                 put_varint(streams[size_stream], event.size);
-                const auto data = event_data(event, blob);
-                std::array<std::byte, inline_data_limit> known{};
-                if (event.kind == access_kind::read && data.size() <= known.size() &&
-                    state.memory.load(event.address, std::span(known).first(data.size())) &&
-                    std::ranges::equal(std::span(known).first(data.size()), data))
+                std::span<const std::byte> data{};
+                if (event.size > inline_data_limit)
                 {
-                    tag |= tag_extra;
+                    const auto reference = bulk_reference_of(event);
+                    data = cursor.data(reference, event.size);
+                    put_varint(streams[bulk_stream], zigzag(reference.block - state.bulk_block_index));
+                    put_varint(streams[bulk_stream], zigzag(reference.offset - state.bulk_offset_base(reference.block)));
+                    state.remember_bulk(reference, event.size);
                 }
                 else
                 {
-                    streams[data_stream].insert(streams[data_stream].end(), data.begin(), data.end());
+                    data = std::as_bytes(std::span(event.payload)).first(static_cast<size_t>(event.size));
+                    std::array<std::byte, inline_data_limit> known{};
+                    if (event.kind == access_kind::read && state.memory.load(event.address, std::span(known).first(data.size())) &&
+                        std::ranges::equal(std::span(known).first(data.size()), data))
+                    {
+                        tag |= tag_extra;
+                    }
+                    else
+                    {
+                        streams[data_stream].insert(streams[data_stream].end(), data.begin(), data.end());
+                    }
                 }
                 state.remember_access(event, data);
             }
@@ -318,9 +377,10 @@ namespace sogen::ttd
         return compressed;
     }
 
-    decoded_chunk decode_chunk(const std::span<const std::byte> compressed, const uint32_t chunk_index,
-                               const std::span<const code_entry> code)
+    decoded_chunk decode_chunk(const std::span<const std::byte> compressed, const std::span<const code_entry> code,
+                               const bulk_resolver& bulk)
     {
+        bulk_cursor cursor(bulk);
         const auto raw = utils::compression::zstd::decompress(compressed);
         chunk_header header{};
         if (raw.size() < sizeof(header))
@@ -394,11 +454,24 @@ namespace sogen::ttd
                 event.address = state.address_base(event) + unzigzag(streams[address_stream].varint());
                 event.size = streams[size_stream].varint();
                 std::span<const std::byte> data{};
-                if (tag & tag_extra)
+                const auto output = std::as_writable_bytes(std::span(event.payload));
+                if (event.size > inline_data_limit)
                 {
-                    const auto output = std::as_writable_bytes(std::span(event.payload));
-                    if (event.kind != access_kind::read || event.size > output.size() ||
-                        !state.memory.load(event.address, output.first(static_cast<size_t>(event.size))))
+                    if (tag & tag_extra)
+                    {
+                        throw std::runtime_error("Invalid TTD known-value read");
+                    }
+                    bulk_reference reference{};
+                    reference.block = state.bulk_block_index + unzigzag(streams[bulk_stream].varint());
+                    reference.offset = state.bulk_offset_base(reference.block) + unzigzag(streams[bulk_stream].varint());
+                    data = cursor.data(reference, event.size);
+                    state.remember_bulk(reference, event.size);
+                    memcpy(event.payload.data(), &reference.offset, sizeof(reference.offset));
+                    memcpy(event.payload.data() + sizeof(reference.offset), &reference.block, sizeof(reference.block));
+                }
+                else if (tag & tag_extra)
+                {
+                    if (event.kind != access_kind::read || !state.memory.load(event.address, output.first(static_cast<size_t>(event.size))))
                     {
                         throw std::runtime_error("Invalid TTD known-value read");
                     }
@@ -406,18 +479,8 @@ namespace sogen::ttd
                 }
                 else
                 {
-                    const uint64_t offset = streams[data_stream].offset();
                     data = streams[data_stream].bytes(event.size);
-                    if (event.size <= inline_data_limit)
-                    {
-                        memcpy(event.payload.data(), data.data(), data.size());
-                    }
-                    else
-                    {
-                        const uint64_t index = chunk_index;
-                        memcpy(event.payload.data(), &offset, sizeof(offset));
-                        memcpy(event.payload.data() + sizeof(offset), &index, sizeof(index));
-                    }
+                    memcpy(event.payload.data(), data.data(), data.size());
                 }
                 state.remember_access(event, data);
             }
@@ -430,9 +493,6 @@ namespace sogen::ttd
                 throw std::runtime_error("Invalid TTD event chunk");
             }
         }
-
-        const auto data_begin = raw.size() - static_cast<size_t>(header.stream_sizes[data_stream]);
-        chunk.blob.assign(raw.begin() + static_cast<ptrdiff_t>(data_begin), raw.end());
         return chunk;
     }
 

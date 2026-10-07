@@ -11,15 +11,17 @@ CHECKPOINT = struct.Struct("<4Q")
 PAGE_BLOCK = struct.Struct("<4Q")
 PAGE_BLOCK_ENTRIES = 4096
 CODE = struct.Struct("<2Q16s")
-CHUNK_HEADER = struct.Struct("<8Q")
+CHUNK_HEADER = struct.Struct("<9Q")
+BULK = struct.Struct("<2Q")
+BULK_REFERENCE = struct.Struct("<2Q")
 MAGIC = b"SOGTTD7\0"
-CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE = 1, 2, 3, 4
+CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE = 1, 2, 3, 4, 5
 READ, WRITE, EXECUTE, HOST_WRITE = 1, 2, 4, 8
 MASK64 = (1 << 64) - 1
 INLINE_DATA_LIMIT = 16
 TAG_KIND, TAG_IRREGULAR_STEP, TAG_EXTRA = 0x0F, 0x10, 0x20
-STREAMS = 7
-TAGS, STEPS, IPS, CODES, ADDRESSES, SIZES, DATA = range(STREAMS)
+STREAMS = 8
+TAGS, STEPS, IPS, CODES, ADDRESSES, SIZES, DATA, BULK_REFS = range(STREAMS)
 
 
 class Event:
@@ -99,8 +101,11 @@ class _Predictor:
     """Mirror of the predictor in src/windows-analyzer/ttd_chunk.cpp; encoder and decoder update it identically."""
 
     def __init__(self):
-        self.step = self.ip = self.next_ip = self.next_code = 0
+        self.step = self.ip = self.next_ip = self.next_code = self.bulk_block = self.bulk_next = 0
         self.code_at, self.last_address_at, self.last_address_of_kind, self.memory = {}, {}, {}, {}
+
+    def bulk_offset_base(self, block):
+        return self.bulk_next if block == self.bulk_block else 0
 
     def address_base(self, ip, kind):
         return self.last_address_at.get(((ip << 4) | kind) & MASK64, self.last_address_of_kind.get(kind, 0))
@@ -128,7 +133,8 @@ def _split_streams(compressed):
     return streams
 
 
-def decode_chunk(compressed, code, first_number=0):
+def decode_chunk(compressed, code, bulk, first_number=0):
+    """bulk(index) returns the bytes of bulk block `index`."""
     streams = _split_streams(compressed)
     tags = streams[TAGS]
     readers = [_Stream(stream) for stream in streams]
@@ -155,21 +161,31 @@ def decode_chunk(compressed, code, first_number=0):
             ip = (state.ip + _unzigzag(readers[IPS].varint())) & MASK64
             address = (state.address_base(ip, kind) + _unzigzag(readers[ADDRESSES].varint())) & MASK64
             size = readers[SIZES].varint()
-            if tag & TAG_EXTRA:
-                data = state.known(address, size)
-                assert kind == READ and data is not None, "invalid known-value read"
+            if size > INLINE_DATA_LIMIT:
+                assert not tag & TAG_EXTRA, "invalid known-value read"
+                block = (state.bulk_block + _unzigzag(readers[BULK_REFS].varint())) & MASK64
+                offset = (state.bulk_offset_base(block) + _unzigzag(readers[BULK_REFS].varint())) & MASK64
+                data = bytes(bulk(block)[offset:offset + size])
+                assert len(data) == size, "invalid bulk data reference"
+                state.bulk_block, state.bulk_next = block, offset + size
+                payload = BULK_REFERENCE.pack(offset, block)
             else:
-                offset = readers[DATA].offset
-                data = readers[DATA].bytes(size)
-            payload = data.ljust(INLINE_DATA_LIMIT, b"\0") if size <= INLINE_DATA_LIMIT else struct.pack("<Q8x", offset)
+                if tag & TAG_EXTRA:
+                    data = state.known(address, size)
+                    assert kind == READ and data is not None, "invalid known-value read"
+                else:
+                    data = readers[DATA].bytes(size)
+                payload = data.ljust(INLINE_DATA_LIMIT, b"\0")
             state.remember_access(ip, kind, address, data)
         state.ip = ip
         events.append(Event(number, step, ip, address, size, kind, payload, data))
     return events
 
 
-def encode_chunk(events, code):
-    """events: (step, ip, address, size, kind, payload_or_data) tuples; code: the trace's CodeTable, extended as needed."""
+def encode_chunk(events, code, bulk=None):
+    """events: (step, ip, address, size, kind, content) tuples. content is the instruction bytes of an execute, the
+    data of an access up to 16 bytes, and the (block, offset) bulk reference of a larger access, whose bytes bulk(block)
+    returns. code: the trace's CodeTable, extended as needed."""
     streams = [bytearray() for _ in range(STREAMS)]
     state = _Predictor()
     for step, ip, address, size, kind, content in events:
@@ -193,11 +209,18 @@ def encode_chunk(events, code):
             _put_varint(streams[IPS], _zigzag(ip - state.ip))
             _put_varint(streams[ADDRESSES], _zigzag(address - state.address_base(ip, kind)))
             _put_varint(streams[SIZES], size)
-            data = bytes(content).ljust(size, b"\0")[:size]
-            if kind == READ and size <= INLINE_DATA_LIMIT and state.known(address, size) == data:
-                tag |= TAG_EXTRA
+            if size > INLINE_DATA_LIMIT:
+                block, offset = content
+                data = bytes(bulk(block)[offset:offset + size])
+                _put_varint(streams[BULK_REFS], _zigzag(block - state.bulk_block))
+                _put_varint(streams[BULK_REFS], _zigzag(offset - state.bulk_offset_base(block)))
+                state.bulk_block, state.bulk_next = block, offset + size
             else:
-                streams[DATA] += data
+                data = bytes(content).ljust(size, b"\0")[:size]
+                if kind == READ and state.known(address, size) == data:
+                    tag |= TAG_EXTRA
+                else:
+                    streams[DATA] += data
             state.remember_access(ip, kind, address, data)
         state.ip = ip
         streams[TAGS].append(tag)
@@ -225,10 +248,20 @@ class Trace:
         self.checkpoints = [CHECKPOINT.unpack_from(self.bytes, offset + i * CHECKPOINT.size) for i in range(size)]
         offset, size = self.sections.get(CODE_TABLE, (0, 0))
         self.code = CodeTable.decode(self.bytes[offset:offset + size]) if size else CodeTable()
+        offset, size = self.sections.get(BULK_TABLE, (0, 0))
+        self.bulk_table = [BULK.unpack_from(self.bytes, offset + i * BULK.size) for i in range(size)]
+        self._bulk_cache = {}
+
+    def bulk(self, index):
+        if index not in self._bulk_cache:
+            offset, size = self.bulk_table[index]
+            self._bulk_cache = {index: zstandard.ZstdDecompressor().decompress(self.bytes[offset:offset + size])
+                                if size else b""}
+        return self._bulk_cache[index]
 
     def chunk_events(self, index):
         first, _, _, _, offset, size = self.chunks[index]
-        return decode_chunk(self.bytes[offset:offset + size], self.code, first)
+        return decode_chunk(self.bytes[offset:offset + size], self.code, self.bulk, first)
 
     def steps_and_kinds(self, index):
         """Fast path over one chunk's tag and step streams, without decoding whole events."""
@@ -283,12 +316,24 @@ def _write_page_index(body, entries):
 
 
 def write_trace(path, events, instruction_count, access_mask=READ | WRITE | EXECUTE | HOST_WRITE):
-    """Write a minimal single-chunk trace without checkpoints, for tools that only read events."""
+    """Write a minimal single-chunk trace without checkpoints, for tools that only read events. Accesses larger than 16
+    bytes give their data as content and go to bulk block 0."""
     code = CodeTable()
-    chunk = encode_chunk(events, code)
+    bulk = bytearray()
+    referenced = []
+    for step, ip, address, size, kind, content in events:
+        if kind != EXECUTE and size > INLINE_DATA_LIMIT:
+            referenced.append((step, ip, address, size, kind, (0, len(bulk))))
+            bulk += bytes(content).ljust(size, b"\0")[:size]
+        else:
+            referenced.append((step, ip, address, size, kind, content))
+    chunk = encode_chunk(referenced, code, lambda _: bulk)
     body = bytearray(HEADER.size)
     chunk_offset = len(body)
     body += chunk
+    bulk_offset = len(body)
+    encoded_bulk = zstandard.ZstdCompressor(level=6).compress(bytes(bulk)) if bulk else b""
+    body += encoded_bulk
     kinds_by_page = _pages(events)
     chunk_table = len(body)
     body += CHUNK.pack(0, len(events), events[0][0], events[-1][0], chunk_offset, len(chunk))
@@ -297,22 +342,34 @@ def write_trace(path, events, instruction_count, access_mask=READ | WRITE | EXEC
     code_table = len(body)
     encoded_code = code.encode()
     body += encoded_code
+    bulk_table = len(body)
+    body += BULK.pack(bulk_offset if encoded_bulk else 0, len(encoded_bulk))
     section_table = len(body)
     body += SECTION.pack(CHUNK_TABLE, chunk_table, 1)
     body += SECTION.pack(CHECKPOINT_TABLE, checkpoint_table, 0)
     body += SECTION.pack(PAGE_INDEX, page_index, page_blocks)
     body += SECTION.pack(CODE_TABLE, code_table, len(encoded_code))
-    body[:HEADER.size] = HEADER.pack(MAGIC, instruction_count, len(events), access_mask, 4, section_table)
+    body += SECTION.pack(BULK_TABLE, bulk_table, 1)
+    body[:HEADER.size] = HEADER.pack(MAGIC, instruction_count, len(events), access_mask, 5, section_table)
     with open(path, "wb") as file:
         file.write(body)
 
 
 def replace_chunk(path, index, events):
-    """Re-encode chunk `index` with `events` (Event objects), appending it, the code table, and a new section table."""
+    """Re-encode chunk `index` with `events` (Event objects), appending it, the code table, and a new section table.
+    Accesses larger than 16 bytes keep their bulk references."""
     trace = Trace(path)
     code = CodeTable(trace.code.entries)
-    encoded = encode_chunk([(e.step, e.ip, e.address, e.size, e.kind, e.payload if e.kind == EXECUTE else e.data)
-                            for e in events], code)
+
+    def content(e):
+        if e.kind == EXECUTE:
+            return e.payload
+        if e.size > INLINE_DATA_LIMIT:
+            offset, block = BULK_REFERENCE.unpack(e.payload)
+            return block, offset
+        return e.data
+
+    encoded = encode_chunk([(e.step, e.ip, e.address, e.size, e.kind, content(e)) for e in events], code, trace.bulk)
     data = bytearray(trace.bytes)
     offset = len(data)
     data += encoded

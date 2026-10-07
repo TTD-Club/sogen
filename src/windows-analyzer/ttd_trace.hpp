@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <array>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -67,7 +68,10 @@ namespace sogen::ttd
         std::vector<checkpoint_entry> checkpoints_{};
         code_table code_{};
         std::vector<access_event> chunk_events_{};
-        std::vector<std::byte> chunk_blob_{};
+        std::vector<bulk_entry> bulk_table_{};
+        std::shared_ptr<std::vector<std::byte>> current_bulk_{std::make_shared<std::vector<std::byte>>()};
+        // The last bulk_reference_span closed blocks, oldest first.
+        std::deque<bulk_block> recent_bulk_{};
         std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
@@ -81,6 +85,7 @@ namespace sogen::ttd
         void append_data_event(access_kind kind, uint64_t address, std::span<const std::byte> data);
         void push_event(const access_event& event);
         void flush_chunk();
+        void close_bulk_block();
         void write_checkpoint(uint64_t step);
         uint64_t append_to_file(std::span<const std::byte> bytes);
     };
@@ -136,6 +141,12 @@ namespace sogen::ttd
             decoded_chunk chunk{};
         };
 
+        struct cached_bulk
+        {
+            uint64_t index{};
+            bulk_block block{};
+        };
+
         std::ifstream file_;
         trace_metadata metadata_{};
         uint32_t version_{};
@@ -145,6 +156,8 @@ namespace sogen::ttd
         std::vector<chunk_entry> chunks_{};
         std::vector<code_entry> code_{};
         std::vector<page_block> page_blocks_{};
+        std::vector<bulk_entry> bulk_table_{};
+        std::vector<cached_bulk> bulk_cache_{};
         std::vector<cached_chunk> chunk_cache_{};
         std::optional<std::pair<uint64_t, std::vector<std::byte>>> state_cache_{};
 
@@ -162,6 +175,7 @@ namespace sogen::ttd
         void read_legacy_layout(uint64_t length);
         std::vector<std::byte> read_bytes(uint64_t offset, uint64_t size);
         const decoded_chunk& chunk(uint32_t index);
+        bulk_block bulk(uint64_t index);
         uint32_t chunk_of(uint64_t number) const;
         std::vector<std::byte> checkpoint_state_at(uint64_t index);
         std::vector<number_range> candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask, uint64_t first_number,
