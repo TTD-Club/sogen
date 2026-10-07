@@ -9,6 +9,7 @@
 #include <string_view>
 
 #include <windows.h>
+#include <intrin.h>
 
 namespace
 {
@@ -34,6 +35,9 @@ int main()
     printf("ttd-value %p\n", const_cast<uint64_t*>(&ttd_value));
     printf("ttd-info %p\n", &ttd_info);
     printf("ttd-code %p\n", code);
+    std::array<int, 4> cpu_info{};
+    __cpuid(cpu_info.data(), 1);
+    printf("ttd-rdrand %d\n", (cpu_info[2] >> 30) & 1);
     fflush(stdout);
 
     ttd_value = 0x2222222222222222;

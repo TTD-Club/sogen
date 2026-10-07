@@ -30,6 +30,7 @@ def main() -> None:
         trace = str(pathlib.Path(directory) / "step.sogttd")
         recording = run("--ttd-record", trace, "--ttd-checkpoint-interval", "100000", *emulator_args, sample)
         address = int(re.search(r"ttd-value ([0-9A-Fa-f]+)", recording).group(1), 16)
+        assert "ttd-rdrand 0" in recording, "TTD recordings must not advertise RDRAND"
 
         def query(access: str, start: int, size: int) -> list[tuple[int, int]]:
             output = run("--ttd-query", trace, "--ttd-access", access, "--ttd-address", hex(start), "--ttd-size", str(size))

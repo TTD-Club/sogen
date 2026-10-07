@@ -42,7 +42,8 @@ prints the resulting instruction pointer. Positions are represented as
 `--ttd-read` prints an eight-byte guest memory value at that position.
 
 Recording and replay force Unicorn, one vCPU, instruction precision, and
-Sogen's relative-time clock. External file/network responses and UI input
+`--reproducible`: Sogen's relative-time clock, and CPUID no longer advertises
+RDRAND (Unicorn serves it from the host's random source outside MSVC builds). External file/network responses and UI input
 must also be identical for deterministic replay; this POC does not capture
 them. Recording is suitable for an isolated, self-contained sample.
 
