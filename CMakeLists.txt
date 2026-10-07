@@ -7,6 +7,7 @@ option(SOGEN_ENABLE_SANITIZER "Enable sanitizer" OFF)
 option(SOGEN_ENABLE_FUZZING "Build the host-side handler fuzzers (libFuzzer); instruments all code with coverage. Pair with SOGEN_ENABLE_SANITIZER=On. Requires clang." OFF)
 option(SOGEN_ENABLE_CLANG_TIDY "Enable clang-tidy checks" OFF)
 option(SOGEN_ENABLE_LTO "Enable interprocedural optimization (LTO/IPO)" ON)
+option(SOGEN_DISABLE_FEX "Disable the optional FEX backend" OFF)
 option(SOGEN_ENABLE_RUST_CODE "Enable code parts written in rust" ON)
 option(SOGEN_ENABLE_REFLECTION "Enable reflection using the reflect library" ON)
 option(SOGEN_ENABLE_SDL3 "Enable SDL3 host UI and audio backends" ON)
@@ -64,7 +65,7 @@ endif()
 # FEX is vendored as a submodule (deps/FEX, pointed at github.com/JackTYM/FEX, a fork with Darwin
 # portability patches) and built in-tree. It requires Clang, an ARM64 host, and a supported POSIX
 # platform. Enabled automatically when those hold and the submodule is checked out.
-if((CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64") AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+if(NOT SOGEN_DISABLE_FEX AND (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64") AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
    AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/FEX/CMakeLists.txt"
    AND CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin|Android)$")
   set(SOGEN_ENABLE_FEX ON)
