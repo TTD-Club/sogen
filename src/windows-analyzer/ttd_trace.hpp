@@ -14,87 +14,21 @@
 #include <windows_emulator.hpp>
 #include <emulator/scoped_hook.hpp>
 
+#include "ttd_chunk.hpp"
+#include "ttd_format.hpp"
+
 namespace sogen::ttd
 {
-    // Version 4 adds the instruction bytes observed immediately before execution; version 5 adds the recorded
-    // access kinds to the header, host writes, and the bytes of every read and write.
-    enum class access_kind : uint64_t
+    struct trace_metadata
     {
-        read = 1,
-        write = 2,
-        execute = 4,
-        host_write = 8,
-    };
-
-    constexpr uint64_t all_access_kinds = 15;
-
-    constexpr const char* access_kind_name(const access_kind kind)
-    {
-        switch (kind)
-        {
-        case access_kind::read:
-            return "read";
-        case access_kind::write:
-            return "write";
-        case access_kind::execute:
-            return "execute";
-        case access_kind::host_write:
-            return "host-write";
-        }
-        return "unknown";
-    }
-
-    struct header
-    {
-        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '5', '\0'};
-        uint64_t snapshot_size{};
         uint64_t instruction_count{};
         uint64_t event_count{};
-        uint64_t checkpoint_count{};
-        uint64_t checkpoint_table_offset{};
-        uint64_t index_offset{};
-        uint64_t index_count{};
-        uint64_t access_mask{};
-        uint64_t data_offset{};
-        uint64_t data_size{};
-    };
-
-    struct checkpoint_entry
-    {
-        uint64_t step{};
-        uint64_t offset{};
-        uint64_t size{};
     };
 
     struct checkpoint_state
     {
         uint64_t step{};
-        std::vector<std::byte> snapshot{};
-    };
-
-    struct access_event
-    {
-        // Emulator instruction counter while the access happens, i.e. the 1-based number of the instruction performing
-        // it. The execute event fires before that instruction runs, but the emulator's counting hook is registered
-        // first, so it carries the same step as the instruction's reads and writes. Seeking to position N yields the
-        // state after instruction N.
-        uint64_t step{};
-        uint64_t ip{};
-        uint64_t address{};
-        uint64_t size{};
-        access_kind kind{};
-        // Execute: the instruction bytes just before execution. Read and writes: the accessed bytes when size <= 16,
-        // otherwise the little-endian offset of those bytes within the data section.
-        std::array<uint8_t, 16> payload{};
-    };
-
-    constexpr size_t inline_data_limit = sizeof(access_event::payload);
-
-    struct index_entry
-    {
-        uint64_t page{};
-        uint64_t event_number{};
-        access_kind kind{};
+        std::vector<std::byte> state{};
     };
 
     struct self_modifying_hit
@@ -108,11 +42,6 @@ namespace sogen::ttd
         uint64_t executions{};
     };
 
-    static_assert(sizeof(header) == 88);
-    static_assert(sizeof(checkpoint_entry) == 24);
-    static_assert(sizeof(access_event) == 56);
-    static_assert(sizeof(index_entry) == 24);
-
     class recorder
     {
       public:
@@ -124,26 +53,32 @@ namespace sogen::ttd
         void finish();
 
       private:
+        static constexpr size_t events_per_chunk = 65536;
+        static constexpr size_t checkpoints_per_keyframe = 16;
+
         windows_emulator& emu_;
         std::filesystem::path path_;
-        std::fstream file_;
-        header header_{};
-        std::filesystem::path checkpoint_path_;
-        std::fstream checkpoint_file_;
+        std::ofstream file_;
+        file_header header_{};
+        std::vector<chunk_entry> chunks_{};
+        std::vector<page_entry> pages_{};
         std::vector<checkpoint_entry> checkpoints_{};
-        std::filesystem::path data_path_;
-        std::fstream data_file_;
+        std::vector<access_event> chunk_events_{};
+        std::vector<std::byte> chunk_blob_{};
+        std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
+        std::vector<std::byte> previous_state_{};
         scoped_hook write_hook_{};
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};
         scoped_hook host_write_hook_{};
-        static constexpr size_t pending_event_limit = 16384;
-        std::vector<access_event> pending_events_{};
+        bool finished_{};
+
         void append_event(access_kind kind, uint64_t address, size_t size);
         void append_data_event(access_kind kind, uint64_t address, std::span<const std::byte> data);
         void push_event(const access_event& event);
-        void flush_events();
-        bool finished_{};
+        void flush_chunk();
+        void write_checkpoint(uint64_t step);
+        uint64_t append_to_file(std::span<const std::byte> bytes);
     };
 
     class trace
@@ -151,29 +86,24 @@ namespace sogen::ttd
       public:
         explicit trace(const std::filesystem::path& path);
 
-        const header& metadata() const
+        const trace_metadata& metadata() const
         {
-            return header_;
+            return metadata_;
         }
 
         std::span<const checkpoint_entry> checkpoints() const
         {
-            return checkpoints_;
+            return std::span(checkpoints_).subspan(1);
         }
 
         bool has_instruction_bytes() const
         {
-            return !legacy_ && !v3_;
+            return this->chunked() || version_ >= 4;
         }
 
         bool has_access_data() const
         {
-            return has_data_;
-        }
-
-        const std::vector<std::byte>& snapshot() const
-        {
-            return snapshot_;
+            return this->chunked();
         }
 
         checkpoint_state checkpoint_for_step(uint64_t step);
@@ -190,23 +120,52 @@ namespace sogen::ttd
         std::optional<uint64_t> latest_write_to_byte(uint64_t page, uint64_t address, uint64_t first_number, uint64_t last_number);
 
       private:
+        struct number_range
+        {
+            uint64_t begin{};
+            uint64_t end{};
+        };
+
+        struct cached_chunk
+        {
+            uint32_t index{};
+            decoded_chunk chunk{};
+        };
+
         std::ifstream file_;
-        header header_{};
-        uint64_t header_size_{sizeof(header)};
-        std::vector<std::byte> snapshot_{};
-        std::vector<checkpoint_entry> checkpoints_{};
-        bool legacy_{};
-        bool v3_{};
-        bool has_data_{};
-        uint64_t event_size_{};
+        trace_metadata metadata_{};
+        uint32_t version_{};
         std::optional<uint64_t> access_mask_{};
+        std::vector<checkpoint_entry> checkpoints_{};
 
-        index_entry index_at(uint64_t position);
-        uint64_t index_lower_bound(uint64_t page, access_kind kind, uint64_t event_number);
+        std::vector<chunk_entry> chunks_{};
+        uint64_t page_index_offset_{};
+        uint64_t page_index_count_{};
+        std::vector<cached_chunk> chunk_cache_{};
+        std::optional<std::pair<uint64_t, std::vector<std::byte>>> state_cache_{};
+
+        uint64_t legacy_event_offset_{};
+        uint64_t legacy_event_size_{};
+        uint64_t legacy_index_offset_{};
+        uint64_t legacy_index_count_{};
+
+        bool chunked() const
+        {
+            return version_ >= 6;
+        }
+
+        void read_chunked_layout(uint64_t length);
+        void read_legacy_layout(uint64_t length);
+        std::vector<std::byte> read_bytes(uint64_t offset, uint64_t size);
+        const decoded_chunk& chunk(uint32_t index);
+        uint32_t chunk_of(uint64_t number) const;
+        std::vector<std::byte> checkpoint_state_at(uint64_t index);
+        std::vector<number_range> candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask, uint64_t first_number,
+                                             uint64_t end_number);
+        std::vector<number_range> chunked_candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask);
+        std::vector<number_range> legacy_candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask, uint64_t first_number,
+                                                    uint64_t end_number);
         uint64_t first_event_at_or_after(uint64_t step);
-
-        template <typename Callback>
-        void for_each_index_group(uint64_t first_page, uint64_t last_page, uint64_t kind_mask, const Callback& callback);
     };
 
     class event_reader

@@ -6,10 +6,12 @@ guest path such as c:/ttd-step-sample.exe when EMULATOR_ARGS selects a root with
 
 import pathlib
 import re
-import struct
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+import ttd_format  # noqa: E402
 
 OLD_VALUE = 0x1111111111111111
 NEW_VALUE = 0x2222222222222222
@@ -61,35 +63,44 @@ def main() -> None:
         assert rip != write_ip
         assert value == NEW_VALUE
 
-        data = pathlib.Path(trace).read_bytes()
-        magic, snapshot_size, instruction_count, event_count, checkpoint_count = struct.unpack_from("<8s4Q", data)
-        assert magic == b"SOGTTD5\0"
+        recorded = ttd_format.Trace(trace)
+        checkpoint_count = len(recorded.checkpoints) - 1
         assert checkpoint_count > 0
-        start = 88 + snapshot_size
 
         # Every position is one executed instruction: no counter values without an execute event.
-        executed = [step for step, _, _, _, kind in struct.iter_unpack("<5Q16x", data[start:start + event_count * 56])
-                    if kind == 4]
-        assert executed == list(range(1, instruction_count + 1))
+        expected_step = 1
+        for index in range(len(recorded.chunks)):
+            steps, kinds = recorded.steps_and_kinds(index)
+            for step, kind in zip(steps, kinds):
+                if kind == ttd_format.EXECUTE:
+                    assert step == expected_step, (step, expected_step)
+                    expected_step += 1
+        assert expected_step == recorded.instruction_count + 1
 
         # Replaying each checkpoint interval from the previous checkpoint must reach exactly the recorded state.
         verified = run("--ttd-replay", trace, "--ttd-verify-checkpoints", *emulator_args, sample)
         assert verified.count(" matches ") == checkpoint_count, verified
 
-        store = next(offset for offset in range(start, start + event_count * 56, 56)
-                     if struct.unpack_from("<5Q", data, offset)[0::2] == (write_step, address, 2))
-        assert data[store + 40:store + 48] == NEW_VALUE.to_bytes(8, "little")
+        store_chunk = next(index for index, (_, _, first, last, _, _) in enumerate(recorded.chunks) if first <= write_step <= last)
+        chunk_events = recorded.chunk_events(store_chunk)
+        store = next(event for event in chunk_events
+                     if (event.step, event.address, event.kind) == (write_step, address, ttd_format.WRITE))
+        assert store.data == NEW_VALUE.to_bytes(8, "little")
 
-        def seek_tampered(field_offset: int, value: bytes, failure: str) -> None:
+        def seek_tampered(field: str, value, failure: str) -> None:
             tampered = pathlib.Path(directory) / "tampered.sogttd"
-            tampered.write_bytes(data[:store + field_offset] + value + data[store + field_offset + len(value):])
+            tampered.write_bytes(pathlib.Path(trace).read_bytes())
+            original = getattr(store, field)
+            setattr(store, field, value)
+            ttd_format.replace_chunk(str(tampered), store_chunk, chunk_events)
+            setattr(store, field, original)
             result = subprocess.run([str(analyzer), "--ttd-replay", str(tampered), "--ttd-seek", hex(write_step), *emulator_args,
                                      sample], text=True, capture_output=True, cwd=analyzer.parent)
             assert result.returncode != 0
             assert failure in result.stdout + result.stderr, result.stdout + result.stderr
 
-        seek_tampered(16, (address + 8).to_bytes(8, "little"), "TTD replay diverged from the recording")
-        seek_tampered(40, (0x3333333333333333).to_bytes(8, "little"), "accessed different data")
+        seek_tampered("address", address + 8, "TTD replay diverged from the recording")
+        seek_tampered("data", (0x3333333333333333).to_bytes(8, "little"), "accessed different data")
 
         history = run("--ttd-history", trace, "--ttd-address", hex(address), "--ttd-size", "8").splitlines()
         assert f"{write_step:x}:0 ip={write_ip:x} kind=write address={address:x} size=8 data=2222222222222222 " \

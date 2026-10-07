@@ -839,8 +839,8 @@ jobs:
       - name: Copy TTD Sample
         run: cp build/release/artifacts/ttd-step-sample.exe build/release/artifacts/root/filesys/c/
 
-      - name: Install Capstone
-        run: python -m pip install "capstone>=5,<6"
+      - name: Install Python Dependencies
+        run: python -m pip install "capstone>=5,<6" zstandard
 
       - name: Trace Format Tests
         run: |

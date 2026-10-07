@@ -1,10 +1,13 @@
-"""Small v4 fixture for instruction bytes and replay-derived taint flow."""
+"""Small v4 and v6 fixtures for instruction bytes and replay-derived taint flow."""
 
 import pathlib
 import struct
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+import ttd_format  # noqa: E402
 
 
 def main():
@@ -56,11 +59,7 @@ def main():
             (4, 0x101b, 0x101b, len(spill), 4, spill),
             (4, 0x101b, 0x4000, 1, 2, b""),
         ]
-        end = 88 + 56 * len(events)
-        with overwritten.open("wb") as file:
-            file.write(struct.pack("<8s10Q", b"SOGTTD5\0", 0, 4, len(events), 0, end, end, 0, 15, end, 0))
-            for step, ip, address, size, kind, code in events:
-                file.write(struct.pack("<5Q16s", step, ip, address, size, kind, code))
+        ttd_format.write_trace(str(overwritten), events, instruction_count=4)
         result = subprocess.run([sys.executable, str(taint_tool), str(overwritten), "--taint", "input:0x2000:1"],
                                 text=True, capture_output=True, check=True)
         assert "memory=3000" in result.stdout

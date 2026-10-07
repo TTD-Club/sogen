@@ -1,15 +1,13 @@
 #include "ttd_trace.hpp"
 #include "snapshot.hpp"
 
-#include <utils/finally.hpp>
+#include <utils/compression.hpp>
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
-#include <limits>
 #include <map>
-#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -21,7 +19,11 @@ namespace sogen::ttd
     namespace
     {
         constexpr uint64_t page_size = 4096;
+        constexpr size_t cached_chunks = 4;
+        constexpr int checkpoint_compression_level = 3;
 
+        // Versions 1-4 stored every event as a fixed-size record, followed by full checkpoint snapshots and a
+        // per-event page index. They remain readable.
         struct v1_header
         {
             char magic[8]{};
@@ -31,8 +33,6 @@ namespace sogen::ttd
             uint64_t index_offset{};
             uint64_t index_count{};
         };
-
-        static_assert(sizeof(v1_header) == 48);
 
         struct v4_header
         {
@@ -46,12 +46,17 @@ namespace sogen::ttd
             uint64_t index_count{};
         };
 
-        static_assert(sizeof(v4_header) == 64);
-
-        struct old_index_entry
+        struct v1_index_entry
         {
             uint64_t page;
             uint64_t event_number;
+        };
+
+        struct v3_index_entry
+        {
+            uint64_t page;
+            uint64_t event_number;
+            access_kind kind;
         };
 
         struct v1_event
@@ -62,9 +67,7 @@ namespace sogen::ttd
             uint64_t size;
         };
 
-        static_assert(sizeof(v1_event) == 32);
-
-        struct v3_access_event
+        struct v3_event
         {
             uint64_t step;
             uint64_t ip;
@@ -73,7 +76,19 @@ namespace sogen::ttd
             access_kind kind;
         };
 
-        static_assert(sizeof(v3_access_event) == 40);
+        struct v4_checkpoint_entry
+        {
+            uint64_t step;
+            uint64_t offset;
+            uint64_t size;
+        };
+
+        static_assert(sizeof(v1_header) == 48);
+        static_assert(sizeof(v4_header) == 64);
+        static_assert(sizeof(v1_event) == 32);
+        static_assert(sizeof(v3_event) == 40);
+        static_assert(sizeof(v3_index_entry) == 24);
+        static_assert(sizeof(v4_checkpoint_entry) == 24);
 
         template <typename T>
         void write_object(std::ostream& stream, const T& object)
@@ -97,39 +112,29 @@ namespace sogen::ttd
             return object;
         }
 
-        constexpr auto writes_required = "TTD replay scans require a trace recorded with write events";
-
-        void append_file(std::fstream& source, std::fstream& target)
+        template <typename T>
+        std::span<const std::byte> bytes_of(const std::vector<T>& values)
         {
-            if (!source.is_open())
-            {
-                return;
-            }
-            source.flush();
-            source.seekg(0);
-            std::vector<char> buffer(1 << 20);
-            while (source.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || source.gcount())
-            {
-                target.write(buffer.data(), source.gcount());
-                if (!target)
-                {
-                    throw std::runtime_error("TTD trace write failed");
-                }
-            }
+            return std::as_bytes(std::span(values));
         }
+
+        constexpr auto writes_required = "TTD replay scans require a trace recorded with write events";
 
         bool overlaps(uint64_t a, uint64_t as, uint64_t b, uint64_t bs)
         {
             return as && bs && a <= b + std::min(bs - 1, UINT64_MAX - b) && b <= a + std::min(as - 1, UINT64_MAX - a);
+        }
+
+        uint64_t last_byte(const uint64_t address, const uint64_t size)
+        {
+            return address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
         }
     }
 
     recorder::recorder(windows_emulator& emu, const std::filesystem::path& path, const uint64_t access_mask)
         : emu_(emu),
           path_(path),
-          file_(path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc),
-          checkpoint_path_(path.string() + ".checkpoints"),
-          data_path_(path.string() + ".data")
+          file_(path, std::ios::binary | std::ios::trunc)
     {
         if (!(access_mask & all_access_kinds))
         {
@@ -139,17 +144,13 @@ namespace sogen::ttd
         {
             throw std::runtime_error("Cannot create TTD trace: " + path.string());
         }
-        // This also makes the initial process/thread state explicit in the snapshot.
-        emu_.setup_process_if_necessary();
-        const auto bytes = snapshot::create_emulator_snapshot(emu_);
-        header_.snapshot_size = bytes.size();
         header_.access_mask = access_mask & all_access_kinds;
         write_object(file_, header_);
-        file_.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        if (!file_)
-        {
-            throw std::runtime_error("Cannot write TTD snapshot");
-        }
+        chunk_events_.reserve(events_per_chunk);
+
+        // This also makes the initial process/thread state explicit in the snapshot.
+        emu_.setup_process_if_necessary();
+        write_checkpoint(emu_.get_executed_instructions());
 
         auto& cpu = emu_.emu();
         if (access_mask & static_cast<uint64_t>(access_kind::write))
@@ -178,6 +179,22 @@ namespace sogen::ttd
                 scoped_hook(cpu, cpu.hook_host_memory_write([this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
                     append_data_event(access_kind::host_write, address, data);
                 }));
+        }
+    }
+
+    recorder::~recorder()
+    {
+        try
+        {
+            finish();
+        }
+        catch (const std::exception& e)
+        {
+            emu_.log.error("TTD trace %s was not finalized: %s\n", path_.string().c_str(), e.what());
+        }
+        catch (...)
+        {
+            emu_.log.error("TTD trace %s was not finalized\n", path_.string().c_str());
         }
     }
 
@@ -216,16 +233,8 @@ namespace sogen::ttd
         }
         else
         {
-            if (!data_file_.is_open())
-            {
-                data_file_.open(data_path_, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
-            }
-            const auto offset = static_cast<uint64_t>(data_file_.tellp());
-            data_file_.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-            if (!data_file_)
-            {
-                throw std::runtime_error("Cannot write TTD access data: " + data_path_.string());
-            }
+            const uint64_t offset = chunk_blob_.size();
+            chunk_blob_.insert(chunk_blob_.end(), data.begin(), data.end());
             memcpy(event.payload.data(), &offset, sizeof(offset));
         }
         push_event(event);
@@ -233,39 +242,68 @@ namespace sogen::ttd
 
     void recorder::push_event(const access_event& event)
     {
-        pending_events_.push_back(event);
+        chunk_events_.push_back(event);
         ++header_.event_count;
-        if (pending_events_.size() == pending_event_limit)
+        const auto last = last_byte(event.address, event.size);
+        for (auto page = event.address / page_size; page <= last / page_size; ++page)
         {
-            flush_events();
+            chunk_pages_[page] |= static_cast<uint32_t>(event.kind);
+        }
+        if (chunk_events_.size() == events_per_chunk)
+        {
+            flush_chunk();
         }
     }
 
-    void recorder::flush_events()
+    void recorder::flush_chunk()
     {
-        file_.write(reinterpret_cast<const char*>(pending_events_.data()),
-                    static_cast<std::streamsize>(pending_events_.size() * sizeof(access_event)));
+        if (chunk_events_.empty())
+        {
+            return;
+        }
+        const auto encoded = encode_chunk(chunk_events_, chunk_blob_);
+        const auto index = static_cast<uint32_t>(chunks_.size());
+        chunks_.push_back({.first_event = header_.event_count - chunk_events_.size(),
+                           .event_count = chunk_events_.size(),
+                           .first_step = chunk_events_.front().step,
+                           .last_step = chunk_events_.back().step,
+                           .offset = append_to_file(encoded),
+                           .size = encoded.size()});
+        for (const auto& [page, kinds] : chunk_pages_)
+        {
+            pages_.push_back({.page = page, .chunk = index, .kinds = kinds});
+        }
+        chunk_events_.clear();
+        chunk_blob_.clear();
+        chunk_pages_.clear();
+    }
+
+    void recorder::write_checkpoint(const uint64_t step)
+    {
+        auto state = snapshot::create_emulator_state(emu_);
+        const auto keyframe = previous_state_.empty() || checkpoints_.size() % checkpoints_per_keyframe == 0;
+        const auto compressed = keyframe ? utils::compression::zstd::compress(state, checkpoint_compression_level)
+                                         : utils::compression::zstd::compress_with_reference(state, previous_state_);
+        if (compressed.empty())
+        {
+            throw std::runtime_error("Cannot compress TTD checkpoint");
+        }
+        checkpoints_.push_back({.step = step,
+                                .offset = append_to_file(compressed),
+                                .size = compressed.size(),
+                                .base = keyframe ? no_base_checkpoint : checkpoints_.size() - 1});
+        previous_state_ = std::move(state);
+    }
+
+    uint64_t recorder::append_to_file(const std::span<const std::byte> bytes)
+    {
+        const auto offset = static_cast<uint64_t>(file_.tellp());
+        file_.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
         if (!file_)
         {
             throw std::runtime_error("TTD trace write failed");
         }
-        pending_events_.clear();
-    }
-
-    recorder::~recorder()
-    {
-        try
-        {
-            finish();
-        }
-        catch (const std::exception& e)
-        {
-            emu_.log.error("TTD trace %s was not finalized: %s\n", path_.string().c_str(), e.what());
-        }
-        catch (...)
-        {
-            emu_.log.error("TTD trace %s was not finalized\n", path_.string().c_str());
-        }
+        return offset;
     }
 
     void recorder::checkpoint()
@@ -275,26 +313,11 @@ namespace sogen::ttd
             throw std::runtime_error("Cannot checkpoint a finished TTD trace");
         }
         const auto step = emu_.get_executed_instructions();
-        if (!step || (!checkpoints_.empty() && step <= checkpoints_.back().step))
+        if (step <= checkpoints_.back().step)
         {
             throw std::runtime_error("TTD checkpoints must have increasing instruction positions");
         }
-        if (!checkpoint_file_.is_open())
-        {
-            checkpoint_file_.open(checkpoint_path_, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
-            if (!checkpoint_file_)
-            {
-                throw std::runtime_error("Cannot create TTD checkpoint file: " + checkpoint_path_.string());
-            }
-        }
-        const auto snapshot = snapshot::create_emulator_snapshot(emu_);
-        const auto offset = static_cast<uint64_t>(checkpoint_file_.tellp());
-        checkpoint_file_.write(reinterpret_cast<const char*>(snapshot.data()), static_cast<std::streamsize>(snapshot.size()));
-        if (!checkpoint_file_)
-        {
-            throw std::runtime_error("Cannot write TTD checkpoint");
-        }
-        checkpoints_.push_back({.step = step, .offset = offset, .size = snapshot.size()});
+        write_checkpoint(step);
     }
 
     void recorder::finish()
@@ -304,186 +327,24 @@ namespace sogen::ttd
             return;
         }
         finished_ = true;
-        const auto remove_sidecar_files = utils::finally([this] {
-            checkpoint_file_.close();
-            data_file_.close();
-            std::error_code error;
-            std::filesystem::remove(checkpoint_path_, error);
-            std::filesystem::remove(data_path_, error);
-        });
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();
         host_write_hook_.remove();
+        flush_chunk();
+        previous_state_ = {};
         header_.instruction_count = emu_.get_executed_instructions();
-        const auto index_less = [](const index_entry& a, const index_entry& b) {
-            if (a.page != b.page)
-            {
-                return a.page < b.page;
-            }
-            if (a.kind != b.kind)
-            {
-                return a.kind < b.kind;
-            }
-            return a.event_number < b.event_number;
+
+        std::ranges::sort(
+            pages_, [](const page_entry& a, const page_entry& b) { return a.page < b.page || (a.page == b.page && a.chunk < b.chunk); });
+        const std::array sections{
+            section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
+            section_entry{
+                .type = section_type::checkpoint_table, .offset = append_to_file(bytes_of(checkpoints_)), .size = checkpoints_.size()},
+            section_entry{.type = section_type::page_index, .offset = append_to_file(bytes_of(pages_)), .size = pages_.size()},
         };
-        constexpr size_t index_chunk_limit = 4'000'000;
-        std::vector<index_entry> index{};
-        index.reserve(index_chunk_limit);
-
-        struct index_runs
-        {
-            std::vector<std::filesystem::path> paths{};
-            std::vector<uint64_t> counts{};
-
-            ~index_runs()
-            {
-                for (const auto& path : paths)
-                {
-                    std::error_code error;
-                    std::filesystem::remove(path, error);
-                }
-            }
-        } runs;
-
-        const auto flush_index_run = [&] {
-            std::sort(index.begin(), index.end(), index_less);
-            const auto path = std::filesystem::path(path_.string() + ".index-run-" + std::to_string(runs.paths.size()));
-            std::ofstream output(path, std::ios::binary | std::ios::trunc);
-            if (!output)
-            {
-                throw std::runtime_error("Cannot create TTD index run: " + path.string());
-            }
-            runs.paths.push_back(path);
-            runs.counts.push_back(index.size());
-            output.write(reinterpret_cast<const char*>(index.data()), static_cast<std::streamsize>(index.size() * sizeof(index_entry)));
-            if (!output)
-            {
-                throw std::runtime_error("Cannot write TTD index run");
-            }
-            index.clear();
-        };
-        uint64_t index_count = 0;
-        flush_events();
-        file_.flush();
-        file_.seekg(static_cast<std::streamoff>(sizeof(header) + header_.snapshot_size));
-        pending_events_.resize(pending_event_limit);
-        for (uint64_t first = 0; first < header_.event_count; first += pending_events_.size())
-        {
-            const auto count = static_cast<size_t>(std::min<uint64_t>(pending_events_.size(), header_.event_count - first));
-            file_.read(reinterpret_cast<char*>(pending_events_.data()), static_cast<std::streamsize>(count * sizeof(access_event)));
-            if (!file_)
-            {
-                throw std::runtime_error("Truncated TTD trace");
-            }
-            for (size_t i = 0; i < count; ++i)
-            {
-                const auto& event = pending_events_[i];
-                const auto last = event.address + std::min<uint64_t>(event.size - 1, UINT64_MAX - event.address);
-                for (auto page = event.address / page_size; page <= last / page_size; ++page)
-                {
-                    index.push_back({page, first + i, event.kind});
-                    ++index_count;
-                    if (index.size() == index_chunk_limit)
-                    {
-                        flush_index_run();
-                    }
-                }
-            }
-        }
-        pending_events_ = {};
-        if (runs.paths.empty())
-        {
-            std::sort(index.begin(), index.end(), index_less);
-        }
-        else if (!index.empty())
-        {
-            flush_index_run();
-        }
-        file_.clear();
-        file_.seekp(0, std::ios::end);
-        header_.data_offset = static_cast<uint64_t>(file_.tellp());
-        append_file(data_file_, file_);
-        header_.data_size = static_cast<uint64_t>(file_.tellp()) - header_.data_offset;
-        const auto checkpoint_base = static_cast<uint64_t>(file_.tellp());
-        append_file(checkpoint_file_, file_);
-        header_.checkpoint_count = checkpoints_.size();
-        header_.checkpoint_table_offset = static_cast<uint64_t>(file_.tellp());
-        for (auto entry : checkpoints_)
-        {
-            entry.offset += checkpoint_base;
-            write_object(file_, entry);
-        }
-        header_.index_offset = static_cast<uint64_t>(file_.tellp());
-        header_.index_count = index_count;
-        if (runs.paths.empty())
-        {
-            for (const auto& entry : index)
-            {
-                write_object(file_, entry);
-            }
-        }
-        else
-        {
-            struct run_reader
-            {
-                std::ifstream file{};
-                uint64_t remaining{};
-                std::array<index_entry, 4096> buffer{};
-                size_t next{};
-                size_t available{};
-
-                std::optional<index_entry> read()
-                {
-                    if (next == available)
-                    {
-                        if (!remaining)
-                        {
-                            return std::nullopt;
-                        }
-                        available = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
-                        file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(available * sizeof(index_entry)));
-                        if (!file)
-                        {
-                            throw std::runtime_error("Truncated TTD index run");
-                        }
-                        remaining -= available;
-                        next = 0;
-                    }
-                    return buffer[next++];
-                }
-            };
-
-            struct merge_item
-            {
-                index_entry entry{};
-                size_t run{};
-            };
-
-            const auto greater = [&](const merge_item& a, const merge_item& b) { return index_less(b.entry, a.entry); };
-            std::priority_queue<merge_item, std::vector<merge_item>, decltype(greater)> queue(greater);
-            std::vector<run_reader> readers(runs.paths.size());
-            for (size_t i = 0; i < readers.size(); ++i)
-            {
-                readers[i].file.open(runs.paths[i], std::ios::binary);
-                if (!readers[i].file)
-                {
-                    throw std::runtime_error("Cannot read TTD index run");
-                }
-                readers[i].remaining = runs.counts[i];
-                queue.push({*readers[i].read(), i});
-            }
-            while (!queue.empty())
-            {
-                const auto item = queue.top();
-                queue.pop();
-                write_object(file_, item.entry);
-                if (const auto next = readers[item.run].read())
-                {
-                    queue.push({*next, item.run});
-                }
-            }
-        }
+        header_.section_count = sections.size();
+        header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
         file_.seekp(0);
         write_object(file_, header_);
         file_.flush();
@@ -500,143 +361,368 @@ namespace sogen::ttd
         {
             throw std::runtime_error("Cannot open TTD trace: " + path.string());
         }
-        char magic[8]{};
-        file_.read(magic, sizeof(magic));
+        std::array<char, 8> magic{};
+        file_.read(magic.data(), magic.size());
         if (!file_)
         {
             throw std::runtime_error("Truncated TTD trace");
         }
-        file_.seekg(0);
-        const auto read_v4_header = [&] {
-            const auto old = read_object<v4_header>(file_);
-            header_size_ = sizeof(v4_header);
-            header_.snapshot_size = old.snapshot_size;
-            header_.instruction_count = old.instruction_count;
-            header_.event_count = old.event_count;
-            header_.checkpoint_count = old.checkpoint_count;
-            header_.checkpoint_table_offset = old.checkpoint_table_offset;
-            header_.index_offset = old.index_offset;
-            header_.index_count = old.index_count;
-        };
-        const header expected{};
-        if (!memcmp(magic, "SOGTTD1\0", sizeof(magic)))
-        {
-            legacy_ = true;
-            const auto old = read_object<v1_header>(file_);
-            header_size_ = sizeof(v1_header);
-            header_.snapshot_size = old.snapshot_size;
-            header_.instruction_count = old.instruction_count;
-            header_.event_count = old.write_count;
-            header_.checkpoint_table_offset = old.index_offset;
-            header_.index_offset = old.index_offset;
-            header_.index_count = old.index_count;
-            access_mask_ = static_cast<uint64_t>(access_kind::write);
-        }
-        else if (!memcmp(magic, "SOGTTD2\0", sizeof(magic)))
-        {
-            legacy_ = true;
-            read_v4_header();
-            access_mask_ = static_cast<uint64_t>(access_kind::write);
-        }
-        else if (!memcmp(magic, "SOGTTD3\0", sizeof(magic)))
-        {
-            v3_ = true;
-            read_v4_header();
-        }
-        else if (!memcmp(magic, "SOGTTD4\0", sizeof(magic)))
-        {
-            read_v4_header();
-        }
-        else if (!memcmp(magic, expected.magic, sizeof(magic)))
-        {
-            header_ = read_object<header>(file_);
-            if (!header_.access_mask || (header_.access_mask & ~all_access_kinds))
-            {
-                throw std::runtime_error("Invalid TTD trace access mask");
-            }
-            access_mask_ = header_.access_mask;
-            has_data_ = true;
-        }
-        else
+        const std::string_view name(magic.data(), magic.size());
+        if (name.substr(0, 6) != "SOGTTD" || magic[7] != '\0' || magic[6] < '1' || magic[6] > '9')
         {
             throw std::runtime_error("Unsupported TTD trace format");
         }
-        if (!header_.index_offset)
+        version_ = static_cast<uint32_t>(magic[6] - '0');
+        if (version_ == 5 || version_ > 6)
+        {
+            throw std::runtime_error("Unsupported TTD trace format");
+        }
+        file_.seekg(0, std::ios::end);
+        const auto length = static_cast<uint64_t>(file_.tellg());
+        file_.seekg(0);
+        if (this->chunked())
+        {
+            read_chunked_layout(length);
+        }
+        else
+        {
+            read_legacy_layout(length);
+        }
+    }
+
+    void trace::read_chunked_layout(const uint64_t length)
+    {
+        const auto header = read_object<file_header>(file_);
+        if (!header.section_table_offset)
         {
             throw std::runtime_error("TTD trace was not finalized; the recording was interrupted");
         }
-        event_size_ = legacy_ ? sizeof(v1_event) : v3_ ? sizeof(v3_access_event) : sizeof(access_event);
-        file_.seekg(0, std::ios::end);
-        const auto length = static_cast<uint64_t>(file_.tellg());
-        if (length < header_size_ || header_.snapshot_size > length - header_size_)
+        if (!header.access_mask || (header.access_mask & ~all_access_kinds))
         {
-            throw std::runtime_error("Invalid TTD trace snapshot size");
+            throw std::runtime_error("Invalid TTD trace access mask");
         }
-        const auto event_start = header_size_ + header_.snapshot_size;
-        if (header_.event_count > (UINT64_MAX - event_start) / event_size_ ||
-            header_.checkpoint_table_offset < event_start + header_.event_count * event_size_ ||
-            header_.checkpoint_table_offset > header_.index_offset ||
-            header_.checkpoint_count > (header_.index_offset - header_.checkpoint_table_offset) / sizeof(checkpoint_entry) ||
-            header_.index_offset > length ||
-            header_.index_count > (length - header_.index_offset) / (legacy_ ? sizeof(old_index_entry) : sizeof(index_entry)) ||
-            (has_data_ && (header_.data_offset < event_start + header_.event_count * event_size_ ||
-                           header_.data_offset > header_.checkpoint_table_offset ||
-                           header_.data_size > header_.checkpoint_table_offset - header_.data_offset)))
+        metadata_ = {.instruction_count = header.instruction_count, .event_count = header.event_count};
+        access_mask_ = header.access_mask;
+
+        const auto fits = [&](const uint64_t offset, const uint64_t count, const uint64_t size) {
+            return offset <= length && count <= (length - offset) / size;
+        };
+        if (header.section_count > 64 || !fits(header.section_table_offset, header.section_count, sizeof(section_entry)))
         {
             throw std::runtime_error("Invalid TTD trace offsets");
         }
-        snapshot_.resize(static_cast<size_t>(header_.snapshot_size));
-        file_.seekg(static_cast<std::streamoff>(header_size_));
-        file_.read(reinterpret_cast<char*>(snapshot_.data()), static_cast<std::streamsize>(snapshot_.size()));
-        if (!file_)
+        file_.seekg(static_cast<std::streamoff>(header.section_table_offset));
+        std::vector<section_entry> sections(static_cast<size_t>(header.section_count));
+        for (auto& section : sections)
         {
-            throw std::runtime_error("Truncated TTD snapshot");
+            section = read_object<section_entry>(file_);
         }
-        file_.seekg(static_cast<std::streamoff>(header_.checkpoint_table_offset));
-        uint64_t previous_step{};
-        for (uint64_t i = 0; i < header_.checkpoint_count; ++i)
+        for (const auto& section : sections)
         {
-            const auto entry = read_object<checkpoint_entry>(file_);
-            if (!entry.step || entry.step <= previous_step || entry.step > header_.instruction_count ||
-                entry.offset < event_start + header_.event_count * event_size_ || entry.offset > header_.checkpoint_table_offset ||
-                entry.size > header_.checkpoint_table_offset - entry.offset)
+            if (section.type == section_type::chunk_table)
+            {
+                if (!fits(section.offset, section.size, sizeof(chunk_entry)))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                file_.seekg(static_cast<std::streamoff>(section.offset));
+                chunks_.resize(static_cast<size_t>(section.size));
+                for (auto& chunk : chunks_)
+                {
+                    chunk = read_object<chunk_entry>(file_);
+                }
+            }
+            else if (section.type == section_type::checkpoint_table)
+            {
+                if (!fits(section.offset, section.size, sizeof(checkpoint_entry)))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                file_.seekg(static_cast<std::streamoff>(section.offset));
+                checkpoints_.resize(static_cast<size_t>(section.size));
+                for (auto& checkpoint : checkpoints_)
+                {
+                    checkpoint = read_object<checkpoint_entry>(file_);
+                }
+            }
+            else if (section.type == section_type::page_index)
+            {
+                if (!fits(section.offset, section.size, sizeof(page_entry)))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                page_index_offset_ = section.offset;
+                page_index_count_ = section.size;
+            }
+        }
+
+        uint64_t next_event = 0;
+        uint64_t previous_step = 0;
+        for (const auto& chunk : chunks_)
+        {
+            if (chunk.first_event != next_event || !chunk.event_count || chunk.first_step > chunk.last_step ||
+                chunk.first_step < previous_step || !fits(chunk.offset, chunk.size, 1))
+            {
+                throw std::runtime_error("Invalid TTD event chunk entry");
+            }
+            next_event += chunk.event_count;
+            previous_step = chunk.last_step;
+        }
+        if (next_event != metadata_.event_count)
+        {
+            throw std::runtime_error("Invalid TTD event chunk entry");
+        }
+        if (checkpoints_.empty() || checkpoints_.front().step != 0)
+        {
+            throw std::runtime_error("TTD trace has no initial state");
+        }
+        for (size_t i = 0; i < checkpoints_.size(); ++i)
+        {
+            const auto& checkpoint = checkpoints_[i];
+            if ((i && checkpoint.step <= checkpoints_[i - 1].step) || checkpoint.step > metadata_.instruction_count ||
+                !fits(checkpoint.offset, checkpoint.size, 1) || (checkpoint.base != no_base_checkpoint && checkpoint.base >= i))
             {
                 throw std::runtime_error("Invalid TTD checkpoint entry");
             }
-            checkpoints_.push_back(entry);
-            previous_step = entry.step;
         }
     }
 
-    index_entry trace::index_at(const uint64_t position)
+    void trace::read_legacy_layout(const uint64_t length)
     {
-        file_.clear();
-        const auto entry_size = legacy_ ? sizeof(old_index_entry) : sizeof(index_entry);
-        file_.seekg(static_cast<std::streamoff>(header_.index_offset + position * entry_size));
-        auto entry = legacy_ ? [&] {
-            const auto old = read_object<old_index_entry>(file_);
-            return index_entry{.page = old.page, .event_number = old.event_number, .kind = access_kind::write};
-        }()
-                             : read_object<index_entry>(file_);
-        if (entry.event_number >= header_.event_count)
+        uint64_t snapshot_size{};
+        uint64_t checkpoint_count{};
+        uint64_t checkpoint_table_offset{};
+        uint64_t header_size{};
+        if (version_ == 1)
         {
-            throw std::runtime_error("Invalid TTD index entry");
+            const auto header = read_object<v1_header>(file_);
+            header_size = sizeof(v1_header);
+            snapshot_size = header.snapshot_size;
+            metadata_ = {.instruction_count = header.instruction_count, .event_count = header.write_count};
+            checkpoint_table_offset = header.index_offset;
+            legacy_index_offset_ = header.index_offset;
+            legacy_index_count_ = header.index_count;
         }
-        return entry;
+        else
+        {
+            const auto header = read_object<v4_header>(file_);
+            header_size = sizeof(v4_header);
+            snapshot_size = header.snapshot_size;
+            metadata_ = {.instruction_count = header.instruction_count, .event_count = header.event_count};
+            checkpoint_count = header.checkpoint_count;
+            checkpoint_table_offset = header.checkpoint_table_offset;
+            legacy_index_offset_ = header.index_offset;
+            legacy_index_count_ = header.index_count;
+        }
+        if (!legacy_index_offset_)
+        {
+            throw std::runtime_error("TTD trace was not finalized; the recording was interrupted");
+        }
+        if (version_ <= 2)
+        {
+            access_mask_ = static_cast<uint64_t>(access_kind::write);
+        }
+        legacy_event_size_ = version_ <= 2 ? sizeof(v1_event) : version_ == 3 ? sizeof(v3_event) : sizeof(access_event);
+        legacy_event_offset_ = header_size + snapshot_size;
+        const auto index_entry_size = version_ <= 2 ? sizeof(v1_index_entry) : sizeof(v3_index_entry);
+        if (length < header_size || snapshot_size > length - header_size)
+        {
+            throw std::runtime_error("Invalid TTD trace snapshot size");
+        }
+        const auto event_end = legacy_event_offset_ + metadata_.event_count * legacy_event_size_;
+        if (metadata_.event_count > (UINT64_MAX - legacy_event_offset_) / legacy_event_size_ || checkpoint_table_offset < event_end ||
+            checkpoint_table_offset > legacy_index_offset_ ||
+            checkpoint_count > (legacy_index_offset_ - checkpoint_table_offset) / sizeof(v4_checkpoint_entry) ||
+            legacy_index_offset_ > length || legacy_index_count_ > (length - legacy_index_offset_) / index_entry_size)
+        {
+            throw std::runtime_error("Invalid TTD trace offsets");
+        }
+
+        checkpoints_.push_back({.step = 0, .offset = header_size, .size = snapshot_size});
+        file_.seekg(static_cast<std::streamoff>(checkpoint_table_offset));
+        for (uint64_t i = 0; i < checkpoint_count; ++i)
+        {
+            const auto entry = read_object<v4_checkpoint_entry>(file_);
+            if (!entry.step || entry.step <= checkpoints_.back().step || entry.step > metadata_.instruction_count ||
+                entry.offset < event_end || entry.offset > checkpoint_table_offset || entry.size > checkpoint_table_offset - entry.offset)
+            {
+                throw std::runtime_error("Invalid TTD checkpoint entry");
+            }
+            checkpoints_.push_back({.step = entry.step, .offset = entry.offset, .size = entry.size});
+        }
     }
 
-    uint64_t trace::index_lower_bound(const uint64_t page, const access_kind kind, const uint64_t event_number)
+    std::vector<std::byte> trace::read_bytes(const uint64_t offset, const uint64_t size)
     {
-        const auto less_than_key = [&](const index_entry& entry) {
-            return entry.page < page ||
-                   (entry.page == page && (entry.kind < kind || (entry.kind == kind && entry.event_number < event_number)));
-        };
+        std::vector<std::byte> bytes(static_cast<size_t>(size));
+        file_.clear();
+        file_.seekg(static_cast<std::streamoff>(offset));
+        file_.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!file_)
+        {
+            throw std::runtime_error("Truncated TTD trace");
+        }
+        return bytes;
+    }
+
+    const decoded_chunk& trace::chunk(const uint32_t index)
+    {
+        const auto cached = std::ranges::find(chunk_cache_, index, &cached_chunk::index);
+        if (cached != chunk_cache_.end())
+        {
+            std::rotate(cached, cached + 1, chunk_cache_.end());
+            return chunk_cache_.back().chunk;
+        }
+        const auto& entry = chunks_.at(index);
+        auto decoded = decode_chunk(read_bytes(entry.offset, entry.size), index);
+        if (decoded.events.size() != entry.event_count)
+        {
+            throw std::runtime_error("Invalid TTD event chunk");
+        }
+        if (chunk_cache_.size() == cached_chunks)
+        {
+            chunk_cache_.erase(chunk_cache_.begin());
+        }
+        chunk_cache_.push_back({.index = index, .chunk = std::move(decoded)});
+        return chunk_cache_.back().chunk;
+    }
+
+    uint32_t trace::chunk_of(const uint64_t number) const
+    {
+        const auto next = std::ranges::upper_bound(chunks_, number, {}, &chunk_entry::first_event);
+        return static_cast<uint32_t>(next - chunks_.begin() - 1);
+    }
+
+    std::vector<std::byte> trace::checkpoint_state_at(const uint64_t index)
+    {
+        if (!this->chunked())
+        {
+            const auto& entry = checkpoints_.at(static_cast<size_t>(index));
+            return snapshot::get_emulator_state(read_bytes(entry.offset, entry.size));
+        }
+
+        std::vector<uint64_t> chain{index};
+        while (checkpoints_.at(static_cast<size_t>(chain.back())).base != no_base_checkpoint &&
+               (!state_cache_ || state_cache_->first != chain.back()))
+        {
+            chain.push_back(checkpoints_.at(static_cast<size_t>(chain.back())).base);
+        }
+        std::vector<std::byte> state{};
+        if (state_cache_ && state_cache_->first == chain.back())
+        {
+            state = state_cache_->second;
+            chain.pop_back();
+        }
+        while (!chain.empty())
+        {
+            const auto& entry = checkpoints_.at(static_cast<size_t>(chain.back()));
+            const auto compressed = read_bytes(entry.offset, entry.size);
+            state = entry.base == no_base_checkpoint ? utils::compression::zstd::decompress(compressed)
+                                                     : utils::compression::zstd::decompress_with_reference(compressed, state);
+            if (state.empty())
+            {
+                throw std::runtime_error("Cannot decompress TTD checkpoint");
+            }
+            chain.pop_back();
+        }
+        state_cache_ = std::make_pair(index, state);
+        return state;
+    }
+
+    checkpoint_state trace::checkpoint_for_step(const uint64_t step)
+    {
+        if (step > metadata_.instruction_count)
+        {
+            throw std::out_of_range("TTD position is beyond end of trace");
+        }
+        const auto next = std::ranges::upper_bound(checkpoints_, step, {}, &checkpoint_entry::step);
+        const auto index = static_cast<uint64_t>(next - checkpoints_.begin() - 1);
+        return {.step = checkpoints_[static_cast<size_t>(index)].step, .state = checkpoint_state_at(index)};
+    }
+
+    access_event trace::event_at(const uint64_t number)
+    {
+        if (number >= metadata_.event_count)
+        {
+            throw std::out_of_range("TTD event is beyond end of trace");
+        }
+        if (this->chunked())
+        {
+            const auto index = chunk_of(number);
+            return chunk(index).events.at(static_cast<size_t>(number - chunks_[index].first_event));
+        }
+        access_event event{};
+        read_events(number, std::span(&event, 1));
+        return event;
+    }
+
+    size_t trace::read_events(const uint64_t first_number, const std::span<access_event> output)
+    {
+        if (first_number >= metadata_.event_count || output.empty())
+        {
+            return 0;
+        }
+        const auto count = static_cast<size_t>(std::min<uint64_t>(output.size(), metadata_.event_count - first_number));
+        if (this->chunked())
+        {
+            size_t copied = 0;
+            while (copied < count)
+            {
+                const auto number = first_number + copied;
+                const auto index = chunk_of(number);
+                const auto& events = chunk(index).events;
+                const auto start = static_cast<size_t>(number - chunks_[index].first_event);
+                const auto available = std::min(count - copied, events.size() - start);
+                std::copy_n(events.begin() + static_cast<ptrdiff_t>(start), available, output.begin() + static_cast<ptrdiff_t>(copied));
+                copied += available;
+            }
+            return count;
+        }
+
+        const auto raw = read_bytes(legacy_event_offset_ + first_number * legacy_event_size_, count * legacy_event_size_);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const auto* entry = raw.data() + i * legacy_event_size_;
+            if (version_ <= 2)
+            {
+                v1_event old{};
+                memcpy(&old, entry, sizeof(old));
+                output[i] = {.step = old.step, .ip = old.ip, .address = old.address, .size = old.size, .kind = access_kind::write};
+            }
+            else if (version_ == 3)
+            {
+                v3_event old{};
+                memcpy(&old, entry, sizeof(old));
+                output[i] = {.step = old.step, .ip = old.ip, .address = old.address, .size = old.size, .kind = old.kind};
+            }
+            else
+            {
+                memcpy(&output[i], entry, sizeof(access_event));
+            }
+        }
+        return count;
+    }
+
+    uint64_t trace::first_event_after(const uint64_t step)
+    {
+        if (this->chunked())
+        {
+            const auto first = std::ranges::partition_point(chunks_, [&](const chunk_entry& entry) { return entry.last_step <= step; });
+            if (first == chunks_.end())
+            {
+                return metadata_.event_count;
+            }
+            const auto index = static_cast<uint32_t>(first - chunks_.begin());
+            const auto& events = chunk(index).events;
+            const auto after = std::ranges::upper_bound(events, step, {}, &access_event::step);
+            return chunks_[index].first_event + static_cast<uint64_t>(after - events.begin());
+        }
         uint64_t low = 0;
-        uint64_t high = header_.index_count;
+        uint64_t high = metadata_.event_count;
         while (low < high)
         {
             const auto middle = low + (high - low) / 2;
-            if (less_than_key(index_at(middle)))
+            if (event_at(middle).step <= step)
             {
                 low = middle + 1;
             }
@@ -651,138 +737,6 @@ namespace sogen::ttd
     uint64_t trace::first_event_at_or_after(const uint64_t step)
     {
         return step ? first_event_after(step - 1) : 0;
-    }
-
-    template <typename Callback>
-    void trace::for_each_index_group(const uint64_t first_page, const uint64_t last_page, const uint64_t kind_mask,
-                                     const Callback& callback)
-    {
-        auto position = index_lower_bound(first_page, access_kind::read, 0);
-        while (position < header_.index_count)
-        {
-            const auto entry = index_at(position);
-            if (entry.page > last_page)
-            {
-                break;
-            }
-            const auto group_end = index_lower_bound(entry.page, entry.kind, UINT64_MAX);
-            if (kind_mask & static_cast<uint64_t>(entry.kind))
-            {
-                callback(entry.page, entry.kind, position, group_end);
-            }
-            position = group_end;
-        }
-    }
-
-    checkpoint_state trace::checkpoint_for_step(uint64_t step)
-    {
-        if (step > header_.instruction_count)
-        {
-            throw std::out_of_range("TTD position is beyond end of trace");
-        }
-        auto it = std::upper_bound(checkpoints_.begin(), checkpoints_.end(), step,
-                                   [](uint64_t value, const checkpoint_entry& entry) { return value < entry.step; });
-        if (it == checkpoints_.begin())
-        {
-            return {0, snapshot_};
-        }
-        --it;
-        checkpoint_state state{it->step, {}};
-        state.snapshot.resize(static_cast<size_t>(it->size));
-        file_.seekg(static_cast<std::streamoff>(it->offset));
-        file_.read(reinterpret_cast<char*>(state.snapshot.data()), static_cast<std::streamsize>(state.snapshot.size()));
-        if (!file_)
-        {
-            throw std::runtime_error("Truncated TTD checkpoint");
-        }
-        return state;
-    }
-
-    access_event trace::event_at(const uint64_t number)
-    {
-        if (number >= header_.event_count)
-        {
-            throw std::out_of_range("TTD event is beyond end of trace");
-        }
-        file_.clear();
-        const auto offset = static_cast<std::streamoff>(header_size_ + header_.snapshot_size + number * event_size_);
-        if (file_.tellg() != offset)
-        {
-            file_.seekg(offset);
-        }
-        if (legacy_)
-        {
-            const auto old = read_object<v1_event>(file_);
-            return {old.step, old.ip, old.address, old.size, access_kind::write};
-        }
-        if (v3_)
-        {
-            const auto old = read_object<v3_access_event>(file_);
-            return {old.step, old.ip, old.address, old.size, old.kind};
-        }
-        return read_object<access_event>(file_);
-    }
-
-    size_t trace::read_events(const uint64_t first_number, const std::span<access_event> output)
-    {
-        if (first_number >= header_.event_count || output.empty())
-        {
-            return 0;
-        }
-        const auto count = static_cast<size_t>(std::min<uint64_t>(output.size(), header_.event_count - first_number));
-        file_.clear();
-        file_.seekg(static_cast<std::streamoff>(header_size_ + header_.snapshot_size + first_number * event_size_));
-        if (!legacy_ && !v3_)
-        {
-            file_.read(reinterpret_cast<char*>(output.data()), static_cast<std::streamsize>(count * sizeof(access_event)));
-            if (!file_)
-            {
-                throw std::runtime_error("Truncated TTD trace");
-            }
-            return count;
-        }
-        std::vector<std::byte> raw(count * event_size_);
-        file_.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
-        if (!file_)
-        {
-            throw std::runtime_error("Truncated TTD trace");
-        }
-        for (size_t i = 0; i < count; ++i)
-        {
-            const auto* entry = raw.data() + i * event_size_;
-            if (legacy_)
-            {
-                v1_event old{};
-                memcpy(&old, entry, sizeof(old));
-                output[i] = {.step = old.step, .ip = old.ip, .address = old.address, .size = old.size, .kind = access_kind::write};
-            }
-            else
-            {
-                v3_access_event old{};
-                memcpy(&old, entry, sizeof(old));
-                output[i] = {.step = old.step, .ip = old.ip, .address = old.address, .size = old.size, .kind = old.kind};
-            }
-        }
-        return count;
-    }
-
-    uint64_t trace::first_event_after(const uint64_t step)
-    {
-        uint64_t low = 0;
-        uint64_t high = header_.event_count;
-        while (low < high)
-        {
-            const auto middle = low + (high - low) / 2;
-            if (event_at(middle).step <= step)
-            {
-                low = middle + 1;
-            }
-            else
-            {
-                high = middle;
-            }
-        }
-        return low;
     }
 
     uint64_t trace::access_mask()
@@ -807,30 +761,284 @@ namespace sogen::ttd
 
     std::vector<std::byte> trace::access_data(const access_event& event)
     {
-        if (!has_data_ || event.kind == access_kind::execute)
+        if (!this->has_access_data() || event.kind == access_kind::execute)
         {
             return {};
         }
-        std::vector<std::byte> data(static_cast<size_t>(event.size));
         if (event.size <= inline_data_limit)
         {
-            memcpy(data.data(), event.payload.data(), data.size());
-            return data;
+            const auto bytes = std::as_bytes(std::span(event.payload)).first(static_cast<size_t>(event.size));
+            return {bytes.begin(), bytes.end()};
         }
         uint64_t offset{};
+        uint64_t index{};
         memcpy(&offset, event.payload.data(), sizeof(offset));
-        if (offset > header_.data_size || event.size > header_.data_size - offset)
+        memcpy(&index, event.payload.data() + sizeof(offset), sizeof(index));
+        if (index >= chunks_.size())
         {
-            throw std::runtime_error("Invalid TTD access data offset");
+            throw std::runtime_error("Invalid TTD access data reference");
         }
-        file_.clear();
-        file_.seekg(static_cast<std::streamoff>(header_.data_offset + offset));
-        file_.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
-        if (!file_)
+        const auto& blob = chunk(static_cast<uint32_t>(index)).blob;
+        const auto begin = blob.begin() + static_cast<ptrdiff_t>(offset);
+        return {begin, begin + static_cast<ptrdiff_t>(event.size)};
+    }
+
+    std::vector<trace::number_range> trace::candidates(const uint64_t first_page, const uint64_t last_page, const uint64_t kind_mask,
+                                                       const uint64_t first_number, const uint64_t end_number)
+    {
+        if (first_number >= end_number)
         {
-            throw std::runtime_error("Truncated TTD access data");
+            return {};
         }
-        return data;
+        if (!this->chunked())
+        {
+            return legacy_candidates(first_page, last_page, kind_mask, first_number, end_number);
+        }
+        std::vector<number_range> ranges{};
+        for (const auto& range : chunked_candidates(first_page, last_page, kind_mask))
+        {
+            const auto begin = std::max(range.begin, first_number);
+            const auto end = std::min(range.end, end_number);
+            if (begin < end)
+            {
+                ranges.push_back({.begin = begin, .end = end});
+            }
+        }
+        return ranges;
+    }
+
+    std::vector<trace::number_range> trace::chunked_candidates(const uint64_t first_page, const uint64_t last_page,
+                                                               const uint64_t kind_mask)
+    {
+        const auto entry_at = [&](const uint64_t position) {
+            file_.clear();
+            file_.seekg(static_cast<std::streamoff>(page_index_offset_ + position * sizeof(page_entry)));
+            return read_object<page_entry>(file_);
+        };
+        uint64_t low = 0;
+        uint64_t high = page_index_count_;
+        while (low < high)
+        {
+            const auto middle = low + (high - low) / 2;
+            if (entry_at(middle).page < first_page)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        std::vector<uint32_t> matches{};
+        constexpr uint64_t batch = 4096;
+        std::vector<page_entry> entries{};
+        for (auto position = low; position < page_index_count_;)
+        {
+            entries.resize(static_cast<size_t>(std::min(batch, page_index_count_ - position)));
+            file_.clear();
+            file_.seekg(static_cast<std::streamoff>(page_index_offset_ + position * sizeof(page_entry)));
+            file_.read(reinterpret_cast<char*>(entries.data()), static_cast<std::streamsize>(entries.size() * sizeof(page_entry)));
+            if (!file_)
+            {
+                throw std::runtime_error("Truncated TTD page index");
+            }
+            position += entries.size();
+            const auto past = std::ranges::find_if(entries, [&](const page_entry& entry) { return entry.page > last_page; });
+            for (auto it = entries.begin(); it != past; ++it)
+            {
+                if (it->kinds & kind_mask)
+                {
+                    if (it->chunk >= chunks_.size())
+                    {
+                        throw std::runtime_error("Invalid TTD page index entry");
+                    }
+                    matches.push_back(it->chunk);
+                }
+            }
+            if (past != entries.end())
+            {
+                break;
+            }
+        }
+        std::ranges::sort(matches);
+        const auto duplicates = std::ranges::unique(matches);
+        matches.erase(duplicates.begin(), duplicates.end());
+
+        std::vector<number_range> ranges{};
+        ranges.reserve(matches.size());
+        for (const auto index : matches)
+        {
+            ranges.push_back({.begin = chunks_[index].first_event, .end = chunks_[index].first_event + chunks_[index].event_count});
+        }
+        return ranges;
+    }
+
+    std::vector<trace::number_range> trace::legacy_candidates(const uint64_t first_page, const uint64_t last_page, const uint64_t kind_mask,
+                                                              const uint64_t first_number, const uint64_t end_number)
+    {
+        const auto entry_size = version_ <= 2 ? sizeof(v1_index_entry) : sizeof(v3_index_entry);
+        const auto entry_at = [&](const uint64_t position) {
+            file_.clear();
+            file_.seekg(static_cast<std::streamoff>(legacy_index_offset_ + position * entry_size));
+            auto entry = version_ <= 2 ? [&] {
+                const auto old = read_object<v1_index_entry>(file_);
+                return v3_index_entry{.page = old.page, .event_number = old.event_number, .kind = access_kind::write};
+            }()
+                                       : read_object<v3_index_entry>(file_);
+            if (entry.event_number >= metadata_.event_count)
+            {
+                throw std::runtime_error("Invalid TTD index entry");
+            }
+            return entry;
+        };
+        const auto lower_bound = [&](const uint64_t page, const access_kind kind, const uint64_t number) {
+            uint64_t low = 0;
+            uint64_t high = legacy_index_count_;
+            while (low < high)
+            {
+                const auto middle = low + (high - low) / 2;
+                const auto entry = entry_at(middle);
+                if (entry.page < page || (entry.page == page && (entry.kind < kind || (entry.kind == kind && entry.event_number < number))))
+                {
+                    low = middle + 1;
+                }
+                else
+                {
+                    high = middle;
+                }
+            }
+            return low;
+        };
+
+        std::vector<uint64_t> numbers{};
+        auto position = lower_bound(first_page, access_kind::read, 0);
+        while (position < legacy_index_count_)
+        {
+            const auto entry = entry_at(position);
+            if (entry.page > last_page)
+            {
+                break;
+            }
+            const auto group_end = lower_bound(entry.page, entry.kind, UINT64_MAX);
+            if (kind_mask & static_cast<uint64_t>(entry.kind))
+            {
+                const auto end = lower_bound(entry.page, entry.kind, end_number);
+                for (auto member = lower_bound(entry.page, entry.kind, first_number); member < end; ++member)
+                {
+                    numbers.push_back(entry_at(member).event_number);
+                }
+            }
+            position = group_end;
+        }
+        std::ranges::sort(numbers);
+        const auto duplicates = std::ranges::unique(numbers);
+        numbers.erase(duplicates.begin(), duplicates.end());
+
+        std::vector<number_range> ranges{};
+        for (const auto number : numbers)
+        {
+            if (!ranges.empty() && ranges.back().end == number)
+            {
+                ++ranges.back().end;
+            }
+            else
+            {
+                ranges.push_back({.begin = number, .end = number + 1});
+            }
+        }
+        return ranges;
+    }
+
+    std::optional<uint64_t> trace::latest_write_to_byte(const uint64_t page, const uint64_t address, const uint64_t first_number,
+                                                        const uint64_t last_number)
+    {
+        if (first_number > last_number)
+        {
+            return std::nullopt;
+        }
+        const auto end_number = last_number == UINT64_MAX ? metadata_.event_count : last_number + 1;
+        const auto ranges = candidates(page, page, static_cast<uint64_t>(access_kind::write), first_number, end_number);
+        for (auto range = ranges.rbegin(); range != ranges.rend(); ++range)
+        {
+            for (auto number = range->end; number-- > range->begin;)
+            {
+                const auto event = event_at(number);
+                if (event.kind == access_kind::write && event.address <= address && address - event.address < event.size)
+                {
+                    return number;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::vector<access_event> trace::accesses(uint64_t address, uint64_t size, uint64_t first_step, uint64_t last_step, uint64_t kind_mask)
+    {
+        std::vector<access_event> result{};
+        if (!size || first_step > last_step)
+        {
+            return result;
+        }
+        const auto first_number = first_event_at_or_after(first_step);
+        const auto end_number = last_step == UINT64_MAX ? metadata_.event_count : first_event_after(last_step);
+        const auto last = last_byte(address, size);
+        for (const auto& range : candidates(address / page_size, last / page_size, kind_mask, first_number, end_number))
+        {
+            for (auto number = range.begin; number < range.end; ++number)
+            {
+                const auto event = event_at(number);
+                if ((kind_mask & static_cast<uint64_t>(event.kind)) && overlaps(event.address, event.size, address, size))
+                {
+                    result.push_back(event);
+                }
+            }
+        }
+        return result;
+    }
+
+    std::optional<access_event> trace::next_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask)
+    {
+        if (!size || step == UINT64_MAX)
+        {
+            return std::nullopt;
+        }
+        const auto last = last_byte(address, size);
+        for (const auto& range :
+             candidates(address / page_size, last / page_size, kind_mask, first_event_after(step), metadata_.event_count))
+        {
+            for (auto number = range.begin; number < range.end; ++number)
+            {
+                const auto event = event_at(number);
+                if ((kind_mask & static_cast<uint64_t>(event.kind)) && overlaps(event.address, event.size, address, size))
+                {
+                    return event;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<access_event> trace::previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask)
+    {
+        if (!size || !step)
+        {
+            return std::nullopt;
+        }
+        const auto last = last_byte(address, size);
+        const auto ranges = candidates(address / page_size, last / page_size, kind_mask, 0, first_event_after(step - 1));
+        for (auto range = ranges.rbegin(); range != ranges.rend(); ++range)
+        {
+            for (auto number = range->end; number-- > range->begin;)
+            {
+                const auto event = event_at(number);
+                if ((kind_mask & static_cast<uint64_t>(event.kind)) && overlaps(event.address, event.size, address, size))
+                {
+                    return event;
+                }
+            }
+        }
+        return std::nullopt;
     }
 
     event_reader::event_reader(trace& recorded, const uint64_t first_number)
@@ -979,122 +1187,6 @@ namespace sogen::ttd
         }
     }
 
-    std::optional<uint64_t> trace::latest_write_to_byte(const uint64_t page, const uint64_t address, const uint64_t first_number,
-                                                        const uint64_t last_number)
-    {
-        if (first_number > last_number || !header_.index_count)
-        {
-            return std::nullopt;
-        }
-        const auto first = index_lower_bound(page, access_kind::write, first_number);
-        auto end = index_lower_bound(page, access_kind::write, last_number == UINT64_MAX ? UINT64_MAX : last_number + 1);
-        while (end > first)
-        {
-            const auto entry = index_at(--end);
-            const auto event = event_at(entry.event_number);
-            if (event.kind == access_kind::write && event.address <= address && address - event.address < event.size)
-            {
-                return entry.event_number;
-            }
-        }
-        return std::nullopt;
-    }
-
-    std::vector<access_event> trace::accesses(uint64_t address, uint64_t size, uint64_t first_step, uint64_t last_step, uint64_t kind_mask)
-    {
-        std::vector<access_event> result{};
-        if (!size || first_step > last_step)
-        {
-            return result;
-        }
-        const auto last = address + std::min(size - 1, UINT64_MAX - address);
-        const auto first_number = first_event_at_or_after(first_step);
-        const auto end_number = last_step == UINT64_MAX ? header_.event_count : first_event_after(last_step);
-        std::vector<uint64_t> numbers{};
-        for_each_index_group(address / page_size, last / page_size, kind_mask,
-                             [&](const uint64_t page, const access_kind kind, const uint64_t, const uint64_t) {
-                                 const auto end = index_lower_bound(page, kind, end_number);
-                                 for (auto position = index_lower_bound(page, kind, first_number); position < end; ++position)
-                                 {
-                                     numbers.push_back(index_at(position).event_number);
-                                 }
-                             });
-        std::ranges::sort(numbers);
-        const auto duplicates = std::ranges::unique(numbers);
-        numbers.erase(duplicates.begin(), duplicates.end());
-        for (const auto number : numbers)
-        {
-            const auto event = event_at(number);
-            if ((kind_mask & static_cast<uint64_t>(event.kind)) && overlaps(event.address, event.size, address, size))
-            {
-                result.push_back(event);
-            }
-        }
-        return result;
-    }
-
-    std::optional<access_event> trace::next_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask)
-    {
-        if (!size || step == UINT64_MAX)
-        {
-            return std::nullopt;
-        }
-        const auto last = address + std::min(size - 1, UINT64_MAX - address);
-        const auto first_number = first_event_after(step);
-        std::optional<access_event> best{};
-        uint64_t best_number = UINT64_MAX;
-        for_each_index_group(address / page_size, last / page_size, kind_mask,
-                             [&](const uint64_t page, const access_kind kind, const uint64_t, const uint64_t group_end) {
-                                 for (auto position = index_lower_bound(page, kind, first_number); position < group_end; ++position)
-                                 {
-                                     const auto number = index_at(position).event_number;
-                                     if (number >= best_number)
-                                     {
-                                         return;
-                                     }
-                                     const auto event = event_at(number);
-                                     if (overlaps(event.address, event.size, address, size))
-                                     {
-                                         best = event;
-                                         best_number = number;
-                                         return;
-                                     }
-                                 }
-                             });
-        return best;
-    }
-
-    std::optional<access_event> trace::previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask)
-    {
-        if (!size || !step)
-        {
-            return std::nullopt;
-        }
-        const auto last = address + std::min(size - 1, UINT64_MAX - address);
-        const auto end_number = first_event_after(step - 1);
-        std::optional<access_event> best{};
-        std::optional<uint64_t> best_number{};
-        for_each_index_group(address / page_size, last / page_size, kind_mask,
-                             [&](const uint64_t page, const access_kind kind, const uint64_t group_begin, const uint64_t) {
-                                 for (auto position = index_lower_bound(page, kind, end_number); position > group_begin;)
-                                 {
-                                     const auto number = index_at(--position).event_number;
-                                     if (best_number && number <= *best_number)
-                                     {
-                                         return;
-                                     }
-                                     const auto event = event_at(number);
-                                     if (overlaps(event.address, event.size, address, size))
-                                     {
-                                         best = event;
-                                         best_number = number;
-                                         return;
-                                     }
-                                 }
-                             });
-        return best;
-    }
-
     std::vector<self_modifying_hit> trace::self_modifying_code()
     {
         using written_bytes = std::array<uint64_t, page_size / 64>;
@@ -1121,7 +1213,7 @@ namespace sogen::ttd
             {
                 continue;
             }
-            const auto last = event->address + std::min<uint64_t>(event->size - 1, UINT64_MAX - event->address);
+            const auto last = last_byte(event->address, event->size);
             for (uint64_t address = event->address;; ++address)
             {
                 if (event->kind == access_kind::write)
@@ -1178,7 +1270,7 @@ namespace sogen::ttd
             {
                 return;
             }
-            const auto last = address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
+            const auto last = last_byte(address, size);
             const auto first_page = address / page_size;
             const auto last_page = last / page_size;
             for (auto it = writers_.begin(); it != writers_.end();)
@@ -1223,7 +1315,7 @@ namespace sogen::ttd
                     emu_.stop();
                     return;
                 }
-                const auto last = address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
+                const auto last = last_byte(address, size);
                 for (uint64_t byte = address; byte <= last; ++byte)
                 {
                     auto [it, inserted] = writers_.try_emplace(byte / page_size);
@@ -1246,7 +1338,7 @@ namespace sogen::ttd
             {
                 return;
             }
-            const auto last = address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
+            const auto last = last_byte(address, size);
             for (uint64_t byte = address; byte <= last; ++byte)
             {
                 const auto page = writers_.find(byte / page_size);
