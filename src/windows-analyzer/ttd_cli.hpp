@@ -39,6 +39,7 @@ namespace sogen::ttd
         size_t min_string_length{6};
 
         std::filesystem::path query{};
+        std::filesystem::path history{};
         std::filesystem::path selfmod{};
         std::filesystem::path first_selfmod{};
         std::string access{"write"};

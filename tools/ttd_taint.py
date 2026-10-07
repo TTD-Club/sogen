@@ -15,7 +15,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
 HEADER = struct.Struct("<8s7Q")
-HEADER_SIZES = {b"SOGTTD4\0": HEADER.size, b"SOGTTD5\0": HEADER.size + 8}
+HEADER_SIZES = {b"SOGTTD4\0": HEADER.size, b"SOGTTD5\0": HEADER.size + 24}
 EVENT = struct.Struct("<5Q16s")
 HOST_WRITE = 8
 GPRS = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp")

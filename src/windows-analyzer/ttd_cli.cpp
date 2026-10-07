@@ -36,6 +36,22 @@ namespace sogen::ttd
             return all_access_kinds;
         }
 
+        std::string to_hex(const std::span<const std::byte> bytes, const size_t limit = SIZE_MAX)
+        {
+            constexpr std::string_view digits = "0123456789abcdef";
+            std::string text{};
+            for (const auto byte : bytes.first(std::min(bytes.size(), limit)))
+            {
+                text += digits[static_cast<uint8_t>(byte) >> 4];
+                text += digits[static_cast<uint8_t>(byte) & 0xf];
+            }
+            if (bytes.size() > limit)
+            {
+                text += "...";
+            }
+            return text;
+        }
+
         uint64_t recorded_kinds(const cli_options& options)
         {
             const auto writes = static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::host_write);
@@ -125,15 +141,60 @@ namespace sogen::ttd
                        static_cast<unsigned long long>(event.ip), static_cast<unsigned long long>(event.address),
                        static_cast<unsigned long long>(event.size), print_kind ? " kind=" : "",
                        print_kind ? access_kind_name(event.kind) : "");
-                if (recorded.has_instruction_bytes() && event.kind == access_kind::execute && event.size <= 15)
+                if (recorded.has_instruction_bytes() && event.kind == access_kind::execute && event.size < inline_data_limit)
                 {
-                    printf(" bytes=");
-                    for (size_t i = 0; i < event.size; ++i)
-                    {
-                        printf("%02x", event.instruction_bytes.at(i));
-                    }
+                    printf(" bytes=%s", to_hex(std::as_bytes(std::span(event.payload)).first(static_cast<size_t>(event.size))).c_str());
+                }
+                if (recorded.has_access_data() && event.kind != access_kind::execute)
+                {
+                    printf(" data=%s", to_hex(recorded.access_data(event), 32).c_str());
                 }
                 printf("\n");
+            }
+            return 0;
+        }
+
+        int run_history(const cli_options& options)
+        {
+            constexpr uint64_t maximum_size = 256;
+            trace recorded(options.history);
+            if (!recorded.has_access_data())
+            {
+                throw std::runtime_error("TTD memory history needs a trace that records access data (format v5)");
+            }
+            const auto address = options.address.value_or(0);
+            const auto size = options.size.value_or(8);
+            if (!size || size > maximum_size)
+            {
+                throw std::runtime_error("TTD memory history size must be 1-256 bytes");
+            }
+            const auto kinds = static_cast<uint64_t>(access_kind::read) | static_cast<uint64_t>(access_kind::write) |
+                               static_cast<uint64_t>(access_kind::host_write);
+            std::vector<std::optional<std::byte>> value(static_cast<size_t>(size));
+            for (const auto& event : recorded.accesses(address, size, 0, options.to, kinds))
+            {
+                const auto data = recorded.access_data(event);
+                for (size_t i = 0; i < data.size(); ++i)
+                {
+                    const auto byte_address = event.address + i;
+                    if (byte_address >= address && byte_address - address < size)
+                    {
+                        value[static_cast<size_t>(byte_address - address)] = data[i];
+                    }
+                }
+                if (event.step < options.from)
+                {
+                    continue;
+                }
+                std::string current{};
+                for (const auto& byte : value)
+                {
+                    current += byte ? to_hex(std::span(&*byte, 1)) : "??";
+                }
+                printf("%llx:0 ip=%llx kind=%s address=%llx size=%llu data=%s value=%s\n", static_cast<unsigned long long>(event.step),
+                       static_cast<unsigned long long>(event.ip), access_kind_name(event.kind),
+                       static_cast<unsigned long long>(event.address), static_cast<unsigned long long>(event.size),
+                       to_hex(data, 32).c_str(), current.c_str());
             }
             return 0;
         }
@@ -273,7 +334,16 @@ namespace sogen::ttd
                 snapshot::load_emulator_snapshot(win_emu, origin.snapshot);
                 replay_verifier verifier(win_emu, recorded, origin.step);
                 win_emu.start(static_cast<size_t>(target.step - origin.step));
-                verifier.finish();
+                try
+                {
+                    verifier.finish();
+                }
+                catch (const std::runtime_error& e)
+                {
+                    ++mismatches;
+                    printf("TTD checkpoint %llx:0 not reached: %s\n", static_cast<unsigned long long>(target.step), e.what());
+                    continue;
+                }
                 if (win_emu.get_executed_instructions() != target.step)
                 {
                     std::ostringstream message;
@@ -398,6 +468,8 @@ namespace sogen::ttd
         app.add_option("--ttd-min-string-length", options.min_string_length, "Minimum recovered string length")->capture_default_str();
 
         app.add_option("--ttd-query", options.query, "Query memory accesses in a TTD trace");
+        app.add_option("--ttd-history", options.history,
+                       "List every read and write of --ttd-address/--ttd-size in a TTD trace with the range's value after each");
         app.add_option("--ttd-selfmod", options.selfmod, "Find executed bytes written earlier in a TTD trace");
         app.add_option("--ttd-first-selfmod", options.first_selfmod,
                        "Find first written-then-executed instruction anywhere, or in an optional address range");
@@ -492,6 +564,10 @@ namespace sogen::ttd
         if (!options.query.empty())
         {
             return run_query(options);
+        }
+        if (!options.history.empty())
+        {
+            return run_history(options);
         }
         return std::nullopt;
     }

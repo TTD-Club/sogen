@@ -122,7 +122,7 @@ namespace sogen::unicorn
 
         struct host_write_hook : hook_object
         {
-            memory_write_metadata_callback callback{};
+            memory_access_data_callback callback{};
         };
 
         struct mmio_callbacks
@@ -419,17 +419,17 @@ namespace sogen::unicorn
                 {
                     return false;
                 }
-                this->notify_host_write(address, size);
+                this->notify_host_write(address, data, size);
                 return true;
             }
 
             void write_memory(const uint64_t address, const void* data, const size_t size) override
             {
                 uce(uc_mem_write(*this, address, data, size));
-                this->notify_host_write(address, size);
+                this->notify_host_write(address, data, size);
             }
 
-            emulator_hook* hook_host_memory_write(memory_write_metadata_callback callback) override
+            emulator_hook* hook_host_memory_write(memory_access_data_callback callback) override
             {
                 auto hook = std::make_unique<host_write_hook>();
                 hook->callback = std::move(callback);
@@ -652,23 +652,39 @@ namespace sogen::unicorn
                 return container->as_opaque_hook();
             }
 
-            emulator_hook* hook_memory_read_metadata(const uint64_t address, const uint64_t size,
-                                                     memory_write_metadata_callback callback) override
+            emulator_hook* hook_memory_data(const uc_hook_type hook_type, const memory_operation operation, const uint64_t address,
+                                            const uint64_t size, memory_access_data_callback callback)
             {
-                auto read_wrapper = [c = std::move(callback), this](uc_engine*, const uc_mem_type type, const uint64_t addr,
-                                                                    const int length, const uint64_t) {
-                    if (map_memory_operation(type) == memory_operation::read && length > 0)
+                auto data_wrapper = [c = std::move(callback), operation, this](uc_engine*, const uc_mem_type type, const uint64_t addr,
+                                                                               const int length, const int64_t value) {
+                    if (map_memory_operation(type) != operation || length <= 0)
                     {
-                        c(*this, addr, static_cast<size_t>(length));
+                        return;
                     }
+                    if (static_cast<size_t>(length) > sizeof(value))
+                    {
+                        throw std::runtime_error("Unicorn reported a memory access wider than its value");
+                    }
+                    c(*this, addr, std::span(reinterpret_cast<const std::byte*>(&value), static_cast<size_t>(length)));
                 };
-                function_wrapper<void, uc_engine*, uc_mem_type, uint64_t, int, int64_t> wrapper(std::move(read_wrapper));
+                function_wrapper<void, uc_engine*, uc_mem_type, uint64_t, int, int64_t> wrapper(std::move(data_wrapper));
                 unicorn_hook hook{*this};
-                uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_MEM_READ_AFTER, wrapper.get_function(), wrapper.get_user_data(),
-                                address, calc_end_address(address, size)));
+                uce(uc_hook_add(*this, hook.make_reference(), hook_type, wrapper.get_function(), wrapper.get_user_data(), address,
+                                calc_end_address(address, size)));
                 auto* container = this->create_hook_container();
                 container->add(std::move(wrapper), std::move(hook));
                 return container->as_opaque_hook();
+            }
+
+            emulator_hook* hook_memory_read_data(const uint64_t address, const uint64_t size, memory_access_data_callback callback) override
+            {
+                return this->hook_memory_data(UC_HOOK_MEM_READ_AFTER, memory_operation::read, address, size, std::move(callback));
+            }
+
+            emulator_hook* hook_memory_write_data(const uint64_t address, const uint64_t size,
+                                                  memory_access_data_callback callback) override
+            {
+                return this->hook_memory_data(UC_HOOK_MEM_WRITE, memory_operation::write, address, size, std::move(callback));
             }
 
             emulator_hook* hook_memory_execution_metadata(memory_execution_metadata_callback callback) override
@@ -708,25 +724,6 @@ namespace sogen::unicorn
                 return container->as_opaque_hook();
             }
 
-            emulator_hook* hook_memory_write_metadata(const uint64_t address, const uint64_t size,
-                                                      memory_write_metadata_callback callback) override
-            {
-                auto write_wrapper = [c = std::move(callback), this](uc_engine*, const uc_mem_type type, const uint64_t addr,
-                                                                     const int length, const uint64_t) {
-                    if (map_memory_operation(type) == memory_operation::write && length > 0)
-                    {
-                        c(*this, addr, static_cast<size_t>(length));
-                    }
-                };
-                function_wrapper<void, uc_engine*, uc_mem_type, uint64_t, int, int64_t> wrapper(std::move(write_wrapper));
-                unicorn_hook hook{*this};
-                uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_MEM_WRITE, wrapper.get_function(), wrapper.get_user_data(), address,
-                                calc_end_address(address, size)));
-                auto* container = this->create_hook_container();
-                container->add(std::move(wrapper), std::move(hook));
-                return container->as_opaque_hook();
-            }
-
             hook_container* create_hook_container()
             {
                 auto container = std::make_unique<hook_container>();
@@ -735,15 +732,16 @@ namespace sogen::unicorn
                 return ptr;
             }
 
-            void notify_host_write(const uint64_t address, const size_t size)
+            void notify_host_write(const uint64_t address, const void* data, const size_t size)
             {
                 if (!size)
                 {
                     return;
                 }
+                const std::span bytes(static_cast<const std::byte*>(data), size);
                 for (auto* hook : this->host_write_hooks_)
                 {
-                    hook->callback(*this, address, size);
+                    hook->callback(*this, address, bytes);
                 }
             }
 

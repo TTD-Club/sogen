@@ -188,29 +188,31 @@ namespace sogen::ttd
                 }
             }
         });
-        write_hook_ = scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-            if (error_ || !size)
-            {
-                return;
-            }
-            const auto expected = expected_writes_.next(static_cast<uint64_t>(access_kind::write));
-            if (!expected)
-            {
-                error_ = "TTD buffer scan produced an unrecorded write";
-                emu_.stop();
-                return;
-            }
-            const auto step = emu_.get_executed_instructions();
-            const auto ip = emu_.emu().read_instruction_pointer();
-            if (expected->step != step || expected->ip != ip || expected->address != address || expected->size != size)
-            {
-                error_ = "TTD buffer scan replay diverged at write event " + std::to_string(expected_writes_.last_number());
-                emu_.stop();
-                return;
-            }
-            pending_.push_back({address, size, step, ip});
-            ++verified_writes_;
-        }));
+        write_hook_ = scoped_hook(
+            cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+                const auto size = data.size();
+                if (error_ || !size)
+                {
+                    return;
+                }
+                const auto expected = expected_writes_.next(static_cast<uint64_t>(access_kind::write));
+                if (!expected)
+                {
+                    error_ = "TTD buffer scan produced an unrecorded write";
+                    emu_.stop();
+                    return;
+                }
+                const auto step = emu_.get_executed_instructions();
+                const auto ip = emu_.emu().read_instruction_pointer();
+                if (expected->step != step || expected->ip != ip || expected->address != address || expected->size != size)
+                {
+                    error_ = "TTD buffer scan replay diverged at write event " + std::to_string(expected_writes_.last_number());
+                    emu_.stop();
+                    return;
+                }
+                pending_.push_back({address, size, step, ip});
+                ++verified_writes_;
+            }));
         execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
             flush_pending();
             if (!size)

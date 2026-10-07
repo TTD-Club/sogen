@@ -31,11 +31,10 @@ python3 tools/ttd_taint.py sample.sogttd --taint input:0x140002000:35 --register
 The application and root for replay must match the recording. `--ttd-seek N`
 restores the nearest checkpoint at or before `N` and executes the remaining
 instructions. While it does, every access of a recorded kind is compared with
-the trace (kind, step, instruction pointer, address, size, and instruction
-bytes for executes); a mismatch, or a recorded event at or before `N` that
-never occurs, fails the seek with the first differing event. Only event
-metadata is compared, not written values, so a replay that writes different
-data to the same places still verifies. Running
+the trace (kind, step, instruction pointer, address, size, instruction bytes
+for executes, and the bytes read or written for v5 traces); a mismatch, or a
+recorded event at or before `N` that never occurs, fails the seek with the
+first differing event. Running
 the same command with `N-1` implements reverse instruction step. The CLI
 prints the resulting instruction pointer. Positions are represented as
 `N:0`, corresponding to Binary Ninja's `(sequence, step)` pair.
@@ -57,11 +56,15 @@ A guest failure before the limit can also leave a finalized trace.
 written values: for every checkpoint it restores the previous checkpoint (or
 the initial snapshot), replays the interval with event verification, and
 compares the complete serialized emulator state with the recorded checkpoint,
-printing `matches` or the first differing state offset. All checkpoints of
-`ttd-step-sample` match. A 40M-instruction write-only recording of
-`test-sample` matched in 74 of 78 intervals; the other four differed in a few
-guest bytes last written from live inputs (DNS lookups over ALPC, socket
-`NtDeviceIoControlFile` results, and values derived from them).
+printing `matches`, the first differing state offset, or the event at which
+the interval's replay diverged, and continues with the next interval. All
+checkpoints of `ttd-step-sample` match. A complete recording of `test-sample`
+(30,147,174 instructions, 60 checkpoints) matched in 57 intervals; the other
+three diverge at host writes carrying live network input (two DNS answers
+delivered over ALPC and one socket `NtDeviceIoControlFile` result). Value
+verification also exposed emulator writes that copied uninitialized host
+stack bytes (struct padding) into the guest, for `TokenBnoIsolation` and for
+window-message callback arguments; those are fixed.
 
 `--ttd-access` accepts `read`, `write` (the default), `host-write`, `execute`,
 or `all`. The directional query flags also use that access filter.
@@ -70,8 +73,8 @@ Host writes are guest-memory writes made by Sogen itself rather than by a guest
 instruction: syscall output buffers, loader and section mappings, exception and
 APC frames. They are recorded whenever write tracing is on, with the step and
 RIP at the time of the write (for a syscall, the instruction after `syscall`),
-and `write` queries list them with `kind=host-write`. Only their range is
-recorded, not their bytes. Writes through host-mapped guest memory and MMIO
+and `write` queries list them with `kind=host-write`, including the written
+bytes. Writes through host-mapped guest memory and MMIO
 regions are not reported. The self-modifying-code analyses consider guest
 writes only, so code mapped by the loader is not reported as written code.
 
@@ -193,22 +196,35 @@ taint flow may be incomplete.
 
 ## Format v5
 
-All fields are little-endian. The 72-byte header is `SOGTTD5\0` plus eight
+All fields are little-endian. The 88-byte header is `SOGTTD5\0` plus ten
 `uint64_t` values: initial snapshot size, instruction count, access-event count,
-checkpoint count, checkpoint-table offset, index offset, index count, and the
-recorded access kinds (a nonzero mask of the kind values below). Version 4 is
-identical except for its 64-byte `SOGTTD4\0` header without the mask; readers
-infer a v3/v4 trace's kinds by scanning its events. An index offset of zero
-marks a recording that was never finalized.
-The header is followed by the initial Sogen `SNAP` snapshot, 56-byte access events
-(`step, ip, address, size, kind, instruction_bytes[16]`), checkpoint snapshots, 24-byte checkpoint
-table entries (`step, offset, size`), and 24-byte index entries
-(`page, event_number, kind`). Kind is 1 for read, 2 for write, 4 for
-execute, and 8 for a host write (v5 only). Execute events contain the instruction bytes as they existed just
-before execution, using `size` bytes up to the x86 maximum of 15. Other
-events have zeroed instruction-byte fields. Versions 1 and 2 remain readable
-as write-only traces; version 3 remains readable without instruction bytes;
-version 4 remains readable.
+checkpoint count, checkpoint-table offset, index offset, index count, the
+recorded access kinds (a nonzero mask of the kind values below), and the data
+section's offset and size. Version 4 has a 64-byte `SOGTTD4\0` header with
+only the first seven values and no data section; readers infer a v3/v4 trace's
+kinds by scanning its events. An index offset of zero marks a recording that
+was never finalized.
+The header is followed by the initial Sogen `SNAP` snapshot, 56-byte access
+events (`step, ip, address, size, kind, payload[16]`), the data section,
+checkpoint snapshots, 24-byte checkpoint table entries (`step, offset, size`),
+and 24-byte index entries (`page, event_number, kind`). Kind is 1 for read, 2
+for write, 4 for execute, and 8 for a host write (v5 only). An execute
+event's payload holds the instruction bytes as they existed just before
+execution (`size` bytes, up to the x86 maximum of 15). A v5 read, write, or
+host write's payload holds the bytes read or written when `size` is at most
+16; for larger accesses (only host writes; guest accesses are at most 8 bytes)
+it holds the 64-bit offset of the bytes within the data section. Versions 1
+and 2 remain readable as write-only traces; version 3 remains readable without
+instruction bytes; version 4 remains readable without access data.
+
+Because every written and read value is recorded, a range's value history is
+available offline: `--ttd-history TRACE --ttd-address A --ttd-size N`
+(up to 256 bytes, optional `--ttd-from`/`--ttd-to`) lists each read and write
+of the range with the bytes accessed and the range's value after the event,
+shown as `??` for bytes not yet written or read since recording began.
+`--ttd-query` prints the same bytes as `data=`. Seeks and every other replay
+verify these bytes too, so a replay that reads or writes different values
+fails at the first such access.
 On the UPX-packed test PE, a v4 query at the unpacked entry
 `0x140001000` returned `bytes=55` (`push rbp`) at position `0x244b89`;
 the self-modifying-code pass linked it to the UPX stub write at position
@@ -239,18 +255,16 @@ seeking to `N-1` reports RIP at the writing instruction.
 `test/ttd_step_test.py` checks this on a recording of
 `src/samples/ttd-step-sample`.
 
-The counter can advance without an instruction completing. When a thread's
-time slice ends (every `0x20000` of its instructions), Sogen's counting hook
-stops the CPU, which skips the recorder's hook and the instruction itself; the
-instruction is counted again when the thread resumes. A faulting instruction
-also has an execute event without completing. Such positions are still
-deterministic for seek, but `instruction_count` is not the number of execute
-events. A recording of `ttd-step-sample` had 3,660,773 instructions and 27
-positions without an execute event (`0x20000`, `0x40096`, `0x60096`, ...);
-seeking to `0x1ffff` and `0x20000` reported the same RIP, so the state does
-not change at such a position. The header's access-event count covers
-all kinds, not only writes (the C++ field was renamed from `write_count` to
-`event_count`; the layout is unchanged).
+Positions are contiguous: every position from 1 to `instruction_count` has
+exactly one execute event (when execute tracing is on), which
+`ttd_step_test.py` checks. The counter only counts instructions that start
+executing. A thread preempted at the end of its time slice is stopped before
+the instruction runs and that instruction is counted when the thread resumes,
+and idle time under the relative clock advances a separate idle counter that
+the clock adds in, not the instruction counter. A faulting instruction still
+has its execute event and position even though it does not complete. A full
+`test-sample` recording has 30,147,174 positions and as many execute events.
+The header's access-event count covers all kinds, not only writes.
 
 ## Larger-program check
 

@@ -61,33 +61,47 @@ def main() -> None:
         assert rip != write_ip
         assert value == NEW_VALUE
 
-        data = bytearray(pathlib.Path(trace).read_bytes())
-        magic, snapshot_size, _, event_count, checkpoint_count = struct.unpack_from("<8s4Q", data)
+        data = pathlib.Path(trace).read_bytes()
+        magic, snapshot_size, instruction_count, event_count, checkpoint_count = struct.unpack_from("<8s4Q", data)
         assert magic == b"SOGTTD5\0"
         assert checkpoint_count > 0
+        start = 88 + snapshot_size
+
+        # Every position is one executed instruction: no counter values without an execute event.
+        executed = [step for step, _, _, _, kind in struct.iter_unpack("<5Q16x", data[start:start + event_count * 56])
+                    if kind == 4]
+        assert executed == list(range(1, instruction_count + 1))
 
         # Replaying each checkpoint interval from the previous checkpoint must reach exactly the recorded state.
         verified = run("--ttd-replay", trace, "--ttd-verify-checkpoints", *emulator_args, sample)
         assert verified.count(" matches ") == checkpoint_count, verified
-        start = 72 + snapshot_size
-        for offset in range(start, start + event_count * 56, 56):
-            step, _, event_address, _, kind = struct.unpack_from("<5Q", data, offset)
-            if step == write_step and kind == 2 and event_address == address:
-                struct.pack_into("<Q", data, offset + 16, address + 8)
-                break
-        else:
-            raise AssertionError("recorded store not found in the event stream")
-        tampered = pathlib.Path(directory) / "tampered.sogttd"
-        tampered.write_bytes(data)
-        result = subprocess.run([str(analyzer), "--ttd-replay", str(tampered), "--ttd-seek", hex(write_step), *emulator_args,
-                                 sample], text=True, capture_output=True, cwd=analyzer.parent)
-        assert result.returncode != 0
-        assert "TTD replay diverged from the recording" in result.stdout + result.stderr
+
+        store = next(offset for offset in range(start, start + event_count * 56, 56)
+                     if struct.unpack_from("<5Q", data, offset)[0::2] == (write_step, address, 2))
+        assert data[store + 40:store + 48] == NEW_VALUE.to_bytes(8, "little")
+
+        def seek_tampered(field_offset: int, value: bytes, failure: str) -> None:
+            tampered = pathlib.Path(directory) / "tampered.sogttd"
+            tampered.write_bytes(data[:store + field_offset] + value + data[store + field_offset + len(value):])
+            result = subprocess.run([str(analyzer), "--ttd-replay", str(tampered), "--ttd-seek", hex(write_step), *emulator_args,
+                                     sample], text=True, capture_output=True, cwd=analyzer.parent)
+            assert result.returncode != 0
+            assert failure in result.stdout + result.stderr, result.stdout + result.stderr
+
+        seek_tampered(16, (address + 8).to_bytes(8, "little"), "TTD replay diverged from the recording")
+        seek_tampered(40, (0x3333333333333333).to_bytes(8, "little"), "accessed different data")
+
+        history = run("--ttd-history", trace, "--ttd-address", hex(address), "--ttd-size", "8").splitlines()
+        assert f"{write_step:x}:0 ip={write_ip:x} kind=write address={address:x} size=8 data=2222222222222222 " \
+               f"value=2222222222222222" in history, history
+        assert any(line.startswith(f"{read_step:x}:0 ip={read_ip:x} kind=read") and line.endswith("value=2222222222222222")
+                   for line in history), history
 
         # VirtualQuery's output is written by the emulated NtQueryVirtualMemory, not by a guest store.
         info = int(re.search(r"ttd-info ([0-9A-Fa-f]+)", recording).group(1), 16)
         output = run("--ttd-query", trace, "--ttd-address", hex(info), "--ttd-size", "48")
-        host_writes = re.findall(r"^([0-9a-f]+):0 ip=[0-9a-f]+ address=[0-9a-f]+ size=\d+ kind=host-write$", output, re.M)
+        host_writes = re.findall(r"^([0-9a-f]+):0 ip=[0-9a-f]+ address=[0-9a-f]+ size=\d+ kind=host-write data=[0-9a-f.]+$",
+                                 output, re.M)
         assert host_writes, output
         host_step = int(host_writes[0], 16)
         assert host_step > read_step

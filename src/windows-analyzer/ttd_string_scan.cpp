@@ -27,12 +27,13 @@ namespace sogen::ttd
             throw std::invalid_argument("Invalid TTD minimum string length");
         }
         auto& cpu = emu_.emu();
-        write_hook_ = scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-            if (size)
-            {
-                pending_.emplace_back(address, size);
-            }
-        }));
+        write_hook_ = scoped_hook(
+            cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+                if (!data.empty())
+                {
+                    pending_.emplace_back(address, data.size());
+                }
+            }));
         execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t, size_t) { flush_pending(); }));
     }
 

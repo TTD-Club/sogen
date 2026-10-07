@@ -99,6 +99,25 @@ namespace sogen::ttd
 
         constexpr auto writes_required = "TTD replay scans require a trace recorded with write events";
 
+        void append_file(std::fstream& source, std::fstream& target)
+        {
+            if (!source.is_open())
+            {
+                return;
+            }
+            source.flush();
+            source.seekg(0);
+            std::vector<char> buffer(1 << 20);
+            while (source.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || source.gcount())
+            {
+                target.write(buffer.data(), source.gcount());
+                if (!target)
+                {
+                    throw std::runtime_error("TTD trace write failed");
+                }
+            }
+        }
+
         bool overlaps(uint64_t a, uint64_t as, uint64_t b, uint64_t bs)
         {
             return as && bs && a <= b + std::min(bs - 1, UINT64_MAX - b) && b <= a + std::min(as - 1, UINT64_MAX - a);
@@ -109,7 +128,8 @@ namespace sogen::ttd
         : emu_(emu),
           path_(path),
           file_(path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc),
-          checkpoint_path_(path.string() + ".checkpoints")
+          checkpoint_path_(path.string() + ".checkpoints"),
+          data_path_(path.string() + ".data")
     {
         if (!(access_mask & all_access_kinds))
         {
@@ -134,16 +154,16 @@ namespace sogen::ttd
         auto& cpu = emu_.emu();
         if (access_mask & static_cast<uint64_t>(access_kind::write))
         {
-            write_hook_ =
-                scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-                    append_event(access_kind::write, address, size);
+            write_hook_ = scoped_hook(
+                cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+                    append_data_event(access_kind::write, address, data);
                 }));
         }
         if (access_mask & static_cast<uint64_t>(access_kind::read))
         {
-            read_hook_ =
-                scoped_hook(cpu, cpu.hook_memory_read_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-                    append_event(access_kind::read, address, size);
+            read_hook_ = scoped_hook(
+                cpu, cpu.hook_memory_read_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+                    append_data_event(access_kind::read, address, data);
                 }));
         }
         if (access_mask & static_cast<uint64_t>(access_kind::execute))
@@ -154,9 +174,10 @@ namespace sogen::ttd
         }
         if (access_mask & static_cast<uint64_t>(access_kind::host_write))
         {
-            host_write_hook_ = scoped_hook(cpu, cpu.hook_host_memory_write([this](cpu_interface&, uint64_t address, size_t size) {
-                append_event(access_kind::host_write, address, size);
-            }));
+            host_write_hook_ =
+                scoped_hook(cpu, cpu.hook_host_memory_write([this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+                    append_data_event(access_kind::host_write, address, data);
+                }));
         }
     }
 
@@ -166,11 +187,52 @@ namespace sogen::ttd
         {
             return;
         }
-        access_event event{emu_.get_executed_instructions(), emu_.emu().read_instruction_pointer(), address, size, kind};
-        if (kind == access_kind::execute && size <= 15 && !emu_.emu().try_read_memory(address, event.instruction_bytes.data(), size))
+        access_event event{.step = emu_.get_executed_instructions(),
+                           .ip = emu_.emu().read_instruction_pointer(),
+                           .address = address,
+                           .size = size,
+                           .kind = kind};
+        if (size < inline_data_limit && !emu_.emu().try_read_memory(address, event.payload.data(), size))
         {
             throw std::runtime_error("Cannot read executed instruction bytes");
         }
+        push_event(event);
+    }
+
+    void recorder::append_data_event(access_kind kind, uint64_t address, std::span<const std::byte> data)
+    {
+        if (data.empty())
+        {
+            return;
+        }
+        access_event event{.step = emu_.get_executed_instructions(),
+                           .ip = emu_.emu().read_instruction_pointer(),
+                           .address = address,
+                           .size = data.size(),
+                           .kind = kind};
+        if (data.size() <= inline_data_limit)
+        {
+            memcpy(event.payload.data(), data.data(), data.size());
+        }
+        else
+        {
+            if (!data_file_.is_open())
+            {
+                data_file_.open(data_path_, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
+            }
+            const auto offset = static_cast<uint64_t>(data_file_.tellp());
+            data_file_.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+            if (!data_file_)
+            {
+                throw std::runtime_error("Cannot write TTD access data: " + data_path_.string());
+            }
+            memcpy(event.payload.data(), &offset, sizeof(offset));
+        }
+        push_event(event);
+    }
+
+    void recorder::push_event(const access_event& event)
+    {
         pending_events_.push_back(event);
         ++header_.event_count;
         if (pending_events_.size() == pending_event_limit)
@@ -242,10 +304,12 @@ namespace sogen::ttd
             return;
         }
         finished_ = true;
-        const auto remove_checkpoint_file = utils::finally([this] {
+        const auto remove_sidecar_files = utils::finally([this] {
             checkpoint_file_.close();
+            data_file_.close();
             std::error_code error;
             std::filesystem::remove(checkpoint_path_, error);
+            std::filesystem::remove(data_path_, error);
         });
         write_hook_.remove();
         read_hook_.remove();
@@ -338,21 +402,11 @@ namespace sogen::ttd
         }
         file_.clear();
         file_.seekp(0, std::ios::end);
+        header_.data_offset = static_cast<uint64_t>(file_.tellp());
+        append_file(data_file_, file_);
+        header_.data_size = static_cast<uint64_t>(file_.tellp()) - header_.data_offset;
         const auto checkpoint_base = static_cast<uint64_t>(file_.tellp());
-        if (checkpoint_file_.is_open())
-        {
-            checkpoint_file_.flush();
-            checkpoint_file_.seekg(0);
-            std::vector<char> buffer(1 << 20);
-            while (checkpoint_file_.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || checkpoint_file_.gcount())
-            {
-                file_.write(buffer.data(), checkpoint_file_.gcount());
-                if (!file_)
-                {
-                    throw std::runtime_error("Cannot write TTD checkpoint");
-                }
-            }
-        }
+        append_file(checkpoint_file_, file_);
         header_.checkpoint_count = checkpoints_.size();
         header_.checkpoint_table_offset = static_cast<uint64_t>(file_.tellp());
         for (auto entry : checkpoints_)
@@ -501,6 +555,7 @@ namespace sogen::ttd
                 throw std::runtime_error("Invalid TTD trace access mask");
             }
             access_mask_ = header_.access_mask;
+            has_data_ = true;
         }
         else
         {
@@ -523,7 +578,10 @@ namespace sogen::ttd
             header_.checkpoint_table_offset > header_.index_offset ||
             header_.checkpoint_count > (header_.index_offset - header_.checkpoint_table_offset) / sizeof(checkpoint_entry) ||
             header_.index_offset > length ||
-            header_.index_count > (length - header_.index_offset) / (legacy_ ? sizeof(old_index_entry) : sizeof(index_entry)))
+            header_.index_count > (length - header_.index_offset) / (legacy_ ? sizeof(old_index_entry) : sizeof(index_entry)) ||
+            (has_data_ && (header_.data_offset < event_start + header_.event_count * event_size_ ||
+                           header_.data_offset > header_.checkpoint_table_offset ||
+                           header_.data_size > header_.checkpoint_table_offset - header_.data_offset)))
         {
             throw std::runtime_error("Invalid TTD trace offsets");
         }
@@ -747,6 +805,34 @@ namespace sogen::ttd
         return *access_mask_;
     }
 
+    std::vector<std::byte> trace::access_data(const access_event& event)
+    {
+        if (!has_data_ || event.kind == access_kind::execute)
+        {
+            return {};
+        }
+        std::vector<std::byte> data(static_cast<size_t>(event.size));
+        if (event.size <= inline_data_limit)
+        {
+            memcpy(data.data(), event.payload.data(), data.size());
+            return data;
+        }
+        uint64_t offset{};
+        memcpy(&offset, event.payload.data(), sizeof(offset));
+        if (offset > header_.data_size || event.size > header_.data_size - offset)
+        {
+            throw std::runtime_error("Invalid TTD access data offset");
+        }
+        file_.clear();
+        file_.seekg(static_cast<std::streamoff>(header_.data_offset + offset));
+        file_.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        if (!file_)
+        {
+            throw std::runtime_error("Truncated TTD access data");
+        }
+        return data;
+    }
+
     event_reader::event_reader(trace& recorded, const uint64_t first_number)
         : trace_(recorded),
           buffer_first_(first_number),
@@ -788,16 +874,16 @@ namespace sogen::ttd
         auto& cpu = emu_.emu();
         if (access_mask_ & static_cast<uint64_t>(access_kind::write))
         {
-            write_hook_ =
-                scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-                    verify(access_kind::write, address, size);
+            write_hook_ = scoped_hook(
+                cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+                    verify(access_kind::write, address, data.size(), data);
                 }));
         }
         if (access_mask_ & static_cast<uint64_t>(access_kind::read))
         {
-            read_hook_ =
-                scoped_hook(cpu, cpu.hook_memory_read_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-                    verify(access_kind::read, address, size);
+            read_hook_ = scoped_hook(
+                cpu, cpu.hook_memory_read_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+                    verify(access_kind::read, address, data.size(), data);
                 }));
         }
         if (access_mask_ & static_cast<uint64_t>(access_kind::execute))
@@ -808,13 +894,14 @@ namespace sogen::ttd
         }
         if (access_mask_ & static_cast<uint64_t>(access_kind::host_write))
         {
-            host_write_hook_ = scoped_hook(cpu, cpu.hook_host_memory_write([this](cpu_interface&, uint64_t address, size_t size) {
-                verify(access_kind::host_write, address, size);
-            }));
+            host_write_hook_ =
+                scoped_hook(cpu, cpu.hook_host_memory_write([this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+                    verify(access_kind::host_write, address, data.size(), data);
+                }));
         }
     }
 
-    void replay_verifier::verify(const access_kind kind, const uint64_t address, const size_t size)
+    void replay_verifier::verify(const access_kind kind, const uint64_t address, const size_t size, const std::span<const std::byte> data)
     {
         if (error_ || !size)
         {
@@ -825,14 +912,18 @@ namespace sogen::ttd
                               .address = address,
                               .size = size,
                               .kind = kind};
-        if (kind == access_kind::execute && trace_.has_instruction_bytes() && size <= 15)
+        if (kind == access_kind::execute && trace_.has_instruction_bytes() && size < inline_data_limit)
         {
-            emu_.emu().try_read_memory(address, observed.instruction_bytes.data(), size);
+            emu_.emu().try_read_memory(address, observed.payload.data(), size);
         }
         const auto expected = reader_.next(access_mask_);
-        if (expected && expected->kind == observed.kind && expected->step == observed.step && expected->ip == observed.ip &&
-            expected->address == observed.address && expected->size == observed.size &&
-            (kind != access_kind::execute || !trace_.has_instruction_bytes() || expected->instruction_bytes == observed.instruction_bytes))
+        const auto same_event = expected && expected->kind == observed.kind && expected->step == observed.step &&
+                                expected->ip == observed.ip && expected->address == observed.address && expected->size == observed.size;
+        const auto same_instruction =
+            kind != access_kind::execute || !trace_.has_instruction_bytes() || (same_event && expected->payload == observed.payload);
+        const auto same_data = kind == access_kind::execute || !trace_.has_access_data() ||
+                               (same_event && std::ranges::equal(trace_.access_data(*expected), data));
+        if (same_event && same_instruction && same_data)
         {
             ++verified_events_;
             return;
@@ -841,6 +932,16 @@ namespace sogen::ttd
             stream << access_kind_name(event.kind) << " step=" << std::hex << event.step << " ip=" << event.ip
                    << " address=" << event.address << std::dec << " size=" << event.size;
         };
+        if (same_event && same_instruction)
+        {
+            std::ostringstream message;
+            message << "TTD replay diverged from the recording at event " << reader_.last_number() << ": ";
+            describe(message, observed);
+            message << " accessed different data";
+            error_ = message.str();
+            emu_.stop();
+            return;
+        }
         std::ostringstream message;
         message << "TTD replay diverged from the recording";
         if (expected)
@@ -1094,49 +1195,52 @@ namespace sogen::ttd
                 }
             }
         });
-        write_hook_ = scoped_hook(cpu, cpu.hook_memory_write_metadata(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, size_t size) {
-            if (error_ || !size)
-            {
-                return;
-            }
-            const auto expected = expected_writes_.next(static_cast<uint64_t>(access_kind::write));
-            if (!expected)
-            {
-                error_ = "TTD replay produced an unrecorded memory write";
-                emu_.stop();
-                return;
-            }
-            const auto number = expected_writes_.last_number();
-            const auto step = emu_.get_executed_instructions();
-            const auto ip = emu_.emu().read_instruction_pointer();
-            if (expected->step != step || expected->ip != ip || expected->address != address || expected->size != size)
-            {
-                std::ostringstream message;
-                message << "TTD replay memory write diverged at event " << number << ": expected step=" << expected->step
-                        << " ip=" << std::hex << expected->ip << " address=" << expected->address << std::dec << " size=" << expected->size
-                        << ", observed step=" << step << " ip=" << std::hex << ip << " address=" << address << std::dec << " size=" << size;
-                error_ = message.str();
-                emu_.stop();
-                return;
-            }
-            const auto last = address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
-            for (uint64_t byte = address; byte <= last; ++byte)
-            {
-                auto [it, inserted] = writers_.try_emplace(byte / page_size);
-                if (inserted)
+        write_hook_ = scoped_hook(
+            cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+                const auto size = data.size();
+                if (error_ || !size)
                 {
-                    it->second.first_number = number;
+                    return;
                 }
-                it->second.bytes[(byte % page_size) / 64] |= uint64_t{1} << (byte % 64);
-                page_latest_write_[byte / page_size] = number + 1;
-                if (byte == UINT64_MAX)
+                const auto expected = expected_writes_.next(static_cast<uint64_t>(access_kind::write));
+                if (!expected)
                 {
-                    break;
+                    error_ = "TTD replay produced an unrecorded memory write";
+                    emu_.stop();
+                    return;
                 }
-            }
-            last_write_number_ = number;
-            ++verified_writes_;
-        }));
+                const auto number = expected_writes_.last_number();
+                const auto step = emu_.get_executed_instructions();
+                const auto ip = emu_.emu().read_instruction_pointer();
+                if (expected->step != step || expected->ip != ip || expected->address != address || expected->size != size)
+                {
+                    std::ostringstream message;
+                    message << "TTD replay memory write diverged at event " << number << ": expected step=" << expected->step
+                            << " ip=" << std::hex << expected->ip << " address=" << expected->address << std::dec
+                            << " size=" << expected->size << ", observed step=" << step << " ip=" << std::hex << ip
+                            << " address=" << address << std::dec << " size=" << size;
+                    error_ = message.str();
+                    emu_.stop();
+                    return;
+                }
+                const auto last = address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
+                for (uint64_t byte = address; byte <= last; ++byte)
+                {
+                    auto [it, inserted] = writers_.try_emplace(byte / page_size);
+                    if (inserted)
+                    {
+                        it->second.first_number = number;
+                    }
+                    it->second.bytes[(byte % page_size) / 64] |= uint64_t{1} << (byte % 64);
+                    page_latest_write_[byte / page_size] = number + 1;
+                    if (byte == UINT64_MAX)
+                    {
+                        break;
+                    }
+                }
+                last_write_number_ = number;
+                ++verified_writes_;
+            }));
         execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
             if (error_ || !size || hits_.size() >= 256)
             {

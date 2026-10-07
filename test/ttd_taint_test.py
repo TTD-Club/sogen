@@ -56,9 +56,9 @@ def main():
             (4, 0x101b, 0x101b, len(spill), 4, spill),
             (4, 0x101b, 0x4000, 1, 2, b""),
         ]
-        end = 72 + 56 * len(events)
+        end = 88 + 56 * len(events)
         with overwritten.open("wb") as file:
-            file.write(struct.pack("<8s8Q", b"SOGTTD5\0", 0, 4, len(events), 0, end, end, 0, 15))
+            file.write(struct.pack("<8s10Q", b"SOGTTD5\0", 0, 4, len(events), 0, end, end, 0, 15, end, 0))
             for step, ip, address, size, kind, code in events:
                 file.write(struct.pack("<5Q16s", step, ip, address, size, kind, code))
         result = subprocess.run([sys.executable, str(taint_tool), str(overwritten), "--taint", "input:0x2000:1"],

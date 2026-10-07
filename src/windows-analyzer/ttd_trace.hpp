@@ -17,7 +17,7 @@
 namespace sogen::ttd
 {
     // Version 4 adds the instruction bytes observed immediately before execution; version 5 adds the recorded
-    // access kinds to the header and host writes.
+    // access kinds to the header, host writes, and the bytes of every read and write.
     enum class access_kind : uint64_t
     {
         read = 1,
@@ -55,6 +55,8 @@ namespace sogen::ttd
         uint64_t index_offset{};
         uint64_t index_count{};
         uint64_t access_mask{};
+        uint64_t data_offset{};
+        uint64_t data_size{};
     };
 
     struct checkpoint_entry
@@ -81,8 +83,12 @@ namespace sogen::ttd
         uint64_t address{};
         uint64_t size{};
         access_kind kind{};
-        std::array<uint8_t, 16> instruction_bytes{};
+        // Execute: the instruction bytes just before execution. Read and writes: the accessed bytes when size <= 16,
+        // otherwise the little-endian offset of those bytes within the data section.
+        std::array<uint8_t, 16> payload{};
     };
+
+    constexpr size_t inline_data_limit = sizeof(access_event::payload);
 
     struct index_entry
     {
@@ -102,7 +108,7 @@ namespace sogen::ttd
         uint64_t executions{};
     };
 
-    static_assert(sizeof(header) == 72);
+    static_assert(sizeof(header) == 88);
     static_assert(sizeof(checkpoint_entry) == 24);
     static_assert(sizeof(access_event) == 56);
     static_assert(sizeof(index_entry) == 24);
@@ -125,6 +131,8 @@ namespace sogen::ttd
         std::filesystem::path checkpoint_path_;
         std::fstream checkpoint_file_;
         std::vector<checkpoint_entry> checkpoints_{};
+        std::filesystem::path data_path_;
+        std::fstream data_file_;
         scoped_hook write_hook_{};
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};
@@ -132,6 +140,8 @@ namespace sogen::ttd
         static constexpr size_t pending_event_limit = 16384;
         std::vector<access_event> pending_events_{};
         void append_event(access_kind kind, uint64_t address, size_t size);
+        void append_data_event(access_kind kind, uint64_t address, std::span<const std::byte> data);
+        void push_event(const access_event& event);
         void flush_events();
         bool finished_{};
     };
@@ -156,6 +166,11 @@ namespace sogen::ttd
             return !legacy_ && !v3_;
         }
 
+        bool has_access_data() const
+        {
+            return has_data_;
+        }
+
         const std::vector<std::byte>& snapshot() const
         {
             return snapshot_;
@@ -171,6 +186,7 @@ namespace sogen::ttd
         size_t read_events(uint64_t first_number, std::span<access_event> output);
         uint64_t first_event_after(uint64_t step);
         uint64_t access_mask();
+        std::vector<std::byte> access_data(const access_event& event);
         std::optional<uint64_t> latest_write_to_byte(uint64_t page, uint64_t address, uint64_t first_number, uint64_t last_number);
 
       private:
@@ -181,6 +197,7 @@ namespace sogen::ttd
         std::vector<checkpoint_entry> checkpoints_{};
         bool legacy_{};
         bool v3_{};
+        bool has_data_{};
         uint64_t event_size_{};
         std::optional<uint64_t> access_mask_{};
 
@@ -235,7 +252,7 @@ namespace sogen::ttd
         scoped_hook host_write_hook_{};
         std::optional<std::string> error_{};
         uint64_t verified_events_{};
-        void verify(access_kind kind, uint64_t address, size_t size);
+        void verify(access_kind kind, uint64_t address, size_t size, std::span<const std::byte> data = {});
     };
 
     class replay_selfmod_scanner
