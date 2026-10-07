@@ -79,6 +79,7 @@ namespace sogen::ttd
         static constexpr int chunk_compression_level = 19;
         static constexpr int bulk_compression_level = 19;
         static constexpr size_t chunk_workers = 4;
+        static constexpr size_t bulk_workers = 4;
         static constexpr size_t max_pending_compressions = 16;
         // Each pending checkpoint holds a full emulator state, so at most one waits while another compresses.
         static constexpr size_t max_pending_checkpoints = 1;
@@ -100,12 +101,18 @@ namespace sogen::ttd
         // The last bulk_reference_span closed blocks, oldest first.
         std::deque<bulk_block> recent_bulk_{};
         background_compressor bulk_compressor_{
-            [](const std::span<const std::byte> data) { return encode_bulk_block(data, bulk_compression_level); }, 1,
+            [](const std::span<const std::byte> data) { return encode_bulk_block(data, bulk_compression_level); }, bulk_workers,
             max_pending_compressions};
         // Encodes and compresses chunks (see flush_chunk).
         background_compressor chunk_compressor_{{}, chunk_workers, max_pending_compressions};
         background_compressor checkpoint_compressor_{{}, 1, max_pending_checkpoints};
         std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
+        static constexpr uint64_t no_recent_page = UINT64_MAX;
+        // Per access kind, the last single page entered into chunk_pages_, so repeated accesses skip the map.
+        std::array<uint64_t, 16> recent_page_of_kind_{};
+        // With execute events recorded, the address of the instruction running now, which guest accesses share.
+        bool tracks_instructions_{};
+        uint64_t instruction_ip_{};
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
         scoped_hook write_hook_{};

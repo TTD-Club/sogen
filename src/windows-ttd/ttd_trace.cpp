@@ -253,9 +253,12 @@ namespace sogen::ttd
         header_.access_mask = access_mask & all_access_kinds;
         write_object(file_, header_);
         chunk_events_.reserve(events_per_chunk);
+        recent_page_of_kind_.fill(no_recent_page);
+        tracks_instructions_ = (access_mask & static_cast<uint64_t>(access_kind::execute)) != 0;
 
         // This also makes the initial process/thread state explicit in the snapshot.
         emu_.setup_process_if_necessary();
+        instruction_ip_ = emu_.emu().read_instruction_pointer();
         write_checkpoint(emu_.get_executed_instructions());
 
         auto& cpu = emu_.emu();
@@ -310,11 +313,9 @@ namespace sogen::ttd
         {
             return;
         }
-        access_event event{.step = emu_.get_executed_instructions(),
-                           .ip = emu_.emu().read_instruction_pointer(),
-                           .address = address,
-                           .size = size,
-                           .kind = kind};
+        // The backend reports an instruction before running it, with the instruction pointer at its address.
+        instruction_ip_ = address;
+        access_event event{.step = emu_.get_executed_instructions(), .ip = address, .address = address, .size = size, .kind = kind};
         if (size < inline_data_limit && !emu_.emu().try_read_memory(address, event.payload.data(), size))
         {
             throw std::runtime_error("Cannot read executed instruction bytes");
@@ -328,11 +329,10 @@ namespace sogen::ttd
         {
             return;
         }
-        access_event event{.step = emu_.get_executed_instructions(),
-                           .ip = emu_.emu().read_instruction_pointer(),
-                           .address = address,
-                           .size = data.size(),
-                           .kind = kind};
+        // A guest access belongs to the instruction the execute hook just reported. Host writes happen outside guest
+        // instructions (syscalls, exception dispatch), where the instruction pointer can differ.
+        const auto ip = kind != access_kind::host_write && tracks_instructions_ ? instruction_ip_ : emu_.emu().read_instruction_pointer();
+        access_event event{.step = emu_.get_executed_instructions(), .ip = ip, .address = address, .size = data.size(), .kind = kind};
         if (data.size() <= inline_data_limit)
         {
             memcpy(event.payload.data(), data.data(), data.size());
@@ -352,10 +352,16 @@ namespace sogen::ttd
     {
         chunk_events_.push_back(event);
         ++header_.event_count;
-        const auto last = last_byte(event.address, event.size);
-        for (auto page = event.address / page_size; page <= last / page_size; ++page)
+        const auto first_page = event.address / page_size;
+        const auto last_page = last_byte(event.address, event.size) / page_size;
+        auto& recent_page = recent_page_of_kind_[static_cast<size_t>(event.kind)];
+        if (first_page != last_page || recent_page != first_page)
         {
-            chunk_pages_[page] |= static_cast<uint32_t>(event.kind);
+            for (auto page = first_page; page <= last_page; ++page)
+            {
+                chunk_pages_[page] |= static_cast<uint32_t>(event.kind);
+            }
+            recent_page = first_page == last_page ? first_page : no_recent_page;
         }
         if (chunk_events_.size() == events_per_chunk)
         {
@@ -401,6 +407,7 @@ namespace sogen::ttd
         chunk_events_ = {};
         chunk_events_.reserve(events_per_chunk);
         chunk_pages_.clear();
+        recent_page_of_kind_.fill(no_recent_page);
         chunk_compressor_.submit_job(index, [events, code_ids = std::move(code_ids), bulk = std::move(bulk)] {
             return utils::compression::zstd::compress(encode_chunk(*events, code_ids, bulk), chunk_compression_level);
         });
