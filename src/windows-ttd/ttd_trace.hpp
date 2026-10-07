@@ -113,6 +113,19 @@ namespace sogen::ttd
         // With execute events recorded, the address of the instruction running now, which guest accesses share.
         bool tracks_instructions_{};
         uint64_t instruction_ip_{};
+
+        // Executed instruction bytes by address, so most execute events skip reading guest memory. Only kept while
+        // every way code can change is observed: guest and host writes are recorded and mapping changes reported.
+        struct cached_instruction
+        {
+            uint64_t size{};
+            std::array<uint8_t, inline_data_limit> bytes{};
+        };
+
+        bool caches_instructions_{};
+        std::unordered_map<uint64_t, cached_instruction> instruction_cache_{};
+        std::unordered_map<uint64_t, std::vector<uint64_t>> cached_instructions_by_page_{};
+        void forget_instructions(uint64_t address, uint64_t size);
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
         scoped_hook write_hook_{};

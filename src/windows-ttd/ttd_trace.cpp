@@ -255,6 +255,9 @@ namespace sogen::ttd
         chunk_events_.reserve(events_per_chunk);
         recent_page_of_kind_.fill(no_recent_page);
         tracks_instructions_ = (access_mask & static_cast<uint64_t>(access_kind::execute)) != 0;
+        constexpr auto code_changes = static_cast<uint64_t>(access_kind::execute) | static_cast<uint64_t>(access_kind::write) |
+                                      static_cast<uint64_t>(access_kind::host_write);
+        caches_instructions_ = (access_mask & code_changes) == code_changes;
 
         // This also makes the initial process/thread state explicit in the snapshot.
         emu_.setup_process_if_necessary();
@@ -289,6 +292,12 @@ namespace sogen::ttd
                     append_data_event(access_kind::host_write, address, data);
                 }));
         }
+        // Last, so a constructor that throws never leaves the callback behind.
+        if (caches_instructions_)
+        {
+            emu_.memory.set_mapping_change_callback(
+                [this](const uint64_t address, const size_t size) { forget_instructions(address, size); });
+        }
     }
 
     recorder::~recorder()
@@ -316,11 +325,53 @@ namespace sogen::ttd
         // The backend reports an instruction before running it, with the instruction pointer at its address.
         instruction_ip_ = address;
         access_event event{.step = emu_.get_executed_instructions(), .ip = address, .address = address, .size = size, .kind = kind};
-        if (size < inline_data_limit && !emu_.emu().try_read_memory(address, event.payload.data(), size))
+        if (size < inline_data_limit)
         {
-            throw std::runtime_error("Cannot read executed instruction bytes");
+            const auto cached = caches_instructions_ ? instruction_cache_.find(address) : instruction_cache_.end();
+            if (cached != instruction_cache_.end() && cached->second.size == size)
+            {
+                event.payload = cached->second.bytes;
+            }
+            else
+            {
+                if (!emu_.emu().try_read_memory(address, event.payload.data(), size))
+                {
+                    throw std::runtime_error("Cannot read executed instruction bytes");
+                }
+                if (caches_instructions_)
+                {
+                    instruction_cache_[address] = {.size = size, .bytes = event.payload};
+                    const auto last = last_byte(address, size);
+                    for (auto page = address / page_size; page <= last / page_size; ++page)
+                    {
+                        cached_instructions_by_page_[page].push_back(address);
+                    }
+                }
+            }
         }
         push_event(event);
+    }
+
+    void recorder::forget_instructions(const uint64_t address, const uint64_t size)
+    {
+        if (cached_instructions_by_page_.empty() || !size)
+        {
+            return;
+        }
+        const auto last = last_byte(address, size);
+        for (auto page = address / page_size; page <= last / page_size; ++page)
+        {
+            const auto entry = cached_instructions_by_page_.find(page);
+            if (entry == cached_instructions_by_page_.end())
+            {
+                continue;
+            }
+            for (const auto instruction : entry->second)
+            {
+                instruction_cache_.erase(instruction);
+            }
+            cached_instructions_by_page_.erase(entry);
+        }
     }
 
     void recorder::append_data_event(access_kind kind, uint64_t address, std::span<const std::byte> data)
@@ -332,6 +383,10 @@ namespace sogen::ttd
         // A guest access belongs to the instruction the execute hook just reported. Host writes happen outside guest
         // instructions (syscalls, exception dispatch), where the instruction pointer can differ.
         const auto ip = kind != access_kind::host_write && tracks_instructions_ ? instruction_ip_ : emu_.emu().read_instruction_pointer();
+        if (kind != access_kind::read)
+        {
+            forget_instructions(address, data.size());
+        }
         access_event event{.step = emu_.get_executed_instructions(), .ip = ip, .address = address, .size = data.size(), .kind = kind};
         if (data.size() <= inline_data_limit)
         {
@@ -540,6 +595,10 @@ namespace sogen::ttd
         read_hook_.remove();
         execute_hook_.remove();
         host_write_hook_.remove();
+        if (caches_instructions_)
+        {
+            emu_.memory.set_mapping_change_callback({});
+        }
         flush_chunk();
         close_bulk_block();
         write_compressed(true);
