@@ -597,21 +597,24 @@ namespace sogen
         struct instruction_tick_clock : utils::tick_clock
         {
             const uint64_t* instructions_{};
+            const uint64_t* idle_ticks_{};
 
-            instruction_tick_clock(const uint64_t& instructions, const system_time_point system_start = {},
+            instruction_tick_clock(const uint64_t& instructions, const uint64_t& idle_ticks, const system_time_point system_start = {},
                                    const steady_time_point steady_start = {})
                 : tick_clock(1000, system_start, steady_start),
-                  instructions_(&instructions)
+                  instructions_(&instructions),
+                  idle_ticks_(&idle_ticks)
             {
             }
 
             uint64_t ticks() override
             {
-                return *this->instructions_;
+                return *this->instructions_ + *this->idle_ticks_;
             }
         };
 
-        std::unique_ptr<utils::clock> get_clock(emulator_interfaces& interfaces, const uint64_t& instructions, const bool use_relative_time)
+        std::unique_ptr<utils::clock> get_clock(emulator_interfaces& interfaces, const uint64_t& instructions, const uint64_t& idle_ticks,
+                                                const bool use_relative_time)
         {
             if (interfaces.clock)
             {
@@ -620,7 +623,7 @@ namespace sogen
 
             if (use_relative_time)
             {
-                return std::make_unique<instruction_tick_clock>(instructions);
+                return std::make_unique<instruction_tick_clock>(instructions, idle_ticks);
             }
 
             return std::make_unique<utils::clock>();
@@ -693,7 +696,7 @@ namespace sogen
     windows_emulator::windows_emulator(std::unique_ptr<x86_64_emulator> emu, const emulator_settings& settings,
                                        emulator_callbacks callbacks, emulator_interfaces interfaces)
         : emu_(std::move(emu)),
-          clock_(get_clock(interfaces, this->executed_instructions_, settings.use_relative_time)),
+          clock_(get_clock(interfaces, this->executed_instructions_, this->idle_ticks_, settings.use_relative_time)),
           dns_lookup_(get_dns_lookup(interfaces)),
           socket_factory_(get_socket_factory(interfaces)),
           ui_backend_(get_ui_backend(interfaces)),
@@ -851,7 +854,7 @@ namespace sogen
 
             if (this->use_relative_time_)
             {
-                this->executed_instructions_ += MAX_INSTRUCTIONS_PER_TIME_SLICE;
+                this->idle_ticks_ += MAX_INSTRUCTIONS_PER_TIME_SLICE;
             }
             else if (host_wait_pending)
             {
@@ -930,13 +933,14 @@ namespace sogen
             thread.callback_return_rax = vcpu.cpu.reg<uint64_t>(x86_register::rax);
         }
 
-        ++this->executed_instructions_;
-        const auto thread_insts = ++thread.executed_instructions;
-        if (thread_insts % MAX_INSTRUCTIONS_PER_TIME_SLICE == 0)
+        // Yielding stops the CPU before this instruction runs; it executes (and is counted) when the thread resumes.
+        if (++thread.executed_instructions % MAX_INSTRUCTIONS_PER_TIME_SLICE == 0)
         {
             this->yield_thread(vcpu);
+            return;
         }
 
+        ++this->executed_instructions_;
         thread.previous_ip = thread.current_ip;
         thread.current_ip = vcpu.cpu.read_instruction_pointer();
 
@@ -1781,6 +1785,7 @@ namespace sogen
         buffer.write(this->application_settings_);
         buffer.write(this->setup_completed_);
         buffer.write(this->executed_instructions_);
+        buffer.write(this->idle_ticks_);
         buffer.write_atomic(this->vcpus_[0]->switch_thread);
         buffer.write(this->use_relative_time_);
 
@@ -1802,6 +1807,7 @@ namespace sogen
         buffer.read(this->application_settings_);
         buffer.read(this->setup_completed_);
         buffer.read(this->executed_instructions_);
+        buffer.read(this->idle_ticks_);
         buffer.read_atomic(this->vcpus_[0]->switch_thread);
 
         const auto old_relative_time = this->use_relative_time_;
@@ -1837,6 +1843,7 @@ namespace sogen
 
         buffer.write(this->setup_completed_);
         buffer.write(this->executed_instructions_);
+        buffer.write(this->idle_ticks_);
         buffer.write_atomic(this->vcpus_[0]->switch_thread);
 
         this->version.serialize(buffer);
@@ -1866,6 +1873,7 @@ namespace sogen
 
         buffer.read(this->setup_completed_);
         buffer.read(this->executed_instructions_);
+        buffer.read(this->idle_ticks_);
         buffer.read_atomic(this->vcpus_[0]->switch_thread);
 
         this->version.deserialize(buffer);

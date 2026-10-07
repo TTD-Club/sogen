@@ -141,6 +141,7 @@ namespace sogen
     class windows_emulator
     {
         uint64_t executed_instructions_{0};
+        uint64_t idle_ticks_{0};
         application_settings application_settings_{};
 
         std::unique_ptr<x86_64_emulator> emu_{};
