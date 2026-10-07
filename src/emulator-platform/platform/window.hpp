@@ -125,7 +125,11 @@ namespace sogen
         int cx;
         int cy;
         uint32_t flags;
+        // Explicit so designated initializers zero it; implicit padding would copy host stack bytes into the guest.
+        uint32_t padding{};
     };
+
+    static_assert(sizeof(EMU_WINDOWPOS) == 40);
 
     struct EMU_WINDOWPOS32
     {

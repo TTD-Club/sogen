@@ -446,10 +446,11 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                c.emu.write_memory(token_information, TOKEN_BNO_ISOLATION_INFORMATION64{
-                                                          .IsolationPrefix = 0,
-                                                          .IsolationEnabled = FALSE,
-                                                      });
+                TOKEN_BNO_ISOLATION_INFORMATION64 info{};
+                memset(&info, 0, sizeof(info));
+                info.IsolationPrefix = 0;
+                info.IsolationEnabled = FALSE;
+                c.emu.write_memory(token_information, info);
 
                 return STATUS_SUCCESS;
             }
