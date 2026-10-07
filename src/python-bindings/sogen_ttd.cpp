@@ -163,6 +163,11 @@ namespace sogen::py
                 return ttd::seek(this->emulator_->native(), this->trace_.native(), position);
             }
 
+            std::vector<std::string> manifest_differences() const
+            {
+                return ttd::manifest_differences(this->emulator_->native(), this->trace_.native());
+            }
+
             uint64_t position() const
             {
                 return this->emulator_->native().get_executed_instructions();
@@ -272,8 +277,9 @@ namespace sogen::py
                         }
                         return manifest;
                     },
-                    "How the trace was recorded (backend, cpuid, emulation_root, executable, checkpoint_interval, tool, and the "
-                    "entries passed to record); empty for older traces")
+                    "How the trace was recorded (build, backend, cpuid, emulation_root, registry, system_dlls, windows_version, "
+                    "executable, command_line, checkpoint_interval, tool, and the entries passed to record); empty for older "
+                    "traces")
                 .def_prop_ro(
                     "checkpoints",
                     [](const ttd_trace& self) {
@@ -377,6 +383,9 @@ namespace sogen::py
                      "Restore the last checkpoint at or before position and replay to it, verifying every recorded event. Raises "
                      "DivergenceError where the replay diverges from the recording, and RuntimeError for a trace recorded with "
                      "another backend or other CPUID results.")
+                .def("manifest_differences", &ttd_replay::manifest_differences,
+                     "After a seek: the recorded inputs outside the checkpoints (emulation_root, registry, system_dlls, "
+                     "build) that differ for this emulator. A divergence error lists them too.")
                 .def_prop_ro("position", &ttd_replay::position)
                 .def_prop_ro("emulator", &ttd_replay::emulator, nb::rv_policy::reference_internal);
         }

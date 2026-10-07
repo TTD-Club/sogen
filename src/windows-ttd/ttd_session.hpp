@@ -4,7 +4,9 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include <windows_emulator.hpp>
 
@@ -42,8 +44,9 @@ namespace sogen::ttd
         uint64_t checkpoint_interval{500000};
         // Instructions to record from the current position; zero runs until the process exits.
         uint64_t max_instructions{};
-        // Front-end entries, stored after the ones record() adds (backend, cpuid, emulation_root, executable,
-        // checkpoint_interval).
+        // Front-end entries, stored after the ones record() adds: build, backend, cpuid, emulation_root, registry
+        // and system_dlls (fingerprints of the hives and of ntdll/kernel32/kernelbase), windows_version, executable,
+        // command_line, checkpoint_interval.
         manifest_entries manifest{};
     };
 
@@ -55,6 +58,11 @@ namespace sogen::ttd
     // `interrupted` returns true, and finalizes the trace. Recording after a seek forks the replayed trace into a new
     // one that starts at the seek position.
     void record(windows_emulator& win_emu, const record_settings& settings, const std::function<bool()>& interrupted = {});
+
+    // The recorded inputs that live outside the checkpoints (emulation root, hives, system DLLs, build) and differ for
+    // this emulator, one description each; a replay reads them again, so any of them can explain a divergence. Use
+    // it on an emulator that holds a restored checkpoint: the system root comes from the emulator state.
+    std::vector<std::string> manifest_differences(const windows_emulator& win_emu, const trace& recorded);
 
     struct seek_result
     {

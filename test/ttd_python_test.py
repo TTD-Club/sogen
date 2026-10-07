@@ -91,7 +91,12 @@ def main() -> None:
         manifest = trace.manifest
         assert manifest["tool"] == "analyzer" and manifest["cpuid"] == "1", manifest
         assert manifest["backend"] == emulator.backend_name and manifest["checkpoint_interval"] == "100000", manifest
+        assert manifest["build"] and manifest["build"] != "unknown", manifest
+        assert re.fullmatch(r"[0-9a-f]{16}", manifest["registry"]) and re.fullmatch(r"[0-9a-f]{16}", manifest["system_dlls"])
+        assert re.fullmatch(r"10\.0\.\d+\.\d+", manifest["windows_version"]), manifest
+        assert pathlib.PurePath(sample).name.lower() in manifest["command_line"].lower(), manifest
         assert ttd_format.Trace(cli_trace).manifest == manifest
+        assert replay.manifest_differences() == []
 
         # Recording after a seek forks the trace: the new trace starts at the seek position and replays on its own,
         # in Python and in the CLI.
@@ -137,13 +142,20 @@ def main() -> None:
                               if (event.step, event.address, event.kind) == (store.position, address, ttd_format.WRITE))
         recorded_store.data = (0x3333333333333333).to_bytes(8, "little")
         ttd_format.replace_chunk(tampered, store_chunk, chunk_events)
+        # It also names recorded inputs that differ for the replay, such as the registry hives.
+        ttd_format.replace_manifest(tampered, {**manifest, "registry": "0" * 16})
         with ttd.Trace(tampered) as tampered_trace:
+            tampered_replay = ttd.Replay(tampered_trace, emulator)
             try:
-                ttd.Replay(tampered_trace, emulator).seek(store.position)
+                tampered_replay.seek(store.position)
             except ttd.DivergenceError as error:
                 assert isinstance(error, RuntimeError) and "accessed different data" in str(error), error
+                assert "registry differs" in str(error), error
+                assert [difference.split(":")[0] for difference in tampered_replay.manifest_differences()] == [
+                    "registry differs"]
             else:
                 raise AssertionError("A tampered recording replayed without divergence")
+            del tampered_replay
 
         # A trace recorded with other CPUID results is refused before replaying.
         ttd_format.replace_manifest(tampered, {**manifest, "cpuid": "0"})

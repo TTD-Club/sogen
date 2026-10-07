@@ -117,6 +117,12 @@ namespace sogen
         registry_manager(const registry_manager&) = delete;
         registry_manager& operator=(const registry_manager&) = delete;
 
+        // The directory the hive files are read from; empty for a manager without hives.
+        const std::filesystem::path& get_hive_path() const
+        {
+            return this->hive_path_;
+        }
+
         std::optional<registry_key> get_key(const utils::path_key& key);
         bool can_create_key(const std::filesystem::path& key) const;
         std::optional<registry_key> create_key(const std::filesystem::path& key);

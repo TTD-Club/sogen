@@ -304,13 +304,20 @@ found through the section table (24-byte entries `type, offset, size`):
   byte-for-byte, which saves 9% of bulk bytes on `test-sample`.
 - Manifest (type 6, size = bytes, at most 1 MiB; absent in older traces):
   key/value pairs, each a `uint32_t` key length, a `uint32_t` value length,
-  and the UTF-8 key and value bytes. The recorder writes `backend`, `cpuid`
-  (the version of the CPUID results the recording depends on),
-  `emulation_root` (empty in host mode), `executable`, and
+  and the UTF-8 key and value bytes. The recorder writes `build` (`git
+  describe` of the Sogen tree, `-dirty` with local changes), `backend`,
+  `cpuid` (the version of the CPUID results the recording depends on),
+  `emulation_root` (empty in host mode), `registry` and `system_dlls`
+  (64-bit FNV-1a fingerprints over name, size, and first 4 KiB of the hive
+  files and of `ntdll`/`kernel32`/`kernelbase.dll`: a hive's base block
+  carries its write sequence numbers and checksum, a DLL's headers its link
+  timestamp), `windows_version`, `executable`, `command_line`, and
   `checkpoint_interval`, then the front end's entries (`tool` is `analyzer`
   or `sogen.ttd`; Python adds the `manifest=` entries of `ttd.record`). A
-  seek refuses a trace with another `backend` or `cpuid` and adds a differing
-  `emulation_root` to a divergence message.
+  seek refuses a trace with another `backend` or `cpuid`. The emulation root,
+  hives, system DLLs, and build live outside the checkpoints and are read
+  again by a replay, so a divergence message lists those that differ
+  (`Replay.manifest_differences()` in Python).
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host

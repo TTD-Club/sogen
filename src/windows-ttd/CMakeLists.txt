@@ -19,4 +19,14 @@ target_link_libraries(windows-ttd PRIVATE
 
 target_include_directories(windows-ttd INTERFACE "${CMAKE_CURRENT_LIST_DIR}")
 
+set(TTD_BUILD_INFO "${CMAKE_CURRENT_BINARY_DIR}/generated/ttd_build_info.hpp")
+add_custom_target(windows-ttd-build-info
+  COMMAND "${CMAKE_COMMAND}" "-DSOURCE_DIR=${CMAKE_CURRENT_LIST_DIR}" "-DOUTPUT=${TTD_BUILD_INFO}"
+    -P "${CMAKE_CURRENT_LIST_DIR}/ttd_build_info.cmake"
+  BYPRODUCTS "${TTD_BUILD_INFO}"
+  COMMENT "Recording the Sogen commit for TTD manifests"
+)
+add_dependencies(windows-ttd windows-ttd-build-info)
+target_include_directories(windows-ttd PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
 sogen_strip_target(windows-ttd)

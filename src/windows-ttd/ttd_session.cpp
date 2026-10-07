@@ -1,6 +1,10 @@
 #include "ttd_session.hpp"
 #include "snapshot.hpp"
+#include "ttd_build_info.hpp"
 
+#include <array>
+#include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 
@@ -14,15 +18,108 @@ namespace sogen::ttd
             return {text.begin(), text.end()};
         }
 
+        // FNV-1a over file names, sizes, and leading bytes. A registry hive's first 4 KiB is its base block, which
+        // holds the hive's write sequence numbers, timestamp, and checksum; a PE's holds its headers with the link
+        // timestamp and checksum. Hashing just those identifies a file version without reading whole hives.
+        class file_fingerprint
+        {
+          public:
+            void add_file(const std::string_view name, const std::filesystem::path& file)
+            {
+                this->add(std::as_bytes(std::span(name)));
+                std::error_code error{};
+                const auto size = std::filesystem::file_size(file, error);
+                if (error)
+                {
+                    constexpr std::string_view missing = "missing";
+                    this->add(std::as_bytes(std::span(missing)));
+                    return;
+                }
+                this->add(std::as_bytes(std::span(&size, 1)));
+                std::array<char, leading_bytes> bytes{};
+                std::ifstream stream(file, std::ios::binary);
+                stream.read(bytes.data(), bytes.size());
+                this->add(std::as_bytes(std::span(bytes).first(static_cast<size_t>(stream.gcount()))));
+            }
+
+            std::string text() const
+            {
+                std::ostringstream text;
+                text << std::hex << std::setw(16) << std::setfill('0') << this->hash_;
+                return text.str();
+            }
+
+          private:
+            static constexpr size_t leading_bytes = 4096;
+            uint64_t hash_{0xcbf29ce484222325};
+
+            void add(const std::span<const std::byte> bytes)
+            {
+                for (const auto byte : bytes)
+                {
+                    this->hash_ = (this->hash_ ^ static_cast<uint8_t>(byte)) * 0x100000001b3;
+                }
+            }
+        };
+
+        std::string registry_fingerprint(const windows_emulator& win_emu)
+        {
+            const auto& directory = win_emu.registry.get_hive_path();
+            if (directory.empty())
+            {
+                return {};
+            }
+            file_fingerprint fingerprint{};
+            for (const auto* hive : {"SYSTEM", "SECURITY", "SAM", "SOFTWARE", "HARDWARE", "NTUSER.DAT"})
+            {
+                fingerprint.add_file(hive, directory / hive);
+            }
+            return fingerprint.text();
+        }
+
+        // The DLLs every process loads, from the emulation root or, in host mode, the host.
+        std::string system_dll_fingerprint(const windows_emulator& win_emu)
+        {
+            const auto& system_root = win_emu.version.get_system_root();
+            if (system_root.is_relative())
+            {
+                return {};
+            }
+            file_fingerprint fingerprint{};
+            for (const auto* dll : {"ntdll.dll", "kernel32.dll", "kernelbase.dll"})
+            {
+                fingerprint.add_file(dll, win_emu.file_sys.translate(system_root / windows_path{"System32"} / windows_path{dll}));
+            }
+            return fingerprint.text();
+        }
+
+        std::string command_line(windows_emulator& win_emu)
+        {
+            const auto parameters = win_emu.process.process_params64.read();
+            return u16_to_u8(read_unicode_string(win_emu.emu(), parameters.CommandLine));
+        }
+
+        std::string windows_version(const windows_emulator& win_emu)
+        {
+            const auto& version = win_emu.version;
+            return std::to_string(version.get_major_version()) + "." + std::to_string(version.get_minor_version()) + "." +
+                   std::to_string(version.get_windows_build_number()) + "." + std::to_string(version.get_windows_update_build_revision());
+        }
+
         manifest_entries recording_manifest(windows_emulator& win_emu, const record_settings& settings)
         {
             win_emu.setup_process_if_necessary();
             const auto* executable = win_emu.mod_manager.executable;
             manifest_entries manifest{
+                {"build", build_commit},
                 {"backend", win_emu.emu().get_name()},
                 {"cpuid", std::string(cpuid_scheme)},
                 {"emulation_root", path_text(win_emu.emulation_root)},
+                {"registry", registry_fingerprint(win_emu)},
+                {"system_dlls", system_dll_fingerprint(win_emu)},
+                {"windows_version", windows_version(win_emu)},
                 {"executable", executable ? path_text(executable->path) : std::string()},
+                {"command_line", command_line(win_emu)},
                 {"checkpoint_interval", std::to_string(settings.checkpoint_interval)},
             };
             manifest.insert(manifest.end(), settings.manifest.begin(), settings.manifest.end());
@@ -43,17 +140,31 @@ namespace sogen::ttd
             }
         }
 
-        // Settings outside the checkpointed state that can make a replay diverge: syscalls read files from the
-        // emulation root again during the replay.
-        std::string replay_differences(const windows_emulator& win_emu, const trace& recorded)
+        std::string difference_suffix(const std::vector<std::string>& differences)
         {
-            const auto root = path_text(win_emu.emulation_root);
-            if (const auto recorded_root = recorded.manifest_value("emulation_root"); recorded_root && *recorded_root != root)
+            std::string suffix{};
+            for (const auto& difference : differences)
             {
-                return "; the recording used emulation root \"" + std::string(*recorded_root) + "\", this replay \"" + root + "\"";
+                suffix += "; " + difference;
             }
-            return {};
+            return suffix;
         }
+    }
+
+    std::vector<std::string> manifest_differences(const windows_emulator& win_emu, const trace& recorded)
+    {
+        std::vector<std::string> differences{};
+        const auto compare = [&](const std::string_view key, const std::string& replayed) {
+            if (const auto value = recorded.manifest_value(key); value && *value != replayed)
+            {
+                differences.push_back(std::string(key) + " differs: recorded \"" + std::string(*value) + "\", replay \"" + replayed + "\"");
+            }
+        };
+        compare("emulation_root", path_text(win_emu.emulation_root));
+        compare("registry", registry_fingerprint(win_emu));
+        compare("system_dlls", system_dll_fingerprint(win_emu));
+        compare("build", build_commit);
+        return differences;
     }
 
     std::optional<cpuid_result> cpuid_override(const uint32_t leaf, const bool hide_rdrand)
@@ -171,7 +282,7 @@ namespace sogen::ttd
         }
         catch (const divergence_error& e)
         {
-            throw divergence_error(e.what() + replay_differences(win_emu, recorded));
+            throw divergence_error(e.what() + difference_suffix(manifest_differences(win_emu, recorded)));
         }
     }
 }
