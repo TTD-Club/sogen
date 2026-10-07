@@ -20,6 +20,7 @@ target_link_libraries(windows-analyzer PRIVATE
   capstone
   windows-emulator
   windows-gdb-stub
+  windows-ttd
   backend-selection
   cli11
 )

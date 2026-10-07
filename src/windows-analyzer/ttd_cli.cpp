@@ -3,6 +3,7 @@
 #include "ttd_cli.hpp"
 #include "ttd_buffer_scan.hpp"
 #include "ttd_string_scan.hpp"
+#include "ttd_session.hpp"
 #include "ttd_trace.hpp"
 #include "snapshot.hpp"
 
@@ -409,22 +410,18 @@ namespace sogen::ttd
 
         replay_result seek(windows_emulator& win_emu, const cli_options& options)
         {
-            const auto checkpoint_step = win_emu.get_executed_instructions();
             trace recorded(options.replay);
-            replay_verifier verifier(win_emu, recorded, checkpoint_step);
-            if (options.seek > checkpoint_step)
+            seek_result result{};
+            try
             {
-                win_emu.start(static_cast<size_t>(options.seek - checkpoint_step));
+                result = ttd::seek(win_emu, recorded, options.seek);
             }
-            verifier.finish();
-            win_emu.log.log("TTD replay verified %llu recorded events\n", static_cast<unsigned long long>(verifier.verified_events()));
-            if (const auto reached = win_emu.get_executed_instructions(); reached != options.seek)
+            catch (const std::runtime_error& e)
             {
-                std::ostringstream message;
-                message << "TTD replay reached position " << std::hex << reached << " instead of " << options.seek;
-                return {.failure = message.str()};
+                return {.failure = e.what()};
             }
-            win_emu.log.log("TTD checkpoint %llx:0\n", static_cast<unsigned long long>(checkpoint_step));
+            win_emu.log.log("TTD replay verified %llu recorded events\n", static_cast<unsigned long long>(result.verified_events));
+            win_emu.log.log("TTD checkpoint %llx:0\n", static_cast<unsigned long long>(result.checkpoint));
             win_emu.log.log("TTD position %llx:0 RIP %llx\n", static_cast<unsigned long long>(options.seek),
                             static_cast<unsigned long long>(win_emu.emu().read_instruction_pointer()));
             if (options.read)
@@ -572,7 +569,8 @@ namespace sogen::ttd
 
     void prepare_replay(windows_emulator& win_emu, const cli_options& options)
     {
-        if (!options.replays() || options.scan_selfmod || !options.buffers.empty())
+        // A plain seek restores its checkpoint itself; fresh-setup scans start from the application.
+        if (!options.replays() || options.scan_selfmod || !options.buffers.empty() || options.is_plain_seek())
         {
             return;
         }
@@ -603,38 +601,14 @@ namespace sogen::ttd
 
     void record(windows_emulator& win_emu, const cli_options& options, const std::function<bool()>& interrupted)
     {
-        recorder trace_recorder(win_emu, options.record, recorded_kinds(options));
-        if (options.no_checkpoints)
-        {
-            win_emu.start(static_cast<size_t>(options.max_instructions));
-        }
-        else
-        {
-            while (!win_emu.process.exit_status && !interrupted())
-            {
-                const auto before = win_emu.get_executed_instructions();
-                if (options.max_instructions && before >= options.max_instructions)
-                {
-                    break;
-                }
-                const auto budget = options.max_instructions ? std::min(options.checkpoint_interval, options.max_instructions - before)
-                                                             : options.checkpoint_interval;
-                win_emu.start(static_cast<size_t>(budget));
-                if (win_emu.process.exit_status || interrupted())
-                {
-                    break;
-                }
-                if (win_emu.get_executed_instructions() - before < budget)
-                {
-                    break;
-                }
-                if (!options.max_instructions || win_emu.get_executed_instructions() < options.max_instructions)
-                {
-                    trace_recorder.checkpoint();
-                }
-            }
-        }
-        trace_recorder.finish();
+        ttd::record(win_emu,
+                    {
+                        .path = options.record,
+                        .access_mask = recorded_kinds(options),
+                        .checkpoint_interval = options.no_checkpoints ? 0 : options.checkpoint_interval,
+                        .max_instructions = options.max_instructions,
+                    },
+                    interrupted);
         win_emu.log.log("TTD recorded %llu instructions\n", static_cast<unsigned long long>(win_emu.get_executed_instructions()));
     }
 }

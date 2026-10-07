@@ -279,17 +279,18 @@ traces, 3 without instruction bytes, 4 without access data). Development
 versions 5 and 6 were never published and are rejected.
 
 A full `test-sample` recording (30.1M instructions, 40.7M events, 61
-checkpoints) is 40.7 MiB in v7; the same recording in the v4-style layout plus
+checkpoints) is 37.5 MiB in v7; the same recording in the v4-style layout plus
 access data was 4,157 MiB (2,176 MiB of fixed-size events, 962 MiB of full
 checkpoints, 958 MiB of per-event index), and 169 MiB in v6 (fixed-width
 columns, keyframe checkpoints, uncompressed page index). Of the v7 trace,
 event chunks take 13.2 MiB (3.7 bits per instruction, including every read
-and every written value up to 16 bytes), bulk blocks 22.5 MiB (almost all image
+and every written value up to 16 bytes), bulk blocks 19.4 MiB (almost all image
 contents written by `NtMapViewOfSection`), checkpoints 3.6 MiB (initial state
 1.4 MiB, three 16-apart deltas 0.7 MiB, 57 adjacent deltas 1.6 MiB), the
 code table 1.3 MiB (243,348 instructions), and the page index 0.06 MiB.
 Without bulk data in the delta references the checkpoints took 46.4 MiB.
-Recording takes 23 s (v6: 29 s, v4-style: 61 s). Queries take 0.02 s for a
+Bulk blocks are compressed at zstd level 19 on a background thread (level 6
+would take 22.5 MiB). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take 0.02 s for a
 next-access lookup and about 3 s for a scan of every chunk; a late seek
 including the checkpoint delta chain takes 0.6 s.
 

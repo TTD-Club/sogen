@@ -98,7 +98,7 @@ class _Stream:
 
 
 class _Predictor:
-    """Mirror of the predictor in src/windows-analyzer/ttd_chunk.cpp; encoder and decoder update it identically."""
+    """Mirror of the predictor in src/windows-ttd/ttd_chunk.cpp; encoder and decoder update it identically."""
 
     def __init__(self):
         self.step = self.ip = self.next_ip = self.next_code = self.bulk_block = self.bulk_next = 0

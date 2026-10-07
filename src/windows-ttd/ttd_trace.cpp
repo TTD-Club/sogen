@@ -23,7 +23,6 @@ namespace sogen::ttd
         constexpr size_t cached_bulk_blocks = bulk_reference_span + 1;
         constexpr int checkpoint_compression_level = 3;
         constexpr int code_table_compression_level = 9;
-        constexpr int bulk_compression_level = 6;
 
         // A checkpoint delta's zstd reference is its base state followed by the bulk blocks recorded in between. This
         // returns that concatenation, or nothing when those blocks are empty and the base state alone is the reference.
@@ -309,23 +308,30 @@ namespace sogen::ttd
 
     void recorder::close_bulk_block()
     {
-        bulk_entry entry{};
         if (!current_bulk_->empty())
         {
-            const auto compressed = utils::compression::zstd::compress(*current_bulk_, bulk_compression_level);
-            if (compressed.empty())
-            {
-                throw std::runtime_error("Cannot compress TTD bulk data");
-            }
-            entry = {.offset = append_to_file(compressed), .size = compressed.size()};
+            bulk_compressor_.submit(bulk_table_.size(), current_bulk_);
         }
-        bulk_table_.push_back(entry);
+        bulk_table_.push_back({});
         recent_bulk_.push_back(std::move(current_bulk_));
         if (recent_bulk_.size() > bulk_reference_span)
         {
             recent_bulk_.pop_front();
         }
         current_bulk_ = std::make_shared<std::vector<std::byte>>();
+        write_compressed_bulk(false);
+    }
+
+    void recorder::write_compressed_bulk(const bool wait)
+    {
+        for (const auto& [index, compressed] : bulk_compressor_.take_finished(wait))
+        {
+            if (compressed.empty())
+            {
+                throw std::runtime_error("Cannot compress TTD bulk data");
+            }
+            bulk_table_.at(static_cast<size_t>(index)) = {.offset = append_to_file(compressed), .size = compressed.size()};
+        }
     }
 
     void recorder::write_checkpoint(const uint64_t step)
@@ -410,6 +416,7 @@ namespace sogen::ttd
         host_write_hook_.remove();
         flush_chunk();
         close_bulk_block();
+        write_compressed_bulk(true);
         base_states_.clear();
         recent_bulk_.clear();
         header_.instruction_count = emu_.get_executed_instructions();

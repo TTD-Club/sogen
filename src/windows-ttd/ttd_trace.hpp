@@ -17,6 +17,7 @@
 #include <emulator/scoped_hook.hpp>
 
 #include "ttd_chunk.hpp"
+#include "ttd_compressor.hpp"
 #include "ttd_format.hpp"
 
 namespace sogen::ttd
@@ -58,6 +59,8 @@ namespace sogen::ttd
         static constexpr size_t events_per_chunk = 65536;
         static constexpr size_t checkpoints_per_level = 16;
         static constexpr size_t checkpoint_levels = 8;
+        // Bulk blocks compress on a background thread, so this slow, strong level does not slow recording down.
+        static constexpr int bulk_compression_level = 19;
 
         windows_emulator& emu_;
         std::filesystem::path path_;
@@ -72,6 +75,7 @@ namespace sogen::ttd
         std::shared_ptr<std::vector<std::byte>> current_bulk_{std::make_shared<std::vector<std::byte>>()};
         // The last bulk_reference_span closed blocks, oldest first.
         std::deque<bulk_block> recent_bulk_{};
+        background_compressor bulk_compressor_{bulk_compression_level};
         std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
@@ -86,6 +90,7 @@ namespace sogen::ttd
         void push_event(const access_event& event);
         void flush_chunk();
         void close_bulk_block();
+        void write_compressed_bulk(bool wait);
         void write_checkpoint(uint64_t step);
         uint64_t append_to_file(std::span<const std::byte> bytes);
     };

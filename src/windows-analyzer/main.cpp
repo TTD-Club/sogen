@@ -17,6 +17,7 @@
 #include "stdout_file_reporter.hpp"
 #include "tenet_tracer.hpp"
 #include "ttd_cli.hpp"
+#include "ttd_session.hpp"
 
 #include <utils/finally.hpp>
 #include <utils/interupt_handler.hpp>
@@ -738,43 +739,17 @@ namespace sogen
                         context.emit_observation<cpuid_event>([&](auto& event) { event.leaf = leaf; });
                     }
 
-                    if (leaf == 1 && !is_whp)
+                    const auto result = is_whp ? std::optional<ttd::cpuid_result>{} : ttd::cpuid_override(leaf, options.reproducible);
+                    if (!result)
                     {
-                        // NOTE: We hard-code these values to disable SSE4.x and AVX
-                        //       See: https://github.com/momo5502/sogen/issues/560
-                        emu.reg<uint32_t>(x86_register::eax, 0x000906EA);
-                        emu.reg<uint32_t>(x86_register::ebx, 0x00100800);
-                        // Unicorn serves RDRAND from the host's random source on non-MSVC builds, which
-                        // reproducible runs (and TTD replay) cannot repeat.
-                        constexpr uint32_t rdrand_feature = 1u << 30;
-                        emu.reg<uint32_t>(x86_register::ecx, options.reproducible ? 0xEFE2F38F & ~rdrand_feature : 0xEFE2F38F);
-                        emu.reg<uint32_t>(x86_register::edx, 0xBFEBFBFF);
-
-                        return instruction_hook_continuation::skip_instruction;
+                        return instruction_hook_continuation::run_instruction;
                     }
 
-                    if (leaf == 0x40000000 && !is_whp)
-                    {
-                        // Microsoft Hv vendor string
-                        emu.reg<uint32_t>(x86_register::eax, 0x40000003);
-                        emu.reg<uint32_t>(x86_register::ebx, 0x7263694d);
-                        emu.reg<uint32_t>(x86_register::ecx, 0x666f736f);
-                        emu.reg<uint32_t>(x86_register::edx, 0x76482074);
-
-                        return instruction_hook_continuation::skip_instruction;
-                    }
-
-                    if (leaf == 0x40000003 && !is_whp)
-                    {
-                        emu.reg<uint32_t>(x86_register::eax, 0x00000000);
-                        emu.reg<uint32_t>(x86_register::ebx, 0x00000001);
-                        emu.reg<uint32_t>(x86_register::ecx, 0x00000000);
-                        emu.reg<uint32_t>(x86_register::edx, 0x00000000);
-
-                        return instruction_hook_continuation::skip_instruction;
-                    }
-
-                    return instruction_hook_continuation::run_instruction;
+                    emu.reg<uint32_t>(x86_register::eax, result->eax);
+                    emu.reg<uint32_t>(x86_register::ebx, result->ebx);
+                    emu.reg<uint32_t>(x86_register::ecx, result->ecx);
+                    emu.reg<uint32_t>(x86_register::edx, result->edx);
+                    return instruction_hook_continuation::skip_instruction;
                 });
             });
 
@@ -1003,6 +978,7 @@ namespace sogen
                 {
                     options.backend = backend_type::unicorn;
                     options.reproducible = true;
+                    options.observe_only = true;
                 }
                 if (options.use_gdb && options.vcpu_count > 1)
                 {

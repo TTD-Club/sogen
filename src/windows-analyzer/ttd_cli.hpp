@@ -59,6 +59,11 @@ namespace sogen::ttd
         {
             return !this->replay.empty();
         }
+
+        bool is_plain_seek() const
+        {
+            return this->replays() && !this->scan_selfmod && !this->verify_checkpoints && this->strings.empty() && this->buffers.empty();
+        }
     };
 
     struct analyzer_configuration
