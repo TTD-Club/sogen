@@ -187,53 +187,84 @@ namespace sogen::ttd
             size_t offset_{};
         };
 
-        // Guest memory as far as the chunk's own accesses have shown it.
+        // Guest memory as far as the chunk's own accesses have shown it, in pages with one validity byte per byte.
         class known_memory
         {
           public:
-            void store(const uint64_t address, const std::span<const std::byte> data)
+            void store(uint64_t address, std::span<const std::byte> data)
             {
-                qword* current = nullptr;
-                uint64_t current_base = 0;
-                for (size_t i = 0; i < data.size(); ++i)
+                while (!data.empty())
                 {
-                    const auto byte_address = address + i;
-                    const auto base = byte_address & ~uint64_t{7};
-                    if (!current || base != current_base)
-                    {
-                        current = &this->qwords_[base];
-                        current_base = base;
-                    }
-                    const auto lane = static_cast<size_t>(byte_address & 7);
-                    current->bytes[lane] = data[i];
-                    current->valid |= static_cast<uint8_t>(1U << lane);
+                    auto& page = this->page_at(address);
+                    const auto offset = static_cast<size_t>(address % known_page_size);
+                    const auto count = std::min(data.size(), known_page_size - offset);
+                    memcpy(page.bytes.data() + offset, data.data(), count);
+                    memset(page.valid.data() + offset, 1, count);
+                    address += count;
+                    data = data.subspan(count);
                 }
             }
 
-            bool load(const uint64_t address, const std::span<std::byte> output) const
+            bool load(uint64_t address, std::span<std::byte> output)
             {
-                for (size_t i = 0; i < output.size(); ++i)
+                while (!output.empty())
                 {
-                    const auto byte_address = address + i;
-                    const auto entry = this->qwords_.find(byte_address & ~uint64_t{7});
-                    const auto lane = static_cast<size_t>(byte_address & 7);
-                    if (entry == this->qwords_.end() || !(entry->second.valid & (1U << lane)))
+                    const auto* page = this->find_page(address);
+                    const auto offset = static_cast<size_t>(address % known_page_size);
+                    const auto count = std::min(output.size(), known_page_size - offset);
+                    if (!page || std::memchr(page->valid.data() + offset, 0, count))
                     {
                         return false;
                     }
-                    output[i] = entry->second.bytes[lane];
+                    memcpy(output.data(), page->bytes.data() + offset, count);
+                    address += count;
+                    output = output.subspan(count);
                 }
                 return true;
             }
 
           private:
-            struct qword
+            static constexpr size_t known_page_size = 4096;
+
+            struct page
             {
-                std::array<std::byte, 8> bytes{};
-                uint8_t valid{};
+                std::array<std::byte, known_page_size> bytes{};
+                std::array<uint8_t, known_page_size> valid{};
             };
 
-            std::unordered_map<uint64_t, qword> qwords_{};
+            std::unordered_map<uint64_t, std::unique_ptr<page>> pages_{};
+            uint64_t last_number_{UINT64_MAX};
+            page* last_page_{};
+
+            page* find_page(const uint64_t address)
+            {
+                const auto number = address / known_page_size;
+                if (number != this->last_number_)
+                {
+                    const auto entry = this->pages_.find(number);
+                    if (entry == this->pages_.end())
+                    {
+                        return nullptr;
+                    }
+                    this->last_number_ = number;
+                    this->last_page_ = entry->second.get();
+                }
+                return this->last_page_;
+            }
+
+            page& page_at(const uint64_t address)
+            {
+                if (auto* existing = this->find_page(address))
+                {
+                    return *existing;
+                }
+                const auto number = address / known_page_size;
+                auto& slot = this->pages_[number];
+                slot = std::make_unique<page>();
+                this->last_number_ = number;
+                this->last_page_ = slot.get();
+                return *slot;
+            }
         };
 
         struct bulk_reference
