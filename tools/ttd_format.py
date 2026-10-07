@@ -452,9 +452,29 @@ def _write_page_index(body, entries):
     return directory, len(blocks)
 
 
-def write_trace(path, events, instruction_count, access_mask=READ | WRITE | EXECUTE | HOST_WRITE):
+def encode_threads(switches, names):
+    """Mirror of encode_threads in src/windows-ttd/ttd_chunk.cpp."""
+    raw = bytearray()
+    _put_varint(raw, len(switches))
+    step = event_number = 0
+    for switch_step, switch_event, thread_id in switches:
+        _put_varint(raw, switch_step - step)
+        _put_varint(raw, switch_event - event_number)
+        _put_varint(raw, thread_id)
+        step, event_number = switch_step, switch_event
+    _put_varint(raw, len(names))
+    for thread_id, name in sorted(names.items()):
+        encoded = name.encode()
+        _put_varint(raw, thread_id)
+        _put_varint(raw, len(encoded))
+        raw += encoded
+    return zstandard.ZstdCompressor(level=19).compress(bytes(raw))
+
+
+def write_trace(path, events, instruction_count, access_mask=READ | WRITE | EXECUTE | HOST_WRITE, thread_switches=None):
     """Write a minimal single-chunk trace without checkpoints, for tools that only read events. Accesses larger than 16
-    bytes give their data as content and go to bulk block 0."""
+    bytes give their data as content and go to bulk block 0. thread_switches: (step, event_number, thread_id) tuples
+    for a threads section."""
     code = CodeTable()
     bulk = bytearray()
     referenced = []
@@ -481,13 +501,16 @@ def write_trace(path, events, instruction_count, access_mask=READ | WRITE | EXEC
     body += encoded_code
     bulk_table = len(body)
     body += BULK.pack(bulk_offset if encoded_bulk else 0, len(encoded_bulk))
+    sections = [(CHUNK_TABLE, chunk_table, 1), (CHECKPOINT_TABLE, checkpoint_table, 0), (PAGE_INDEX, page_index, page_blocks),
+                (CODE_TABLE, code_table, len(encoded_code)), (BULK_TABLE, bulk_table, 1)]
+    if thread_switches is not None:
+        encoded_threads = encode_threads(thread_switches, {thread_id: "" for _, _, thread_id in thread_switches})
+        sections.append((THREADS, len(body), len(encoded_threads)))
+        body += encoded_threads
     section_table = len(body)
-    body += SECTION.pack(CHUNK_TABLE, chunk_table, 1)
-    body += SECTION.pack(CHECKPOINT_TABLE, checkpoint_table, 0)
-    body += SECTION.pack(PAGE_INDEX, page_index, page_blocks)
-    body += SECTION.pack(CODE_TABLE, code_table, len(encoded_code))
-    body += SECTION.pack(BULK_TABLE, bulk_table, 1)
-    body[:HEADER.size] = HEADER.pack(MAGIC, instruction_count, len(events), access_mask, 5, section_table)
+    for section in sections:
+        body += SECTION.pack(*section)
+    body[:HEADER.size] = HEADER.pack(MAGIC, instruction_count, len(events), access_mask, len(sections), section_table)
     with open(path, "wb") as file:
         file.write(body)
 

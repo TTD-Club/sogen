@@ -66,6 +66,26 @@ def main():
         assert "memory=4000" not in result.stdout
         assert "tainted_memory_writes=1" in result.stdout
 
+        # Register taint follows thread switches: thread 2's al is not thread 1's.
+        threads = pathlib.Path(directory) / "threads.sogttd"
+        other_store = bytes.fromhex("a20040000000000000")  # movabs byte ptr [0x4000], al
+        events = [
+            (1, 0x1000, 0x1000, len(load), 4, load),
+            (1, 0x1000, 0x2000, 1, 1, b""),
+            (2, 0x1009, 0x1009, len(store), 4, store),
+            (2, 0x1009, 0x3000, 1, 2, b""),
+            (3, 0x1012, 0x1012, len(other_store), 4, other_store),
+            (3, 0x1012, 0x4000, 1, 2, b""),
+        ]
+        ttd_format.write_trace(str(threads), events, instruction_count=3, thread_switches=[(1, 0, 1), (2, 2, 2), (3, 4, 1)])
+        result = subprocess.run([sys.executable, str(taint_tool), str(threads), "--taint", "input:0x2000:1", "--register", "al"],
+                                text=True, capture_output=True, check=True)
+        assert "memory=4000" in result.stdout and "memory=3000" not in result.stdout, result.stdout
+        assert "register=rax taint_mask=1" in result.stdout, result.stdout
+        result = subprocess.run([sys.executable, str(taint_tool), str(threads), "--taint", "input:0x2000:1", "--register", "al",
+                                 "--thread", "2"], text=True, capture_output=True, check=True)
+        assert "register=rax taint_mask=0" in result.stdout and "register=rax last_read=2:0 ip=1009" in result.stdout
+
 
 if __name__ == "__main__":
     main()

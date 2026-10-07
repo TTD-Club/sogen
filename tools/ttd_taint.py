@@ -3,7 +3,8 @@
 
 Requires capstone 5 (and zstandard for v7 and v8 traces). This is a bounded x64
 data-flow prototype: unsupported instructions are reported as gaps when they
-consume tainted data.
+consume tainted data. Register taint is kept per thread when the trace records
+thread switches; memory taint is shared by all threads.
 """
 
 import argparse
@@ -49,9 +50,12 @@ def reg_slice(name):
 class TaintReplay:
     def __init__(self, sources, max_hits):
         self.memory = {}
-        self.registers = collections.defaultdict(lambda: [0] * 16)
-        self.last_read = {}
-        self.last_write = {}
+        # Per thread (None without thread switches): register taint and the last instruction reading or writing each.
+        self.thread_registers = collections.defaultdict(lambda: collections.defaultdict(lambda: [0] * 16))
+        self.thread_last_read = collections.defaultdict(dict)
+        self.thread_last_write = collections.defaultdict(dict)
+        self.thread = None
+        self.switch_thread(None)
         self.sources = sources
         self.max_hits = max_hits
         self.hits = 0
@@ -63,6 +67,12 @@ class TaintReplay:
             self.pending_sources.append((step, index, address, size))
         self.pending_sources.sort()
         self.apply_sources(0)
+
+    def switch_thread(self, thread):
+        self.thread = thread
+        self.registers = self.thread_registers[thread]
+        self.last_read = self.thread_last_read[thread]
+        self.last_write = self.thread_last_write[thread]
 
     def apply_sources(self, step):
         while self.pending_sources and self.pending_sources[0][0] <= step:
@@ -104,7 +114,9 @@ class TaintReplay:
                 self.memory.pop(address + i, None)
 
     def process(self, execute, accesses, decoder):
-        step, ip, _, size, _, code = execute
+        step, ip, _, size, _, code, thread = execute
+        if thread != self.thread:
+            self.switch_thread(thread)
         self.apply_sources(step)
         instructions = list(decoder.disasm(code[:size], ip, count=1))
         if len(instructions) != 1 or instructions[0].size != size:
@@ -195,13 +207,20 @@ class TaintReplay:
 
 
 def events(path):
+    """(step, ip, address, size, kind, payload, thread) tuples; thread is None without recorded thread switches."""
     with open(path, "rb") as file:
         magic = file.read(8)
     if magic in (b"SOGTTD7\0", b"SOGTTD8\0"):
         import ttd_format
 
-        for event in ttd_format.Trace(path).events():
-            yield event.step, event.ip, event.address, event.size, event.kind, event.payload
+        trace = ttd_format.Trace(path)
+        switches = trace.thread_switches
+        current = -1
+        for event in trace.events():
+            while current + 1 < len(switches) and switches[current + 1][1] <= event.number:
+                current += 1
+            thread = switches[current][2] if current >= 0 else None
+            yield event.step, event.ip, event.address, event.size, event.kind, event.payload, thread
         return
     with open(path, "rb") as file:
         with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
@@ -212,7 +231,7 @@ def events(path):
             if start + count * EVENT.size > len(data):
                 raise ValueError("truncated event stream")
             for offset in range(start, start + count * EVENT.size, EVENT.size):
-                yield EVENT.unpack_from(data, offset)
+                yield *EVENT.unpack_from(data, offset), None
 
 
 def main():
@@ -220,6 +239,8 @@ def main():
     parser.add_argument("trace")
     parser.add_argument("--taint", action="append", required=True, metavar="NAME:ADDRESS:SIZE[:STEP]")
     parser.add_argument("--register", help="report the last replay-derived read and write of this register")
+    parser.add_argument("--thread", type=lambda value: int(value, 0),
+                        help="report --register for this thread id (default: the thread that ran last)")
     parser.add_argument("--through-step", type=lambda value: int(value, 0))
     parser.add_argument("--max-hits", type=int, default=32)
     args = parser.parse_args()
@@ -257,6 +278,8 @@ def main():
         location = reg_slice(args.register)
         if location is None:
             parser.error("unsupported register")
+        if args.thread is not None:
+            replay.switch_thread(args.thread)
         base = location[0]
         for operation, index in (("last_read", replay.last_read), ("last_write", replay.last_write)):
             value = index.get(base)

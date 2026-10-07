@@ -302,7 +302,10 @@ It prints tainted memory writes, a bounded count of unsupported tainted
 flows, and an optional register's last read/write. `--through-step` limits
 analysis to a position. Read, write, and execute recording must all be on.
 Host writes in a v7 or v8 trace clear taint from the bytes they overwrite; they are
-not yet taint sources.
+not yet taint sources. With a threads section, register taint and the
+last read/write positions are kept per thread (memory taint is shared);
+`--thread ID` picks the thread `--register` reports on (default: the one
+that ran last).
 For `test/ttd_xor_string_sample.c`, tainting the 35 encoded bytes at
 `0x140002000` produced 34 tainted output-byte writes beginning at
 `0x140005000`, with zero reported unsupported tainted flows through position
