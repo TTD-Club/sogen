@@ -15,6 +15,7 @@
 
 #include <windows_emulator.hpp>
 #include <emulator/scoped_hook.hpp>
+#include <utils/compression.hpp>
 
 #include "ttd_chunk.hpp"
 #include "ttd_compressor.hpp"
@@ -59,8 +60,13 @@ namespace sogen::ttd
         static constexpr size_t events_per_chunk = 65536;
         static constexpr size_t checkpoints_per_level = 16;
         static constexpr size_t checkpoint_levels = 8;
-        // Bulk blocks compress on a background thread, so this slow, strong level does not slow recording down.
+        // Chunks and bulk blocks compress on background threads, so these slow, strong levels do not slow recording
+        // down. Level 19 takes about as long per chunk as recording it; two chunk workers still slowed a test-sample
+        // recording by 10%, four did not.
+        static constexpr int chunk_compression_level = 19;
         static constexpr int bulk_compression_level = 19;
+        static constexpr size_t chunk_workers = 4;
+        static constexpr size_t max_pending_compressions = 16;
 
         windows_emulator& emu_;
         std::filesystem::path path_;
@@ -76,7 +82,11 @@ namespace sogen::ttd
         // The last bulk_reference_span closed blocks, oldest first.
         std::deque<bulk_block> recent_bulk_{};
         background_compressor bulk_compressor_{
-            [](const std::span<const std::byte> data) { return encode_bulk_block(data, bulk_compression_level); }};
+            [](const std::span<const std::byte> data) { return encode_bulk_block(data, bulk_compression_level); }, 1,
+            max_pending_compressions};
+        background_compressor chunk_compressor_{
+            [](const std::span<const std::byte> data) { return utils::compression::zstd::compress(data, chunk_compression_level); },
+            chunk_workers, max_pending_compressions};
         std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
@@ -91,7 +101,7 @@ namespace sogen::ttd
         void push_event(const access_event& event);
         void flush_chunk();
         void close_bulk_block();
-        void write_compressed_bulk(bool wait);
+        void write_compressed(bool wait);
         void write_checkpoint(uint64_t step);
         uint64_t append_to_file(std::span<const std::byte> bytes);
     };

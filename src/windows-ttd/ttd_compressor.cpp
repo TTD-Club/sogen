@@ -2,10 +2,14 @@
 
 namespace sogen::ttd
 {
-    background_compressor::background_compressor(encoder encode)
+    background_compressor::background_compressor(encoder encode, const size_t workers, const size_t max_pending)
         : encode_(std::move(encode)),
-          worker_([this] { this->run(); })
+          max_pending_(max_pending)
     {
+        for (size_t i = 0; i < workers; ++i)
+        {
+            this->workers_.emplace_back([this] { this->run(); });
+        }
     }
 
     background_compressor::~background_compressor()
@@ -15,13 +19,18 @@ namespace sogen::ttd
             this->stopping_ = true;
         }
         this->work_available_.notify_all();
-        this->worker_.join();
+        this->space_available_.notify_all();
+        for (auto& worker : this->workers_)
+        {
+            worker.join();
+        }
     }
 
     void background_compressor::submit(const uint64_t id, std::shared_ptr<const std::vector<std::byte>> data)
     {
         {
-            const std::scoped_lock lock(this->mutex_);
+            std::unique_lock lock(this->mutex_);
+            this->space_available_.wait(lock, [this] { return this->stopping_ || this->pending_.size() < this->max_pending_; });
             this->pending_.emplace_back(id, std::move(data));
             ++this->unfinished_;
         }
@@ -53,6 +62,7 @@ namespace sogen::ttd
                 job = std::move(this->pending_.front());
                 this->pending_.pop_front();
             }
+            this->space_available_.notify_one();
 
             auto compressed = this->encode_(*job.second);
             job.second.reset();

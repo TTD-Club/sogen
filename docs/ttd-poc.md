@@ -244,8 +244,9 @@ All fields are little-endian; `tools/ttd_format.py` is a reference reader and
 writer. The 48-byte header is `SOGTTD8\0` plus five `uint64_t` values:
 instruction count, event count, recorded access kinds (a nonzero mask of the
 kind values below), section count, and section-table offset. A section-table
-offset of zero marks a recording that was never finalized. Event chunks and
-checkpoints follow the header in recording order; the tables at the end are
+offset of zero marks a recording that was never finalized. Event chunks,
+checkpoints, and bulk blocks follow the header in the order the recorder
+finished compressing them (not necessarily recording order); the tables at the end are
 found through the section table (24-byte entries `type, offset, size`):
 
 - Chunk table (type 1, size = entry count): 48-byte entries `first_event,
@@ -332,20 +333,21 @@ with full checkpoint snapshots and a per-event page index; they remain readable
 data). Development versions 5 and 6 were never published and are rejected.
 
 A full `test-sample` recording (30.1M instructions, 40.7M events, 61
-checkpoints) is 35.8 MiB in v8 (37.5 MiB in v7); the same recording in the
+checkpoints) is 34.0 MiB in v8 (37.5 MiB in v7); the same recording in the
 v4-style layout plus access data was 4,157 MiB (2,176 MiB of fixed-size
 events, 962 MiB of full checkpoints, 958 MiB of per-event index), and 169 MiB
 in v6 (fixed-width columns, keyframe checkpoints, uncompressed page index). Of
-the v8 trace, event chunks take 13.2 MiB (3.7 bits per instruction, including
-every read and every written value up to 16 bytes), bulk blocks 17.6 MiB
+the v8 trace, event chunks take 11.4 MiB (3.2 bits per instruction, including
+every read and every written value up to 16 bytes; 13.2 MiB at zstd level 6),
+bulk blocks 17.6 MiB
 (59.8 MiB raw, almost all image contents written by `NtMapViewOfSection`;
 19.4 MiB without the x86-64 filter), checkpoints 3.6 MiB (initial state
 1.4 MiB, three 16-apart deltas 0.7 MiB, 57 adjacent deltas 1.6 MiB), the
 code table 1.3 MiB (243,348 instructions), and the page index 0.06 MiB.
 Without bulk data in the delta references the checkpoints took 46.4 MiB.
-Bulk blocks are compressed at zstd level 19 on a background thread (level 6
-would take 22.5 MiB unfiltered). Recording takes 20 s (v6: 29 s, v4-style:
-61 s). Queries take 0.02 s for a next-access lookup and about 3 s for a scan
+Chunks (on four threads) and bulk blocks (on one) are compressed at zstd
+level 19 in the background (level 6 bulk blocks would take 22.5 MiB
+unfiltered). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take 0.02 s for a next-access lookup and about 3 s for a scan
 of every chunk; a late seek including the checkpoint delta chain takes 0.7 s
 (0.6 s in v7).
 
@@ -362,9 +364,10 @@ On the UPX-packed test PE, a v4 query at the unpacked entry
 the self-modifying-code pass linked it to the UPX stub write at position
 `0x219cb4`.
 The recorder keeps one chunk of events (65,536), the code table, the page
-entries, the base state of each checkpoint level, and the last 16 bulk
-blocks in memory and writes
-chunks and checkpoints to the trace as they are produced. Readers validate offsets, tables, and chunk contents before using
+entries, the base state of each checkpoint level, the last 16 bulk
+blocks, and up to 16 chunks and 16 bulk blocks waiting for compression in
+memory, and writes chunks, bulk blocks, and checkpoints to the trace as they
+are produced. Readers validate offsets, tables, and chunk contents before using
 them and keep the four most recently decoded chunks and the last restored
 checkpoint state cached. Queries bound candidate chunks by event number
 (event numbers grow with step) and stop next/previous searches at the first

@@ -288,22 +288,22 @@ namespace sogen::ttd
         {
             return;
         }
-        const auto encoded = encode_chunk(chunk_events_, code_, [this](const uint64_t block) -> bulk_block {
+        auto encoded = encode_chunk(chunk_events_, code_, [this](const uint64_t block) -> bulk_block {
             return block == bulk_table_.size() ? current_bulk_ : nullptr;
         });
         const auto index = static_cast<uint32_t>(chunks_.size());
         chunks_.push_back({.first_event = header_.event_count - chunk_events_.size(),
                            .event_count = chunk_events_.size(),
                            .first_step = chunk_events_.front().step,
-                           .last_step = chunk_events_.back().step,
-                           .offset = append_to_file(encoded),
-                           .size = encoded.size()});
+                           .last_step = chunk_events_.back().step});
         for (const auto& [page, kinds] : chunk_pages_)
         {
             pages_.push_back({.page = page, .chunk = index, .kinds = kinds});
         }
         chunk_events_.clear();
         chunk_pages_.clear();
+        chunk_compressor_.submit(index, std::make_shared<const std::vector<std::byte>>(std::move(encoded)));
+        write_compressed(false);
     }
 
     void recorder::close_bulk_block()
@@ -319,11 +319,21 @@ namespace sogen::ttd
             recent_bulk_.pop_front();
         }
         current_bulk_ = std::make_shared<std::vector<std::byte>>();
-        write_compressed_bulk(false);
+        write_compressed(false);
     }
 
-    void recorder::write_compressed_bulk(const bool wait)
+    void recorder::write_compressed(const bool wait)
     {
+        for (const auto& [index, compressed] : chunk_compressor_.take_finished(wait))
+        {
+            if (compressed.empty())
+            {
+                throw std::runtime_error("Cannot compress TTD event chunk");
+            }
+            auto& entry = chunks_.at(static_cast<size_t>(index));
+            entry.offset = append_to_file(compressed);
+            entry.size = compressed.size();
+        }
         for (const auto& [index, compressed] : bulk_compressor_.take_finished(wait))
         {
             if (compressed.empty())
@@ -416,7 +426,7 @@ namespace sogen::ttd
         host_write_hook_.remove();
         flush_chunk();
         close_bulk_block();
-        write_compressed_bulk(true);
+        write_compressed(true);
         base_states_.clear();
         recent_bulk_.clear();
         header_.instruction_count = emu_.get_executed_instructions();

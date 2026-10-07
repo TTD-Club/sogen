@@ -39,7 +39,8 @@ namespace sogen::ttd
     // or known value flags), then varint steps, instruction pointers, code ids, addresses, sizes, access data, and bulk
     // references. Each stream predicts from earlier events of the same chunk only, so chunks decode independently given
     // the code table and the bulk blocks. Accesses larger than an event payload keep their bytes in a bulk block; their
-    // payload holds the offset and block index, which `bulk` resolves.
+    // payload holds the offset and block index, which `bulk` resolves. encode_chunk returns the frame's content; the
+    // caller compresses it.
     std::vector<std::byte> encode_chunk(std::span<const access_event> events, code_table& code, const bulk_resolver& bulk);
     decoded_chunk decode_chunk(std::span<const std::byte> compressed, std::span<const code_entry> code, const bulk_resolver& bulk);
 

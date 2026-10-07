@@ -12,7 +12,7 @@ namespace sogen::ttd
 {
     namespace
     {
-        constexpr int chunk_compression_level = 6;
+        constexpr int page_block_compression_level = 6;
         constexpr uint64_t no_previous_version = UINT64_MAX;
 
         constexpr uint8_t tag_kind_mask = 0x0F;
@@ -424,13 +424,7 @@ namespace sogen::ttd
         {
             raw.insert(raw.end(), bytes.begin(), bytes.end());
         }
-
-        auto compressed = utils::compression::zstd::compress(raw, chunk_compression_level);
-        if (compressed.empty())
-        {
-            throw std::runtime_error("Cannot compress TTD event chunk");
-        }
-        return compressed;
+        return raw;
     }
 
     decoded_chunk decode_chunk(const std::span<const std::byte> compressed, const std::span<const code_entry> code,
@@ -578,7 +572,7 @@ namespace sogen::ttd
         {
             raw.insert(raw.end(), bytes.begin(), bytes.end());
         }
-        auto compressed = utils::compression::zstd::compress(raw, chunk_compression_level);
+        auto compressed = utils::compression::zstd::compress(raw, page_block_compression_level);
         if (compressed.empty())
         {
             throw std::runtime_error("Cannot compress TTD page index");
