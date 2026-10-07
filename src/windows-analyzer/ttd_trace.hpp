@@ -5,6 +5,7 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -54,7 +55,8 @@ namespace sogen::ttd
 
       private:
         static constexpr size_t events_per_chunk = 65536;
-        static constexpr size_t checkpoints_per_keyframe = 16;
+        static constexpr size_t checkpoints_per_level = 16;
+        static constexpr size_t checkpoint_levels = 8;
 
         windows_emulator& emu_;
         std::filesystem::path path_;
@@ -63,10 +65,12 @@ namespace sogen::ttd
         std::vector<chunk_entry> chunks_{};
         std::vector<page_entry> pages_{};
         std::vector<checkpoint_entry> checkpoints_{};
+        code_table code_{};
         std::vector<access_event> chunk_events_{};
         std::vector<std::byte> chunk_blob_{};
         std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
-        std::vector<std::byte> previous_state_{};
+        // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
+        std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
         scoped_hook write_hook_{};
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};
@@ -139,8 +143,8 @@ namespace sogen::ttd
         std::vector<checkpoint_entry> checkpoints_{};
 
         std::vector<chunk_entry> chunks_{};
-        uint64_t page_index_offset_{};
-        uint64_t page_index_count_{};
+        std::vector<code_entry> code_{};
+        std::vector<page_block> page_blocks_{};
         std::vector<cached_chunk> chunk_cache_{};
         std::optional<std::pair<uint64_t, std::vector<std::byte>>> state_cache_{};
 
@@ -151,7 +155,7 @@ namespace sogen::ttd
 
         bool chunked() const
         {
-            return version_ >= 6;
+            return version_ >= 7;
         }
 
         void read_chunked_layout(uint64_t length);

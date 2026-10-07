@@ -1,4 +1,4 @@
-"""Small v4 and v6 fixtures for instruction bytes and replay-derived taint flow."""
+"""Small v4 and v7 fixtures for instruction bytes and replay-derived taint flow."""
 
 import pathlib
 import struct

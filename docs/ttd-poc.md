@@ -32,7 +32,7 @@ The application and root for replay must match the recording. `--ttd-seek N`
 restores the nearest checkpoint at or before `N` and executes the remaining
 instructions. While it does, every access of a recorded kind is compared with
 the trace (kind, step, instruction pointer, address, size, instruction bytes
-for executes, and the bytes read or written for v6 traces); a mismatch, or a
+for executes, and the bytes read or written for v7 traces); a mismatch, or a
 recorded event at or before `N` that never occurs, fails the seek with the
 first differing event. Running
 the same command with `N-1` implements reverse instruction step. The CLI
@@ -59,9 +59,10 @@ compares the complete serialized emulator state with the recorded checkpoint,
 printing `matches`, the first differing state offset, or the event at which
 the interval's replay diverged, and continues with the next interval. All
 checkpoints of `ttd-step-sample` match. A complete recording of `test-sample`
-(30,147,174 instructions, 60 checkpoints) matched in 57 intervals; the other
-three diverge at host writes carrying live network input (two DNS answers
-delivered over ALPC and one socket `NtDeviceIoControlFile` result). Value
+(30,147,174 instructions, 60 checkpoints) matched in 56 or 57 intervals,
+depending on the network; the others diverge at host writes carrying live
+network input (DNS answers delivered over ALPC and socket
+`NtDeviceIoControlFile` results). Value
 verification also exposed emulator writes that copied uninitialized host
 stack bytes (struct padding) into the guest, for `TokenBnoIsolation` and for
 window-message callback arguments; those are fixed.
@@ -182,7 +183,7 @@ MOVZX/MOVSX, LEA, basic arithmetic/bitwise operations, PUSH/POP, and MOVS.
 It prints tainted memory writes, a bounded count of unsupported tainted
 flows, and an optional register's last read/write. `--through-step` limits
 analysis to a position. Read, write, and execute recording must all be on.
-Host writes in a v6 trace clear taint from the bytes they overwrite; they are
+Host writes in a v7 trace clear taint from the bytes they overwrite; they are
 not yet taint sources.
 For `test/ttd_xor_string_sample.c`, tainting the 35 encoded bytes at
 `0x140002000` produced 34 tainted output-byte writes beginning at
@@ -194,57 +195,89 @@ thread-specific register state, MMIO, and data from the initial snapshot other
 than selected source ranges are not fully modeled. A gap means the reported
 taint flow may be incomplete.
 
-## Format v6
+## Format v7
 
 All fields are little-endian; `tools/ttd_format.py` is a reference reader and
-writer. The 48-byte header is `SOGTTD6\0` plus five `uint64_t` values:
+writer. The 48-byte header is `SOGTTD7\0` plus five `uint64_t` values:
 instruction count, event count, recorded access kinds (a nonzero mask of the
 kind values below), section count, and section-table offset. A section-table
 offset of zero marks a recording that was never finalized. Event chunks and
 checkpoints follow the header in recording order; the tables at the end are
-found through the section table (24-byte entries `type, offset, count`):
+found through the section table (24-byte entries `type, offset, size`):
 
-- Chunk table (type 1): 48-byte entries `first_event, event_count, first_step,
-  last_step, offset, size`, contiguous in event number.
-- Checkpoint table (type 2): 32-byte entries `step, offset, size, base`.
-  Entry 0 is the initial state at step 0. A checkpoint is the serialized
-  emulator state compressed with zstd; when `base` is not `UINT64_MAX` it is
-  a zstd delta (`refPrefix` with long-distance matching) against the state of
-  checkpoint `base`. The recorder writes a full keyframe every 16 checkpoints
-  and otherwise a delta against the previous one, so restoring a checkpoint
-  decompresses at most 16 states.
-- Page index (type 3): 16-byte entries `page, chunk, kinds`, sorted by page
-  and chunk, one per 4 KiB page touched by any event of a chunk, with the
-  union of the kinds that touched it. A query decompresses only the chunks
-  listed for its pages.
+- Chunk table (type 1, size = entry count): 48-byte entries `first_event,
+  event_count, first_step, last_step, offset, size`, contiguous in event
+  number.
+- Checkpoint table (type 2, size = entry count): 32-byte entries `step,
+  offset, size, base`. Entry 0 is the initial state at step 0, the serialized
+  emulator state compressed with zstd. Every other checkpoint is a zstd delta
+  (`refPrefix` with long-distance matching) against the state of checkpoint
+  `base`. The recorder uses `base = i - p`, where `p` is the largest power of
+  16 dividing `i`, so restoring any checkpoint decompresses fewer than 16
+  deltas per power of 16 (17 states for checkpoint 47: 47 to 32, 16, and 0).
+- Page index (type 3, size = block count): 32-byte block entries
+  `first_page, entry_count, offset, size`. Each block is a zstd frame of up to
+  4,096 consecutive page entries `(page, chunk, kinds)`, sorted by page and
+  chunk, one per 4 KiB page touched by any event of a chunk with the union of
+  the kinds that touched it. The frame holds three `uint64_t` stream sizes and
+  then the streams: varint page deltas (the first relative to `first_page`),
+  varint chunks (deltas while the page repeats), and one kinds byte per entry.
+  A query decodes only the blocks covering its pages and then only the chunks
+  they list.
+- Code table (type 4, size = compressed bytes): one zstd frame of 32-byte
+  entries `address, size, bytes[16]`, one per distinct executed instruction
+  (address and bytes), in order of first execution. Self-modified code gets a
+  new entry for each new byte sequence at an address.
 
 Unknown section types are ignored, so sections can be added without a new
-version. An event chunk is one zstd frame holding `event_count, blob_size`
-and then columns for all of its events: step deltas, instruction-pointer
-deltas, address minus instruction pointer, size, kind (one byte), and a
-16-byte payload, followed by the blob. Kind is 1 for read, 2 for write, 4 for
-execute, and 8 for a host write. An execute event's payload holds the
-instruction bytes as they existed just before execution (`size` bytes, up to
-the x86 maximum of 15). A read, write, or host write's payload holds the bytes
-read or written when `size` is at most 16; larger accesses (only host writes;
-guest accesses are at most 8 bytes) store their bytes in the chunk's blob and
-the blob offset in the payload.
+version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
+write. An event chunk is one zstd frame holding `event_count`, seven stream
+sizes, and the streams. Each stream predicts from earlier events of the same
+chunk only, so a chunk decodes on its own given the code table:
+
+- Tags, one byte per event: the kind (bits 0-3), an irregular-step flag (bit
+  4), and bit 5, which for an execute means "a code id follows" and for a read
+  means "the value is known".
+- Steps: a varint step delta, present only for events with the irregular-step
+  flag. Otherwise an execute advances the step by one and an access keeps it.
+- Instruction pointers: zigzag varints, for an execute relative to the end of
+  the previous executed instruction, otherwise relative to the previous event's
+  instruction pointer.
+- Code ids: zigzag varint deltas from one past the last code id named in the
+  chunk. An execute without one reuses the id last named for its address in the
+  chunk. The code table supplies its size and instruction bytes as they existed
+  just before execution.
+- Addresses: for an execute, the zigzag difference from its instruction
+  pointer; for an access, from the address that the last access of the same
+  kind by the same instruction pointer used in this chunk (or else the last
+  access of the same kind).
+- Sizes: varint access sizes.
+- Data: the bytes of every read, write, and host write in event order, except
+  reads flagged as known, whose bytes equal what earlier accesses of the chunk
+  left at those addresses and are rebuilt by the decoder.
+
+Decoded accesses up to 16 bytes carry their data inline; larger ones (only
+host writes; guest accesses are at most 8 bytes) refer to their offset in the
+data stream.
 
 Versions 1 to 4 stored fixed-size event records with full checkpoint snapshots
 and a per-event page index; they remain readable (1 and 2 as write-only
-traces, 3 without instruction bytes, 4 without access data). An unreleased
-v5 was never published.
+traces, 3 without instruction bytes, 4 without access data). Development
+versions 5 and 6 were never published and are rejected.
 
-A full `test-sample` recording (30.1M instructions, 40.7M events, 60
-checkpoints) is 169 MiB in v6; the same recording in the v4-style layout plus
+A full `test-sample` recording (30.1M instructions, 40.7M events, 61
+checkpoints) is 83.5 MiB in v7; the same recording in the v4-style layout plus
 access data was 4,157 MiB (2,176 MiB of fixed-size events, 962 MiB of full
-checkpoints, 958 MiB of per-event index). Of the v6 trace, event chunks take
-70.5 MiB (19.6 bits per instruction, including every read and written value), checkpoints 82 MiB (four 14.5 MiB keyframes and 57 deltas averaging
-0.4 MiB), and the page index 16 MiB. The initial state counts as the first
-keyframe. Recording time dropped from 61 s to
-29 s because far less is written. Queries over this trace take 0.06 s for a
-next-access lookup and about 2 s for a scan of every chunk; a late seek
-including the checkpoint delta chain takes 0.7 s.
+checkpoints, 958 MiB of per-event index), and 169 MiB in v6 (fixed-width
+columns, keyframe checkpoints, uncompressed page index). Of the v7 trace,
+event chunks take 35.7 MiB (9.9 bits per instruction, including every read
+and written value), checkpoints 46.4 MiB (initial state 1.4 MiB, three
+16-apart deltas 21 MiB, 57 adjacent deltas 24 MiB), the page index 0.06 MiB,
+and the code table 1.3 MiB (243,348 instructions). About 22 MiB of the event
+chunks are image contents written by `NtMapViewOfSection`. Recording takes
+20 s (v6: 29 s, v4-style: 61 s). Queries take 0.02 s for a next-access lookup
+and about 3 s for a scan of every chunk; a late seek including the checkpoint
+delta chain takes 0.34 s.
 
 Because every written and read value is recorded, a range's value history is
 available offline: `--ttd-history TRACE --ttd-address A --ttd-size N`
@@ -258,9 +291,9 @@ On the UPX-packed test PE, a v4 query at the unpacked entry
 `0x140001000` returned `bytes=55` (`push rbp`) at position `0x244b89`;
 the self-modifying-code pass linked it to the UPX stub write at position
 `0x219cb4`.
-The recorder keeps one chunk of events (65,536) and the previous checkpoint's
-state in memory and writes chunks and checkpoints to the trace as they are
-produced. Readers validate offsets, tables, and chunk contents before using
+The recorder keeps one chunk of events (65,536), the code table, the page
+entries, and the base state of each checkpoint level in memory and writes
+chunks and checkpoints to the trace as they are produced. Readers validate offsets, tables, and chunk contents before using
 them and keep the four most recently decoded chunks and the last restored
 checkpoint state cached. Queries bound candidate chunks by event number
 (event numbers grow with step) and stop next/previous searches at the first

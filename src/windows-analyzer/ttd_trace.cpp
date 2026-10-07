@@ -21,6 +21,7 @@ namespace sogen::ttd
         constexpr uint64_t page_size = 4096;
         constexpr size_t cached_chunks = 4;
         constexpr int checkpoint_compression_level = 3;
+        constexpr int code_table_compression_level = 9;
 
         // Versions 1-4 stored every event as a fixed-size record, followed by full checkpoint snapshots and a
         // per-event page index. They remain readable.
@@ -261,7 +262,7 @@ namespace sogen::ttd
         {
             return;
         }
-        const auto encoded = encode_chunk(chunk_events_, chunk_blob_);
+        const auto encoded = encode_chunk(chunk_events_, chunk_blob_, code_);
         const auto index = static_cast<uint32_t>(chunks_.size());
         chunks_.push_back({.first_event = header_.event_count - chunk_events_.size(),
                            .event_count = chunk_events_.size(),
@@ -280,19 +281,36 @@ namespace sogen::ttd
 
     void recorder::write_checkpoint(const uint64_t step)
     {
-        auto state = snapshot::create_emulator_state(emu_);
-        const auto keyframe = previous_state_.empty() || checkpoints_.size() % checkpoints_per_keyframe == 0;
-        const auto compressed = keyframe ? utils::compression::zstd::compress(state, checkpoint_compression_level)
-                                         : utils::compression::zstd::compress_with_reference(state, previous_state_);
+        auto state = std::make_shared<const std::vector<std::byte>>(snapshot::create_emulator_state(emu_));
+        const auto index = static_cast<uint64_t>(checkpoints_.size());
+        if (!index)
+        {
+            const auto compressed = utils::compression::zstd::compress(*state, checkpoint_compression_level);
+            if (compressed.empty())
+            {
+                throw std::runtime_error("Cannot compress TTD checkpoint");
+            }
+            checkpoints_.push_back({.step = step, .offset = append_to_file(compressed), .size = compressed.size()});
+            base_states_.assign(checkpoint_levels, state);
+            return;
+        }
+
+        // Checkpoint i is a delta against i - p, where p is the largest power of checkpoints_per_level dividing i, so
+        // restoring any checkpoint applies fewer than checkpoints_per_level deltas per level.
+        size_t level = 0;
+        uint64_t distance = 1;
+        while (level + 1 < checkpoint_levels && index % (distance * checkpoints_per_level) == 0)
+        {
+            ++level;
+            distance *= checkpoints_per_level;
+        }
+        const auto compressed = utils::compression::zstd::compress_with_reference(*state, *base_states_[level]);
         if (compressed.empty())
         {
             throw std::runtime_error("Cannot compress TTD checkpoint");
         }
-        checkpoints_.push_back({.step = step,
-                                .offset = append_to_file(compressed),
-                                .size = compressed.size(),
-                                .base = keyframe ? no_base_checkpoint : checkpoints_.size() - 1});
-        previous_state_ = std::move(state);
+        checkpoints_.push_back({.step = step, .offset = append_to_file(compressed), .size = compressed.size(), .base = index - distance});
+        std::fill_n(base_states_.begin(), level + 1, state);
     }
 
     uint64_t recorder::append_to_file(const std::span<const std::byte> bytes)
@@ -332,16 +350,33 @@ namespace sogen::ttd
         execute_hook_.remove();
         host_write_hook_.remove();
         flush_chunk();
-        previous_state_ = {};
+        base_states_.clear();
         header_.instruction_count = emu_.get_executed_instructions();
 
         std::ranges::sort(
             pages_, [](const page_entry& a, const page_entry& b) { return a.page < b.page || (a.page == b.page && a.chunk < b.chunk); });
+        std::vector<page_block> page_blocks{};
+        for (size_t first = 0; first < pages_.size(); first += page_block_entries)
+        {
+            const auto entries = std::span(pages_).subspan(first, std::min<size_t>(page_block_entries, pages_.size() - first));
+            const auto encoded = encode_page_block(entries);
+            page_blocks.push_back({.first_page = entries.front().page,
+                                   .entry_count = entries.size(),
+                                   .offset = append_to_file(encoded),
+                                   .size = encoded.size()});
+        }
+        pages_ = {};
+        const auto code = utils::compression::zstd::compress(bytes_of(code_.entries()), code_table_compression_level);
+        if (code.empty())
+        {
+            throw std::runtime_error("Cannot compress TTD code table");
+        }
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
                 .type = section_type::checkpoint_table, .offset = append_to_file(bytes_of(checkpoints_)), .size = checkpoints_.size()},
-            section_entry{.type = section_type::page_index, .offset = append_to_file(bytes_of(pages_)), .size = pages_.size()},
+            section_entry{.type = section_type::page_index, .offset = append_to_file(bytes_of(page_blocks)), .size = page_blocks.size()},
+            section_entry{.type = section_type::code_table, .offset = append_to_file(code), .size = code.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -373,7 +408,7 @@ namespace sogen::ttd
             throw std::runtime_error("Unsupported TTD trace format");
         }
         version_ = static_cast<uint32_t>(magic[6] - '0');
-        if (version_ == 5 || version_ > 6)
+        if (version_ == 5 || version_ == 6 || version_ > 7)
         {
             throw std::runtime_error("Unsupported TTD trace format");
         }
@@ -447,12 +482,35 @@ namespace sogen::ttd
             }
             else if (section.type == section_type::page_index)
             {
-                if (!fits(section.offset, section.size, sizeof(page_entry)))
+                if (!fits(section.offset, section.size, sizeof(page_block)))
                 {
                     throw std::runtime_error("Invalid TTD trace offsets");
                 }
-                page_index_offset_ = section.offset;
-                page_index_count_ = section.size;
+                file_.seekg(static_cast<std::streamoff>(section.offset));
+                page_blocks_.resize(static_cast<size_t>(section.size));
+                for (auto& block : page_blocks_)
+                {
+                    block = read_object<page_block>(file_);
+                    if (!block.entry_count || block.entry_count > page_block_entries || !fits(block.offset, block.size, 1) ||
+                        (&block != page_blocks_.data() && block.first_page < (&block - 1)->first_page))
+                    {
+                        throw std::runtime_error("Invalid TTD page index block");
+                    }
+                }
+            }
+            else if (section.type == section_type::code_table)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                const auto code = utils::compression::zstd::decompress(read_bytes(section.offset, section.size));
+                if (code.size() % sizeof(code_entry))
+                {
+                    throw std::runtime_error("Invalid TTD code table");
+                }
+                code_.resize(code.size() / sizeof(code_entry));
+                std::ranges::copy(code, reinterpret_cast<std::byte*>(code_.data()));
             }
         }
 
@@ -574,7 +632,7 @@ namespace sogen::ttd
             return chunk_cache_.back().chunk;
         }
         const auto& entry = chunks_.at(index);
-        auto decoded = decode_chunk(read_bytes(entry.offset, entry.size), index);
+        auto decoded = decode_chunk(read_bytes(entry.offset, entry.size), index, code_);
         if (decoded.events.size() != entry.event_count)
         {
             throw std::runtime_error("Invalid TTD event chunk");
@@ -810,55 +868,27 @@ namespace sogen::ttd
     std::vector<trace::number_range> trace::chunked_candidates(const uint64_t first_page, const uint64_t last_page,
                                                                const uint64_t kind_mask)
     {
-        const auto entry_at = [&](const uint64_t position) {
-            file_.clear();
-            file_.seekg(static_cast<std::streamoff>(page_index_offset_ + position * sizeof(page_entry)));
-            return read_object<page_entry>(file_);
-        };
-        uint64_t low = 0;
-        uint64_t high = page_index_count_;
-        while (low < high)
+        // Entries of one page can continue from the block before the first block starting at or after it.
+        auto block = std::ranges::lower_bound(page_blocks_, first_page, {}, &page_block::first_page);
+        if (block != page_blocks_.begin())
         {
-            const auto middle = low + (high - low) / 2;
-            if (entry_at(middle).page < first_page)
-            {
-                low = middle + 1;
-            }
-            else
-            {
-                high = middle;
-            }
+            --block;
         }
 
         std::vector<uint32_t> matches{};
-        constexpr uint64_t batch = 4096;
-        std::vector<page_entry> entries{};
-        for (auto position = low; position < page_index_count_;)
+        for (; block != page_blocks_.end() && block->first_page <= last_page; ++block)
         {
-            entries.resize(static_cast<size_t>(std::min(batch, page_index_count_ - position)));
-            file_.clear();
-            file_.seekg(static_cast<std::streamoff>(page_index_offset_ + position * sizeof(page_entry)));
-            file_.read(reinterpret_cast<char*>(entries.data()), static_cast<std::streamsize>(entries.size() * sizeof(page_entry)));
-            if (!file_)
+            for (const auto& entry : decode_page_block(read_bytes(block->offset, block->size), *block))
             {
-                throw std::runtime_error("Truncated TTD page index");
-            }
-            position += entries.size();
-            const auto past = std::ranges::find_if(entries, [&](const page_entry& entry) { return entry.page > last_page; });
-            for (auto it = entries.begin(); it != past; ++it)
-            {
-                if (it->kinds & kind_mask)
+                if (entry.page < first_page || entry.page > last_page || !(entry.kinds & kind_mask))
                 {
-                    if (it->chunk >= chunks_.size())
-                    {
-                        throw std::runtime_error("Invalid TTD page index entry");
-                    }
-                    matches.push_back(it->chunk);
+                    continue;
                 }
-            }
-            if (past != entries.end())
-            {
-                break;
+                if (entry.chunk >= chunks_.size())
+                {
+                    throw std::runtime_error("Invalid TTD page index entry");
+                }
+                matches.push_back(entry.chunk);
             }
         }
         std::ranges::sort(matches);

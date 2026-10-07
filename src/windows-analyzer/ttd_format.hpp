@@ -52,12 +52,12 @@ namespace sogen::ttd
 
     constexpr size_t inline_data_limit = sizeof(access_event::payload);
 
-    // Version 6 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
+    // Version 7 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
     // section table points to. Unknown section types are ignored, so sections can be added without a new version.
     struct file_header
     {
         // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '6', '\0'};
+        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '7', '\0'};
         uint64_t instruction_count{};
         uint64_t event_count{};
         uint64_t access_mask{};
@@ -70,6 +70,8 @@ namespace sogen::ttd
         chunk_table = 1,
         checkpoint_table = 2,
         page_index = 3,
+        // zstd-compressed code_entry array; the section size is the compressed byte count.
+        code_table = 4,
     };
 
     struct section_entry
@@ -107,9 +109,31 @@ namespace sogen::ttd
         uint32_t kinds{};
     };
 
+    constexpr uint64_t page_block_entries = 4096;
+
+    // The page index is a directory of blocks, each a zstd frame holding up to page_block_entries consecutive
+    // page_entry values (sorted by page and chunk) as varint columns.
+    struct page_block
+    {
+        uint64_t first_page{};
+        uint64_t entry_count{};
+        uint64_t offset{};
+        uint64_t size{};
+    };
+
+    // One distinct executed instruction: its address, length, and bytes. Execute events refer to entries by index.
+    struct code_entry
+    {
+        uint64_t address{};
+        uint64_t size{};
+        std::array<uint8_t, 16> bytes{};
+    };
+
     static_assert(sizeof(file_header) == 48);
+    static_assert(sizeof(code_entry) == 32);
     static_assert(sizeof(section_entry) == 24);
     static_assert(sizeof(chunk_entry) == 48);
     static_assert(sizeof(checkpoint_entry) == 32);
     static_assert(sizeof(page_entry) == 16);
+    static_assert(sizeof(page_block) == 32);
 }
