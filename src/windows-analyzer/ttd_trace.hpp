@@ -70,14 +70,6 @@ namespace sogen::ttd
         std::vector<std::byte> snapshot{};
     };
 
-    struct write_event
-    {
-        uint64_t step{};
-        uint64_t ip{};
-        uint64_t address{};
-        uint64_t size{};
-    };
-
     struct access_event
     {
         // Emulator instruction counter while the access happens, i.e. the 1-based number of the instruction performing
@@ -112,7 +104,6 @@ namespace sogen::ttd
 
     static_assert(sizeof(header) == 72);
     static_assert(sizeof(checkpoint_entry) == 24);
-    static_assert(sizeof(write_event) == 32);
     static_assert(sizeof(access_event) == 56);
     static_assert(sizeof(index_entry) == 24);
 

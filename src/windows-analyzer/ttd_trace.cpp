@@ -54,6 +54,16 @@ namespace sogen::ttd
             uint64_t event_number;
         };
 
+        struct v1_event
+        {
+            uint64_t step;
+            uint64_t ip;
+            uint64_t address;
+            uint64_t size;
+        };
+
+        static_assert(sizeof(v1_event) == 32);
+
         struct v3_access_event
         {
             uint64_t step;
@@ -500,7 +510,7 @@ namespace sogen::ttd
         {
             throw std::runtime_error("TTD trace was not finalized; the recording was interrupted");
         }
-        event_size_ = legacy_ ? sizeof(write_event) : v3_ ? sizeof(v3_access_event) : sizeof(access_event);
+        event_size_ = legacy_ ? sizeof(v1_event) : v3_ ? sizeof(v3_access_event) : sizeof(access_event);
         file_.seekg(0, std::ios::end);
         const auto length = static_cast<uint64_t>(file_.tellg());
         if (length < header_size_ || header_.snapshot_size > length - header_size_)
@@ -644,7 +654,7 @@ namespace sogen::ttd
         }
         if (legacy_)
         {
-            const auto old = read_object<write_event>(file_);
+            const auto old = read_object<v1_event>(file_);
             return {old.step, old.ip, old.address, old.size, access_kind::write};
         }
         if (v3_)
@@ -684,7 +694,7 @@ namespace sogen::ttd
             const auto* entry = raw.data() + i * event_size_;
             if (legacy_)
             {
-                write_event old{};
+                v1_event old{};
                 memcpy(&old, entry, sizeof(old));
                 output[i] = {.step = old.step, .ip = old.ip, .address = old.address, .size = old.size, .kind = access_kind::write};
             }

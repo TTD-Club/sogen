@@ -16,9 +16,7 @@
 #include "jsonl_reporter.hpp"
 #include "stdout_file_reporter.hpp"
 #include "tenet_tracer.hpp"
-#include "ttd_trace.hpp"
-#include "ttd_string_scan.hpp"
-#include "ttd_buffer_scan.hpp"
+#include "ttd_cli.hpp"
 
 #include <utils/finally.hpp>
 #include <utils/interupt_handler.hpp>
@@ -31,33 +29,11 @@
 #include <csignal>
 #endif
 #include <fstream>
-#include <sstream>
 
 namespace sogen
 {
     namespace
     {
-        uint64_t ttd_query_kinds(const std::string_view access)
-        {
-            if (access == "read")
-            {
-                return static_cast<uint64_t>(ttd::access_kind::read);
-            }
-            if (access == "write")
-            {
-                return static_cast<uint64_t>(ttd::access_kind::write) | static_cast<uint64_t>(ttd::access_kind::host_write);
-            }
-            if (access == "host-write")
-            {
-                return static_cast<uint64_t>(ttd::access_kind::host_write);
-            }
-            if (access == "execute")
-            {
-                return static_cast<uint64_t>(ttd::access_kind::execute);
-            }
-            return ttd::all_access_kinds;
-        }
-
         std::filesystem::path get_current_binary_dir()
         {
 #ifdef _WIN32
@@ -84,25 +60,7 @@ namespace sogen
             bool log_executable_access{false};
             bool log_foreign_module_access{false};
             bool tenet_trace{false};
-            std::filesystem::path ttd_record{};
-            std::filesystem::path ttd_replay{};
-            bool ttd_scan_selfmod{false};
-            bool ttd_verify_checkpoints{false};
-            uint64_t ttd_seek{};
-            uint64_t ttd_checkpoint_interval{500000};
-            uint64_t ttd_max_instructions{};
-            std::filesystem::path ttd_dump_image{};
-            std::optional<uint64_t> ttd_dump_address{};
-            std::optional<uint64_t> ttd_dump_size{};
-            size_t ttd_dump_wave{1};
-            bool ttd_no_checkpoints{false};
-            bool ttd_no_read_trace{false};
-            bool ttd_no_write_trace{false};
-            bool ttd_no_execute_trace{false};
-            std::optional<uint64_t> ttd_read{};
-            std::filesystem::path ttd_strings{};
-            std::filesystem::path ttd_buffers{};
-            size_t ttd_min_string_length{6};
+            ttd::cli_options ttd{};
             bool prepend_call_count{false};
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
             bool pause_before_start{false};
@@ -444,7 +402,6 @@ namespace sogen
                 return false;
             };
 
-            std::optional<ttd::recorder> ttd_recorder{};
             try
             {
                 if (options.use_gdb)
@@ -476,305 +433,28 @@ namespace sogen
                         debugger::enter_breakpoint(win_emu, win_emu.mod_manager.executable->entry_point);
                     }
 #endif
-                    if (!options.ttd_record.empty())
+                    if (options.ttd.replays())
                     {
-                        const auto writes =
-                            static_cast<uint64_t>(ttd::access_kind::write) | static_cast<uint64_t>(ttd::access_kind::host_write);
-                        const auto access_mask = (options.ttd_no_read_trace ? 0 : static_cast<uint64_t>(ttd::access_kind::read)) |
-                                                 (options.ttd_no_write_trace ? 0 : writes) |
-                                                 (options.ttd_no_execute_trace ? 0 : static_cast<uint64_t>(ttd::access_kind::execute));
-                        ttd_recorder.emplace(win_emu, options.ttd_record, access_mask);
-                    }
-                    if (!options.ttd_strings.empty())
-                    {
-                        ttd::trace string_trace(options.ttd_replay);
-                        ttd::replay_verifier verifier(win_emu, string_trace, win_emu.get_executed_instructions());
-                        ttd::string_scanner scanner(win_emu, options.ttd_min_string_length);
-                        scanner.scan_initial_memory();
-                        const auto end = string_trace.metadata().instruction_count;
-                        if (end > win_emu.get_executed_instructions())
+                        const auto result = ttd::replay(win_emu, options.ttd);
+                        if (result.failure)
                         {
-                            win_emu.start(static_cast<size_t>(end - win_emu.get_executed_instructions()));
-                        }
-                        verifier.finish();
-                        scanner.finish();
-                        scanner.save(options.ttd_strings);
-                        win_emu.log.log("TTD recovered %zu strings to %s\n", scanner.count(), options.ttd_strings.string().c_str());
-                        do_post_emulation_work(c);
-                        c.emit_summary<run_finished_event>([&](auto& event) {
-                            event.success = true;
-                            event.exit_status = win_emu.process.exit_status;
-                        });
-                        flush_reporters(c);
-                        return true;
-                    }
-                    if (!options.ttd_replay.empty())
-                    {
-                        if (!options.ttd_buffers.empty())
-                        {
-                            ttd::trace buffer_trace(options.ttd_replay);
-                            win_emu.setup_process_if_necessary();
-                            ttd::buffer_scanner scanner(win_emu, buffer_trace);
-                            for (const auto& checkpoint : buffer_trace.checkpoints())
-                            {
-                                const auto before = win_emu.get_executed_instructions();
-                                win_emu.start(static_cast<size_t>(checkpoint.step - before));
-                                if (win_emu.get_executed_instructions() != checkpoint.step)
-                                {
-                                    return emit_failure("TTD buffer replay stopped before recorded checkpoint");
-                                }
-                            }
-                            const auto before = win_emu.get_executed_instructions();
-                            win_emu.start(static_cast<size_t>(buffer_trace.metadata().instruction_count - before));
-                            if (win_emu.get_executed_instructions() != buffer_trace.metadata().instruction_count)
-                            {
-                                return emit_failure("TTD buffer replay stopped before recorded instruction count");
-                            }
-                            scanner.finish();
-                            scanner.save(options.ttd_buffers);
-                            printf("TTD buffer scan verified %llu writes; recovered %zu candidates to %s; skipped %llu unreadable bytes\n",
-                                   static_cast<unsigned long long>(scanner.verified_writes()), scanner.count(),
-                                   options.ttd_buffers.string().c_str(), static_cast<unsigned long long>(scanner.skipped_bytes()));
-                            do_post_emulation_work(c);
-                            c.emit_summary<run_finished_event>([&](auto& event) {
-                                event.success = true;
-                                event.exit_status = std::nullopt;
-                            });
-                            flush_reporters(c);
-                            return true;
-                        }
-                        if (options.ttd_scan_selfmod)
-                        {
-                            ttd::trace replay_trace(options.ttd_replay);
-                            win_emu.setup_process_if_necessary();
-                            uint64_t capture_address = 0;
-                            size_t capture_size = 0;
-                            if (!options.ttd_dump_image.empty())
-                            {
-                                const auto& image = *win_emu.mod_manager.executable;
-                                capture_address = options.ttd_dump_address.value_or(image.image_base);
-                                const auto requested_size = options.ttd_dump_size.value_or(image.size_of_image);
-                                if (!requested_size || requested_size > 64ull * 1024 * 1024 ||
-                                    capture_address > UINT64_MAX - requested_size)
-                                {
-                                    throw std::runtime_error("TTD first-hit dump size is invalid or exceeds 64 MiB");
-                                }
-                                capture_size = static_cast<size_t>(requested_size);
-                            }
-                            ttd::replay_selfmod_scanner scanner(win_emu, replay_trace, capture_address, capture_size,
-                                                                options.ttd_dump_wave);
-                            for (const auto& checkpoint : replay_trace.checkpoints())
-                            {
-                                const auto before = win_emu.get_executed_instructions();
-                                win_emu.start(static_cast<size_t>(checkpoint.step - before));
-                                if (win_emu.get_executed_instructions() != checkpoint.step)
-                                {
-                                    scanner.finish();
-                                    return emit_failure("TTD replay stopped before recorded checkpoint");
-                                }
-                            }
-                            const auto before = win_emu.get_executed_instructions();
-                            win_emu.start(static_cast<size_t>(replay_trace.metadata().instruction_count - before));
-                            scanner.finish();
-                            if (win_emu.get_executed_instructions() != replay_trace.metadata().instruction_count)
-                            {
-                                return emit_failure("TTD replay stopped before recorded instruction count");
-                            }
-                            if (!scanner.captured_memory().empty())
-                            {
-                                if (capture_size)
-                                {
-                                    std::ofstream dump(options.ttd_dump_image, std::ios::binary | std::ios::trunc);
-                                    if (!dump)
-                                    {
-                                        throw std::runtime_error("Cannot open TTD first-hit dump");
-                                    }
-                                    const auto& data = scanner.captured_memory();
-                                    dump.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-                                    if (!dump)
-                                    {
-                                        throw std::runtime_error("Writing TTD first-hit dump failed");
-                                    }
-                                    printf("TTD wave %zu dump %s base=%llx size=%llx missing_pages=%llu\n", options.ttd_dump_wave,
-                                           options.ttd_dump_image.string().c_str(), static_cast<unsigned long long>(capture_address),
-                                           static_cast<unsigned long long>(capture_size),
-                                           static_cast<unsigned long long>(scanner.missing_capture_pages()));
-                                }
-                            }
-                            for (size_t index = 0; index < scanner.hits().size(); ++index)
-                            {
-                                const auto& hit = scanner.hits()[index];
-                                printf("address=%llx size=%llu write=%llx:0 write_ip=%llx execute=%llx:0 execute_ip=%llx wave=%zu\n",
-                                       static_cast<unsigned long long>(hit.address), static_cast<unsigned long long>(hit.size),
-                                       static_cast<unsigned long long>(hit.write_step), static_cast<unsigned long long>(hit.write_ip),
-                                       static_cast<unsigned long long>(hit.execute_step), static_cast<unsigned long long>(hit.execute_ip),
-                                       index + 1);
-                            }
-                            if (scanner.hits().size() == 256)
-                            {
-                                printf("TTD self-modifying-code report reached its 256-wave limit\n");
-                            }
-                            printf("TTD replay verified %llu writes across %llu instructions\n",
-                                   static_cast<unsigned long long>(scanner.verified_writes()),
-                                   static_cast<unsigned long long>(win_emu.get_executed_instructions()));
-                            do_post_emulation_work(c);
-                            c.emit_summary<run_finished_event>([&](auto& event) {
-                                event.success = true;
-                                event.exit_status = std::nullopt;
-                            });
-                            flush_reporters(c);
-                            return true;
-                        }
-                        if (options.ttd_verify_checkpoints)
-                        {
-                            ttd::trace verify_trace(options.ttd_replay);
-                            size_t mismatches = 0;
-                            for (const auto& target : verify_trace.checkpoints())
-                            {
-                                const auto origin = verify_trace.checkpoint_for_step(target.step - 1);
-                                snapshot::load_emulator_snapshot(win_emu, origin.snapshot);
-                                ttd::replay_verifier verifier(win_emu, verify_trace, origin.step);
-                                win_emu.start(static_cast<size_t>(target.step - origin.step));
-                                verifier.finish();
-                                if (win_emu.get_executed_instructions() != target.step)
-                                {
-                                    std::ostringstream message;
-                                    message << "TTD replay from checkpoint " << std::hex << origin.step << " reached position "
-                                            << win_emu.get_executed_instructions() << " instead of " << target.step;
-                                    return emit_failure(message.str());
-                                }
-                                utils::buffer_serializer serializer{};
-                                win_emu.serialize(serializer);
-                                const auto& observed = serializer.get_buffer();
-                                const auto expected = snapshot::get_emulator_state(verify_trace.checkpoint_for_step(target.step).snapshot);
-                                const auto [observed_end, expected_end] = std::ranges::mismatch(observed, expected);
-                                if (observed_end == observed.end() && expected_end == expected.end())
-                                {
-                                    printf("TTD checkpoint %llx:0 matches (%llu events verified)\n",
-                                           static_cast<unsigned long long>(target.step),
-                                           static_cast<unsigned long long>(verifier.verified_events()));
-                                    continue;
-                                }
-                                ++mismatches;
-                                printf("TTD checkpoint %llx:0 differs at state offset %llx (replayed %zu bytes, recorded %zu bytes)\n",
-                                       static_cast<unsigned long long>(target.step),
-                                       static_cast<unsigned long long>(observed_end - observed.begin()), observed.size(), expected.size());
-                            }
-                            if (mismatches)
-                            {
-                                return emit_failure(std::to_string(mismatches) + " TTD checkpoints differ from their replay");
-                            }
-                            do_post_emulation_work(c);
-                            c.emit_summary<run_finished_event>([&](auto& event) {
-                                event.success = true;
-                                event.exit_status = std::nullopt;
-                            });
-                            flush_reporters(c);
-                            return true;
-                        }
-                        const auto checkpoint_step = win_emu.get_executed_instructions();
-                        ttd::trace seek_trace(options.ttd_replay);
-                        ttd::replay_verifier verifier(win_emu, seek_trace, checkpoint_step);
-                        if (options.ttd_seek > checkpoint_step)
-                        {
-                            win_emu.start(static_cast<size_t>(options.ttd_seek - checkpoint_step));
-                        }
-                        verifier.finish();
-                        win_emu.log.log("TTD replay verified %llu recorded events\n",
-                                        static_cast<unsigned long long>(verifier.verified_events()));
-                        if (const auto reached = win_emu.get_executed_instructions(); reached != options.ttd_seek)
-                        {
-                            std::ostringstream message;
-                            message << "TTD replay reached position " << std::hex << reached << " instead of " << options.ttd_seek;
-                            return emit_failure(message.str());
-                        }
-                        win_emu.log.log("TTD checkpoint %llx:0\n", static_cast<unsigned long long>(checkpoint_step));
-                        win_emu.log.log("TTD position %llx:0 RIP %llx\n", static_cast<unsigned long long>(options.ttd_seek),
-                                        static_cast<unsigned long long>(win_emu.emu().read_instruction_pointer()));
-                        if (options.ttd_read)
-                        {
-                            const auto value = win_emu.emu().read_memory<uint64_t>(*options.ttd_read);
-                            win_emu.log.log("TTD memory %llx = %llx\n", static_cast<unsigned long long>(*options.ttd_read),
-                                            static_cast<unsigned long long>(value));
-                        }
-                        if (!options.ttd_dump_image.empty())
-                        {
-                            const auto& image = *win_emu.mod_manager.executable;
-                            const auto dump_address = options.ttd_dump_address.value_or(image.image_base);
-                            const auto dump_size = options.ttd_dump_size.value_or(image.size_of_image);
-                            if (!dump_size || dump_size > 512ull * 1024 * 1024 || dump_address > UINT64_MAX - dump_size)
-                            {
-                                throw std::runtime_error("TTD image dump size is invalid or exceeds 512 MiB");
-                            }
-                            std::ofstream dump(options.ttd_dump_image, std::ios::binary | std::ios::trunc);
-                            if (!dump)
-                            {
-                                throw std::runtime_error("Cannot open TTD image dump");
-                            }
-                            std::array<char, 4096> page{};
-                            uint64_t missing_pages = 0;
-                            for (uint64_t offset = 0; offset < dump_size; offset += page.size())
-                            {
-                                page.fill(0);
-                                const auto length = static_cast<size_t>(std::min<uint64_t>(page.size(), dump_size - offset));
-                                if (!win_emu.emu().try_read_memory(dump_address + offset, page.data(), length))
-                                {
-                                    ++missing_pages;
-                                }
-                                dump.write(page.data(), static_cast<std::streamsize>(length));
-                            }
-                            if (!dump)
-                            {
-                                throw std::runtime_error("Writing TTD image dump failed");
-                            }
-                            win_emu.log.log("TTD image dump %s base=%llx size=%llx missing_pages=%llu\n",
-                                            options.ttd_dump_image.string().c_str(), static_cast<unsigned long long>(dump_address),
-                                            static_cast<unsigned long long>(dump_size), static_cast<unsigned long long>(missing_pages));
+                            return emit_failure(*result.failure);
                         }
                         do_post_emulation_work(c);
                         c.emit_summary<run_finished_event>([&](auto& event) {
                             event.success = true;
-                            event.exit_status = std::nullopt;
+                            event.exit_status = result.exit_status;
                         });
                         flush_reporters(c);
                         return true;
                     }
-                    if (ttd_recorder && !options.ttd_no_checkpoints)
+                    if (options.ttd.records())
                     {
-                        while (!win_emu.process.exit_status && !signals_received)
-                        {
-                            const auto before = win_emu.get_executed_instructions();
-                            if (options.ttd_max_instructions && before >= options.ttd_max_instructions)
-                            {
-                                break;
-                            }
-                            const auto budget = options.ttd_max_instructions
-                                                    ? std::min(options.ttd_checkpoint_interval, options.ttd_max_instructions - before)
-                                                    : options.ttd_checkpoint_interval;
-                            win_emu.start(static_cast<size_t>(budget));
-                            if (win_emu.process.exit_status || signals_received)
-                            {
-                                break;
-                            }
-                            if (win_emu.get_executed_instructions() - before < budget)
-                            {
-                                break;
-                            }
-                            if (!options.ttd_max_instructions || win_emu.get_executed_instructions() < options.ttd_max_instructions)
-                            {
-                                ttd_recorder->checkpoint();
-                            }
-                        }
+                        ttd::record(win_emu, options.ttd, [&] { return signals_received > 0; });
                     }
                     else
                     {
-                        win_emu.start(ttd_recorder && options.ttd_max_instructions ? static_cast<size_t>(options.ttd_max_instructions) : 0);
-                    }
-                    if (ttd_recorder)
-                    {
-                        ttd_recorder->finish();
-                        win_emu.log.log("TTD recorded %llu instructions\n",
-                                        static_cast<unsigned long long>(win_emu.get_executed_instructions()));
+                        win_emu.start();
                     }
                 }
 
@@ -809,8 +489,8 @@ namespace sogen
             exit_status = win_emu.process.exit_status;
             if (!exit_status.has_value())
             {
-                if (!options.ttd_record.empty() && options.ttd_max_instructions &&
-                    win_emu.get_executed_instructions() >= options.ttd_max_instructions)
+                if (options.ttd.records() && options.ttd.max_instructions &&
+                    win_emu.get_executed_instructions() >= options.ttd.max_instructions)
                 {
                     do_post_emulation_work(c);
                     c.emit_summary<run_finished_event>([&](auto& event) {
@@ -971,16 +651,7 @@ namespace sogen
 
             const auto concise_logging = options.concise_logging;
             const auto win_emu = setup_emulator(options, args);
-            std::optional<ttd::trace> replay_trace{};
-            if (!options.ttd_replay.empty())
-            {
-                replay_trace.emplace(options.ttd_replay);
-                if (!options.ttd_scan_selfmod && options.ttd_buffers.empty())
-                {
-                    const auto checkpoint = replay_trace->checkpoint_for_step(options.ttd_seek);
-                    snapshot::load_emulator_snapshot(*win_emu, checkpoint.snapshot);
-                }
-            }
+            ttd::prepare_replay(*win_emu, options.ttd);
             apply_registry_files(*win_emu, options);
             context.win_emu = win_emu.get();
 
@@ -1258,48 +929,7 @@ namespace sogen
                 "Very concise logging");
             app.add_flag("-x,--exec", options.log_executable_access, "Log r/w access to executable memory");
             app.add_flag("-t,--tenet-trace", options.tenet_trace, "Enable Tenet tracer");
-            app.add_option("--ttd-record", options.ttd_record, "Record a checkpointed TTD trace");
-            app.add_option("--ttd-replay", options.ttd_replay, "Restore a TTD trace snapshot");
-            app.add_flag("--ttd-scan-selfmod", options.ttd_scan_selfmod, "Replay a TTD trace to find written-then-executed code waves");
-            app.add_flag("--ttd-verify-checkpoints", options.ttd_verify_checkpoints,
-                         "Replay each TTD checkpoint interval and compare the reached state with the next checkpoint");
-            app.add_option("--ttd-seek", options.ttd_seek, "Replay through this instruction position");
-            app.add_option("--ttd-checkpoint-interval", options.ttd_checkpoint_interval, "Instructions between recording checkpoints")
-                ->capture_default_str();
-            app.add_option("--ttd-max-instructions", options.ttd_max_instructions, "Stop recording after this many instructions");
-            app.add_option("--ttd-dump-image", options.ttd_dump_image, "Dump mapped executable image at replay position");
-            app.add_option("--ttd-dump-address", options.ttd_dump_address, "Guest base address for a replay memory dump");
-            app.add_option("--ttd-dump-size", options.ttd_dump_size, "Guest byte length for a replay memory dump");
-            app.add_option("--ttd-dump-wave", options.ttd_dump_wave, "Code-write wave to capture during a replay scan")
-                ->capture_default_str();
-            app.add_flag("--ttd-no-checkpoints", options.ttd_no_checkpoints, "Record only the initial snapshot (baseline comparison)");
-            app.add_flag("--ttd-no-read-trace", options.ttd_no_read_trace, "Disable memory-read event recording");
-            app.add_flag("--ttd-no-write-trace", options.ttd_no_write_trace, "Disable memory-write event recording");
-            app.add_flag("--ttd-no-execute-trace", options.ttd_no_execute_trace, "Disable instruction-execute event recording");
-            app.add_option("--ttd-read", options.ttd_read, "Read eight guest bytes at the replay position");
-            app.add_option("--ttd-strings", options.ttd_strings, "Recover strings during deterministic replay into a TSV file");
-            app.add_option("--ttd-buffers", options.ttd_buffers, "Recover written buffers during deterministic replay into a TSV file");
-            app.add_option("--ttd-min-string-length", options.ttd_min_string_length, "Minimum recovered string length")
-                ->capture_default_str();
-            std::filesystem::path ttd_query{};
-            std::filesystem::path ttd_selfmod{};
-            std::filesystem::path ttd_first_selfmod{};
-            uint64_t ttd_address{}, ttd_size{1}, ttd_from{}, ttd_to{UINT64_MAX};
-            bool ttd_next_write{}, ttd_prev_write{};
-            std::string ttd_access{"write"};
-            app.add_option("--ttd-query", ttd_query, "Query memory accesses in a TTD trace");
-            app.add_option("--ttd-selfmod", ttd_selfmod, "Find executed bytes written earlier in a TTD trace");
-            app.add_option("--ttd-first-selfmod", ttd_first_selfmod,
-                           "Find first written-then-executed instruction anywhere, or in an optional address range");
-            app.add_option("--ttd-access", ttd_access, "Access type: read, write (guest and host), host-write, execute, or all")
-                ->check(CLI::IsMember({"read", "write", "host-write", "execute", "all"}));
-            auto* ttd_address_option =
-                app.add_option("--ttd-address", ttd_address, "First address for TTD write query or self-modifying-code filter");
-            auto* ttd_size_option = app.add_option("--ttd-size", ttd_size, "Byte length for TTD write query or self-modifying-code filter");
-            app.add_option("--ttd-from", ttd_from, "First instruction position for TTD write query");
-            app.add_option("--ttd-to", ttd_to, "Last instruction position for TTD write query");
-            app.add_flag("--ttd-next-access,--ttd-next-write", ttd_next_write, "Find the next matching access after --ttd-from");
-            app.add_flag("--ttd-prev-access,--ttd-prev-write", ttd_prev_write, "Find the previous matching access before --ttd-from");
+            ttd::add_options(app, options.ttd);
             app.add_flag("--first-exec", options.log_first_section_execution, "Print first executions of sections");
             app.add_flag("--inst-summary", options.instruction_summary, "Print a summary of executed instructions of the analyzed modules");
             app.add_flag("--skip-syscalls", options.skip_syscalls, "Skip the logging of regular syscalls");
@@ -1355,158 +985,18 @@ namespace sogen
 
             try
             {
-                if (!ttd_first_selfmod.empty())
+                if (const auto exit_code = ttd::run_offline(options.ttd))
                 {
-                    ttd::trace trace(ttd_first_selfmod);
-                    std::optional<ttd::self_modifying_hit> first{};
-                    const bool filter_address = ttd_address_option->count() || ttd_size_option->count();
-                    for (const auto& hit : trace.self_modifying_code())
-                    {
-                        if (filter_address && (hit.address < ttd_address || hit.address - ttd_address >= ttd_size))
-                        {
-                            continue;
-                        }
-                        if (!first || hit.execute_step < first->execute_step)
-                        {
-                            first = hit;
-                        }
-                    }
-                    if (first)
-                    {
-                        printf("address=%llx size=%llu write=%llx:0 write_ip=%llx execute=%llx:0 execute_ip=%llx\n",
-                               static_cast<unsigned long long>(first->address), static_cast<unsigned long long>(first->size),
-                               static_cast<unsigned long long>(first->write_step), static_cast<unsigned long long>(first->write_ip),
-                               static_cast<unsigned long long>(first->execute_step), static_cast<unsigned long long>(first->execute_ip));
-                    }
-                    return first ? 0 : 2;
+                    return *exit_code;
                 }
-                if (!ttd_selfmod.empty())
-                {
-                    ttd::trace trace(ttd_selfmod);
-                    for (const auto& hit : trace.self_modifying_code())
-                    {
-                        printf("address=%llx size=%llu write=%llx:0 write_ip=%llx execute=%llx:0 execute_ip=%llx count=%llu\n",
-                               static_cast<unsigned long long>(hit.address), static_cast<unsigned long long>(hit.size),
-                               static_cast<unsigned long long>(hit.write_step), static_cast<unsigned long long>(hit.write_ip),
-                               static_cast<unsigned long long>(hit.execute_step), static_cast<unsigned long long>(hit.execute_ip),
-                               static_cast<unsigned long long>(hit.executions));
-                    }
-                    return 0;
-                }
-                if (!ttd_query.empty())
-                {
-                    ttd::trace trace(ttd_query);
-                    const auto kind_mask = ttd_query_kinds(ttd_access);
-                    if (ttd_next_write && ttd_prev_write)
-                    {
-                        throw std::runtime_error("Choose only one TTD access direction");
-                    }
-                    std::vector<ttd::access_event> writes{};
-                    if (ttd_next_write)
-                    {
-                        if (auto event = trace.next_access(ttd_address, ttd_size, ttd_from, kind_mask))
-                        {
-                            writes.push_back(*event);
-                        }
-                    }
-                    else if (ttd_prev_write)
-                    {
-                        if (auto event = trace.previous_access(ttd_address, ttd_size, ttd_from, kind_mask))
-                        {
-                            writes.push_back(*event);
-                        }
-                    }
-                    else
-                    {
-                        writes = trace.accesses(ttd_address, ttd_size, ttd_from, ttd_to, kind_mask);
-                    }
-                    for (const auto& write : writes)
-                    {
-                        const auto print_kind = ttd_access != "write" || write.kind != ttd::access_kind::write;
-                        printf("%llx:0 ip=%llx address=%llx size=%llu%s%s", static_cast<unsigned long long>(write.step),
-                               static_cast<unsigned long long>(write.ip), static_cast<unsigned long long>(write.address),
-                               static_cast<unsigned long long>(write.size), print_kind ? " kind=" : "",
-                               print_kind ? ttd::access_kind_name(write.kind) : "");
-                        if (trace.has_instruction_bytes() && write.kind == ttd::access_kind::execute && write.size <= 15)
-                        {
-                            printf(" bytes=");
-                            for (size_t i = 0; i < write.size; ++i)
-                            {
-                                printf("%02x", write.instruction_bytes[i]);
-                            }
-                        }
-                        printf("\n");
-                    }
-                    return 0;
-                }
-                if ((!options.ttd_record.empty() || !options.ttd_replay.empty()) && options.vcpu_count != 1)
-                {
-                    throw std::runtime_error("TTD POC requires --vcpus 1");
-                }
-                if (!options.ttd_record.empty() && !options.ttd_replay.empty())
-                {
-                    throw std::runtime_error("TTD record and replay cannot be combined");
-                }
-                if ((!options.ttd_record.empty() || !options.ttd_replay.empty()) &&
-                    (options.use_gdb || !options.dump.empty() || !options.minidump_path.empty()))
-                {
-                    throw std::runtime_error("TTD POC requires a fresh application run without GDB or snapshot input");
-                }
-                if (options.ttd_replay.empty() && (options.ttd_seek || options.ttd_read || !options.ttd_dump_image.empty() ||
-                                                   options.ttd_dump_address || options.ttd_dump_size))
-                {
-                    throw std::runtime_error("TTD seek and memory inspection require --ttd-replay");
-                }
-                if (options.ttd_scan_selfmod && (options.ttd_replay.empty() || options.ttd_seek))
-                {
-                    throw std::runtime_error("TTD self-modifying-code replay scan requires --ttd-replay from position zero");
-                }
-                if (options.ttd_verify_checkpoints &&
-                    (options.ttd_replay.empty() || options.ttd_seek || options.ttd_scan_selfmod || !options.ttd_buffers.empty() ||
-                     !options.ttd_strings.empty() || options.ttd_read || !options.ttd_dump_image.empty()))
-                {
-                    throw std::runtime_error("TTD checkpoint verification requires --ttd-replay and no other TTD replay mode");
-                }
-                if (!options.ttd_dump_wave || options.ttd_dump_wave > 256 ||
-                    (options.ttd_dump_wave != 1 && (!options.ttd_scan_selfmod || options.ttd_dump_image.empty())))
-                {
-                    throw std::runtime_error("TTD dump wave must be 1-256 and requires a replay scan with a dump path");
-                }
-                if (options.ttd_dump_address.has_value() != options.ttd_dump_size.has_value() ||
-                    (options.ttd_dump_address && options.ttd_dump_image.empty()))
-                {
-                    throw std::runtime_error("TTD dump range requires --ttd-dump-image, --ttd-dump-address, and --ttd-dump-size");
-                }
-                if (options.ttd_record.empty() && options.ttd_max_instructions)
-                {
-                    throw std::runtime_error("TTD instruction limit requires --ttd-record");
-                }
-                if (!options.ttd_strings.empty() && (options.ttd_replay.empty() || options.ttd_seek))
-                {
-                    throw std::runtime_error("TTD string recovery requires --ttd-replay from position zero");
-                }
-                if (!options.ttd_buffers.empty() &&
-                    (options.ttd_replay.empty() || options.ttd_seek || options.ttd_scan_selfmod || !options.ttd_strings.empty()))
-                {
-                    throw std::runtime_error("TTD buffer recovery requires a dedicated --ttd-replay from position zero");
-                }
-                if (!options.ttd_record.empty() && !options.ttd_no_checkpoints && !options.ttd_checkpoint_interval)
-                {
-                    throw std::runtime_error("TTD checkpoint interval must be positive");
-                }
-                if ((options.ttd_no_read_trace || options.ttd_no_write_trace || options.ttd_no_execute_trace) && options.ttd_record.empty())
-                {
-                    throw std::runtime_error("TTD trace toggles require --ttd-record");
-                }
-                if ((!options.ttd_record.empty() || !options.ttd_replay.empty()) && options.disable_instruction_precision)
-                {
-                    throw std::runtime_error("TTD POC requires instruction precision");
-                }
-                if ((!options.ttd_record.empty() || !options.ttd_replay.empty()) && !backend_name.empty() && backend_name != "unicorn")
-                {
-                    throw std::runtime_error("TTD POC supports only the Unicorn backend");
-                }
-                if (!options.ttd_record.empty() || !options.ttd_replay.empty())
+                ttd::validate(options.ttd, {
+                                               .vcpu_count = options.vcpu_count,
+                                               .gdb = options.use_gdb,
+                                               .snapshot_input = !options.dump.empty() || !options.minidump_path.empty(),
+                                               .instruction_precision = !options.disable_instruction_precision,
+                                               .backend_name = backend_name,
+                                           });
+                if (options.ttd.records() || options.ttd.replays())
                 {
                     options.backend = backend_type::unicorn;
                     options.reproducible = true;
