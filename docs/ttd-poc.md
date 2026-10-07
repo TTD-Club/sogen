@@ -136,9 +136,13 @@ encodings, or strings outside the heuristic length and termination rules.
 `--ttd-buffers OUT.tsv` replays a trace with write events from a fresh
 setup, verifying every guest write as `--ttd-scan-selfmod` does, and groups
 guest writes into regions: writes within 16 bytes and 250,000 instructions of
-a region extend it. A region is classified when it is overwritten, unmapped,
-evicted, or the replay ends, and each contiguous run of at least 16 written
-bytes is reported with the first kind that applies: a file signature
+a region extend it, and overwrites update it in place. A region is classified
+when a write changes bytes that were executed, when it would exceed its size
+limit, when its memory is remapped, when it is evicted, or when the replay
+ends, so it reports its last contents: data wiped in place (for example a
+decrypted buffer zeroed after use) is not recovered here, while `--ttd-strings`
+does see transient text. Each contiguous run of at least 16 written bytes is
+reported with the first kind that applies: a file signature
 (`pe_image`, `elf_image`, `png_image`, `jpeg_image`, `gif_image`, `bmp_image`,
 `pdf_document`, `zip_archive`, `gzip_stream`, `sqlite_database`,
 `pem_private_key`, `pem_public_key`), `contains_executed_code`, `ascii_text`

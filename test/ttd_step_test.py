@@ -103,6 +103,18 @@ def main() -> None:
         replayed = run("--ttd-replay", trace, "--ttd-scan-selfmod", *emulator_args, sample)
         assert f"address={code:x} size=5 write={hit.group(2)}:0" in replayed, replayed
 
+        # The sample builds this string in writable memory and wipes it again; only the replay sees it.
+        strings = pathlib.Path(directory) / "strings.tsv"
+        run("--ttd-replay", trace, "--ttd-strings", str(strings), *emulator_args, sample)
+        transient = [row.split("\t") for row in strings.read_text().splitlines()[1:]
+                     if "SOGEN_TTD_TRANSIENT_STRING_FOR_RECOVERY" in row]
+        assert any(int(step, 16) > 0 for _, step, _, _ in transient), transient
+
+        buffers = pathlib.Path(directory) / "buffers.tsv"
+        summary = run("--ttd-replay", trace, "--ttd-buffers", str(buffers), *emulator_args, sample)
+        assert re.search(r"TTD buffer scan verified \d+ writes", summary), summary
+        assert buffers.read_text().startswith("address\tsize\tfirst_step")
+
 
 if __name__ == "__main__":
     main()

@@ -1,11 +1,12 @@
 // Fixture for test/ttd_step_test.py: one store and one load of a known global, one syscall that writes its output
-// into a known global, and code written at runtime and then executed. The addresses are printed so the test can locate
-// the matching trace events.
+// into a known global, code written at runtime and then executed, and a string that only exists transiently. The
+// addresses are printed so the test can locate the matching trace events.
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string_view>
 
 #include <windows.h>
 
@@ -17,6 +18,9 @@ namespace
 
     // mov eax, 42; ret
     constexpr std::array<uint8_t, 6> generated_code{0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};
+
+    constexpr std::string_view transient_text = "SOGEN_TTD_TRANSIENT_STRING_FOR_RECOVERY";
+    std::array<volatile char, transient_text.size() + 1> transient{};
 }
 
 int main()
@@ -43,6 +47,16 @@ int main()
     if (reinterpret_cast<int (*)()>(code)() != 42)
     {
         return 3;
+    }
+
+    for (size_t i = 0; i < transient_text.size(); ++i)
+    {
+        transient[i] = transient_text[i];
+    }
+    transient[transient_text.size()] = 0;
+    for (auto& character : transient)
+    {
+        character = 0;
     }
 
     return ttd_copy == 0x2222222222222222 ? 0 : 1;
