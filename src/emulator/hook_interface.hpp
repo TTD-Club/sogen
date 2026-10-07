@@ -90,36 +90,35 @@ namespace sogen
         virtual emulator_hook* hook_memory_read(uint64_t address, uint64_t size, memory_access_hook_callback callback) = 0;
         virtual emulator_hook* hook_memory_write(uint64_t address, uint64_t size, memory_access_hook_callback callback) = 0;
 
-        // The ordinary Unicorn write hook exposes at most eight value bytes. This
-        // metadata hook preserves the actual guest write width for range indexing.
-        virtual emulator_hook* hook_memory_write_metadata(uint64_t address, uint64_t size, memory_write_metadata_callback callback)
+        // The metadata hooks report exact access widths and instruction sizes, which the value hooks above cannot
+        // (they cap widths at eight bytes and do not report instruction sizes). Backends that cannot provide them
+        // refuse instead of approximating, so trace recording cannot silently record wrong extents.
+        // NOLINTBEGIN(performance-unnecessary-value-param)
+        virtual emulator_hook* hook_memory_write_metadata(uint64_t /*address*/, uint64_t /*size*/,
+                                                          memory_write_metadata_callback /*callback*/)
         {
-            return hook_memory_write(address, size,
-                                     [callback = std::move(callback)](cpu_interface& cpu, uint64_t addr, const void*, size_t width) {
-                                         callback(cpu, addr, width);
-                                     });
+            throw std::runtime_error("This backend cannot report memory write metadata");
         }
 
-        virtual emulator_hook* hook_memory_read_metadata(uint64_t address, uint64_t size, memory_write_metadata_callback callback)
+        virtual emulator_hook* hook_memory_read_metadata(uint64_t /*address*/, uint64_t /*size*/,
+                                                         memory_write_metadata_callback /*callback*/)
         {
-            return hook_memory_read(address, size,
-                                    [callback = std::move(callback)](cpu_interface& cpu, uint64_t addr, const void*, size_t width) {
-                                        callback(cpu, addr, width);
-                                    });
+            throw std::runtime_error("This backend cannot report memory read metadata");
         }
 
-        virtual emulator_hook* hook_memory_execution_metadata(memory_execution_metadata_callback callback)
+        virtual emulator_hook* hook_memory_execution_metadata(memory_execution_metadata_callback /*callback*/)
         {
-            return hook_memory_execution([callback = std::move(callback)](cpu_interface& cpu, uint64_t addr) { callback(cpu, addr, 1); });
+            throw std::runtime_error("This backend cannot report instruction execution metadata");
         }
 
         // Reports writes made through the memory interface (syscall handlers, loaders, exception dispatch), which
         // bypass the guest memory hooks above.
-        // NOLINTNEXTLINE(performance-unnecessary-value-param)
         virtual emulator_hook* hook_host_memory_write(memory_write_metadata_callback /*callback*/)
         {
             throw std::runtime_error("This backend cannot report host memory writes");
         }
+
+        // NOLINTEND(performance-unnecessary-value-param)
 
         virtual emulator_hook* hook_instruction(int instruction_type, instruction_hook_callback callback) = 0;
 
