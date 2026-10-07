@@ -18,6 +18,7 @@ BULK_REFERENCE = struct.Struct("<2Q")
 MAGIC = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
 CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS, SYSCALLS = 1, 2, 3, 4, 5, 6, 7, 8
+MODULES, THREADS = 9, 10
 SYSCALL_HEADER = struct.Struct("<8Q")
 # checkpoint, event_number, step, window, message, reserved, wparam, lparam
 UI_INPUT = struct.Struct("<4QII2Q")
@@ -316,6 +317,42 @@ def decode_syscalls(compressed):
     return entries
 
 
+def _text(stream):
+    return stream.bytes(stream.varint()).decode()
+
+
+def decode_modules(compressed):
+    """Mirror of decode_modules in src/windows-ttd/ttd_chunk.cpp: dicts with base, size, load_step, load_event_number,
+    unload_step and unload_event_number (None while loaded at the end), name, and path."""
+    stream = _Stream(zstandard.ZstdDecompressor().decompress(compressed))
+    modules = []
+    for _ in range(stream.varint()):
+        base, size, load_step, load_event, unload, unload_event = (stream.varint() for _ in range(6))
+        modules.append({"base": base, "size": size, "load_step": load_step, "load_event_number": load_event,
+                        "unload_step": unload - 1 if unload else None,
+                        "unload_event_number": unload_event if unload else None,
+                        "name": _text(stream), "path": _text(stream)})
+    assert stream.offset == len(stream.data), "invalid modules"
+    return modules
+
+
+def decode_threads(compressed):
+    """Mirror of decode_threads in src/windows-ttd/ttd_chunk.cpp: (step, event_number, thread_id) switches and the
+    names by thread id."""
+    stream = _Stream(zstandard.ZstdDecompressor().decompress(compressed))
+    switches, step, event_number = [], 0, 0
+    for _ in range(stream.varint()):
+        step += stream.varint()
+        event_number += stream.varint()
+        switches.append((step, event_number, stream.varint()))
+    names = {}
+    for _ in range(stream.varint()):
+        thread_id = stream.varint()
+        names[thread_id] = _text(stream)
+    assert stream.offset == len(stream.data), "invalid threads"
+    return switches, names
+
+
 class Trace:
     def __init__(self, path):
         self.path = path
@@ -345,6 +382,11 @@ class Trace:
         self.ui_inputs = [UI_INPUT.unpack_from(self.bytes, offset + i * UI_INPUT.size) for i in range(size)]
         offset, size = self.sections.get(SYSCALLS, (0, 0))
         self.syscalls = decode_syscalls(self.bytes[offset:offset + size]) if SYSCALLS in self.sections else None
+        offset, size = self.sections.get(MODULES, (0, 0))
+        self.modules = decode_modules(self.bytes[offset:offset + size]) if MODULES in self.sections else []
+        offset, size = self.sections.get(THREADS, (0, 0))
+        self.thread_switches, self.thread_names = (decode_threads(self.bytes[offset:offset + size])
+                                                   if THREADS in self.sections else ([], {}))
         self._bulk_cache = {}
 
     def bulk(self, index):

@@ -7,12 +7,14 @@
 #include <cstring>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 
 namespace sogen::ttd
 {
     namespace
     {
         constexpr int page_block_compression_level = 6;
+        // Syscall, module, and thread tables.
         constexpr int syscall_compression_level = 19;
         constexpr size_t syscall_stream_count = 6;
         constexpr uint64_t no_previous_version = UINT64_MAX;
@@ -188,6 +190,29 @@ namespace sogen::ttd
             std::span<const std::byte> data_{};
             size_t offset_{};
         };
+
+        void put_text(std::vector<std::byte>& output, const std::string_view text)
+        {
+            put_varint(output, text.size());
+            const auto* bytes = reinterpret_cast<const std::byte*>(text.data());
+            output.insert(output.end(), bytes, bytes + text.size());
+        }
+
+        std::string read_text(stream_reader& reader)
+        {
+            const auto bytes = reader.bytes(reader.varint());
+            return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+        }
+
+        std::vector<std::byte> compress_table(const std::span<const std::byte> raw, const std::string_view name)
+        {
+            auto compressed = utils::compression::zstd::compress(raw, syscall_compression_level);
+            if (compressed.empty())
+            {
+                throw std::runtime_error("Cannot compress TTD " + std::string(name));
+            }
+            return compressed;
+        }
 
         // Guest memory as far as the chunk's own accesses have shown it, in pages with one validity byte per byte.
         class known_memory
@@ -719,9 +744,7 @@ namespace sogen::ttd
         for (const auto& [id, name] : table.names)
         {
             put_varint(streams[5], id);
-            put_varint(streams[5], name.size());
-            const auto* text = reinterpret_cast<const std::byte*>(name.data());
-            streams[5].insert(streams[5].end(), text, text + name.size());
+            put_text(streams[5], name);
         }
 
         const std::array<uint64_t, 2> counts{table.entries.size(), table.names.size()};
@@ -737,12 +760,7 @@ namespace sogen::ttd
         {
             raw.insert(raw.end(), bytes.begin(), bytes.end());
         }
-        auto compressed = utils::compression::zstd::compress(raw, syscall_compression_level);
-        if (compressed.empty())
-        {
-            throw std::runtime_error("Cannot compress TTD syscalls");
-        }
-        return compressed;
+        return compress_table(raw, "syscalls");
     }
 
     syscall_table decode_syscalls(const std::span<const std::byte> compressed)
@@ -798,19 +816,140 @@ namespace sogen::ttd
         for (uint64_t i = 0; i < counts[1]; ++i)
         {
             const auto id = streams[5].varint();
-            const auto length = streams[5].varint();
             if (id > UINT32_MAX)
             {
                 throw std::runtime_error("Invalid TTD syscall name");
             }
-            const auto text = streams[5].bytes(length);
-            table.names[static_cast<uint32_t>(id)] = std::string(reinterpret_cast<const char*>(text.data()), text.size());
+            table.names[static_cast<uint32_t>(id)] = read_text(streams[5]);
         }
         if (!std::ranges::all_of(streams, [](const stream_reader& stream) { return stream.done(); }))
         {
             throw std::runtime_error("Invalid TTD syscalls");
         }
         return table;
+    }
+
+    std::vector<std::byte> encode_modules(const std::span<const module_entry> modules)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, modules.size());
+        for (const auto& mod : modules)
+        {
+            put_varint(raw, mod.base);
+            put_varint(raw, mod.size);
+            put_varint(raw, mod.load_step);
+            put_varint(raw, mod.load_event_number);
+            put_varint(raw, mod.unload_step ? *mod.unload_step + 1 : 0);
+            put_varint(raw, mod.unload_event_number.value_or(0));
+            put_text(raw, mod.name);
+            put_text(raw, mod.path);
+        }
+        return compress_table(raw, "modules");
+    }
+
+    std::vector<module_entry> decode_modules(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        // Every module takes at least eight bytes.
+        if (count > raw.size() / 8)
+        {
+            throw std::runtime_error("Invalid TTD modules");
+        }
+        std::vector<module_entry> modules(static_cast<size_t>(count));
+        for (auto& mod : modules)
+        {
+            mod.base = reader.varint();
+            mod.size = reader.varint();
+            mod.load_step = reader.varint();
+            mod.load_event_number = reader.varint();
+            const auto unload_step = reader.varint();
+            const auto unload_event_number = reader.varint();
+            if (unload_step)
+            {
+                mod.unload_step = unload_step - 1;
+                mod.unload_event_number = unload_event_number;
+            }
+            mod.name = read_text(reader);
+            mod.path = read_text(reader);
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD modules");
+        }
+        return modules;
+    }
+
+    std::vector<std::byte> encode_threads(const thread_table& threads)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, threads.switches.size());
+        uint64_t step = 0;
+        uint64_t event_number = 0;
+        for (const auto& entry : threads.switches)
+        {
+            if (entry.step < step || entry.event_number < event_number)
+            {
+                throw std::runtime_error("TTD thread switches must be in recording order");
+            }
+            put_varint(raw, entry.step - step);
+            put_varint(raw, entry.event_number - event_number);
+            put_varint(raw, entry.thread_id);
+            step = entry.step;
+            event_number = entry.event_number;
+        }
+        put_varint(raw, threads.names.size());
+        for (const auto& [id, name] : threads.names)
+        {
+            put_varint(raw, id);
+            put_text(raw, name);
+        }
+        return compress_table(raw, "threads");
+    }
+
+    thread_table decode_threads(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        // Every switch takes at least three bytes.
+        if (count > raw.size() / 3)
+        {
+            throw std::runtime_error("Invalid TTD threads");
+        }
+        thread_table threads{};
+        threads.switches.resize(static_cast<size_t>(count));
+        uint64_t step = 0;
+        uint64_t event_number = 0;
+        for (auto& entry : threads.switches)
+        {
+            const auto step_delta = reader.varint();
+            const auto event_delta = reader.varint();
+            const auto id = reader.varint();
+            if (step_delta > UINT64_MAX - step || event_delta > UINT64_MAX - event_number || id > UINT32_MAX)
+            {
+                throw std::runtime_error("Invalid TTD thread switch");
+            }
+            step += step_delta;
+            event_number += event_delta;
+            entry = {.step = step, .event_number = event_number, .thread_id = static_cast<uint32_t>(id)};
+        }
+        const auto names = reader.varint();
+        for (uint64_t i = 0; i < names; ++i)
+        {
+            const auto id = reader.varint();
+            if (id > UINT32_MAX)
+            {
+                throw std::runtime_error("Invalid TTD thread name");
+            }
+            threads.names[static_cast<uint32_t>(id)] = read_text(reader);
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD threads");
+        }
+        return threads;
     }
 
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)

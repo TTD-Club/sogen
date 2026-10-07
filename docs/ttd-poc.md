@@ -37,6 +37,12 @@ with ttd.Trace("sample.sogttd") as trace:
         if syscall.name == "NtCreateFile" and syscall.result != 0:
             print(hex(syscall.position), hex(syscall.result))
 
+    # Modules (name, path, base, size, load/unload positions) and threads, for symbolization and per-thread views.
+    module = trace.module_at(store.ip, store.position)  # Module or None
+    thread = trace.thread_at(store.position)             # id of the thread executing that instruction
+    print(trace.thread_switches, trace.thread_names)
+    main_executes = trace.events(kinds=ttd.EXECUTE, thread=trace.thread_switches[0].thread_id)
+
     # Replay: every recorded event is verified on the way; ttd.DivergenceError (a RuntimeError) names the first
     # divergence. Syscalls whose live writes or result differ (a network answer, a missing file) and host writes with
     # other live bytes take the recorded ones (result.substituted_inputs counts them) unless Replay(..., strict=True).
@@ -75,8 +81,8 @@ gives a headless one). `Trace.ui_inputs` lists the window events a recording log
 window exists (scripted input; a recording logs it like live input). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
 also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_python_test.py` covers queries,
 the manifest, replay of a CLI trace, a fork and a recorded fork (replayed in Python and the CLI), divergence and
-CPUID-mismatch errors, the replay scans (also on a fork), the syscall list, a replay after an input file the
-recording saw was deleted, and replay of a Python trace in the CLI. The Python
+CPUID-mismatch errors, the replay scans (also on a fork), the syscall, module, and thread lists, a replay after an
+input file the recording saw was deleted, and replay of a Python trace in the CLI. The Python
 scans start from the trace's initial checkpoint, so they also work on a recorded fork; the CLI's replay scans
 (`--ttd-strings`, `--ttd-buffers`, `--ttd-scan-selfmod`) need a trace that starts at position 0.
 
@@ -400,6 +406,21 @@ found through the section table (24-byte entries `type, offset, size`):
   `event_count` events: its host writes, and the descriptor-table reads Unicorn
   reports when a handler loads segment registers (`NtCallbackReturn`). A
   `test-sample` recording holds 4,601 syscalls in 16 KB.
+- Modules (type 9, size = compressed bytes; absent in older traces): one
+  zstd frame of a varint count and, per module in load order (those mapped
+  before the trace's start first, loaded at its start position), varints
+  `base, size, load_step, load_event_number, unload_step + 1` (0 while still
+  mapped at the end) and `unload_event_number`, then the name and the guest
+  path, each a varint length and UTF-8 bytes. The event numbers count the
+  events recorded before the load or unload. `test-sample`: 50 modules, 2 of
+  them unloaded, 1.3 KB.
+- Threads (type 10, size = compressed bytes; absent in older traces): one
+  zstd frame of varints: the switch count; per switch the step delta, the
+  event-number delta, and the thread id; then the name count and per thread
+  that ran its id and its name (varint length and UTF-8, empty when unnamed).
+  A switch is noted at the new thread's first execute event (any event when
+  executes are not recorded); the first entry is the thread running at the
+  start. `test-sample`: 16 threads, 190 switches, 627 bytes.
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host

@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -74,6 +75,47 @@ namespace sogen::ttd
     // little-endian uint64 values, and the names as varint id, varint length, and bytes.
     std::vector<std::byte> encode_syscalls(const syscall_table& table);
     syscall_table decode_syscalls(std::span<const std::byte> compressed);
+
+    // A module mapped into the process: present from load_step (after load_event_number events; the start of the trace
+    // for modules mapped before it) until unload_step, if it was unmapped while recording.
+    struct module_entry
+    {
+        uint64_t base{};
+        uint64_t size{};
+        uint64_t load_step{};
+        uint64_t load_event_number{};
+        std::optional<uint64_t> unload_step{};
+        std::optional<uint64_t> unload_event_number{};
+        std::string name{};
+        std::string path{};
+    };
+
+    // From event `event_number` (at step `step`) on, thread `thread_id` runs: with execute events recorded, the event is
+    // the thread's first instruction after the switch.
+    struct thread_switch
+    {
+        uint64_t step{};
+        uint64_t event_number{};
+        uint32_t thread_id{};
+    };
+
+    struct thread_table
+    {
+        std::vector<thread_switch> switches{};
+        // UTF-8 names of the threads that ran, empty for unnamed ones.
+        std::map<uint32_t, std::string> names{};
+    };
+
+    // The modules section is a zstd frame of a varint count and per module, as varints: base, size, load step, load
+    // event number, unload step + 1 (0 while loaded at the end), unload event number, then the name and the path as a
+    // varint length and UTF-8 bytes.
+    std::vector<std::byte> encode_modules(std::span<const module_entry> modules);
+    std::vector<module_entry> decode_modules(std::span<const std::byte> compressed);
+
+    // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
+    // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.
+    std::vector<std::byte> encode_threads(const thread_table& threads);
+    thread_table decode_threads(std::span<const std::byte> compressed);
 
     // A bulk block is a zstd frame of its bytes after an x86-64 filter that turns branch and RIP-relative
     // displacements into absolute block offsets (`filtered`; version 7 traces store the bytes unfiltered). An empty

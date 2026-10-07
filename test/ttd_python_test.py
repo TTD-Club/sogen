@@ -123,6 +123,8 @@ def main() -> None:
             assert len(fork.checkpoints) > 1
             assert load.position <= fork.instruction_count <= store.position + fork_length
             assert fork.manifest["parent"] == "cli" and fork.manifest["tool"] == "sogen.ttd", fork.manifest
+            assert fork.module_at(store.ip, store.position).load_position == store.position
+            assert fork.thread_switches[0].position > store.position
             assert len(list(fork.events(kinds=ttd.EXECUTE))) == fork.instruction_count - fork.start_position
             forked_loads = fork.accesses(address, 8, kinds=ttd.READ)
             assert [event.position for event in forked_loads] == [load.position], forked_loads
@@ -219,9 +221,32 @@ def main() -> None:
         query = next(syscall for syscall in syscalls if syscall.position == info_write.position)
         assert query.name == "NtQueryVirtualMemory" and query.result == 0 and query.event_count >= 1, query
         assert trace.event(query.event_number).position == info_write.position
-        mirrored = ttd_format.Trace(cli_trace).syscalls
+        mirror_trace = ttd_format.Trace(cli_trace)
+        mirrored = mirror_trace.syscalls
         assert [(s.step, s.event_number, s.event_count, s.result, s.id, s.name) for s in mirrored] == [
             (s.position, s.event_number, s.event_count, s.result, s.id, s.name) for s in syscalls]
+
+        # Modules and threads: the sample's store runs in its own image on the main thread, the first one to run.
+        sample_name = pathlib.PureWindowsPath(sample).name.lower()
+        modules = trace.modules
+        assert {"ntdll.dll", "kernel32.dll", sample_name} <= {module.name.lower() for module in modules}, modules
+        image = trace.module_at(store.ip, store.position)
+        assert image.name.lower() == sample_name and image.load_position == 0 and image.unload_position is None, image
+        assert trace.module_at(store.ip, 0).base == image.base and trace.module_at(0x10, store.position) is None
+        kernel32 = next(module for module in modules if module.name.lower() == "kernel32.dll")
+        assert kernel32.load_position > 0 and trace.module_at(kernel32.base, kernel32.load_position - 1) is None
+        switches = trace.thread_switches
+        main_thread = switches[0].thread_id
+        assert switches[0].position == 1 and switches[0].event_number == 0, switches[0]
+        assert trace.thread_at(store.position) == main_thread and trace.thread_at(0) is None
+        assert set(trace.thread_names) == {switch.thread_id for switch in switches}
+        assert all(trace.thread_at(switch.position) == switch.thread_id for switch in switches)
+        per_thread = {thread: sum(1 for _ in trace.events(kinds=ttd.EXECUTE, thread=thread)) for thread in trace.thread_names}
+        assert len(per_thread) > 1 and sum(per_thread.values()) == trace.instruction_count, per_thread
+        assert [(m.base, m.size, m.load_position, m.unload_position, m.name, m.path) for m in modules] == [
+            (m["base"], m["size"], m["load_step"], m["unload_step"], m["name"], m["path"]) for m in mirror_trace.modules]
+        assert [(s.position, s.event_number, s.thread_id) for s in switches] == mirror_trace.thread_switches
+        assert trace.thread_names == mirror_trace.thread_names
 
         # Live input that changes a syscall's outcome: ttd-input.txt exists while recording and is gone for the replay,
         # so NtQueryAttributesFile fails and writes nothing. A strict replay names the syscall; others undo its live

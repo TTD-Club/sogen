@@ -82,6 +82,10 @@ namespace sogen::ttd
         // Every dispatched syscall (see syscall_entry), encoded as described at encode_syscalls; the section size is the
         // compressed byte count.
         syscalls = 8,
+        // The modules mapped while recording, encoded as described at encode_modules; size = compressed bytes.
+        modules = 9,
+        // The running thread over the recording, encoded as described at encode_threads; size = compressed bytes.
+        threads = 10,
     };
 
     // A syscall instruction the emulator dispatched: its handler ran after `event_number` events had been recorded,

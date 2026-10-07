@@ -175,27 +175,55 @@ namespace sogen::py
         class ttd_event_iterator
         {
           public:
-            ttd_event_iterator(const ttd_trace& recorded, const uint64_t first, const uint64_t kinds)
+            ttd_event_iterator(const ttd_trace& recorded, const uint64_t first, const uint64_t kinds, const std::optional<uint32_t> thread)
                 : trace_(recorded),
                   reader_(recorded.native(), first),
-                  kinds_(kinds)
+                  kinds_(kinds),
+                  thread_(thread)
             {
+                if (thread && recorded.native().threads().switches.empty())
+                {
+                    throw std::runtime_error("This TTD trace does not record threads");
+                }
             }
 
             ttd_event next()
             {
-                const auto event = this->reader_.next(this->kinds_);
-                if (!event)
+                while (true)
                 {
-                    throw nb::stop_iteration();
+                    const auto event = this->reader_.next(this->kinds_);
+                    if (!event)
+                    {
+                        throw nb::stop_iteration();
+                    }
+                    if (!this->thread_ || this->thread_of(this->reader_.last_number()) == *this->thread_)
+                    {
+                        return this->trace_.event(*event);
+                    }
                 }
-                return this->trace_.event(*event);
             }
 
           private:
             ttd_trace trace_;
             ttd::event_reader reader_;
             uint64_t kinds_{};
+            std::optional<uint32_t> thread_{};
+            // The switch in effect for the last event; events are read in order.
+            size_t switch_{};
+
+            std::optional<uint32_t> thread_of(const uint64_t number)
+            {
+                const auto& switches = this->trace_.native().threads().switches;
+                while (this->switch_ + 1 < switches.size() && switches[this->switch_ + 1].event_number <= number)
+                {
+                    ++this->switch_;
+                }
+                if (switches[this->switch_].event_number > number)
+                {
+                    return std::nullopt;
+                }
+                return switches[this->switch_].thread_id;
+            }
         };
 
         class ttd_replay
@@ -354,6 +382,33 @@ namespace sogen::py
                         "registers): events event_number to event_number + event_count - 1")
                 .def("__repr__", &ttd_syscall::repr);
 
+            nb::class_<ttd::module_entry>(m, "Module", "A module mapped while recording")
+                .def_ro("name", &ttd::module_entry::name)
+                .def_ro("path", &ttd::module_entry::path, "Guest path")
+                .def_ro("base", &ttd::module_entry::base)
+                .def_ro("size", &ttd::module_entry::size)
+                .def_ro("load_position", &ttd::module_entry::load_step, "The trace's start for modules mapped before it")
+                .def_ro("load_event_number", &ttd::module_entry::load_event_number, "Number of events recorded before the load")
+                .def_ro("unload_position", &ttd::module_entry::unload_step, "None while still mapped at the end")
+                .def_ro("unload_event_number", &ttd::module_entry::unload_event_number)
+                .def("__repr__", [](const ttd::module_entry& self) {
+                    std::ostringstream text;
+                    text << std::hex << "Module(name=" << self.name << ", base=0x" << self.base << ", size=0x" << self.size
+                         << ", load_position=0x" << self.load_step << ")";
+                    return text.str();
+                });
+
+            nb::class_<ttd::thread_switch>(m, "ThreadSwitch", "Thread thread_id runs from event event_number on")
+                .def_ro("position", &ttd::thread_switch::step, "Position of the thread's first instruction after the switch")
+                .def_ro("event_number", &ttd::thread_switch::event_number)
+                .def_ro("thread_id", &ttd::thread_switch::thread_id)
+                .def("__repr__", [](const ttd::thread_switch& self) {
+                    std::ostringstream text;
+                    text << "ThreadSwitch(position=0x" << std::hex << self.step << ", event_number=" << std::dec << self.event_number
+                         << ", thread_id=" << self.thread_id << ")";
+                    return text.str();
+                });
+
             nb::class_<ttd::recovered_string>(m, "RecoveredString")
                 .def_ro("address", &ttd::recovered_string::address)
                 .def_ro("position", &ttd::recovered_string::step, "Position at which the string was last seen extended")
@@ -480,11 +535,36 @@ namespace sogen::py
                      "Every read and write of the range up to end, with the range's value after each")
                 .def(
                     "events",
-                    [](const ttd_trace& self, const uint64_t first, const access_kind kinds) {
-                        return ttd_event_iterator(self, first, static_cast<uint64_t>(kinds));
+                    [](const ttd_trace& self, const uint64_t first, const access_kind kinds, const std::optional<uint32_t> thread) {
+                        return ttd_event_iterator(self, first, static_cast<uint64_t>(kinds), thread);
                     },
                     nb::arg("first") = 0, nb::arg("kinds") = static_cast<access_kind>(ttd::all_access_kinds),
-                    "Iterate events from event number first")
+                    nb::arg("thread") = nb::none(), "Iterate events from event number first, optionally only those of one thread")
+                .def_prop_ro(
+                    "modules",
+                    [](const ttd_trace& self) {
+                        const auto modules = self.native().modules();
+                        return std::vector<ttd::module_entry>(modules.begin(), modules.end());
+                    },
+                    "Every module mapped while recording, in load order (those mapped before the start first); empty for "
+                    "traces recorded before modules were recorded")
+                .def(
+                    "module_at",
+                    [](const ttd_trace& self, const uint64_t address, const uint64_t position) -> std::optional<ttd::module_entry> {
+                        const auto* mod = self.native().module_at(address, position);
+                        return mod ? std::optional(*mod) : std::nullopt;
+                    },
+                    nb::arg("address"), nb::arg("position"), "The module whose image holds address at position, or None")
+                .def_prop_ro(
+                    "thread_switches", [](const ttd_trace& self) { return self.native().threads().switches; },
+                    "Where another thread starts running, in order (the first entry is the thread running at the start); "
+                    "empty for traces recorded before threads were recorded")
+                .def_prop_ro(
+                    "thread_names", [](const ttd_trace& self) { return self.native().threads().names; },
+                    "Name of each thread that ran, by id; empty for unnamed threads")
+                .def(
+                    "thread_at", [](const ttd_trace& self, const uint64_t position) { return self.native().thread_at(position); },
+                    nb::arg("position"), "Id of the thread executing the instruction at position, or None before the first switch")
                 .def(
                     "event", [](const ttd_trace& self, const uint64_t number) { return self.event(self.native().event_at(number)); },
                     nb::arg("number"))

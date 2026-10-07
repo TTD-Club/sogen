@@ -243,45 +243,6 @@ namespace sogen::ttd
         }
     }
 
-    syscall_observer::syscall_observer(windows_emulator& emu, callback enter, callback exit)
-        : emu_(&emu),
-          enter_(emu.callbacks.on_syscall_enter.add(std::move(enter))),
-          exit_(emu.callbacks.on_syscall_exit.add(std::move(exit)))
-    {
-    }
-
-    syscall_observer::~syscall_observer()
-    {
-        reset();
-    }
-
-    syscall_observer::syscall_observer(syscall_observer&& other) noexcept
-    {
-        *this = std::move(other);
-    }
-
-    syscall_observer& syscall_observer::operator=(syscall_observer&& other) noexcept
-    {
-        if (this != &other)
-        {
-            reset();
-            emu_ = std::exchange(other.emu_, nullptr);
-            enter_ = other.enter_;
-            exit_ = other.exit_;
-        }
-        return *this;
-    }
-
-    void syscall_observer::reset()
-    {
-        if (emu_)
-        {
-            emu_->callbacks.on_syscall_enter.remove(enter_);
-            emu_->callbacks.on_syscall_exit.remove(exit_);
-            emu_ = nullptr;
-        }
-    }
-
     recorder::recorder(windows_emulator& emu, const std::filesystem::path& path, const uint64_t access_mask, manifest_entries manifest)
         : emu_(emu),
           path_(path),
@@ -358,12 +319,51 @@ namespace sogen::ttd
                                       .lparam = event.lParam});
             });
         }
-        syscall_observer_ = syscall_observer(
-            emu_,
-            [this](uint32_t) {
-                open_syscall_ = syscall_entry{.step = emu_.get_executed_instructions(), .event_number = header_.event_count};
-            },
-            [this](const uint32_t id) { close_syscall(id); });
+        syscall_enter_ = syscall_callback(emu_.callbacks.on_syscall_enter, [this](uint32_t) {
+            open_syscall_ = syscall_entry{.step = emu_.get_executed_instructions(), .event_number = header_.event_count};
+        });
+        syscall_exit_ = syscall_callback(emu_.callbacks.on_syscall_exit, [this](const uint32_t id) { close_syscall(id); });
+
+        for (const auto& mod : emu_.mod_manager.modules() | std::views::values)
+        {
+            add_module(mod);
+        }
+        module_load_ = module_callback(emu_.callbacks.on_module_load, [this](const mapped_module& mod) { add_module(mod); });
+        module_unload_ = module_callback(emu_.callbacks.on_module_unload, [this](const mapped_module& mod) {
+            const auto loaded = loaded_modules_.find(mod.image_base);
+            if (loaded == loaded_modules_.end())
+            {
+                return;
+            }
+            auto& entry = modules_[loaded->second];
+            entry.unload_step = emu_.get_executed_instructions();
+            entry.unload_event_number = header_.event_count;
+            loaded_modules_.erase(loaded);
+        });
+    }
+
+    void recorder::add_module(const mapped_module& mod)
+    {
+        loaded_modules_[mod.image_base] = modules_.size();
+        modules_.push_back({.base = mod.image_base,
+                            .size = mod.size_of_image,
+                            .load_step = emu_.get_executed_instructions(),
+                            .load_event_number = header_.event_count,
+                            .name = mod.name,
+                            .path = mod.module_path.string()});
+    }
+
+    void recorder::note_thread(const access_event& event)
+    {
+        const auto* thread = emu_.vcpu(0).active_thread;
+        if (!thread || running_thread_ == thread->id)
+        {
+            return;
+        }
+        running_thread_ = thread->id;
+        // The event is already counted.
+        threads_.switches.push_back({.step = event.step, .event_number = header_.event_count - 1, .thread_id = thread->id});
+        threads_.names[thread->id] = u16_to_u8(thread->name);
     }
 
     void recorder::close_syscall(const uint32_t id)
@@ -498,6 +498,11 @@ namespace sogen::ttd
     {
         chunk_events_.push_back(event);
         ++header_.event_count;
+        // A thread's first instruction after a switch marks the switch; without execute events, any event does.
+        if (event.kind == access_kind::execute || !tracks_instructions_)
+        {
+            note_thread(event);
+        }
         const auto first_page = event.address / page_size;
         const auto last_page = last_byte(event.address, event.size) / page_size;
         auto& recent_page = recent_page_of_kind_[static_cast<size_t>(event.kind)];
@@ -682,7 +687,18 @@ namespace sogen::ttd
             return;
         }
         finished_ = true;
-        syscall_observer_.reset();
+        syscall_enter_.reset();
+        syscall_exit_.reset();
+        module_load_.reset();
+        module_unload_.reset();
+        // Names given after a thread's last switch.
+        for (const auto& thread : emu_.process.threads | std::views::values)
+        {
+            if (threads_.names.contains(thread.id))
+            {
+                threads_.names[thread.id] = u16_to_u8(thread.name);
+            }
+        }
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();
@@ -722,6 +738,8 @@ namespace sogen::ttd
         }
         const auto manifest = encode_manifest(manifest_);
         const auto syscalls = encode_syscalls(syscalls_);
+        const auto modules = encode_modules(modules_);
+        const auto threads = encode_threads(threads_);
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -732,6 +750,8 @@ namespace sogen::ttd
             section_entry{.type = section_type::manifest, .offset = append_to_file(manifest), .size = manifest.size()},
             section_entry{.type = section_type::ui_inputs, .offset = append_to_file(bytes_of(ui_inputs_)), .size = ui_inputs_.size()},
             section_entry{.type = section_type::syscalls, .offset = append_to_file(syscalls), .size = syscalls.size()},
+            section_entry{.type = section_type::modules, .offset = append_to_file(modules), .size = modules.size()},
+            section_entry{.type = section_type::threads, .offset = append_to_file(threads), .size = threads.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -913,6 +933,22 @@ namespace sogen::ttd
                 }
                 syscalls_ = decode_syscalls(read_bytes(section.offset, section.size));
             }
+            else if (section.type == section_type::modules || section.type == section_type::threads)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                const auto bytes = read_bytes(section.offset, section.size);
+                if (section.type == section_type::modules)
+                {
+                    modules_ = decode_modules(bytes);
+                }
+                else
+                {
+                    threads_ = decode_threads(bytes);
+                }
+            }
         }
 
         uint64_t next_event = 0;
@@ -969,6 +1005,22 @@ namespace sogen::ttd
                 entry.event_number + entry.event_count > metadata_.event_count)
             {
                 throw std::runtime_error("Invalid TTD syscall entry");
+            }
+        }
+        for (const auto& mod : modules_)
+        {
+            if (mod.load_step > metadata_.instruction_count || mod.load_event_number > metadata_.event_count ||
+                (mod.unload_step && (*mod.unload_step < mod.load_step || *mod.unload_step > metadata_.instruction_count ||
+                                     *mod.unload_event_number < mod.load_event_number || *mod.unload_event_number > metadata_.event_count)))
+            {
+                throw std::runtime_error("Invalid TTD module entry");
+            }
+        }
+        for (const auto& entry : threads_.switches)
+        {
+            if (entry.step > metadata_.instruction_count || entry.event_number >= metadata_.event_count)
+            {
+                throw std::runtime_error("Invalid TTD thread switch");
             }
         }
     }
@@ -1255,6 +1307,30 @@ namespace sogen::ttd
         }
         const auto entry = syscalls_->names.find(id);
         return entry == syscalls_->names.end() ? std::nullopt : std::optional<std::string_view>(entry->second);
+    }
+
+    const module_entry* trace::module_at(const uint64_t address, const uint64_t step) const
+    {
+        // The latest load wins: an image base can be reused after an unload.
+        for (const auto& mod : std::views::reverse(modules_))
+        {
+            if (address - mod.base < mod.size && mod.load_step <= step && (!mod.unload_step || step < *mod.unload_step))
+            {
+                return &mod;
+            }
+        }
+        return nullptr;
+    }
+
+    std::optional<uint32_t> trace::thread_at(const uint64_t step) const
+    {
+        const auto& switches = threads_.switches;
+        const auto next = std::ranges::upper_bound(switches, step, {}, &thread_switch::step);
+        if (next == switches.begin())
+        {
+            return std::nullopt;
+        }
+        return std::prev(next)->thread_id;
     }
 
     uint64_t trace::checkpoint_index(const uint64_t step) const
@@ -1745,7 +1821,8 @@ namespace sogen::ttd
                 }
             }));
         }
-        syscall_observer_ = syscall_observer(emu_, [this](const uint32_t id) { enter_syscall(id); }, [this](uint32_t) { exit_syscall(); });
+        syscall_enter_ = syscall_callback(emu_.callbacks.on_syscall_enter, [this](const uint32_t id) { enter_syscall(id); });
+        syscall_exit_ = syscall_callback(emu_.callbacks.on_syscall_exit, [this](uint32_t) { exit_syscall(); });
     }
 
     void replay_verifier::diverge(const std::string& message)
@@ -1994,7 +2071,8 @@ namespace sogen::ttd
 
     void replay_verifier::finish()
     {
-        syscall_observer_.reset();
+        syscall_enter_.reset();
+        syscall_exit_.reset();
         host_write_before_hook_.remove();
         write_hook_.remove();
         read_hook_.remove();

@@ -60,26 +60,59 @@ namespace sogen::ttd
         uint64_t executions{};
     };
 
-    // Calls `enter` and `exit` around the dispatch of each syscall instruction until destroyed or reset.
-    class syscall_observer
+    // Keeps a callback in one of the emulator's callback lists until destroyed or reset.
+    template <typename Signature>
+    class scoped_callback
     {
       public:
-        using callback = std::function<void(uint32_t syscall_id)>;
+        scoped_callback() = default;
 
-        syscall_observer() = default;
-        syscall_observer(windows_emulator& emu, callback enter, callback exit);
-        ~syscall_observer();
-        syscall_observer(const syscall_observer&) = delete;
-        syscall_observer& operator=(const syscall_observer&) = delete;
-        syscall_observer(syscall_observer&& other) noexcept;
-        syscall_observer& operator=(syscall_observer&& other) noexcept;
-        void reset();
+        scoped_callback(utils::callback_list<Signature>& list, std::function<Signature> callback)
+            : list_(&list),
+              id_(list.add(std::move(callback)))
+        {
+        }
+
+        ~scoped_callback()
+        {
+            reset();
+        }
+
+        scoped_callback(const scoped_callback&) = delete;
+        scoped_callback& operator=(const scoped_callback&) = delete;
+
+        scoped_callback(scoped_callback&& other) noexcept
+        {
+            *this = std::move(other);
+        }
+
+        scoped_callback& operator=(scoped_callback&& other) noexcept
+        {
+            if (this != &other)
+            {
+                reset();
+                list_ = std::exchange(other.list_, nullptr);
+                id_ = other.id_;
+            }
+            return *this;
+        }
+
+        void reset()
+        {
+            if (list_)
+            {
+                list_->remove(id_);
+                list_ = nullptr;
+            }
+        }
 
       private:
-        windows_emulator* emu_{};
-        utils::callback_id_type enter_{};
-        utils::callback_id_type exit_{};
+        utils::callback_list<Signature>* list_{};
+        utils::callback_id_type id_{};
     };
+
+    using syscall_callback = scoped_callback<void(uint32_t syscall_id)>;
+    using module_callback = scoped_callback<void(mapped_module& mod)>;
 
     class recorder
     {
@@ -152,8 +185,20 @@ namespace sogen::ttd
         syscall_table syscalls_{};
         // The syscall whose handler is running: its step and the event count when the handler started.
         std::optional<syscall_entry> open_syscall_{};
-        syscall_observer syscall_observer_{};
+        syscall_callback syscall_enter_{};
+        syscall_callback syscall_exit_{};
         void close_syscall(uint32_t id);
+
+        std::vector<module_entry> modules_{};
+        // Index in modules_ of each loaded module by image base.
+        std::unordered_map<uint64_t, size_t> loaded_modules_{};
+        module_callback module_load_{};
+        module_callback module_unload_{};
+        void add_module(const mapped_module& mod);
+
+        thread_table threads_{};
+        std::optional<uint32_t> running_thread_{};
+        void note_thread(const access_event& event);
 
         bool caches_instructions_{};
         std::unordered_map<uint64_t, cached_instruction> instruction_cache_{};
@@ -227,6 +272,25 @@ namespace sogen::ttd
         // The name the recording emulator gave a syscall id, or nothing when the trace does not know it.
         std::optional<std::string_view> syscall_name(uint32_t id) const;
 
+        // Every module mapped while recording, in load order (those mapped before the start first); empty for traces
+        // recorded before modules were recorded.
+        std::span<const module_entry> modules() const
+        {
+            return modules_;
+        }
+
+        // The module whose image holds `address` at position `step`.
+        const module_entry* module_at(uint64_t address, uint64_t step) const;
+
+        // Thread switches and names; empty for traces recorded before threads were recorded.
+        const thread_table& threads() const
+        {
+            return threads_;
+        }
+
+        // The thread running instruction `step`, or nothing before the first switch.
+        std::optional<uint32_t> thread_at(uint64_t step) const;
+
         // Index of the checkpoint at `step` (0 for the initial state); throws if no checkpoint is there.
         uint64_t checkpoint_index(uint64_t step) const;
 
@@ -280,6 +344,8 @@ namespace sogen::ttd
         manifest_entries manifest_{};
         std::vector<ui_input_entry> ui_inputs_{};
         std::optional<syscall_table> syscalls_{};
+        std::vector<module_entry> modules_{};
+        thread_table threads_{};
 
         std::vector<chunk_entry> chunks_{};
         std::vector<code_entry> code_{};
@@ -418,7 +484,8 @@ namespace sogen::ttd
         std::vector<live_event> syscall_events_{};
         std::vector<std::byte> previous_bytes_{};
         scoped_hook host_write_before_hook_{};
-        syscall_observer syscall_observer_{};
+        syscall_callback syscall_enter_{};
+        syscall_callback syscall_exit_{};
 
         void verify(access_kind kind, uint64_t address, size_t size, std::span<const std::byte> data = {});
         bool matches(const access_event& expected, const access_event& observed, std::span<const std::byte> data, bool compare_data = true);
