@@ -17,7 +17,8 @@ BULK = struct.Struct("<2Q")
 BULK_REFERENCE = struct.Struct("<2Q")
 MAGIC = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
-CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE = 1, 2, 3, 4, 5
+CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST = 1, 2, 3, 4, 5, 6
+MANIFEST_SIZES = struct.Struct("<2I")
 READ, WRITE, EXECUTE, HOST_WRITE = 1, 2, 4, 8
 MASK64 = (1 << 64) - 1
 INLINE_DATA_LIMIT = 16
@@ -262,6 +263,20 @@ def encode_chunk(events, code, bulk=None):
     return zstandard.ZstdCompressor(level=6).compress(raw)
 
 
+def decode_manifest(data):
+    manifest, offset = {}, 0
+    while offset < len(data):
+        key_size, value_size = MANIFEST_SIZES.unpack_from(data, offset)
+        offset += MANIFEST_SIZES.size
+        key = data[offset:offset + key_size].decode()
+        offset += key_size
+        manifest[key] = data[offset:offset + value_size].decode()
+        offset += value_size
+        if offset > len(data):
+            raise ValueError("invalid TTD manifest")
+    return manifest
+
+
 class Trace:
     def __init__(self, path):
         self.path = path
@@ -285,6 +300,8 @@ class Trace:
         self.code = CodeTable.decode(self.bytes[offset:offset + size]) if size else CodeTable()
         offset, size = self.sections.get(BULK_TABLE, (0, 0))
         self.bulk_table = [BULK.unpack_from(self.bytes, offset + i * BULK.size) for i in range(size)]
+        offset, size = self.sections.get(MANIFEST, (0, 0))
+        self.manifest = decode_manifest(self.bytes[offset:offset + size])
         self._bulk_cache = {}
 
     def bulk(self, index):
@@ -415,6 +432,31 @@ def replace_chunk(path, index, events):
     sections = dict(trace.sections)
     sections[CODE_TABLE] = (len(data), len(encoded_code))
     data += encoded_code
+    section_table = len(data)
+    for kind, (section_offset, size) in sections.items():
+        data += SECTION.pack(kind, section_offset, size)
+    data[:HEADER.size] = HEADER.pack(trace.magic, trace.instruction_count, trace.event_count, trace.access_mask, len(sections),
+                                     section_table)
+    with open(path, "wb") as file:
+        file.write(data)
+
+
+def encode_manifest(manifest):
+    data = bytearray()
+    for key, value in manifest.items():
+        key, value = key.encode(), value.encode()
+        data += MANIFEST_SIZES.pack(len(key), len(value)) + key + value
+    return bytes(data)
+
+
+def replace_manifest(path, manifest):
+    """Append `manifest` (a dict of str) and a new section table pointing to it."""
+    trace = Trace(path)
+    data = bytearray(trace.bytes)
+    encoded = encode_manifest(manifest)
+    sections = dict(trace.sections)
+    sections[MANIFEST] = (len(data), len(encoded))
+    data += encoded
     section_table = len(data)
     for kind, (section_offset, size) in sections.items():
         data += SECTION.pack(kind, section_offset, size)

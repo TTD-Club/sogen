@@ -74,6 +74,9 @@ namespace sogen::ttd
         // zstd-compressed code_entry array; the section size is the compressed byte count.
         code_table = 4,
         bulk_table = 5,
+        // How the trace was recorded, as UTF-8 key/value pairs; the section size is the byte count. Each pair is a
+        // uint32 key length and a uint32 value length followed by the key and value bytes.
+        manifest = 6,
     };
 
     struct section_entry
@@ -99,7 +102,8 @@ namespace sogen::ttd
     // the bulk blocks recorded between the two checkpoints, so data written by large accesses is stored only once.
     constexpr uint64_t bulk_reference_span = 16;
 
-    // Checkpoint 0 is the initial state. A checkpoint with a base is a zstd delta against the base's state.
+    // Checkpoint 0 is the initial state; its step is the first position of the trace, which is not zero for a trace
+    // recorded from a forked replay. A checkpoint with a base is a zstd delta against the base's state.
     struct checkpoint_entry
     {
         uint64_t step{};

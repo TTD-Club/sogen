@@ -7,6 +7,7 @@ directory. SAMPLE is a host path (host mode), or a guest path when EMULATOR_ARGS
 import gc
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -85,6 +86,76 @@ def main() -> None:
         assert read_u64(emulator, address) == FORKED_VALUE
         replay.seek(load.position)
         assert read_u64(emulator, address) == NEW_VALUE
+
+        # The manifest says how a trace was recorded; tools/ttd_format.py reads the same entries.
+        manifest = trace.manifest
+        assert manifest["tool"] == "analyzer" and manifest["cpuid"] == "1", manifest
+        assert manifest["backend"] == emulator.backend_name and manifest["checkpoint_interval"] == "100000", manifest
+        assert ttd_format.Trace(cli_trace).manifest == manifest
+
+        # Recording after a seek forks the trace: the new trace starts at the seek position and replays on its own,
+        # in Python and in the CLI.
+        fork_trace = str(pathlib.Path(directory) / "fork.sogttd")
+        replay.seek(store.position)
+        emulator.write_memory(address, FORKED_VALUE.to_bytes(8, "little"))
+        fork_length = load.position - store.position + 20000
+        with ttd.record(emulator, fork_trace, checkpoint_interval=5000, max_instructions=fork_length,
+                        manifest={"parent": "cli"}) as fork:
+            assert fork.start_position == store.position and fork.checkpoints[0] == store.position, fork.checkpoints
+            assert fork.checkpoints[1:] == list(range(store.position + 5000, fork.instruction_count, 5000)), fork.checkpoints
+            assert len(fork.checkpoints) > 1
+            assert load.position <= fork.instruction_count <= store.position + fork_length
+            assert fork.manifest["parent"] == "cli" and fork.manifest["tool"] == "sogen.ttd", fork.manifest
+            assert len(list(fork.events(kinds=ttd.EXECUTE))) == fork.instruction_count - fork.start_position
+            forked_loads = fork.accesses(address, 8, kinds=ttd.READ)
+            assert [event.position for event in forked_loads] == [load.position], forked_loads
+            assert forked_loads[0].data == FORKED_VALUE.to_bytes(8, "little")
+
+            fork_replay = ttd.Replay(fork, ttd.create_emulator(sample, **settings))
+            fork_replay.seek(load.position)
+            assert read_u64(fork_replay.emulator, address) == FORKED_VALUE
+            fork_replay.seek(fork.instruction_count)
+            try:
+                fork_replay.seek(store.position - 1)
+            except IndexError as error:
+                assert "before the start" in str(error)
+            else:
+                raise AssertionError("A fork replay restored a position before the fork")
+            del fork_replay
+        output = run("--ttd-replay", fork_trace, "--ttd-seek", hex(load.position), "--ttd-read", hex(address), *emulator_args,
+                     sample)
+        assert int(re.search(r"TTD memory [0-9a-f]+ = ([0-9a-f]+)", output).group(1), 16) == FORKED_VALUE, output
+
+        # A replay that does not repeat the recording raises DivergenceError, a RuntimeError.
+        tampered = str(pathlib.Path(directory) / "tampered.sogttd")
+        shutil.copyfile(cli_trace, tampered)
+        mirror = ttd_format.Trace(tampered)
+        store_chunk = next(index for index, (_, _, first, last, _, _) in enumerate(mirror.chunks)
+                           if first <= store.position <= last)
+        chunk_events = mirror.chunk_events(store_chunk)
+        recorded_store = next(event for event in chunk_events
+                              if (event.step, event.address, event.kind) == (store.position, address, ttd_format.WRITE))
+        recorded_store.data = (0x3333333333333333).to_bytes(8, "little")
+        ttd_format.replace_chunk(tampered, store_chunk, chunk_events)
+        with ttd.Trace(tampered) as tampered_trace:
+            try:
+                ttd.Replay(tampered_trace, emulator).seek(store.position)
+            except ttd.DivergenceError as error:
+                assert isinstance(error, RuntimeError) and "accessed different data" in str(error), error
+            else:
+                raise AssertionError("A tampered recording replayed without divergence")
+
+        # A trace recorded with other CPUID results is refused before replaying.
+        ttd_format.replace_manifest(tampered, {**manifest, "cpuid": "0"})
+        with ttd.Trace(tampered) as tampered_trace:
+            try:
+                ttd.Replay(tampered_trace, emulator).seek(1)
+            except ttd.DivergenceError:
+                raise AssertionError("A CPUID mismatch was reported as a divergence")
+            except RuntimeError as error:
+                assert "CPUID results 0" in str(error), error
+            else:
+                raise AssertionError("A trace with other CPUID results replayed")
 
         try:
             ttd.Replay(trace, sogen.windows.create_application(sample, **settings))

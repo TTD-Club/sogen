@@ -29,7 +29,10 @@ with ttd.Trace("sample.sogttd") as trace:
     executes = trace.events(kinds=ttd.EXECUTE)      # iterator; event.data holds the instruction bytes
     hits = trace.self_modifying_code()
 
-    # Replay: every recorded event is verified on the way; RuntimeError names the first divergence.
+    print(trace.manifest)  # {'backend': ..., 'cpuid': '1', 'emulation_root': ..., 'tool': 'sogen.ttd', ...}
+
+    # Replay: every recorded event is verified on the way; ttd.DivergenceError (a RuntimeError) names the first
+    # divergence.
     emu = ttd.create_emulator("c:/sample.exe", emulation_root="root")
     replay = ttd.Replay(trace, emu)
     replay.seek(store.position - 1)                 # also seeks backwards
@@ -40,12 +43,20 @@ with ttd.Trace("sample.sogttd") as trace:
     emu.write_memory(0x140005000, (0x4141).to_bytes(8, "little"))
     emu.start(10_000)
     replay.seek(store.position)
+
+    # Recording a fork: a trace recorded after a seek starts at that position (trace.start_position) and
+    # replays on its own like any other trace. max_instructions counts from the fork.
+    replay.seek(store.position)
+    emu.write_memory(0x140005000, (0x4141).to_bytes(8, "little"))
+    fork = ttd.record(emu, "fork.sogttd", max_instructions=100_000, manifest={"parent": "sample.sogttd"})
 ```
 
 `Replay` refuses emulators that are not deterministic (more than one vCPU, no instruction precision, or no
 relative clock). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
 also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_python_test.py` covers queries,
-replay of a CLI trace, a fork, and replay of a Python trace in the CLI.
+the manifest, replay of a CLI trace, a fork and a recorded fork (replayed in Python and the CLI), divergence and
+CPUID-mismatch errors, and replay of a Python trace in the CLI. The CLI's replay scans (`--ttd-strings`,
+`--ttd-buffers`, `--ttd-scan-selfmod`) need a trace that starts at position 0.
 
 ## Recording and querying
 
@@ -253,8 +264,9 @@ found through the section table (24-byte entries `type, offset, size`):
   event_count, first_step, last_step, offset, size`, contiguous in event
   number.
 - Checkpoint table (type 2, size = entry count): 32-byte entries `step,
-  offset, size, base`. Entry 0 is the initial state at step 0, the serialized
-  emulator state compressed with zstd. Every other checkpoint is a zstd delta
+  offset, size, base`. Entry 0 is the initial state, the serialized emulator
+  state compressed with zstd, at step 0 or, for a trace recorded from a
+  forked replay, at the fork position (no event has a smaller step). Every other checkpoint is a zstd delta
   (`refPrefix` with long-distance matching) against the state of checkpoint
   `base`. The recorder uses `base = i - p`, where `p` is the largest power of
   16 dividing `i`, so restoring any checkpoint decompresses fewer than 16
@@ -290,6 +302,15 @@ found through the section table (24-byte entries `type, offset, size`):
   continues at `f + 3`, and a non-candidate at the next byte. The decoder runs
   the same scan with `disp - f`. Calls to the same target then repeat
   byte-for-byte, which saves 9% of bulk bytes on `test-sample`.
+- Manifest (type 6, size = bytes, at most 1 MiB; absent in older traces):
+  key/value pairs, each a `uint32_t` key length, a `uint32_t` value length,
+  and the UTF-8 key and value bytes. The recorder writes `backend`, `cpuid`
+  (the version of the CPUID results the recording depends on),
+  `emulation_root` (empty in host mode), `executable`, and
+  `checkpoint_interval`, then the front end's entries (`tool` is `analyzer`
+  or `sogen.ttd`; Python adds the `manifest=` entries of `ttd.record`). A
+  seek refuses a trace with another `backend` or `cpuid` and adds a differing
+  `emulation_root` to a divergence message.
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host

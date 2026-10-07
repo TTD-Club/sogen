@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <string_view>
 
 #include <windows_emulator.hpp>
 
@@ -39,12 +40,20 @@ namespace sogen::ttd
         uint64_t access_mask{all_access_kinds};
         // Zero records only the initial state.
         uint64_t checkpoint_interval{500000};
-        // Zero runs until the process exits.
+        // Instructions to record from the current position; zero runs until the process exits.
         uint64_t max_instructions{};
+        // Front-end entries, stored after the ones record() adds (backend, cpuid, emulation_root, executable,
+        // checkpoint_interval).
+        manifest_entries manifest{};
     };
 
+    // Identifies the cpuid_override results. Change it whenever they change: replays refuse traces recorded with other
+    // results instead of diverging at the first CPUID.
+    constexpr std::string_view cpuid_scheme = "1";
+
     // Records the emulator from its current state until the process exits, the instruction limit is reached, or
-    // `interrupted` returns true, and finalizes the trace.
+    // `interrupted` returns true, and finalizes the trace. Recording after a seek forks the replayed trace into a new
+    // one that starts at the seek position.
     void record(windows_emulator& win_emu, const record_settings& settings, const std::function<bool()>& interrupted = {});
 
     struct seek_result
@@ -54,6 +63,8 @@ namespace sogen::ttd
     };
 
     // Restores the last checkpoint at or before `position` and replays to it, verifying every recorded event. Throws
-    // when the replay diverges from the recording or stops before `position`.
+    // divergence_error when the replay diverges from the recording or stops before `position`, naming the manifest
+    // settings this replay does not share with the recording, and refuses a trace recorded with another backend or
+    // other CPUID results.
     seek_result seek(windows_emulator& win_emu, trace& recorded, uint64_t position);
 }

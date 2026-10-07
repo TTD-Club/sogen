@@ -214,6 +214,14 @@ namespace sogen::ttd
             }
         }
 
+        void require_start_at_zero(const trace& recorded)
+        {
+            if (recorded.start_position())
+            {
+                throw std::runtime_error("TTD replay scans need a trace that starts at position zero, not a forked one");
+            }
+        }
+
         std::optional<std::string> run_to(windows_emulator& win_emu, const uint64_t position, const char* failure)
         {
             const auto before = win_emu.get_executed_instructions();
@@ -231,6 +239,7 @@ namespace sogen::ttd
         replay_result scan_strings(windows_emulator& win_emu, const cli_options& options)
         {
             trace recorded(options.replay);
+            require_start_at_zero(recorded);
             replay_verifier verifier(win_emu, recorded, win_emu.get_executed_instructions());
             string_scanner scanner(win_emu, options.min_string_length);
             scanner.scan_initial_memory();
@@ -249,6 +258,7 @@ namespace sogen::ttd
         replay_result scan_buffers(windows_emulator& win_emu, const cli_options& options)
         {
             trace recorded(options.replay);
+            require_start_at_zero(recorded);
             win_emu.setup_process_if_necessary();
             buffer_scanner scanner(win_emu, recorded);
             for (const auto& checkpoint : recorded.checkpoints())
@@ -274,6 +284,7 @@ namespace sogen::ttd
         replay_result scan_selfmod(windows_emulator& win_emu, const cli_options& options)
         {
             trace recorded(options.replay);
+            require_start_at_zero(recorded);
             win_emu.setup_process_if_necessary();
             uint64_t capture_address = 0;
             size_t capture_size = 0;
@@ -607,6 +618,7 @@ namespace sogen::ttd
                         .access_mask = recorded_kinds(options),
                         .checkpoint_interval = options.no_checkpoints ? 0 : options.checkpoint_interval,
                         .max_instructions = options.max_instructions,
+                        .manifest = {{"tool", "analyzer"}},
                     },
                     interrupted);
         win_emu.log.log("TTD recorded %llu instructions\n", static_cast<unsigned long long>(win_emu.get_executed_instructions()));

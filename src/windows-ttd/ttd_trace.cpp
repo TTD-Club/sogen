@@ -180,13 +180,68 @@ namespace sogen::ttd
         {
             return address + std::min<uint64_t>(size - 1, UINT64_MAX - address);
         }
+
+        constexpr uint64_t max_manifest_size = 1024 * 1024;
+
+        std::vector<std::byte> encode_manifest(const manifest_entries& manifest)
+        {
+            std::vector<std::byte> encoded{};
+            const auto append = [&](const void* data, const size_t size) {
+                const auto* bytes = static_cast<const std::byte*>(data);
+                encoded.insert(encoded.end(), bytes, bytes + size);
+            };
+            for (const auto& [key, value] : manifest)
+            {
+                const auto key_size = static_cast<uint32_t>(key.size());
+                const auto value_size = static_cast<uint32_t>(value.size());
+                append(&key_size, sizeof(key_size));
+                append(&value_size, sizeof(value_size));
+                append(key.data(), key.size());
+                append(value.data(), value.size());
+            }
+            if (encoded.size() > max_manifest_size)
+            {
+                throw std::invalid_argument("TTD manifest exceeds 1 MiB");
+            }
+            return encoded;
+        }
+
+        manifest_entries decode_manifest(const std::span<const std::byte> encoded)
+        {
+            manifest_entries manifest{};
+            size_t offset = 0;
+            const auto take = [&](const size_t size) {
+                if (size > encoded.size() - offset)
+                {
+                    throw std::runtime_error("Invalid TTD manifest");
+                }
+                const auto bytes = encoded.subspan(offset, size);
+                offset += size;
+                return bytes;
+            };
+            const auto text = [](const std::span<const std::byte> bytes) {
+                return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            };
+            while (offset < encoded.size())
+            {
+                uint32_t key_size{};
+                uint32_t value_size{};
+                memcpy(&key_size, take(sizeof(key_size)).data(), sizeof(key_size));
+                memcpy(&value_size, take(sizeof(value_size)).data(), sizeof(value_size));
+                auto key = text(take(key_size));
+                manifest.emplace_back(std::move(key), text(take(value_size)));
+            }
+            return manifest;
+        }
     }
 
-    recorder::recorder(windows_emulator& emu, const std::filesystem::path& path, const uint64_t access_mask)
+    recorder::recorder(windows_emulator& emu, const std::filesystem::path& path, const uint64_t access_mask, manifest_entries manifest)
         : emu_(emu),
           path_(path),
-          file_(path, std::ios::binary | std::ios::trunc)
+          file_(path, std::ios::binary | std::ios::trunc),
+          manifest_(std::move(manifest))
     {
+        encode_manifest(manifest_);
         if (!(access_mask & all_access_kinds))
         {
             throw std::invalid_argument("A TTD recording needs at least one access kind");
@@ -475,6 +530,7 @@ namespace sogen::ttd
         {
             throw std::runtime_error("Cannot compress TTD code table");
         }
+        const auto manifest = encode_manifest(manifest_);
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -482,6 +538,7 @@ namespace sogen::ttd
             section_entry{.type = section_type::page_index, .offset = append_to_file(bytes_of(page_blocks)), .size = page_blocks.size()},
             section_entry{.type = section_type::code_table, .offset = append_to_file(code), .size = code.size()},
             section_entry{.type = section_type::bulk_table, .offset = append_to_file(bytes_of(bulk_table_)), .size = bulk_table_.size()},
+            section_entry{.type = section_type::manifest, .offset = append_to_file(manifest), .size = manifest.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -634,6 +691,14 @@ namespace sogen::ttd
                     }
                 }
             }
+            else if (section.type == section_type::manifest)
+            {
+                if (section.size > max_manifest_size || !fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                manifest_ = decode_manifest(read_bytes(section.offset, section.size));
+            }
         }
 
         uint64_t next_event = 0;
@@ -652,9 +717,13 @@ namespace sogen::ttd
         {
             throw std::runtime_error("Invalid TTD event chunk entry");
         }
-        if (checkpoints_.empty() || checkpoints_.front().step != 0)
+        if (checkpoints_.empty())
         {
             throw std::runtime_error("TTD trace has no initial state");
+        }
+        if (!chunks_.empty() && chunks_.front().first_step < checkpoints_.front().step)
+        {
+            throw std::runtime_error("TTD trace has events before its initial state");
         }
         if (bulk_table_.size() != checkpoints_.size())
         {
@@ -935,11 +1004,25 @@ namespace sogen::ttd
         return state;
     }
 
+    std::optional<std::string_view> trace::manifest_value(const std::string_view key) const
+    {
+        const auto entry = std::ranges::find(manifest_, key, &manifest_entries::value_type::first);
+        if (entry == manifest_.end())
+        {
+            return std::nullopt;
+        }
+        return entry->second;
+    }
+
     checkpoint_state trace::checkpoint_for_step(const uint64_t step)
     {
         if (step > metadata_.instruction_count)
         {
             throw std::out_of_range("TTD position is beyond end of trace");
+        }
+        if (step < this->start_position())
+        {
+            throw std::out_of_range("TTD position is before the start of the trace");
         }
         const auto next = std::ranges::upper_bound(checkpoints_, step, {}, &checkpoint_entry::step);
         const auto index = static_cast<uint64_t>(next - checkpoints_.begin() - 1);
@@ -1453,7 +1536,7 @@ namespace sogen::ttd
         host_write_hook_.remove();
         if (error_)
         {
-            throw std::runtime_error(*error_);
+            throw divergence_error(*error_);
         }
         const auto position = emu_.get_executed_instructions();
         if (const auto missed = reader_.next(access_mask_); missed && missed->step <= position)
@@ -1461,7 +1544,7 @@ namespace sogen::ttd
             std::ostringstream message;
             message << "TTD replay reached position " << std::hex << position << " without recorded event " << std::dec
                     << reader_.last_number() << " at step " << std::hex << missed->step;
-            throw std::runtime_error(message.str());
+            throw divergence_error(message.str());
         }
     }
 

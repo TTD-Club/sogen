@@ -213,6 +213,7 @@ namespace sogen::py
                 .value("HOST_WRITE", access_kind::host_write, "A write Sogen makes itself: syscall output, loader, exception frames")
                 .export_values();
             m.attr("ALL") = static_cast<access_kind>(ttd::all_access_kinds);
+            const nb::exception<ttd::divergence_error> divergence_error(m, "DivergenceError", PyExc_RuntimeError);
 
             nb::class_<ttd_event>(m, "Event", "One recorded access. Position N is the state after instruction N.")
                 .def_ro("position", &ttd_event::position, "1-based number of the instruction performing the access")
@@ -259,16 +260,31 @@ namespace sogen::py
                 .def_prop_ro("event_count", [](const ttd_trace& self) { return self.native().metadata().event_count; })
                 .def_prop_ro("access_mask", [](const ttd_trace& self) { return static_cast<access_kind>(self.native().access_mask()); })
                 .def_prop_ro(
+                    "start_position", [](const ttd_trace& self) { return self.native().start_position(); },
+                    "Position of the initial state: 0, or the fork position of a trace recorded after a seek")
+                .def_prop_ro(
+                    "manifest",
+                    [](const ttd_trace& self) {
+                        nb::dict manifest{};
+                        for (const auto& [key, value] : self.native().manifest())
+                        {
+                            manifest[nb::str(key.data(), key.size())] = nb::str(value.data(), value.size());
+                        }
+                        return manifest;
+                    },
+                    "How the trace was recorded (backend, cpuid, emulation_root, executable, checkpoint_interval, tool, and the "
+                    "entries passed to record); empty for older traces")
+                .def_prop_ro(
                     "checkpoints",
                     [](const ttd_trace& self) {
-                        std::vector<uint64_t> positions{0};
+                        std::vector<uint64_t> positions{self.native().start_position()};
                         for (const auto& checkpoint : self.native().checkpoints())
                         {
                             positions.push_back(checkpoint.step);
                         }
                         return positions;
                     },
-                    "Positions a seek can restore directly, starting with 0")
+                    "Positions a seek can restore directly, starting with start_position")
                 .def(
                     "accesses",
                     [](const ttd_trace& self, const uint64_t address, const uint64_t size, const access_kind kinds, const uint64_t start,
@@ -328,20 +344,30 @@ namespace sogen::py
             m.def(
                 "record",
                 [](sogen_windows_emulator& emulator, const std::filesystem::path& path, const uint64_t checkpoint_interval,
-                   const uint64_t max_instructions, const access_kind kinds) {
+                   const uint64_t max_instructions, const access_kind kinds, const std::optional<nb::dict>& manifest) {
+                    ttd::manifest_entries entries{{"tool", "sogen.ttd"}};
+                    if (manifest)
+                    {
+                        for (const auto& [key, value] : *manifest)
+                        {
+                            entries.emplace_back(nb::cast<std::string>(key), nb::cast<std::string>(value));
+                        }
+                    }
                     {
                         const nb::gil_scoped_release release{};
                         ttd::record(emulator.native(), {.path = path,
                                                         .access_mask = static_cast<uint64_t>(kinds),
                                                         .checkpoint_interval = checkpoint_interval,
-                                                        .max_instructions = max_instructions});
+                                                        .max_instructions = max_instructions,
+                                                        .manifest = std::move(entries)});
                     }
                     return ttd_trace(path);
                 },
                 nb::arg("emulator"), nb::arg("path"), nb::arg("checkpoint_interval") = 500000, nb::arg("max_instructions") = 0,
-                nb::arg("kinds") = static_cast<access_kind>(ttd::all_access_kinds),
-                "Run the emulator from its current state until the process exits or max_instructions is reached, recording a "
-                "trace. A checkpoint_interval of 0 keeps only the initial state.");
+                nb::arg("kinds") = static_cast<access_kind>(ttd::all_access_kinds), nb::arg("manifest") = nb::none(),
+                "Run the emulator from its current state until the process exits or max_instructions more instructions ran, "
+                "recording a trace. A checkpoint_interval of 0 keeps only the initial state. manifest: extra str entries for "
+                "Trace.manifest. Recording after Replay.seek forks the replayed trace: the new trace starts at that position.");
 
             nb::class_<ttd_replay>(m, "Replay",
                                    "Moves an emulator to recorded positions. After a seek the emulator is a normal emulator at that "
@@ -349,7 +375,8 @@ namespace sogen::py
                 .def(nb::init<ttd_trace, sogen_windows_emulator&>(), nb::arg("trace"), nb::arg("emulator"), nb::keep_alive<1, 3>())
                 .def("seek", &ttd_replay::seek, nb::arg("position"), nb::call_guard<nb::gil_scoped_release>(),
                      "Restore the last checkpoint at or before position and replay to it, verifying every recorded event. Raises "
-                     "RuntimeError where the replay diverges from the recording.")
+                     "DivergenceError where the replay diverges from the recording, and RuntimeError for a trace recorded with "
+                     "another backend or other CPUID results.")
                 .def_prop_ro("position", &ttd_replay::position)
                 .def_prop_ro("emulator", &ttd_replay::emulator, nb::rv_policy::reference_internal);
         }

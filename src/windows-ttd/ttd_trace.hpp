@@ -9,8 +9,11 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <windows_emulator.hpp>
@@ -23,6 +26,15 @@
 
 namespace sogen::ttd
 {
+    using manifest_entries = std::vector<std::pair<std::string, std::string>>;
+
+    // A replay that does not repeat the recording.
+    class divergence_error : public std::runtime_error
+    {
+      public:
+        using std::runtime_error::runtime_error;
+    };
+
     struct trace_metadata
     {
         uint64_t instruction_count{};
@@ -49,7 +61,8 @@ namespace sogen::ttd
     class recorder
     {
       public:
-        recorder(windows_emulator& emu, const std::filesystem::path& path, uint64_t access_mask = all_access_kinds);
+        recorder(windows_emulator& emu, const std::filesystem::path& path, uint64_t access_mask = all_access_kinds,
+                 manifest_entries manifest = {});
         ~recorder();
         recorder(const recorder&) = delete;
         recorder& operator=(const recorder&) = delete;
@@ -78,6 +91,7 @@ namespace sogen::ttd
         code_table code_{};
         std::vector<access_event> chunk_events_{};
         std::vector<bulk_entry> bulk_table_{};
+        manifest_entries manifest_{};
         std::shared_ptr<std::vector<std::byte>> current_bulk_{std::make_shared<std::vector<std::byte>>()};
         // The last bulk_reference_span closed blocks, oldest first.
         std::deque<bulk_block> recent_bulk_{};
@@ -120,6 +134,20 @@ namespace sogen::ttd
         {
             return std::span(checkpoints_).subspan(1);
         }
+
+        // The position of the initial state: zero unless the trace was recorded from a forked replay.
+        uint64_t start_position() const
+        {
+            return checkpoints_.empty() ? 0 : checkpoints_.front().step;
+        }
+
+        // Empty for traces recorded before the manifest existed.
+        const manifest_entries& manifest() const
+        {
+            return manifest_;
+        }
+
+        std::optional<std::string_view> manifest_value(std::string_view key) const;
 
         bool has_instruction_bytes() const
         {
@@ -168,6 +196,7 @@ namespace sogen::ttd
         uint32_t version_{};
         std::optional<uint64_t> access_mask_{};
         std::vector<checkpoint_entry> checkpoints_{};
+        manifest_entries manifest_{};
 
         std::vector<chunk_entry> chunks_{};
         std::vector<code_entry> code_{};
