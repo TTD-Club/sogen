@@ -84,6 +84,10 @@ namespace sogen
 
         void set_mapping_change_callback(std::function<void(uint64_t, size_t)> callback)
         {
+            if (callback && mapping_change_callback_)
+            {
+                throw std::logic_error("A memory mapping change callback is already installed");
+            }
             mapping_change_callback_ = std::move(callback);
         }
 
