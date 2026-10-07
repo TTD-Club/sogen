@@ -13,6 +13,10 @@ target_link_libraries(windows-ttd PUBLIC
   windows-emulator
 )
 
+target_link_libraries(windows-ttd PRIVATE
+  disassembler
+)
+
 target_include_directories(windows-ttd INTERFACE "${CMAKE_CURRENT_LIST_DIR}")
 
 sogen_strip_target(windows-ttd)

@@ -129,6 +129,11 @@ def main() -> None:
         replayed = run("--ttd-replay", trace, "--ttd-scan-selfmod", *emulator_args, sample)
         assert f"address={code:x} size=5 write={hit.group(2)}:0" in replayed, replayed
 
+        # The backend cannot decode ud2; its execute event still carries the real length and bytes.
+        illegal = int(re.search(r"ttd-ud2 ([0-9A-Fa-f]+)", recording).group(1), 16)
+        executes = run("--ttd-query", trace, "--ttd-access", "execute", "--ttd-address", hex(illegal), "--ttd-size", "0x1000")
+        assert re.fullmatch(rf"[0-9a-f]+:0 ip={illegal:x} address={illegal:x} size=2 kind=execute bytes=0f0b\n", executes), executes
+
         # The sample builds this string in writable memory and wipes it again; only the replay sees it.
         strings = pathlib.Path(directory) / "strings.tsv"
         run("--ttd-replay", trace, "--ttd-strings", str(strings), *emulator_args, sample)

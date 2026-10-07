@@ -55,6 +55,7 @@ namespace sogen
 
     using memory_access_hook_callback = std::function<void(cpu_interface& cpu, uint64_t address, const void* data, size_t size)>;
     using memory_access_data_callback = std::function<void(cpu_interface& cpu, uint64_t address, std::span<const std::byte> data)>;
+    // `size` is the instruction's length, or 0 when the backend cannot decode it (the instruction then raises an exception).
     using memory_execution_metadata_callback = std::function<void(cpu_interface& cpu, uint64_t address, size_t size)>;
     using memory_execution_hook_callback = std::function<void(cpu_interface& cpu, uint64_t address)>;
 

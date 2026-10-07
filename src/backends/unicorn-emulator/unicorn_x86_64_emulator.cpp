@@ -690,7 +690,10 @@ namespace sogen::unicorn
             emulator_hook* hook_memory_execution_metadata(memory_execution_metadata_callback callback) override
             {
                 auto exec_wrapper = [c = std::move(callback), this](uc_engine*, const uint64_t addr, const uint32_t size) {
-                    c(*this, addr, size);
+                    // Unicorn leaves this placeholder when the translator cannot decode the instruction (ud2, invalid
+                    // or unsupported opcodes).
+                    constexpr uint32_t unknown_instruction_size = 0xF1F1F1F1;
+                    c(*this, addr, size == unknown_instruction_size ? 0 : size);
                 };
                 function_wrapper<void, uc_engine*, uint64_t, uint32_t> wrapper(std::move(exec_wrapper));
                 unicorn_hook hook{*this};

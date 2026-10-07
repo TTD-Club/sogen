@@ -1,6 +1,8 @@
 #include "ttd_trace.hpp"
 #include "snapshot.hpp"
 
+#include <disassembler.hpp>
+
 #include <utils/compression.hpp>
 
 #include <algorithm>
@@ -24,6 +26,29 @@ namespace sogen::ttd
         constexpr size_t cached_bulk_blocks = bulk_reference_span + 1;
         constexpr int checkpoint_compression_level = 3;
         constexpr int code_table_compression_level = 9;
+        constexpr size_t max_instruction_size = 15;
+
+        // The length of an instruction the backend executed without decoding it (size 0: it raises an exception), as
+        // capstone decodes it, or 1 when capstone cannot decode it either. Recording and replay both use this, so the
+        // execute event matches.
+        uint64_t executed_size(windows_emulator& emu, const uint64_t address, const size_t reported)
+        {
+            if (reported)
+            {
+                return reported;
+            }
+            auto& cpu = emu.emu();
+            std::array<uint8_t, max_instruction_size> bytes{};
+            size_t readable = 0;
+            while (readable < bytes.size() && cpu.try_read_memory(address + readable, bytes.data() + readable, 1))
+            {
+                ++readable;
+            }
+            const disassembler decoder{};
+            const auto decoded =
+                decoder.disassemble(cpu, cpu.reg<uint16_t>(x86_register::cs), std::span(bytes).first(readable), 1, address);
+            return decoded.empty() ? 1 : decoded[0].size;
+        }
 
         // A checkpoint delta's zstd reference is its base state followed by the bulk blocks recorded in between. This
         // returns that concatenation, or nothing when those blocks are empty and the base state alone is the reference.
@@ -196,7 +221,7 @@ namespace sogen::ttd
         if (access_mask & static_cast<uint64_t>(access_kind::execute))
         {
             execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
-                append_event(access_kind::execute, address, size);
+                append_event(access_kind::execute, address, executed_size(emu_, address, size));
             }));
         }
         if (access_mask & static_cast<uint64_t>(access_kind::host_write))
@@ -1350,7 +1375,7 @@ namespace sogen::ttd
         if (access_mask_ & static_cast<uint64_t>(access_kind::execute))
         {
             execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
-                verify(access_kind::execute, address, size);
+                verify(access_kind::execute, address, executed_size(emu_, address, size));
             }));
         }
         if (access_mask_ & static_cast<uint64_t>(access_kind::host_write))
