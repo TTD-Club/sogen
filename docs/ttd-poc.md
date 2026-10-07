@@ -470,7 +470,7 @@ are wall clock, including process start; cdb's start (~0.3 s) is subtracted from
 |---|---|---|---|---|
 | Native run (no recording) | 0.005 s | | 0.10 s | |
 | Instructions recorded | 942,561 (2 threads) | 3,692,281 | 6,873,623 (12 threads) | 30,183,325 |
-| Recording time | 0.12 s (3 runs) | 1.91 s | 0.68–0.77 s (3 runs) | 20.6 s |
+| Recording time | 0.12 s (3 runs) | 1.37 s (1.91 s before `3ce3b19d`) | 0.68–0.77 s (3 runs) | 12.0 s, 3 runs (20.6 s before `3ce3b19d`) |
 | Trace file | 24.0 MiB | 5.8 MiB | 76.0 MiB | 34.1 MiB |
 | Trace after zstd 19 | 4.0 MiB | 5.75 MiB | 17.9 MiB | 33.4 MiB |
 | Bits per instruction, as stored | 214 | 13.1 | 92.7 | 9.5 |
@@ -485,8 +485,9 @@ are padded and mostly redundant (zstd shrinks them 4–6×), and its index, need
 trace size. Sogen stores every access value and full checkpoints in that size; Microsoft stores what its replay CPU
 needs to re-execute.
 
-Summary: Microsoft TTD records about 7× slower than native (≈10M instructions/s here); Sogen records about 1.5M
-instructions/s, roughly 5× slower than its own untraced emulation and over 200× slower than native. Per
+Summary: Microsoft TTD records about 7× slower than native (≈10M instructions/s here); Sogen records about 2.5M
+instructions/s (1.5M before the recorder work in `3ce3b19d`..`da4cc31f`), roughly 3× slower than its own untraced
+emulation (3.9 s) and over 100× slower than native. Per
 instruction, Sogen's traces are 10–16× smaller than Microsoft's files as written and 2.3–2.7× smaller than
 Microsoft's after zstd, before counting Microsoft's index. Microsoft seeks faster (its keyframes are much denser than
 Sogen's 500,000-instruction checkpoints); address queries are comparable.
