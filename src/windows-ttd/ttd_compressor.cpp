@@ -28,10 +28,15 @@ namespace sogen::ttd
 
     void background_compressor::submit(const uint64_t id, std::shared_ptr<const std::vector<std::byte>> data)
     {
+        this->submit_job(id, [this, data = std::move(data)] { return this->encode_(*data); });
+    }
+
+    void background_compressor::submit_job(const uint64_t id, job work)
+    {
         {
             std::unique_lock lock(this->mutex_);
             this->space_available_.wait(lock, [this] { return this->stopping_ || this->pending_.size() < this->max_pending_; });
-            this->pending_.emplace_back(id, std::move(data));
+            this->pending_.emplace_back(id, std::move(work));
             ++this->unfinished_;
         }
         this->work_available_.notify_one();
@@ -51,7 +56,7 @@ namespace sogen::ttd
     {
         while (true)
         {
-            std::pair<uint64_t, std::shared_ptr<const std::vector<std::byte>>> job{};
+            std::pair<uint64_t, job> next{};
             {
                 std::unique_lock lock(this->mutex_);
                 this->work_available_.wait(lock, [this] { return this->stopping_ || !this->pending_.empty(); });
@@ -59,17 +64,17 @@ namespace sogen::ttd
                 {
                     return;
                 }
-                job = std::move(this->pending_.front());
+                next = std::move(this->pending_.front());
                 this->pending_.pop_front();
             }
             this->space_available_.notify_one();
 
-            auto compressed = this->encode_(*job.second);
-            job.second.reset();
+            auto compressed = next.second();
+            next.second = nullptr;
 
             {
                 const std::scoped_lock lock(this->mutex_);
-                this->finished_.emplace_back(job.first, std::move(compressed));
+                this->finished_.emplace_back(next.first, std::move(compressed));
                 --this->unfinished_;
             }
             this->work_done_.notify_all();

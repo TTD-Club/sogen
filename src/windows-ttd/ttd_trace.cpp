@@ -423,6 +423,16 @@ namespace sogen::ttd
             }
             bulk_table_.at(static_cast<size_t>(index)) = {.offset = append_to_file(compressed), .size = compressed.size()};
         }
+        for (const auto& [index, compressed] : checkpoint_compressor_.take_finished(wait))
+        {
+            if (compressed.empty())
+            {
+                throw std::runtime_error("Cannot compress TTD checkpoint");
+            }
+            auto& entry = checkpoints_.at(static_cast<size_t>(index));
+            entry.offset = append_to_file(compressed);
+            entry.size = compressed.size();
+        }
     }
 
     void recorder::write_checkpoint(const uint64_t step)
@@ -431,13 +441,11 @@ namespace sogen::ttd
         const auto index = static_cast<uint64_t>(checkpoints_.size());
         if (!index)
         {
-            const auto compressed = utils::compression::zstd::compress(*state, checkpoint_compression_level);
-            if (compressed.empty())
-            {
-                throw std::runtime_error("Cannot compress TTD checkpoint");
-            }
-            checkpoints_.push_back({.step = step, .offset = append_to_file(compressed), .size = compressed.size()});
+            checkpoints_.push_back({.step = step});
+            checkpoint_compressor_.submit_job(index,
+                                              [state] { return utils::compression::zstd::compress(*state, checkpoint_compression_level); });
             base_states_.assign(checkpoint_levels, state);
+            write_compressed(false);
             return;
         }
 
@@ -455,16 +463,13 @@ namespace sogen::ttd
         {
             between.assign(recent_bulk_.end() - static_cast<ptrdiff_t>(distance), recent_bulk_.end());
         }
-        const auto& base = *base_states_[level];
-        const auto extended = extended_reference(base, between);
-        const auto compressed =
-            utils::compression::zstd::compress_with_reference(*state, extended.empty() ? std::span(base) : std::span(extended));
-        if (compressed.empty())
-        {
-            throw std::runtime_error("Cannot compress TTD checkpoint");
-        }
-        checkpoints_.push_back({.step = step, .offset = append_to_file(compressed), .size = compressed.size(), .base = index - distance});
+        checkpoints_.push_back({.step = step, .base = index - distance});
+        checkpoint_compressor_.submit_job(index, [state, base = base_states_[level], between = std::move(between)] {
+            const auto extended = extended_reference(*base, between);
+            return utils::compression::zstd::compress_with_reference(*state, extended.empty() ? std::span(*base) : std::span(extended));
+        });
         std::fill_n(base_states_.begin(), level + 1, state);
+        write_compressed(false);
     }
 
     uint64_t recorder::append_to_file(const std::span<const std::byte> bytes)
