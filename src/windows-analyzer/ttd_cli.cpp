@@ -222,6 +222,16 @@ namespace sogen::ttd
             }
         }
 
+        // These scans replay from a fresh setup without event verification, which recorded window input needs.
+        void require_no_ui_input(const trace& recorded)
+        {
+            if (!recorded.ui_inputs().empty())
+            {
+                throw std::runtime_error("This TTD replay scan cannot replay recorded window input; use sogen.ttd's Replay.buffers() or "
+                                         "Replay.self_modifying_waves()");
+            }
+        }
+
         std::optional<std::string> run_to(windows_emulator& win_emu, const uint64_t position, const char* failure)
         {
             const auto before = win_emu.get_executed_instructions();
@@ -241,12 +251,22 @@ namespace sogen::ttd
             trace recorded(options.replay);
             require_start_at_zero(recorded);
             replay_verifier verifier(win_emu, recorded, win_emu.get_executed_instructions());
+            const ui_replay ui(win_emu, recorded.ui_inputs(), 0, [&verifier] { return verifier.next_event_number(); });
             string_scanner scanner(win_emu, options.min_string_length);
             scanner.scan_initial_memory();
-            const auto end = recorded.metadata().instruction_count;
-            if (end > win_emu.get_executed_instructions())
+            // One start() per checkpoint interval, as the recording ran: recorded window input arrives at those pumps.
+            auto reached = true;
+            for (const auto& checkpoint : recorded.checkpoints())
             {
-                win_emu.start(static_cast<size_t>(end - win_emu.get_executed_instructions()));
+                reached = !run_to(win_emu, checkpoint.step, "");
+                if (!reached)
+                {
+                    break;
+                }
+            }
+            if (reached)
+            {
+                run_to(win_emu, recorded.metadata().instruction_count, "");
             }
             verifier.finish();
             scanner.finish();
@@ -259,6 +279,7 @@ namespace sogen::ttd
         {
             trace recorded(options.replay);
             require_start_at_zero(recorded);
+            require_no_ui_input(recorded);
             win_emu.setup_process_if_necessary();
             buffer_scanner scanner(win_emu, recorded);
             for (const auto& checkpoint : recorded.checkpoints())
@@ -285,6 +306,7 @@ namespace sogen::ttd
         {
             trace recorded(options.replay);
             require_start_at_zero(recorded);
+            require_no_ui_input(recorded);
             win_emu.setup_process_if_necessary();
             uint64_t capture_address = 0;
             size_t capture_size = 0;
@@ -345,6 +367,8 @@ namespace sogen::ttd
                 const auto origin = recorded.checkpoint_for_step(target.step - 1);
                 snapshot::load_emulator_state(win_emu, origin.state);
                 replay_verifier verifier(win_emu, recorded, origin.step);
+                const ui_replay ui(win_emu, recorded.ui_inputs(), recorded.checkpoint_index(origin.step),
+                                   [&verifier] { return verifier.next_event_number(); });
                 win_emu.start(static_cast<size_t>(target.step - origin.step));
                 try
                 {

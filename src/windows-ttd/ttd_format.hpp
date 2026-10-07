@@ -77,6 +77,23 @@ namespace sogen::ttd
         // How the trace was recorded, as UTF-8 key/value pairs; the section size is the byte count. Each pair is a
         // uint32 key length and a uint32 value length followed by the key and value bytes.
         manifest = 6,
+        // ui_input_entry array (size = entry count): host window events delivered to the guest while recording.
+        ui_inputs = 7,
+    };
+
+    // A window event the host UI delivered between instruction slices. It reached the guest after `event_number`
+    // events had been recorded, after checkpoint `checkpoint` was taken; a replay delivers it at that point instead
+    // of taking live input.
+    struct ui_input_entry
+    {
+        uint64_t checkpoint{};
+        uint64_t event_number{};
+        uint64_t step{};
+        uint64_t window{};
+        uint32_t message{};
+        uint32_t reserved{};
+        uint64_t wparam{};
+        uint64_t lparam{};
     };
 
     struct section_entry
@@ -156,4 +173,5 @@ namespace sogen::ttd
     static_assert(sizeof(checkpoint_entry) == 32);
     static_assert(sizeof(page_entry) == 16);
     static_assert(sizeof(page_block) == 32);
+    static_assert(sizeof(ui_input_entry) == 56);
 }

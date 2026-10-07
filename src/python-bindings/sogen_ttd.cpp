@@ -6,6 +6,7 @@
 #include <ttd_session.hpp>
 #include <ttd_string_scan.hpp>
 #include <ttd_trace.hpp>
+#include <ttd_ui.hpp>
 
 #include <sstream>
 
@@ -263,14 +264,12 @@ namespace sogen::py
             {
                 settings[key] = value;
             }
-            if (kwargs.contains("headless") && !nb::cast<bool>(kwargs["headless"]))
-            {
-                throw nb::value_error("TTD emulators are always headless: live window input cannot be replayed");
-            }
             settings["backend"] = backend_type::unicorn;
             settings["use_relative_time"] = true;
-            settings["headless"] = true;
-            sogen_windows_emulator emulator(create_application_emulator(application, args, nb::borrow<nb::kwargs>(settings)));
+            sogen_windows_emulator emulator(
+                create_application_emulator(application, args, nb::borrow<nb::kwargs>(settings), [](std::unique_ptr<ui_backend> inner) {
+                    return std::unique_ptr<ui_backend>(std::make_unique<ttd::recordable_ui_backend>(std::move(inner)));
+                }));
             ttd::install_cpuid_overrides(emulator.native());
             return emulator;
         }
@@ -309,6 +308,15 @@ namespace sogen::py
                 .def_ro("execute_position", &ttd::self_modifying_hit::execute_step)
                 .def_ro("execute_ip", &ttd::self_modifying_hit::execute_ip)
                 .def_ro("executions", &ttd::self_modifying_hit::executions);
+
+            nb::class_<ttd::ui_input_entry>(m, "UiInput", "A host window event delivered while recording")
+                .def_ro("position", &ttd::ui_input_entry::step)
+                .def_ro("event_number", &ttd::ui_input_entry::event_number, "Number of events recorded before it")
+                .def_ro("checkpoint", &ttd::ui_input_entry::checkpoint, "Index of the last checkpoint before it")
+                .def_ro("window", &ttd::ui_input_entry::window)
+                .def_ro("message", &ttd::ui_input_entry::message)
+                .def_ro("wparam", &ttd::ui_input_entry::wparam)
+                .def_ro("lparam", &ttd::ui_input_entry::lparam);
 
             nb::class_<ttd::recovered_string>(m, "RecoveredString")
                 .def_ro("address", &ttd::recovered_string::address)
@@ -349,6 +357,13 @@ namespace sogen::py
                 .def_prop_ro("instruction_count", [](const ttd_trace& self) { return self.native().metadata().instruction_count; })
                 .def_prop_ro("event_count", [](const ttd_trace& self) { return self.native().metadata().event_count; })
                 .def_prop_ro("access_mask", [](const ttd_trace& self) { return static_cast<access_kind>(self.native().access_mask()); })
+                .def_prop_ro(
+                    "ui_inputs",
+                    [](const ttd_trace& self) {
+                        const auto inputs = self.native().ui_inputs();
+                        return std::vector<ttd::ui_input_entry>(inputs.begin(), inputs.end());
+                    },
+                    "Host window events delivered while recording, which a replay delivers again")
                 .def_prop_ro(
                     "start_position", [](const ttd_trace& self) { return self.native().start_position(); },
                     "Position of the initial state: 0, or the fork position of a trace recorded after a seek")
@@ -439,9 +454,25 @@ namespace sogen::py
                     return create_ttd_emulator(application, args, kwargs);
                 },
                 nb::arg("application"), nb::arg("args") = nb::none(), nb::arg("kwargs"),
-                "A Windows emulator set up for recording and replay: Unicorn, the relative clock, headless (no live window "
-                "input, which a replay cannot repeat), and the CPUID results traces depend on. Accepts the keyword arguments of "
-                "sogen.windows.create_application except backend and use_relative_time.");
+                "A Windows emulator set up for recording and replay: Unicorn, the relative clock, the CPUID results traces "
+                "depend on, and a UI whose window input a recording logs and a replay delivers again (headless=True for no "
+                "window). Accepts the keyword arguments of sogen.windows.create_application except backend and "
+                "use_relative_time.");
+
+            m.def(
+                "inject_ui_event",
+                [](sogen_windows_emulator& emulator, const uint64_t window, const uint32_t message, const uint64_t wparam,
+                   const uint64_t lparam) {
+                    auto* ui = dynamic_cast<ttd::recordable_ui_backend*>(&emulator.native().ui());
+                    if (!ui)
+                    {
+                        throw nb::value_error("inject_ui_event needs an emulator from ttd.create_emulator");
+                    }
+                    ui->inject({.window = window, .message = message, .wParam = wparam, .lParam = lparam});
+                },
+                nb::arg("emulator"), nb::arg("window"), nb::arg("message"), nb::arg("wparam") = 0, nb::arg("lparam") = 0,
+                "Deliver a window event at the emulator's next UI pump as if the host window produced it; a recording logs "
+                "it like live input");
 
             m.def(
                 "record",

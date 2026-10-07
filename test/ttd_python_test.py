@@ -18,6 +18,8 @@ import ttd_format  # noqa: E402
 OLD_VALUE = 0x1111111111111111
 NEW_VALUE = 0x2222222222222222
 FORKED_VALUE = 0x4444444444444444
+WM_APP = 0x8000
+UI_VALUE = 0x5A5A
 
 
 def main() -> None:
@@ -197,23 +199,60 @@ def main() -> None:
         else:
             raise AssertionError("Replay accepted an emulator without the relative clock")
 
-        # Host window events arrive whenever the desktop delivers them, so TTD emulators take no live UI input.
+        # Host window events arrive whenever the desktop delivers them, so a TTD emulator's UI logs them while
+        # recording and replays the logged ones; a plain live UI is refused.
         try:
             ttd.Replay(trace, sogen.windows.create_application(sample, backend=sogen.Backend.unicorn, use_relative_time=True,
                                                                **settings))
         except RuntimeError as error:
-            assert "headless" in str(error), error
+            assert "recordable or headless UI" in str(error), error
         else:
             raise AssertionError("Replay accepted an emulator with live window input")
-        try:
-            ttd.create_emulator(sample, headless=False, **settings)
-        except ValueError as error:
-            assert "headless" in str(error), error
-        else:
-            raise AssertionError("create_emulator accepted headless=False")
-        assert trace.manifest["ui"] == "headless"
+        assert trace.manifest["ui"] == "recorded" and trace.ui_inputs == []
         del replay, emulator
         trace.close()
+
+        # Window input: an injected WM_APP reaches the sample's window while recording, and replays deliver it again at
+        # the same point. Without the recorded input the replay diverges where the input arrived.
+        window = int(re.search(r"ttd-window ([0-9A-Fa-f]+)", recording).group(1), 16)
+        ui_address = int(re.search(r"ttd-ui ([0-9A-Fa-f]+)", recording).group(1), 16)
+        ui_trace = str(pathlib.Path(directory) / "ui.sogttd")
+        ui_emulator = ttd.create_emulator(sample, headless=True, **settings)
+        ttd.inject_ui_event(ui_emulator, window, WM_APP, UI_VALUE)
+        with ttd.record(ui_emulator, ui_trace, checkpoint_interval=100000) as ui_recorded:
+            inputs = ui_recorded.ui_inputs
+            assert [(i.window, i.message, i.wparam) for i in inputs] == [(window, WM_APP, UI_VALUE)], inputs
+            assert ui_recorded.manifest["ui"] == "recorded"
+            ui_writes = ui_recorded.accesses(ui_address, 8, kinds=ttd.WRITE)
+            assert ui_writes and ui_writes[-1].data == UI_VALUE.to_bytes(8, "little"), ui_writes
+            ui_replay = ttd.Replay(ui_recorded, ttd.create_emulator(sample, headless=True, **settings))
+            ui_replay.seek(ui_recorded.instruction_count)
+            assert read_u64(ui_replay.emulator, ui_address) == UI_VALUE
+            ui_replay.seek(ui_writes[-1].position - 1)
+            assert read_u64(ui_replay.emulator, ui_address) == 0
+            assert ui_replay.strings()
+            try:
+                ttd.Replay(ui_recorded, sogen.windows.create_application(sample, backend=sogen.Backend.unicorn,
+                                                                         use_relative_time=True, headless=True,
+                                                                         **settings)).seek(ui_recorded.instruction_count)
+            except RuntimeError as error:
+                assert "recorded window input" in str(error), error
+            else:
+                raise AssertionError("A replay without a recordable UI accepted a trace with window input")
+            del ui_replay
+        verified = run("--ttd-replay", ui_trace, "--ttd-verify-checkpoints", *emulator_args, sample)
+        assert " differs " not in verified and " not reached" not in verified, verified
+        stripped = str(pathlib.Path(directory) / "stripped.sogttd")
+        shutil.copyfile(ui_trace, stripped)
+        ttd_format.drop_section(stripped, ttd_format.UI_INPUTS)
+        with ttd.Trace(stripped) as stripped_trace:
+            try:
+                # From the start: a seek to the end would restore a checkpoint taken after the input arrived.
+                ttd.Replay(stripped_trace, ttd.create_emulator(sample, headless=True, **settings)).strings()
+            except ttd.DivergenceError:
+                pass
+            else:
+                raise AssertionError("A replay without the recorded window input did not diverge")
 
         # A Python recording replays in the CLI, every checkpoint interval reaching the recorded state.
         python_trace = str(pathlib.Path(directory) / "python.sogttd")

@@ -19,6 +19,7 @@
 #include "tenet_tracer.hpp"
 #include "ttd_cli.hpp"
 #include "ttd_session.hpp"
+#include "ttd_ui.hpp"
 #include <subprocess_process_manager.hpp>
 
 #include <utils/finally.hpp>
@@ -716,11 +717,18 @@ namespace sogen
             }
 #endif
             const auto concise_logging = options.concise_logging;
-            // TTD runs headless: host window events cannot be replayed (ttd::require_deterministic).
-            const auto ttd_active = options.ttd.records() || options.ttd.replays();
-            const auto win_emu = setup_emulator(
-                options, args,
-                emulator_interfaces{.ui = ttd_active ? std::make_unique<null_ui_backend>() : nullptr, .processes = manager.get()});
+            // Host window events are input a replay cannot repeat: a recording shows the window and logs its events,
+            // a replay runs headless and delivers the logged ones.
+            std::unique_ptr<ui_backend> ui{};
+            if (options.ttd.records())
+            {
+                ui = std::make_unique<ttd::recordable_ui_backend>(create_default_ui_backend());
+            }
+            else if (options.ttd.replays())
+            {
+                ui = std::make_unique<ttd::recordable_ui_backend>(std::make_unique<null_ui_backend>());
+            }
+            const auto win_emu = setup_emulator(options, args, emulator_interfaces{.ui = std::move(ui), .processes = manager.get()});
             ttd::prepare_replay(*win_emu, options.ttd);
             apply_registry_files(*win_emu, options);
 #ifndef OS_EMSCRIPTEN

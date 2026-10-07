@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -34,6 +35,7 @@ namespace nb = nanobind;
 namespace sogen
 {
     class emulator_thread;
+    class ui_backend;
     class linux_emulator;
     class linux_memory_manager;
     class memory_manager;
@@ -115,6 +117,10 @@ namespace sogen::py
     std::unique_ptr<windows_emulator> create_empty_emulator(const nb::kwargs& kwargs);
     std::unique_ptr<windows_emulator> create_application_emulator(const nb::object& application, const nb::object& args,
                                                                   const nb::kwargs& kwargs);
+    // `wrap_ui` receives the UI backend the kwargs select (a null one for headless=True) and returns the one to use.
+    using ui_wrapper = std::function<std::unique_ptr<ui_backend>(std::unique_ptr<ui_backend>)>;
+    std::unique_ptr<windows_emulator> create_application_emulator(const nb::object& application, const nb::object& args,
+                                                                  const nb::kwargs& kwargs, const ui_wrapper& wrap_ui);
     std::unique_ptr<linux_emulator> create_empty_linux_emulator(const nb::kwargs& kwargs);
     std::unique_ptr<linux_emulator> create_linux_application_emulator(const nb::object& application, const nb::object& args,
                                                                       const nb::kwargs& kwargs);

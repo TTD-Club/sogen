@@ -17,7 +17,9 @@ BULK = struct.Struct("<2Q")
 BULK_REFERENCE = struct.Struct("<2Q")
 MAGIC = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
-CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST = 1, 2, 3, 4, 5, 6
+CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS = 1, 2, 3, 4, 5, 6, 7
+# checkpoint, event_number, step, window, message, reserved, wparam, lparam
+UI_INPUT = struct.Struct("<4QII2Q")
 MANIFEST_SIZES = struct.Struct("<2I")
 READ, WRITE, EXECUTE, HOST_WRITE = 1, 2, 4, 8
 MASK64 = (1 << 64) - 1
@@ -302,6 +304,8 @@ class Trace:
         self.bulk_table = [BULK.unpack_from(self.bytes, offset + i * BULK.size) for i in range(size)]
         offset, size = self.sections.get(MANIFEST, (0, 0))
         self.manifest = decode_manifest(self.bytes[offset:offset + size])
+        offset, size = self.sections.get(UI_INPUTS, (0, 0))
+        self.ui_inputs = [UI_INPUT.unpack_from(self.bytes, offset + i * UI_INPUT.size) for i in range(size)]
         self._bulk_cache = {}
 
     def bulk(self, index):
@@ -447,6 +451,20 @@ def encode_manifest(manifest):
         key, value = key.encode(), value.encode()
         data += MANIFEST_SIZES.pack(len(key), len(value)) + key + value
     return bytes(data)
+
+
+def drop_section(path, kind):
+    """Append a section table without section `kind`."""
+    trace = Trace(path)
+    data = bytearray(trace.bytes)
+    sections = {k: v for k, v in trace.sections.items() if k != kind}
+    section_table = len(data)
+    for section_kind, (section_offset, size) in sections.items():
+        data += SECTION.pack(section_kind, section_offset, size)
+    data[:HEADER.size] = HEADER.pack(trace.magic, trace.instruction_count, trace.event_count, trace.access_mask, len(sections),
+                                     section_table)
+    with open(path, "wb") as file:
+        file.write(data)
 
 
 def replace_manifest(path, manifest):

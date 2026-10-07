@@ -23,6 +23,7 @@
 #include "ttd_chunk.hpp"
 #include "ttd_compressor.hpp"
 #include "ttd_format.hpp"
+#include "ttd_ui.hpp"
 
 namespace sogen::ttd
 {
@@ -122,6 +123,10 @@ namespace sogen::ttd
             std::array<uint8_t, inline_data_limit> bytes{};
         };
 
+        // Host window events, when the emulator has a recordable UI backend.
+        recordable_ui_backend* ui_{};
+        std::vector<ui_input_entry> ui_inputs_{};
+
         bool caches_instructions_{};
         std::unordered_map<uint64_t, cached_instruction> instruction_cache_{};
         std::unordered_map<uint64_t, std::vector<uint64_t>> cached_instructions_by_page_{};
@@ -173,6 +178,15 @@ namespace sogen::ttd
 
         std::optional<std::string_view> manifest_value(std::string_view key) const;
 
+        // Host window events delivered while recording, in delivery order.
+        std::span<const ui_input_entry> ui_inputs() const
+        {
+            return ui_inputs_;
+        }
+
+        // Index of the checkpoint at `step` (0 for the initial state); throws if no checkpoint is there.
+        uint64_t checkpoint_index(uint64_t step) const;
+
         bool has_instruction_bytes() const
         {
             return this->chunked() || version_ >= 4;
@@ -221,6 +235,7 @@ namespace sogen::ttd
         std::optional<uint64_t> access_mask_{};
         std::vector<checkpoint_entry> checkpoints_{};
         manifest_entries manifest_{};
+        std::vector<ui_input_entry> ui_inputs_{};
 
         std::vector<chunk_entry> chunks_{};
         std::vector<code_entry> code_{};
@@ -305,9 +320,16 @@ namespace sogen::ttd
             return verified_events_;
         }
 
+        // The number of the next recorded event the replay should produce.
+        uint64_t next_event_number() const
+        {
+            return first_number_ + verified_events_;
+        }
+
       private:
         windows_emulator& emu_;
         trace& trace_;
+        uint64_t first_number_{};
         event_reader reader_;
         uint64_t access_mask_{};
         scoped_hook write_hook_{};

@@ -13,7 +13,8 @@ replays the same traces as the CLI below; traces recorded by either replay in th
 import sogen
 from sogen import ttd
 
-# An emulator for recording or replay: Unicorn, the relative clock, headless, and the CPUID results traces depend on.
+# An emulator for recording or replay: Unicorn, the relative clock, the CPUID results traces depend on, and a UI whose
+# window events a recording logs and a replay delivers again (headless=True for no window).
 # Takes the keyword arguments of sogen.windows.create_application (emulation_root, registry_directory, ...).
 emu = ttd.create_emulator("c:/sample.exe", emulation_root="root")
 trace = ttd.record(emu, "sample.sogttd", checkpoint_interval=500_000)
@@ -62,7 +63,10 @@ with ttd.Trace("sample.sogttd") as trace:
 ```
 
 `Replay` refuses emulators that are not deterministic (more than one vCPU, no instruction precision, no
-relative clock, or a live UI; `sogen.windows.create_application(..., headless=True)` gives a headless one). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
+relative clock, or a live UI whose events cannot be recorded; `sogen.windows.create_application(..., headless=True)`
+gives a headless one). `Trace.ui_inputs` lists the window events a recording logged;
+`ttd.inject_ui_event(emu, window, message, wparam, lparam)` delivers one as if the host window produced it, once that
+window exists (scripted input; a recording logs it like live input). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
 also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_python_test.py` covers queries,
 the manifest, replay of a CLI trace, a fork and a recorded fork (replayed in Python and the CLI), divergence and
 CPUID-mismatch errors, the replay scans (also on a fork), and replay of a Python trace in the CLI. The Python
@@ -108,14 +112,18 @@ prints the resulting instruction pointer. Positions are represented as
 Recording and replay force Unicorn, one vCPU, instruction precision,
 `--reproducible` (Sogen's relative-time clock, and CPUID no longer advertises
 RDRAND, which Unicorn serves from the host's random source outside MSVC
-builds), and no live UI: the analyzer and `ttd.create_emulator` use a headless
-UI backend, and `ttd::require_deterministic` refuses any other. Host window
-events (focus, mouse, keys) arrive whenever the desktop delivers them, so a
-replay could not repeat them; before this, a window gaining focus at a
-different moment in the replay rewrote the shared `USER_SERVERINFO` and broke
-checkpoint verification. External file and network responses must also be
-identical for deterministic replay; this POC does not capture them yet.
-Recording is suitable for an isolated, self-contained sample.
+builds), and a recordable UI. Host window events (focus, mouse, keys) arrive
+whenever the desktop delivers them, so they are input: `ttd::recordable_ui_backend`
+wraps the real window while recording and logs every event it delivers with the
+number of trace events recorded before it and the latest checkpoint index (the
+`ui_inputs` section). A replay runs headless and delivers the logged events at
+the same points instead of live input; after a Python seek the emulator takes
+live input again, so a fork is interactive. The analyzer records with its
+normal window and replays headless; `ttd.create_emulator` shows the window
+unless `headless=True`. `ttd::require_deterministic` refuses a plain live UI
+backend. External file and network responses must also be identical for
+deterministic replay; this POC does not capture them yet. Recording is
+suitable for an isolated, self-contained sample.
 
 `--ttd-no-checkpoints` keeps just the initial snapshot for comparison. The
 default interval is 500,000 instructions. Checkpoints are taken only between
@@ -129,12 +137,14 @@ the initial snapshot), replays the interval with event verification, and
 compares the complete serialized emulator state with the recorded checkpoint,
 printing `matches`, the first differing state offset, or the event at which
 the interval's replay diverged, and continues with the next interval. All
-checkpoints of `ttd-step-sample` match. A complete headless recording of
-`test-sample` (30.18M instructions, 60 checkpoints) matches in 59 intervals;
-the other diverges at a UDP datagram's sender address, whose port the host OS
-assigns afresh each run (`afd_endpoint::ioctl_receive_datagram`). Other runs
-can also diverge at DNS answers delivered over ALPC. Before recordings became
-headless, 56 to 58 intervals matched. Value
+checkpoints of `ttd-step-sample` match. A complete recording of `test-sample`
+with its live window (30.18M instructions, 60 checkpoints, 4 window events
+recorded) matches in 59 intervals; the other diverges at a UDP datagram's
+sender address, whose port the host OS assigns afresh each run
+(`afd_endpoint::ioctl_receive_datagram`). Other runs can also diverge at DNS
+answers delivered over ALPC. Before window events were recorded, 56 to 58
+intervals matched: a focus event arriving at a different moment in the replay
+rewrote the shared `USER_SERVERINFO`. Value
 verification also exposed emulator writes that copied uninitialized host
 stack bytes (struct padding) into the guest, for `TokenBnoIsolation` and for
 window-message callback arguments; those are fixed.
@@ -325,7 +335,7 @@ found through the section table (24-byte entries `type, offset, size`):
   and the UTF-8 key and value bytes. The recorder writes `build` (`git
   describe` of the Sogen tree, `-dirty` with local changes), `backend`,
   `cpuid` (the version of the CPUID results the recording depends on), `ui`
-  (`headless`; absent in traces recorded with a live window),
+  (`recorded` or `headless`; absent in older traces),
   `emulation_root` (empty in host mode), `registry` and `system_dlls`
   (XXH64, as 16 hex digits, over each file's name, 64-bit size, and full
   contents, in order: hives `SYSTEM`, `SECURITY`, `SAM`, `SOFTWARE`,
@@ -338,6 +348,16 @@ found through the section table (24-byte entries `type, offset, size`):
   hives, system DLLs, and build live outside the checkpoints and are read
   again by a replay, so a divergence message lists those that differ
   (`Replay.manifest_differences()` in Python).
+
+- UI inputs (type 7, size = entry count; absent in older traces): 56-byte
+  entries `checkpoint, event_number, step, window, message (uint32), reserved
+  (uint32), wparam, lparam`, one per host window event delivered while
+  recording, in delivery order: it reached the guest after `event_number`
+  events were recorded, after checkpoint `checkpoint` was taken. A replay
+  from checkpoint K delivers the entries with `checkpoint >= K` at the first
+  UI pump where it has verified `event_number` events. Replays therefore stop
+  at every checkpoint between the start and the target, as the recording's
+  budgeted `start()` calls did, since the UI is pumped at those boundaries.
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host

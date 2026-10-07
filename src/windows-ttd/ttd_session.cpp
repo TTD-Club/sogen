@@ -126,7 +126,7 @@ namespace sogen::ttd
                 {"build", build_commit},
                 {"backend", win_emu.emu().get_name()},
                 {"cpuid", std::string(cpuid_scheme)},
-                {"ui", "headless"},
+                {"ui", dynamic_cast<const recordable_ui_backend*>(&win_emu.ui()) ? "recorded" : "headless"},
                 {"emulation_root", path_text(win_emu.emulation_root)},
                 {"registry", registry_fingerprint(win_emu)},
                 {"system_dlls", system_dll_fingerprint(win_emu)},
@@ -234,9 +234,10 @@ namespace sogen::ttd
         {
             throw std::runtime_error("TTD requires the relative clock (reproducible mode)");
         }
-        if (!dynamic_cast<const null_ui_backend*>(&win_emu.ui()))
+        if (!dynamic_cast<const null_ui_backend*>(&win_emu.ui()) && !dynamic_cast<const recordable_ui_backend*>(&win_emu.ui()))
         {
-            throw std::runtime_error("TTD requires a headless emulator: live window input (focus, mouse, keys) cannot be replayed");
+            throw std::runtime_error("TTD requires a recordable or headless UI: live window input (focus, mouse, keys) must be "
+                                     "recorded to be replayed (use ttd.create_emulator)");
         }
     }
 
@@ -284,6 +285,8 @@ namespace sogen::ttd
         try
         {
             replay_verifier verifier(win_emu, recorded, checkpoint.step);
+            const ui_replay ui(win_emu, recorded.ui_inputs(), recorded.checkpoint_index(checkpoint.step),
+                               [&verifier] { return verifier.next_event_number(); });
             if (position > checkpoint.step)
             {
                 win_emu.start(static_cast<size_t>(position - checkpoint.step));
@@ -314,6 +317,8 @@ namespace sogen::ttd
         try
         {
             replay_verifier verifier(win_emu, recorded, start);
+            const ui_replay ui(win_emu, recorded.ui_inputs(), 0, [&verifier] { return verifier.next_event_number(); });
+            // One start() per checkpoint interval, as the recording ran: the UI is pumped at each boundary.
             const auto run_to = [&](const uint64_t position) {
                 const auto before = win_emu.get_executed_instructions();
                 if (position > before)

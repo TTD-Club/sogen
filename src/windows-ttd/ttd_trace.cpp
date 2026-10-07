@@ -292,11 +292,24 @@ namespace sogen::ttd
                     append_data_event(access_kind::host_write, address, data);
                 }));
         }
-        // Last, so a constructor that throws never leaves the callback behind.
+        // Last, so a constructor that throws never leaves a callback behind.
         if (caches_instructions_)
         {
             emu_.memory.set_mapping_change_callback(
                 [this](const uint64_t address, const size_t size) { forget_instructions(address, size); });
+        }
+        ui_ = dynamic_cast<recordable_ui_backend*>(&emu_.ui());
+        if (ui_)
+        {
+            ui_->start_recording([this](const ui_event& event) {
+                ui_inputs_.push_back({.checkpoint = checkpoints_.size() - 1,
+                                      .event_number = header_.event_count,
+                                      .step = emu_.get_executed_instructions(),
+                                      .window = static_cast<uint64_t>(event.window),
+                                      .message = event.message,
+                                      .wparam = event.wParam,
+                                      .lparam = event.lParam});
+            });
         }
     }
 
@@ -599,6 +612,10 @@ namespace sogen::ttd
         {
             emu_.memory.set_mapping_change_callback({});
         }
+        if (ui_)
+        {
+            ui_->stop();
+        }
         flush_chunk();
         close_bulk_block();
         write_compressed(true);
@@ -633,6 +650,7 @@ namespace sogen::ttd
             section_entry{.type = section_type::code_table, .offset = append_to_file(code), .size = code.size()},
             section_entry{.type = section_type::bulk_table, .offset = append_to_file(bytes_of(bulk_table_)), .size = bulk_table_.size()},
             section_entry{.type = section_type::manifest, .offset = append_to_file(manifest), .size = manifest.size()},
+            section_entry{.type = section_type::ui_inputs, .offset = append_to_file(bytes_of(ui_inputs_)), .size = ui_inputs_.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -793,6 +811,19 @@ namespace sogen::ttd
                 }
                 manifest_ = decode_manifest(read_bytes(section.offset, section.size));
             }
+            else if (section.type == section_type::ui_inputs)
+            {
+                if (!fits(section.offset, section.size, sizeof(ui_input_entry)))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                file_.seekg(static_cast<std::streamoff>(section.offset));
+                ui_inputs_.resize(static_cast<size_t>(section.size));
+                for (auto& input : ui_inputs_)
+                {
+                    input = read_object<ui_input_entry>(file_);
+                }
+            }
         }
 
         uint64_t next_event = 0;
@@ -830,6 +861,16 @@ namespace sogen::ttd
                 !fits(checkpoint.offset, checkpoint.size, 1) || (checkpoint.base != no_base_checkpoint && checkpoint.base >= i))
             {
                 throw std::runtime_error("Invalid TTD checkpoint entry");
+            }
+        }
+        for (size_t i = 0; i < ui_inputs_.size(); ++i)
+        {
+            const auto& input = ui_inputs_[i];
+            const auto ordered = !i || std::pair(ui_inputs_[i - 1].checkpoint, ui_inputs_[i - 1].event_number) <=
+                                           std::pair(input.checkpoint, input.event_number);
+            if (input.checkpoint >= checkpoints_.size() || input.event_number > metadata_.event_count || !ordered)
+            {
+                throw std::runtime_error("Invalid TTD UI input entry");
             }
         }
     }
@@ -1106,6 +1147,16 @@ namespace sogen::ttd
             return std::nullopt;
         }
         return entry->second;
+    }
+
+    uint64_t trace::checkpoint_index(const uint64_t step) const
+    {
+        const auto entry = std::ranges::lower_bound(checkpoints_, step, {}, &checkpoint_entry::step);
+        if (entry == checkpoints_.end() || entry->step != step)
+        {
+            throw std::out_of_range("No TTD checkpoint at this position");
+        }
+        return static_cast<uint64_t>(entry - checkpoints_.begin());
     }
 
     checkpoint_state trace::checkpoint_for_step(const uint64_t step)
@@ -1531,7 +1582,8 @@ namespace sogen::ttd
     replay_verifier::replay_verifier(windows_emulator& emu, trace& recorded, const uint64_t from_step)
         : emu_(emu),
           trace_(recorded),
-          reader_(recorded, recorded.first_event_after(from_step)),
+          first_number_(recorded.first_event_after(from_step)),
+          reader_(recorded, first_number_),
           access_mask_(recorded.access_mask())
     {
         auto& cpu = emu_.emu();
