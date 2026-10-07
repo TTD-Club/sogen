@@ -4,6 +4,49 @@ This is an experimental trace in `windows-analyzer`, based on Sogen's own
 serialized snapshots, instruction counter, and Unicorn write hooks. It is not a Microsoft
 TTD `.run` file and is not yet a Binary Ninja debug adapter.
 
+## Python API
+
+The `sogen.ttd` module (built with the Python bindings, `SOGEN_ENABLE_PYTHON_BINDINGS`) records, queries, and
+replays the same traces as the CLI below; traces recorded by either replay in the other.
+
+```python
+import sogen
+from sogen import ttd
+
+# An emulator for recording or replay: Unicorn, the relative clock, and the CPUID results traces depend on.
+# Takes the keyword arguments of sogen.windows.create_application (emulation_root, registry_directory, ...).
+emu = ttd.create_emulator("c:/sample.exe", emulation_root="root")
+trace = ttd.record(emu, "sample.sogttd", checkpoint_interval=500_000)
+
+# Offline queries; positions are instruction numbers (position N is the state after instruction N).
+with ttd.Trace("sample.sogttd") as trace:
+    for event in trace.accesses(0x140005000, 8, kinds=ttd.WRITE | ttd.HOST_WRITE):
+        print(event.position, hex(event.ip), event.data.hex())
+    store = trace.next_access(0x140005000, 8, position=1000, kinds=ttd.WRITE)
+    load = trace.previous_access(0x140005000, 8, position=store.position, kinds=ttd.READ)
+    for entry in trace.history(0x140005000, 8):   # value after each access, None where unknown
+        print(entry.event.position, entry.value)
+    executes = trace.events(kinds=ttd.EXECUTE)      # iterator; event.data holds the instruction bytes
+    hits = trace.self_modifying_code()
+
+    # Replay: every recorded event is verified on the way; RuntimeError names the first divergence.
+    emu = ttd.create_emulator("c:/sample.exe", emulation_root="root")
+    replay = ttd.Replay(trace, emu)
+    replay.seek(store.position - 1)                 # also seeks backwards
+    rip = emu.read_register(sogen.Register.rip)
+
+    # Fork: after a seek the emulator is an ordinary emulator. Change it and run on unverified;
+    # a later seek returns to the recorded timeline.
+    emu.write_memory(0x140005000, (0x4141).to_bytes(8, "little"))
+    emu.start(10_000)
+    replay.seek(store.position)
+```
+
+`Replay` refuses emulators that are not deterministic (more than one vCPU, no instruction precision, or no
+relative clock). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
+also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_python_test.py` covers queries,
+replay of a CLI trace, a fork, and replay of a Python trace in the CLI.
+
 ## Recording and querying
 
 Use an ordinary Sogen Windows emulation root and a Windows PE:

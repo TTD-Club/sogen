@@ -1,0 +1,364 @@
+#include <nanobind/nanobind.h>
+
+#include "sogen_internal.hpp"
+
+#include <ttd_session.hpp>
+#include <ttd_trace.hpp>
+
+#include <sstream>
+
+namespace sogen::py
+{
+    namespace
+    {
+        using ttd::access_kind;
+
+        nb::bytes to_bytes(const std::span<const std::byte> data)
+        {
+            return nb::bytes(reinterpret_cast<const char*>(data.data()), data.size());
+        }
+
+        struct ttd_event
+        {
+            uint64_t position{};
+            uint64_t ip{};
+            uint64_t address{};
+            uint64_t size{};
+            access_kind kind{};
+            // Bytes read or written, or for an execute the instruction bytes.
+            std::vector<std::byte> data{};
+
+            std::string repr() const
+            {
+                std::ostringstream text;
+                text << std::hex << "Event(position=0x" << this->position << ", kind=" << ttd::access_kind_name(this->kind) << ", ip=0x"
+                     << this->ip << ", address=0x" << this->address << ", size=" << std::dec << this->size << ")";
+                return text.str();
+            }
+        };
+
+        struct ttd_history_entry
+        {
+            ttd_event event{};
+            // The range's bytes after the event; None for bytes no access has shown yet.
+            std::vector<std::optional<uint8_t>> value{};
+        };
+
+        class ttd_trace
+        {
+          public:
+            explicit ttd_trace(const std::filesystem::path& path)
+                : trace_(std::make_shared<ttd::trace>(path))
+            {
+            }
+
+            ttd::trace& native() const
+            {
+                if (!this->trace_)
+                {
+                    throw std::runtime_error("TTD trace is closed");
+                }
+                return *this->trace_;
+            }
+
+            // The file stays open while a replay or an event iterator of this trace exists.
+            void close()
+            {
+                this->trace_.reset();
+            }
+
+            ttd_event event(const ttd::access_event& event) const
+            {
+                ttd_event result{.position = event.step, .ip = event.ip, .address = event.address, .size = event.size, .kind = event.kind};
+                if (event.kind == access_kind::execute)
+                {
+                    if (this->native().has_instruction_bytes() && event.size < ttd::inline_data_limit)
+                    {
+                        const auto bytes = std::as_bytes(std::span(event.payload)).first(static_cast<size_t>(event.size));
+                        result.data.assign(bytes.begin(), bytes.end());
+                    }
+                }
+                else
+                {
+                    result.data = this->native().access_data(event);
+                }
+                return result;
+            }
+
+            std::vector<ttd_event> events(const std::vector<ttd::access_event>& events) const
+            {
+                std::vector<ttd_event> result{};
+                result.reserve(events.size());
+                for (const auto& event : events)
+                {
+                    result.push_back(this->event(event));
+                }
+                return result;
+            }
+
+            std::vector<ttd_history_entry> history(const uint64_t address, const uint64_t size, const uint64_t end) const
+            {
+                constexpr auto kinds = static_cast<uint64_t>(access_kind::read) | static_cast<uint64_t>(access_kind::write) |
+                                       static_cast<uint64_t>(access_kind::host_write);
+                std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
+                std::vector<ttd_history_entry> result{};
+                for (const auto& access : this->native().accesses(address, size, 0, end, kinds))
+                {
+                    auto event = this->event(access);
+                    for (size_t i = 0; i < event.data.size(); ++i)
+                    {
+                        const auto byte_address = event.address + i;
+                        if (byte_address >= address && byte_address - address < size)
+                        {
+                            value[static_cast<size_t>(byte_address - address)] = static_cast<uint8_t>(event.data[i]);
+                        }
+                    }
+                    result.push_back({.event = std::move(event), .value = value});
+                }
+                return result;
+            }
+
+          private:
+            std::shared_ptr<ttd::trace> trace_;
+        };
+
+        class ttd_event_iterator
+        {
+          public:
+            ttd_event_iterator(const ttd_trace& recorded, const uint64_t first, const uint64_t kinds)
+                : trace_(recorded),
+                  reader_(recorded.native(), first),
+                  kinds_(kinds)
+            {
+            }
+
+            ttd_event next()
+            {
+                const auto event = this->reader_.next(this->kinds_);
+                if (!event)
+                {
+                    throw nb::stop_iteration();
+                }
+                return this->trace_.event(*event);
+            }
+
+          private:
+            ttd_trace trace_;
+            ttd::event_reader reader_;
+            uint64_t kinds_{};
+        };
+
+        class ttd_replay
+        {
+          public:
+            ttd_replay(ttd_trace recorded, sogen_windows_emulator& emulator)
+                : trace_(std::move(recorded)),
+                  emulator_(&emulator)
+            {
+                ttd::require_deterministic(emulator.native());
+            }
+
+            ttd::seek_result seek(const uint64_t position) const
+            {
+                return ttd::seek(this->emulator_->native(), this->trace_.native(), position);
+            }
+
+            uint64_t position() const
+            {
+                return this->emulator_->native().get_executed_instructions();
+            }
+
+            sogen_windows_emulator& emulator() const
+            {
+                return *this->emulator_;
+            }
+
+          private:
+            ttd_trace trace_;
+            sogen_windows_emulator* emulator_{};
+        };
+
+        uint64_t end_position(const std::optional<uint64_t>& end)
+        {
+            return end.value_or(UINT64_MAX);
+        }
+
+        sogen_windows_emulator create_ttd_emulator(const nb::object& application, const nb::object& args, const nb::kwargs& kwargs)
+        {
+            for (const auto* forced : {"backend", "use_relative_time"})
+            {
+                if (kwargs.contains(forced))
+                {
+                    throw nb::value_error("TTD emulators always use the Unicorn backend and the relative clock");
+                }
+            }
+            nb::dict settings{};
+            for (const auto& [key, value] : kwargs)
+            {
+                settings[key] = value;
+            }
+            settings["backend"] = backend_type::unicorn;
+            settings["use_relative_time"] = true;
+            sogen_windows_emulator emulator(create_application_emulator(application, args, nb::borrow<nb::kwargs>(settings)));
+            ttd::install_cpuid_overrides(emulator.native());
+            return emulator;
+        }
+
+        void register_types(nb::module_& m)
+        {
+            nb::enum_<access_kind>(m, "Access", nb::is_flag(), "Kinds of recorded events; combine with |")
+                .value("READ", access_kind::read)
+                .value("WRITE", access_kind::write, "A write by a guest instruction")
+                .value("EXECUTE", access_kind::execute)
+                .value("HOST_WRITE", access_kind::host_write, "A write Sogen makes itself: syscall output, loader, exception frames")
+                .export_values();
+            m.attr("ALL") = static_cast<access_kind>(ttd::all_access_kinds);
+
+            nb::class_<ttd_event>(m, "Event", "One recorded access. Position N is the state after instruction N.")
+                .def_ro("position", &ttd_event::position, "1-based number of the instruction performing the access")
+                .def_ro("ip", &ttd_event::ip)
+                .def_ro("address", &ttd_event::address)
+                .def_ro("size", &ttd_event::size)
+                .def_ro("kind", &ttd_event::kind)
+                .def_prop_ro(
+                    "data", [](const ttd_event& self) { return to_bytes(self.data); },
+                    "Bytes read or written; instruction bytes for executes")
+                .def("__repr__", &ttd_event::repr);
+
+            nb::class_<ttd_history_entry>(m, "HistoryEntry")
+                .def_ro("event", &ttd_history_entry::event)
+                .def_ro("value", &ttd_history_entry::value, "The range after the event; None for bytes not seen yet");
+
+            nb::class_<ttd::self_modifying_hit>(m, "SelfModifyingHit", "An executed instruction whose bytes were written earlier")
+                .def_ro("address", &ttd::self_modifying_hit::address)
+                .def_ro("size", &ttd::self_modifying_hit::size)
+                .def_ro("write_position", &ttd::self_modifying_hit::write_step)
+                .def_ro("write_ip", &ttd::self_modifying_hit::write_ip)
+                .def_ro("execute_position", &ttd::self_modifying_hit::execute_step)
+                .def_ro("execute_ip", &ttd::self_modifying_hit::execute_ip)
+                .def_ro("executions", &ttd::self_modifying_hit::executions);
+
+            nb::class_<ttd::seek_result>(m, "SeekResult")
+                .def_ro("checkpoint", &ttd::seek_result::checkpoint, "Position of the checkpoint the seek restored")
+                .def_ro("verified_events", &ttd::seek_result::verified_events);
+        }
+
+        void register_trace(nb::module_& m)
+        {
+            nb::class_<ttd_event_iterator>(m, "EventIterator")
+                .def("__iter__", [](nb::handle self) { return self; })
+                .def("__next__", &ttd_event_iterator::next);
+
+            nb::class_<ttd_trace>(m, "Trace", "A recorded trace, queried without replaying")
+                .def(nb::init<std::filesystem::path>(), nb::arg("path"))
+                .def("close", &ttd_trace::close, "Release the trace file; replays and iterators keep their own reference")
+                .def("__enter__", [](nb::handle self) { return self; })
+                .def(
+                    "__exit__", [](ttd_trace& self, const nb::args&) { self.close(); }, nb::arg("args"))
+                .def_prop_ro("instruction_count", [](const ttd_trace& self) { return self.native().metadata().instruction_count; })
+                .def_prop_ro("event_count", [](const ttd_trace& self) { return self.native().metadata().event_count; })
+                .def_prop_ro("access_mask", [](const ttd_trace& self) { return static_cast<access_kind>(self.native().access_mask()); })
+                .def_prop_ro(
+                    "checkpoints",
+                    [](const ttd_trace& self) {
+                        std::vector<uint64_t> positions{0};
+                        for (const auto& checkpoint : self.native().checkpoints())
+                        {
+                            positions.push_back(checkpoint.step);
+                        }
+                        return positions;
+                    },
+                    "Positions a seek can restore directly, starting with 0")
+                .def(
+                    "accesses",
+                    [](const ttd_trace& self, const uint64_t address, const uint64_t size, const access_kind kinds, const uint64_t start,
+                       const std::optional<uint64_t> end) {
+                        return self.events(self.native().accesses(address, size, start, end_position(end), static_cast<uint64_t>(kinds)));
+                    },
+                    nb::arg("address"), nb::arg("size") = 1, nb::arg("kinds") = static_cast<access_kind>(ttd::all_access_kinds),
+                    nb::arg("start") = 0, nb::arg("end") = nb::none(),
+                    "Events overlapping [address, address + size) at positions start through end, in order")
+                .def(
+                    "next_access",
+                    [](const ttd_trace& self, const uint64_t address, const uint64_t size, const uint64_t position,
+                       const access_kind kinds) -> std::optional<ttd_event> {
+                        const auto event = self.native().next_access(address, size, position, static_cast<uint64_t>(kinds));
+                        return event ? std::optional(self.event(*event)) : std::nullopt;
+                    },
+                    nb::arg("address"), nb::arg("size") = 1, nb::arg("position") = 0,
+                    nb::arg("kinds") = static_cast<access_kind>(ttd::all_access_kinds), "The first matching event after position")
+                .def(
+                    "previous_access",
+                    [](const ttd_trace& self, const uint64_t address, const uint64_t size, const uint64_t position,
+                       const access_kind kinds) -> std::optional<ttd_event> {
+                        const auto event = self.native().previous_access(address, size, position, static_cast<uint64_t>(kinds));
+                        return event ? std::optional(self.event(*event)) : std::nullopt;
+                    },
+                    nb::arg("address"), nb::arg("size") = 1, nb::arg("position"),
+                    nb::arg("kinds") = static_cast<access_kind>(ttd::all_access_kinds), "The last matching event before position")
+                .def("history", &ttd_trace::history, nb::arg("address"), nb::arg("size") = 8, nb::arg("end") = UINT64_MAX,
+                     "Every read and write of the range up to end, with the range's value after each")
+                .def(
+                    "events",
+                    [](const ttd_trace& self, const uint64_t first, const access_kind kinds) {
+                        return ttd_event_iterator(self, first, static_cast<uint64_t>(kinds));
+                    },
+                    nb::arg("first") = 0, nb::arg("kinds") = static_cast<access_kind>(ttd::all_access_kinds),
+                    "Iterate events from event number first")
+                .def(
+                    "event", [](const ttd_trace& self, const uint64_t number) { return self.event(self.native().event_at(number)); },
+                    nb::arg("number"))
+                .def(
+                    "self_modifying_code", [](const ttd_trace& self) { return self.native().self_modifying_code(); },
+                    "Executed instructions whose bytes a guest instruction wrote earlier");
+        }
+
+        void register_replay(nb::module_& m)
+        {
+            m.def(
+                "create_emulator",
+                [](const nb::object& application, const nb::object& args, const nb::kwargs& kwargs) {
+                    return create_ttd_emulator(application, args, kwargs);
+                },
+                nb::arg("application"), nb::arg("args") = nb::none(), nb::arg("kwargs"),
+                "A Windows emulator set up for recording and replay: Unicorn, the relative clock, and the CPUID results traces "
+                "depend on. Accepts the keyword arguments of sogen.windows.create_application except backend and "
+                "use_relative_time.");
+
+            m.def(
+                "record",
+                [](sogen_windows_emulator& emulator, const std::filesystem::path& path, const uint64_t checkpoint_interval,
+                   const uint64_t max_instructions, const access_kind kinds) {
+                    {
+                        const nb::gil_scoped_release release{};
+                        ttd::record(emulator.native(), {.path = path,
+                                                        .access_mask = static_cast<uint64_t>(kinds),
+                                                        .checkpoint_interval = checkpoint_interval,
+                                                        .max_instructions = max_instructions});
+                    }
+                    return ttd_trace(path);
+                },
+                nb::arg("emulator"), nb::arg("path"), nb::arg("checkpoint_interval") = 500000, nb::arg("max_instructions") = 0,
+                nb::arg("kinds") = static_cast<access_kind>(ttd::all_access_kinds),
+                "Run the emulator from its current state until the process exits or max_instructions is reached, recording a "
+                "trace. A checkpoint_interval of 0 keeps only the initial state.");
+
+            nb::class_<ttd_replay>(m, "Replay",
+                                   "Moves an emulator to recorded positions. After a seek the emulator is a normal emulator at that "
+                                   "position: change registers or memory and start() it to fork the recording.")
+                .def(nb::init<ttd_trace, sogen_windows_emulator&>(), nb::arg("trace"), nb::arg("emulator"), nb::keep_alive<1, 3>())
+                .def("seek", &ttd_replay::seek, nb::arg("position"), nb::call_guard<nb::gil_scoped_release>(),
+                     "Restore the last checkpoint at or before position and replay to it, verifying every recorded event. Raises "
+                     "RuntimeError where the replay diverges from the recording.")
+                .def_prop_ro("position", &ttd_replay::position)
+                .def_prop_ro("emulator", &ttd_replay::emulator, nb::rv_policy::reference_internal);
+        }
+    }
+
+    void register_ttd_bindings(nb::module_& m)
+    {
+        register_types(m);
+        register_trace(m);
+        register_replay(m);
+    }
+}

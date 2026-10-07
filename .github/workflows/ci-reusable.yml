@@ -1276,6 +1276,12 @@ jobs:
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
           ANALYSIS_SAMPLE: ${{github.workspace}}/build/release/artifacts/test-sample.exe
 
+      - name: Run Python TTD Test Script
+        if: ${{ startsWith(matrix.runner, 'windows') }}
+        run: |
+          cp build/release/artifacts/ttd-step-sample.exe build/release/artifacts/root/filesys/c/
+          python test/ttd_python_test.py build/release/artifacts/analyzer.exe c:/ttd-step-sample.exe -e ${{github.workspace}}/build/release/artifacts/root
+
       - name: Run Python Linux Unicorn Test Script
         if: ${{ startsWith(matrix.runner, 'ubuntu') }}
         run: python src/python-bindings/test_linux.py
