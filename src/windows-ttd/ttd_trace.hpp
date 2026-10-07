@@ -234,6 +234,21 @@ namespace sogen::ttd
         uint64_t first_event_at_or_after(uint64_t step);
     };
 
+    struct trace_difference
+    {
+        // The differing events and their numbers in each trace. An absent event means that trace has no further event up
+        // to the end both share; its number is then meaningless.
+        uint64_t first_number{};
+        std::optional<access_event> first{};
+        uint64_t second_number{};
+        std::optional<access_event> second{};
+    };
+
+    // The first event two traces record differently, comparing the kinds both recorded (with their data) from the
+    // later start position to the earlier end; nothing when they agree. For a fork and its parent this is where the
+    // change first shows.
+    std::optional<trace_difference> first_difference(trace& first, trace& second);
+
     class event_reader
     {
       public:

@@ -1548,6 +1548,52 @@ namespace sogen::ttd
         }
     }
 
+    std::optional<trace_difference> first_difference(trace& first, trace& second)
+    {
+        const auto kinds = first.access_mask() & second.access_mask();
+        if (!kinds)
+        {
+            throw std::runtime_error("The TTD traces record no common access kind");
+        }
+        const auto start = std::max(first.start_position(), second.start_position());
+        const auto end = std::min(first.metadata().instruction_count, second.metadata().instruction_count);
+        const auto instruction_bytes = first.has_instruction_bytes() && second.has_instruction_bytes();
+        const auto access_data = first.has_access_data() && second.has_access_data();
+        event_reader first_reader(first, first.first_event_after(start));
+        event_reader second_reader(second, second.first_event_after(start));
+        const auto next = [&](event_reader& reader) {
+            auto event = reader.next(kinds);
+            return event && event->step <= end ? event : std::nullopt;
+        };
+        while (true)
+        {
+            const auto a = next(first_reader);
+            const auto b = next(second_reader);
+            if (!a && !b)
+            {
+                return std::nullopt;
+            }
+            auto same =
+                a && b && a->kind == b->kind && a->step == b->step && a->ip == b->ip && a->address == b->address && a->size == b->size;
+            const auto compare_payload = a && (a->kind == access_kind::execute ? instruction_bytes && a->size < inline_data_limit
+                                                                               : access_data && a->size <= inline_data_limit);
+            if (same && compare_payload)
+            {
+                same = std::ranges::equal(std::span(a->payload).first(static_cast<size_t>(a->size)),
+                                          std::span(b->payload).first(static_cast<size_t>(b->size)));
+            }
+            else if (same && access_data && a->kind != access_kind::execute)
+            {
+                same = first.access_data(*a) == second.access_data(*b);
+            }
+            if (!same)
+            {
+                return trace_difference{
+                    .first_number = first_reader.last_number(), .first = a, .second_number = second_reader.last_number(), .second = b};
+            }
+        }
+    }
+
     std::vector<self_modifying_hit> trace::self_modifying_code()
     {
         using written_bytes = std::array<uint64_t, page_size / 64>;

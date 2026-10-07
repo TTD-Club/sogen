@@ -116,6 +116,15 @@ def main() -> None:
             assert [event.position for event in forked_loads] == [load.position], forked_loads
             assert forked_loads[0].data == FORKED_VALUE.to_bytes(8, "little")
 
+            # Comparing the fork with its parent finds the load of the changed value.
+            difference = ttd.first_difference(trace, fork)
+            assert difference.first.position == load.position and difference.first.kind == ttd.READ, difference.first
+            assert difference.first.data == NEW_VALUE.to_bytes(8, "little"), difference.first
+            assert difference.second.data == FORKED_VALUE.to_bytes(8, "little"), difference.second
+            assert trace.event(difference.first_number).position == load.position
+            assert fork.event(difference.second_number).position == load.position
+            assert ttd.first_difference(fork, fork) is None and ttd.first_difference(trace, trace) is None
+
             fork_replay = ttd.Replay(fork, ttd.create_emulator(sample, **settings))
             fork_replay.seek(load.position)
             assert read_u64(fork_replay.emulator, address) == FORKED_VALUE

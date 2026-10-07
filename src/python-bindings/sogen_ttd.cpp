@@ -122,6 +122,35 @@ namespace sogen::py
             std::shared_ptr<ttd::trace> trace_;
         };
 
+        struct ttd_difference
+        {
+            std::optional<uint64_t> first_number{};
+            std::optional<ttd_event> first{};
+            std::optional<uint64_t> second_number{};
+            std::optional<ttd_event> second{};
+        };
+
+        std::optional<ttd_difference> first_difference(const ttd_trace& first, const ttd_trace& second)
+        {
+            const auto difference = ttd::first_difference(first.native(), second.native());
+            if (!difference)
+            {
+                return std::nullopt;
+            }
+            ttd_difference result{};
+            if (difference->first)
+            {
+                result.first_number = difference->first_number;
+                result.first = first.event(*difference->first);
+            }
+            if (difference->second)
+            {
+                result.second_number = difference->second_number;
+                result.second = second.event(*difference->second);
+            }
+            return result;
+        }
+
         class ttd_event_iterator
         {
           public:
@@ -333,6 +362,17 @@ namespace sogen::py
                 .def(
                     "self_modifying_code", [](const ttd_trace& self) { return self.native().self_modifying_code(); },
                     "Executed instructions whose bytes a guest instruction wrote earlier");
+
+            nb::class_<ttd_difference>(m, "Difference", "The first event two traces record differently")
+                .def_ro("first", &ttd_difference::first, "The first trace's event; None when it has no further event")
+                .def_ro("first_number", &ttd_difference::first_number)
+                .def_ro("second", &ttd_difference::second, "The second trace's event; None when it has no further event")
+                .def_ro("second_number", &ttd_difference::second_number);
+
+            m.def("first_difference", &first_difference, nb::arg("first"), nb::arg("second"), nb::call_guard<nb::gil_scoped_release>(),
+                  "The first event the traces record differently (kinds both recorded, with their data), from the later "
+                  "start_position to the earlier end; None when they agree. For a recorded fork and its parent this is where "
+                  "the change first shows.");
         }
 
         void register_replay(nb::module_& m)

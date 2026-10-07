@@ -49,6 +49,11 @@ with ttd.Trace("sample.sogttd") as trace:
     replay.seek(store.position)
     emu.write_memory(0x140005000, (0x4141).to_bytes(8, "little"))
     fork = ttd.record(emu, "fork.sogttd", max_instructions=100_000, manifest={"parent": "sample.sogttd"})
+
+    # Where two traces part: the first event recorded differently (kinds both recorded, data included), from the
+    # later start to the earlier end, or None. For the fork above, the first access that sees the changed memory.
+    difference = ttd.first_difference(trace, fork)
+    print(difference.first, difference.second)       # Events; None where a trace has no further event
 ```
 
 `Replay` refuses emulators that are not deterministic (more than one vCPU, no instruction precision, or no
