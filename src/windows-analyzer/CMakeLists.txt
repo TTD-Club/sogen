@@ -19,6 +19,7 @@ target_link_libraries(windows-analyzer PRIVATE
   disassembler
   capstone
   windows-emulator
+  process-manager
   windows-gdb-stub
   windows-ttd
   backend-selection
@@ -43,4 +44,3 @@ if(SOGEN_ENABLE_REFLECTION)
     reflect
   )
 endif()
-
