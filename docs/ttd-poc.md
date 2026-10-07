@@ -83,8 +83,10 @@ also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_p
 the manifest, replay of a CLI trace, a fork and a recorded fork (replayed in Python and the CLI), divergence and
 CPUID-mismatch errors, the replay scans (also on a fork), the syscall, module, and thread lists, a replay after an
 input file the recording saw was deleted, and replay of a Python trace in the CLI. The Python
-scans start from the trace's initial checkpoint, so they also work on a recorded fork; the CLI's replay scans
-(`--ttd-strings`, `--ttd-buffers`, `--ttd-scan-selfmod`) need a trace that starts at position 0.
+scans start from the trace's initial checkpoint, so they also work on a recorded fork, as does `--ttd-strings`;
+`--ttd-buffers` and `--ttd-scan-selfmod` start from the application's setup and need a trace that starts at
+position 0. Every replay scan verifies all recorded events, takes recorded inputs unless strict, and delivers
+recorded window input.
 
 ## Recording and querying
 
@@ -217,7 +219,9 @@ region. The output is raw mapped memory, with unmapped pages zero-filled; it
 is not a reconstructed on-disk PE with repaired imports or sections. The dump
 still needs the original application and emulation root used for recording.
 
-For a trace with write events, `--ttd-scan-selfmod` starts a fresh emulation and
+For a trace with write events, `--ttd-scan-selfmod` starts a fresh emulation,
+verifies every recorded event as a seek does (taking recorded inputs unless
+`--ttd-strict`, and delivering recorded window input), and also
 compares each observed write with its recorded position, instruction
 pointer, address, and size, and checks the byte range of each executed
 instruction against earlier writes. It prints the first overlap only after
@@ -257,7 +261,7 @@ instruction boundary, writes made outside the hooked guest CPU, nonprintable
 encodings, or strings outside the heuristic length and termination rules.
 
 `--ttd-buffers OUT.tsv` replays a trace with write events from a fresh
-setup, verifying every guest write as `--ttd-scan-selfmod` does, and groups
+setup, verifying every event as `--ttd-scan-selfmod` does, and groups
 guest writes into regions: writes within 16 bytes and 250,000 instructions of
 a region extend it, and overwrites update it in place. A region is classified
 when a write changes bytes that were executed, when it would exceed its size

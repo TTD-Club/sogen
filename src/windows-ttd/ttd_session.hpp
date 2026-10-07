@@ -85,6 +85,8 @@ namespace sogen::ttd
 
     // Restores the trace's initial state, calls `attach` (to hook analyses such as the replay scans onto the restored
     // emulator), and replays the whole trace, one checkpoint interval at a time as it was recorded, verifying every
-    // recorded event. Throws like seek.
-    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach, bool strict = false);
+    // recorded event. Throws like seek. Without `restore`, the replay starts from the application's own setup on a
+    // fresh emulator instead, which needs a trace that starts at position 0.
+    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach, bool strict = false,
+                              bool restore = true);
 }

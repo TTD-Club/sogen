@@ -10,6 +10,8 @@
 #include <CLI/CLI.hpp>
 
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <sstream>
 
 namespace sogen::ttd
@@ -214,129 +216,93 @@ namespace sogen::ttd
             }
         }
 
-        void require_start_at_zero(const trace& recorded)
+        // Replays the whole trace with event verification and the recorded window input (see ttd::replay_to_end), calling
+        // `attach` to hook a scan onto the emulator first. Returns the divergence, if any.
+        //
+        // The buffer and self-modifying-code scans start from the application's own setup rather than the initial
+        // snapshot: one sample diverged after restoring its snapshot, while a fresh setup verified its whole run.
+        std::optional<std::string> replay_whole_trace(windows_emulator& win_emu, trace& recorded, const cli_options& options,
+                                                      const std::function<void()>& attach, const bool restore)
         {
-            if (recorded.start_position())
+            try
             {
-                throw std::runtime_error("TTD replay scans need a trace that starts at position zero, not a forked one");
+                const auto result = replay_to_end(win_emu, recorded, attach, options.strict, restore);
+                win_emu.log.log("TTD replay verified %llu recorded events (%llu inputs taken from the recording)\n",
+                                static_cast<unsigned long long>(result.verified_events),
+                                static_cast<unsigned long long>(result.substituted_inputs));
+                return std::nullopt;
             }
-        }
-
-        // These scans replay from a fresh setup without event verification, which recorded window input needs.
-        void require_no_ui_input(const trace& recorded)
-        {
-            if (!recorded.ui_inputs().empty())
+            catch (const divergence_error& e)
             {
-                throw std::runtime_error("This TTD replay scan cannot replay recorded window input; use sogen.ttd's Replay.buffers() or "
-                                         "Replay.self_modifying_waves()");
+                return e.what();
             }
-        }
-
-        std::optional<std::string> run_to(windows_emulator& win_emu, const uint64_t position, const char* failure)
-        {
-            const auto before = win_emu.get_executed_instructions();
-            if (position > before)
-            {
-                win_emu.start(static_cast<size_t>(position - before));
-            }
-            if (win_emu.get_executed_instructions() != position)
-            {
-                return failure;
-            }
-            return std::nullopt;
         }
 
         replay_result scan_strings(windows_emulator& win_emu, const cli_options& options)
         {
             trace recorded(options.replay);
-            require_start_at_zero(recorded);
-            replay_verifier verifier(win_emu, recorded, win_emu.get_executed_instructions(), options.strict);
-            const ui_replay ui(win_emu, recorded.ui_inputs(), 0, [&verifier] { return verifier.next_event_number(); });
-            string_scanner scanner(win_emu, options.min_string_length);
-            scanner.scan_initial_memory();
-            // One start() per checkpoint interval, as the recording ran: recorded window input arrives at those pumps.
-            auto reached = true;
-            for (const auto& checkpoint : recorded.checkpoints())
+            std::optional<string_scanner> scanner{};
+            if (auto failure = replay_whole_trace(
+                    win_emu, recorded, options,
+                    [&] {
+                        scanner.emplace(win_emu, options.min_string_length);
+                        scanner->scan_initial_memory();
+                    },
+                    true))
             {
-                reached = !run_to(win_emu, checkpoint.step, "");
-                if (!reached)
-                {
-                    break;
-                }
+                return {.failure = std::move(failure)};
             }
-            if (reached)
-            {
-                run_to(win_emu, recorded.metadata().instruction_count, "");
-            }
-            verifier.finish();
-            scanner.finish();
-            scanner.save(options.strings);
-            win_emu.log.log("TTD recovered %zu strings to %s\n", scanner.count(), options.strings.string().c_str());
+            scanner->finish();
+            scanner->save(options.strings);
+            win_emu.log.log("TTD recovered %zu strings to %s\n", scanner->count(), options.strings.string().c_str());
             return {.exit_status = win_emu.process.exit_status};
         }
 
         replay_result scan_buffers(windows_emulator& win_emu, const cli_options& options)
         {
             trace recorded(options.replay);
-            require_start_at_zero(recorded);
-            require_no_ui_input(recorded);
-            win_emu.setup_process_if_necessary();
-            buffer_scanner scanner(win_emu, recorded);
-            for (const auto& checkpoint : recorded.checkpoints())
-            {
-                if (auto failure = run_to(win_emu, checkpoint.step, "TTD buffer replay stopped before recorded checkpoint"))
-                {
-                    return {.failure = std::move(failure)};
-                }
-            }
-            if (auto failure =
-                    run_to(win_emu, recorded.metadata().instruction_count, "TTD buffer replay stopped before recorded instruction count"))
+            std::optional<buffer_scanner> scanner{};
+            if (auto failure = replay_whole_trace(win_emu, recorded, options, [&] { scanner.emplace(win_emu, recorded); }, false))
             {
                 return {.failure = std::move(failure)};
             }
-            scanner.finish();
-            scanner.save(options.buffers);
+            scanner->finish();
+            scanner->save(options.buffers);
             printf("TTD buffer scan verified %llu writes; recovered %zu candidates to %s; skipped %llu unreadable bytes\n",
-                   static_cast<unsigned long long>(scanner.verified_writes()), scanner.count(), options.buffers.string().c_str(),
-                   static_cast<unsigned long long>(scanner.skipped_bytes()));
+                   static_cast<unsigned long long>(scanner->verified_writes()), scanner->count(), options.buffers.string().c_str(),
+                   static_cast<unsigned long long>(scanner->skipped_bytes()));
             return {};
         }
 
         replay_result scan_selfmod(windows_emulator& win_emu, const cli_options& options)
         {
             trace recorded(options.replay);
-            require_start_at_zero(recorded);
-            require_no_ui_input(recorded);
-            win_emu.setup_process_if_necessary();
             uint64_t capture_address = 0;
             size_t capture_size = 0;
-            if (!options.dump_image.empty())
-            {
-                const auto& image = *win_emu.mod_manager.executable;
-                capture_address = options.dump_address.value_or(image.image_base);
-                const auto requested_size = options.dump_size.value_or(image.size_of_image);
-                if (!requested_size || requested_size > 64ull * 1024 * 1024 || capture_address > UINT64_MAX - requested_size)
-                {
-                    throw std::runtime_error("TTD first-hit dump size is invalid or exceeds 64 MiB");
-                }
-                capture_size = static_cast<size_t>(requested_size);
-            }
-            replay_selfmod_scanner scanner(win_emu, recorded, capture_address, capture_size, options.dump_wave);
-            for (const auto& checkpoint : recorded.checkpoints())
-            {
-                if (auto failure = run_to(win_emu, checkpoint.step, "TTD replay stopped before recorded checkpoint"))
-                {
-                    scanner.finish();
-                    return {.failure = std::move(failure)};
-                }
-            }
-            const auto failure =
-                run_to(win_emu, recorded.metadata().instruction_count, "TTD replay stopped before recorded instruction count");
-            scanner.finish();
+            std::optional<replay_selfmod_scanner> selfmod{};
+            const auto failure = replay_whole_trace(
+                win_emu, recorded, options,
+                [&] {
+                    if (!options.dump_image.empty())
+                    {
+                        const auto& image = *win_emu.mod_manager.executable;
+                        capture_address = options.dump_address.value_or(image.image_base);
+                        const auto requested_size = options.dump_size.value_or(image.size_of_image);
+                        if (!requested_size || requested_size > 64ull * 1024 * 1024 || capture_address > UINT64_MAX - requested_size)
+                        {
+                            throw std::runtime_error("TTD first-hit dump size is invalid or exceeds 64 MiB");
+                        }
+                        capture_size = static_cast<size_t>(requested_size);
+                    }
+                    selfmod.emplace(win_emu, recorded, capture_address, capture_size, options.dump_wave);
+                },
+                false);
             if (failure)
             {
                 return {.failure = failure};
             }
+            selfmod->finish();
+            const auto& scanner = *selfmod;
             if (!scanner.captured_memory().empty() && capture_size)
             {
                 write_file(options.dump_image, scanner.captured_memory(), "first-hit dump");
@@ -614,8 +580,8 @@ namespace sogen::ttd
 
     void prepare_replay(windows_emulator& win_emu, const cli_options& options)
     {
-        // A plain seek restores its checkpoint itself; fresh-setup scans start from the application.
-        if (!options.replays() || options.scan_selfmod || !options.buffers.empty() || options.is_plain_seek())
+        // A plain seek and the string scan restore their checkpoint themselves; the other scans start from the setup.
+        if (!options.replays() || options.scan_selfmod || !options.buffers.empty() || !options.strings.empty() || options.is_plain_seek())
         {
             return;
         }

@@ -346,7 +346,14 @@ def main() -> None:
             del ui_replay
         verified = run("--ttd-replay", ui_trace, "--ttd-verify-checkpoints", *emulator_args, sample)
         assert " differs " not in verified and " not reached" not in verified, verified
-        stripped = str(pathlib.Path(directory) / "stripped.sogttd")
+        # The CLI's replay scans deliver the recorded window input too, and run on recorded forks.
+        ui_buffers = pathlib.Path(directory) / "ui-buffers.tsv"
+        assert "TTD buffer scan verified" in run("--ttd-replay", ui_trace, "--ttd-buffers", str(ui_buffers), *emulator_args, sample)
+        assert "TTD replay verified" in run("--ttd-replay", ui_trace, "--ttd-scan-selfmod", *emulator_args, sample)
+        fork_strings = pathlib.Path(directory) / "fork-strings.tsv"
+        run("--ttd-replay", fork_trace, "--ttd-strings", str(fork_strings), *emulator_args, sample)
+        assert fork_strings.exists()
+        stripped =str(pathlib.Path(directory) / "stripped.sogttd")
         shutil.copyfile(ui_trace, stripped)
         ttd_format.drop_section(stripped, ttd_format.UI_INPUTS)
         with ttd.Trace(stripped) as stripped_trace:

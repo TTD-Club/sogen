@@ -308,13 +308,27 @@ namespace sogen::ttd
         }
     }
 
-    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach, const bool strict)
+    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach, const bool strict,
+                              const bool restore)
     {
         require_deterministic(win_emu);
-        check_manifest(win_emu, recorded);
         const auto start = recorded.start_position();
         const auto end = recorded.metadata().instruction_count;
-        snapshot::load_emulator_state(win_emu, recorded.checkpoint_for_step(start).state);
+        if (restore)
+        {
+            check_manifest(win_emu, recorded);
+            snapshot::load_emulator_state(win_emu, recorded.checkpoint_for_step(start).state);
+        }
+        else
+        {
+            if (start || win_emu.get_executed_instructions())
+            {
+                throw std::runtime_error("A TTD replay from the application's setup needs a trace and an emulator at position 0, "
+                                         "not a forked trace");
+            }
+            win_emu.setup_process_if_necessary();
+            check_manifest(win_emu, recorded);
+        }
         attach();
         try
         {
