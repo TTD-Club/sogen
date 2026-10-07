@@ -126,6 +126,7 @@ namespace sogen::ttd
                 {"build", build_commit},
                 {"backend", win_emu.emu().get_name()},
                 {"cpuid", std::string(cpuid_scheme)},
+                {"ui", "headless"},
                 {"emulation_root", path_text(win_emu.emulation_root)},
                 {"registry", registry_fingerprint(win_emu)},
                 {"system_dlls", system_dll_fingerprint(win_emu)},
@@ -232,6 +233,10 @@ namespace sogen::ttd
         if (!win_emu.uses_relative_time())
         {
             throw std::runtime_error("TTD requires the relative clock (reproducible mode)");
+        }
+        if (!dynamic_cast<const null_ui_backend*>(&win_emu.ui()))
+        {
+            throw std::runtime_error("TTD requires a headless emulator: live window input (focus, mouse, keys) cannot be replayed");
         }
     }
 

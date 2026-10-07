@@ -716,7 +716,11 @@ namespace sogen
             }
 #endif
             const auto concise_logging = options.concise_logging;
-            const auto win_emu = setup_emulator(options, args, emulator_interfaces{.processes = manager.get()});
+            // TTD runs headless: host window events cannot be replayed (ttd::require_deterministic).
+            const auto ttd_active = options.ttd.records() || options.ttd.replays();
+            const auto win_emu = setup_emulator(
+                options, args,
+                emulator_interfaces{.ui = ttd_active ? std::make_unique<null_ui_backend>() : nullptr, .processes = manager.get()});
             ttd::prepare_replay(*win_emu, options.ttd);
             apply_registry_files(*win_emu, options);
 #ifndef OS_EMSCRIPTEN

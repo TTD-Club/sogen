@@ -263,8 +263,13 @@ namespace sogen::py
             {
                 settings[key] = value;
             }
+            if (kwargs.contains("headless") && !nb::cast<bool>(kwargs["headless"]))
+            {
+                throw nb::value_error("TTD emulators are always headless: live window input cannot be replayed");
+            }
             settings["backend"] = backend_type::unicorn;
             settings["use_relative_time"] = true;
+            settings["headless"] = true;
             sogen_windows_emulator emulator(create_application_emulator(application, args, nb::borrow<nb::kwargs>(settings)));
             ttd::install_cpuid_overrides(emulator.native());
             return emulator;
@@ -434,9 +439,9 @@ namespace sogen::py
                     return create_ttd_emulator(application, args, kwargs);
                 },
                 nb::arg("application"), nb::arg("args") = nb::none(), nb::arg("kwargs"),
-                "A Windows emulator set up for recording and replay: Unicorn, the relative clock, and the CPUID results traces "
-                "depend on. Accepts the keyword arguments of sogen.windows.create_application except backend and "
-                "use_relative_time.");
+                "A Windows emulator set up for recording and replay: Unicorn, the relative clock, headless (no live window "
+                "input, which a replay cannot repeat), and the CPUID results traces depend on. Accepts the keyword arguments of "
+                "sogen.windows.create_application except backend and use_relative_time.");
 
             m.def(
                 "record",

@@ -294,6 +294,10 @@ namespace sogen::py
         emulator_interfaces make_emulator_interfaces(const nb::kwargs& kwargs)
         {
             emulator_interfaces interfaces{};
+            if (get_kwarg<bool>(kwargs, "headless", false))
+            {
+                interfaces.ui = std::make_unique<null_ui_backend>();
+            }
             if (kwargs.contains("dns_resolver"))
             {
                 nb::object resolver = kwargs["dns_resolver"];

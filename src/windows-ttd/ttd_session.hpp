@@ -32,8 +32,8 @@ namespace sogen::ttd
     // replaying without the analyzer.
     void install_cpuid_overrides(windows_emulator& win_emu);
 
-    // Throws unless the emulator runs the way TTD recording and replay require: one vCPU, instruction precision, and
-    // the relative clock.
+    // Throws unless the emulator runs the way TTD recording and replay require: one vCPU, instruction precision, the
+    // relative clock, and no live UI (a null_ui_backend; host window events arrive whenever the desktop delivers them).
     void require_deterministic(const windows_emulator& win_emu);
 
     struct record_settings

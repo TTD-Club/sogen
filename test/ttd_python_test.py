@@ -196,6 +196,22 @@ def main() -> None:
             assert "relative clock" in str(error)
         else:
             raise AssertionError("Replay accepted an emulator without the relative clock")
+
+        # Host window events arrive whenever the desktop delivers them, so TTD emulators take no live UI input.
+        try:
+            ttd.Replay(trace, sogen.windows.create_application(sample, backend=sogen.Backend.unicorn, use_relative_time=True,
+                                                               **settings))
+        except RuntimeError as error:
+            assert "headless" in str(error), error
+        else:
+            raise AssertionError("Replay accepted an emulator with live window input")
+        try:
+            ttd.create_emulator(sample, headless=False, **settings)
+        except ValueError as error:
+            assert "headless" in str(error), error
+        else:
+            raise AssertionError("create_emulator accepted headless=False")
+        assert trace.manifest["ui"] == "headless"
         del replay, emulator
         trace.close()
 

@@ -13,7 +13,7 @@ replays the same traces as the CLI below; traces recorded by either replay in th
 import sogen
 from sogen import ttd
 
-# An emulator for recording or replay: Unicorn, the relative clock, and the CPUID results traces depend on.
+# An emulator for recording or replay: Unicorn, the relative clock, headless, and the CPUID results traces depend on.
 # Takes the keyword arguments of sogen.windows.create_application (emulation_root, registry_directory, ...).
 emu = ttd.create_emulator("c:/sample.exe", emulation_root="root")
 trace = ttd.record(emu, "sample.sogttd", checkpoint_interval=500_000)
@@ -61,8 +61,8 @@ with ttd.Trace("sample.sogttd") as trace:
     print(difference.first, difference.second)       # Events; None where a trace has no further event
 ```
 
-`Replay` refuses emulators that are not deterministic (more than one vCPU, no instruction precision, or no
-relative clock). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
+`Replay` refuses emulators that are not deterministic (more than one vCPU, no instruction precision, no
+relative clock, or a live UI; `sogen.windows.create_application(..., headless=True)` gives a headless one). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
 also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_python_test.py` covers queries,
 the manifest, replay of a CLI trace, a fork and a recorded fork (replayed in Python and the CLI), divergence and
 CPUID-mismatch errors, the replay scans (also on a fork), and replay of a Python trace in the CLI. The Python
@@ -105,11 +105,17 @@ prints the resulting instruction pointer. Positions are represented as
 `N:0`, corresponding to Binary Ninja's `(sequence, step)` pair.
 `--ttd-read` prints an eight-byte guest memory value at that position.
 
-Recording and replay force Unicorn, one vCPU, instruction precision, and
-`--reproducible`: Sogen's relative-time clock, and CPUID no longer advertises
-RDRAND (Unicorn serves it from the host's random source outside MSVC builds). External file/network responses and UI input
-must also be identical for deterministic replay; this POC does not capture
-them. Recording is suitable for an isolated, self-contained sample.
+Recording and replay force Unicorn, one vCPU, instruction precision,
+`--reproducible` (Sogen's relative-time clock, and CPUID no longer advertises
+RDRAND, which Unicorn serves from the host's random source outside MSVC
+builds), and no live UI: the analyzer and `ttd.create_emulator` use a headless
+UI backend, and `ttd::require_deterministic` refuses any other. Host window
+events (focus, mouse, keys) arrive whenever the desktop delivers them, so a
+replay could not repeat them; before this, a window gaining focus at a
+different moment in the replay rewrote the shared `USER_SERVERINFO` and broke
+checkpoint verification. External file and network responses must also be
+identical for deterministic replay; this POC does not capture them yet.
+Recording is suitable for an isolated, self-contained sample.
 
 `--ttd-no-checkpoints` keeps just the initial snapshot for comparison. The
 default interval is 500,000 instructions. Checkpoints are taken only between
@@ -123,11 +129,12 @@ the initial snapshot), replays the interval with event verification, and
 compares the complete serialized emulator state with the recorded checkpoint,
 printing `matches`, the first differing state offset, or the event at which
 the interval's replay diverged, and continues with the next interval. All
-checkpoints of `ttd-step-sample` match. A complete recording of `test-sample`
-(30,147,174 instructions, 60 checkpoints) matched in 56 or 57 intervals,
-depending on the network; the others diverge at host writes carrying live
-network input (DNS answers delivered over ALPC and socket
-`NtDeviceIoControlFile` results). Value
+checkpoints of `ttd-step-sample` match. A complete headless recording of
+`test-sample` (30.18M instructions, 60 checkpoints) matches in 59 intervals;
+the other diverges at a UDP datagram's sender address, whose port the host OS
+assigns afresh each run (`afd_endpoint::ioctl_receive_datagram`). Other runs
+can also diverge at DNS answers delivered over ALPC. Before recordings became
+headless, 56 to 58 intervals matched. Value
 verification also exposed emulator writes that copied uninitialized host
 stack bytes (struct padding) into the guest, for `TokenBnoIsolation` and for
 window-message callback arguments; those are fixed.
@@ -317,7 +324,8 @@ found through the section table (24-byte entries `type, offset, size`):
   key/value pairs, each a `uint32_t` key length, a `uint32_t` value length,
   and the UTF-8 key and value bytes. The recorder writes `build` (`git
   describe` of the Sogen tree, `-dirty` with local changes), `backend`,
-  `cpuid` (the version of the CPUID results the recording depends on),
+  `cpuid` (the version of the CPUID results the recording depends on), `ui`
+  (`headless`; absent in traces recorded with a live window),
   `emulation_root` (empty in host mode), `registry` and `system_dlls`
   (XXH64, as 16 hex digits, over each file's name, 64-bit size, and full
   contents, in order: hives `SYSTEM`, `SECURITY`, `SAM`, `SOFTWARE`,
