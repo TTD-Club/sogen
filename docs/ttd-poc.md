@@ -455,6 +455,40 @@ from the initial snapshot. The v3 trace recorded in 19.37 seconds, including
 the post-run index build. These are single-run wall-clock measurements, not
 a general performance claim.
 
+## Microsoft TTD comparison
+
+Measured on 2026-10-07 on one Windows 11 26200 machine (24 logical processors): Microsoft TTD 1.11.611 recording
+natively (`tools/msttd_record.ps1`, run elevated) against Sogen's recorder in host mode. Replay-side numbers for
+Microsoft TTD come from WinDbg 1.2610's `cdb` (`tools/msttd_cdb.ps1`, no elevation); its instruction counts from
+`tools/msttd_count_instructions.js`, which sums the last step of every sequence (one step is one instruction). Times
+are wall clock, including process start; cdb's start (~0.3 s) is subtracted from its operations, so anything under
+~0.05 s is noise. Single runs unless noted.
+
+| | `ttd-step-sample` Microsoft | `ttd-step-sample` Sogen | `test-sample` Microsoft | `test-sample` Sogen |
+|---|---|---|---|---|
+| Native run (no recording) | 0.005 s | | 0.10 s | |
+| Instructions recorded | 942,566 | 3,692,281 | 6,873,653 | 30,183,325 |
+| Recording time | 0.12 s (3 runs) | 1.91 s | 0.68–0.77 s (3 runs) | 20.6 s |
+| Trace file | 24.0 MiB | 5.8 MiB | 76.0 MiB | 34.1 MiB |
+| Trace after zstd 19 | 4.0 MiB | 5.75 MiB | 17.9 MiB | 33.4 MiB |
+| Bits per instruction, as stored | 214 | 13.1 | 92.7 | 9.5 |
+| Index | 30.4 MiB, built in ~0.2 s | in the trace | 87.5 MiB, ~0.2 s | in the trace (0.06 MiB) |
+| Seek to the middle / end | < 0.05 s | | < 0.05 s | 0.29 / 0.40 s |
+| Writes / reads in the main image | | | 38 / 3,515, ~0.07 s each | 280 / 19,648, 0.06 / 0.48 s |
+
+Caveats: Sogen's runs execute about 4× the instructions of the native ones (its emulated loader and environment
+differ), so compare per instruction. `test-sample` exits 1 natively, and with exit code `0x80000001` under Microsoft
+TTD, so that native run may stop earlier than Sogen's; the step sample exits 0 under both. Microsoft's `.run` files
+are padded and mostly redundant (zstd shrinks them 4–6×), and its index, needed for fast queries, adds 1.15–1.3× the
+trace size. Sogen stores every access value and full checkpoints in that size; Microsoft stores what its replay CPU
+needs to re-execute.
+
+Summary: Microsoft TTD records about 7× slower than native (≈10M instructions/s here); Sogen records about 1.5M
+instructions/s, roughly 5× slower than its own untraced emulation and over 200× slower than native. Per
+instruction, Sogen's traces are 10–16× smaller than Microsoft's files as written and 2.3–2.7× smaller than
+Microsoft's after zstd, before counting Microsoft's index. Microsoft seeks faster (its keyframes are much denser than
+Sogen's 500,000-instruction checkpoints); address queries are comparable.
+
 ## Binary Ninja TTD adapter comparison
 
 The current `DbgEngTTDAdapter` exposes reverse go/step into/step over/step
