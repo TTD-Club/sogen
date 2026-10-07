@@ -347,8 +347,9 @@ code table 1.3 MiB (243,348 instructions), and the page index 0.06 MiB.
 Without bulk data in the delta references the checkpoints took 46.4 MiB.
 Chunks (on four threads) and bulk blocks (on one) are compressed at zstd
 level 19 in the background (level 6 bulk blocks would take 22.5 MiB
-unfiltered). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take 0.02 s for a next-access lookup and about 3 s for a scan
-of every chunk; a late seek including the checkpoint delta chain takes 0.4 s
+unfiltered). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take
+0.02 s for a next-access lookup and about 2 s for a scan of every chunk; a
+late seek including the checkpoint delta chain takes 0.4 s
 (a chain of 15 deltas, each decompressed with its base state and bulk
 blocks as the reference; the bulk blocks of a delta decode in parallel).
 
