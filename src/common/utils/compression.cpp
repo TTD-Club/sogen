@@ -34,6 +34,16 @@ namespace sogen
                 return buffer;
             }
 
+            std::optional<size_t> decompressed_size(const std::span<const std::byte> data)
+            {
+                const auto size = ZSTD_getFrameContentSize(data.data(), data.size());
+                if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN)
+                {
+                    return std::nullopt;
+                }
+                return static_cast<size_t>(size);
+            }
+
             std::vector<std::byte> compress(const std::span<const std::byte> data, const int compression_level)
             {
                 const auto max_size = ZSTD_compressBound(data.size());
@@ -93,34 +103,40 @@ namespace sogen
                 return result;
             }
 
-            std::vector<std::byte> decompress_with_reference(const std::span<const std::byte> data,
-                                                             const std::span<const std::byte> reference)
+            bool decompress_with_reference(const std::span<const std::byte> data, const std::span<const std::byte> reference,
+                                           std::vector<std::byte>& output)
             {
                 const auto decompressed_size = ZSTD_getFrameContentSize(data.data(), data.size());
                 if (decompressed_size == ZSTD_CONTENTSIZE_ERROR || decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN)
                 {
-                    return {};
+                    return false;
                 }
 
                 const std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> context(ZSTD_createDCtx(), &ZSTD_freeDCtx);
                 if (!context)
                 {
-                    return {};
+                    return false;
                 }
                 ZSTD_DCtx_setParameter(context.get(), ZSTD_d_windowLogMax,
                                        reference_window_log(static_cast<size_t>(decompressed_size), reference.size()));
                 if (ZSTD_isError(ZSTD_DCtx_refPrefix(context.get(), reference.data(), reference.size())))
                 {
-                    return {};
+                    return false;
                 }
 
-                std::vector<std::byte> buffer(static_cast<size_t>(decompressed_size));
-                const auto result = ZSTD_decompressDCtx(context.get(), buffer.data(), buffer.size(), data.data(), data.size());
-                if (ZSTD_isError(result) || result != buffer.size())
+                output.resize(static_cast<size_t>(decompressed_size));
+                const auto result = ZSTD_decompressDCtx(context.get(), output.data(), output.size(), data.data(), data.size());
+                return !ZSTD_isError(result) && result == output.size();
+            }
+
+            std::vector<std::byte> decompress_with_reference(const std::span<const std::byte> data,
+                                                             const std::span<const std::byte> reference)
+            {
+                std::vector<std::byte> buffer{};
+                if (!decompress_with_reference(data, reference, buffer))
                 {
                     return {};
                 }
-
                 return buffer;
             }
         }

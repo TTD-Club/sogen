@@ -36,25 +36,38 @@ namespace sogen::ttd
             std::array<uint64_t, stream_count> stream_sizes{};
         };
 
-        // Offset of the 32-bit displacement of a call/jmp rel32, call/jmp [rip+disp32], or 64-bit mov/lea with a
-        // RIP-relative operand starting at `i`. Only opcode bytes before the displacement are inspected.
-        std::optional<size_t> displacement_at(const std::span<const std::byte> data, const size_t i)
+        enum class displacement_opcode : uint8_t
         {
-            const auto at = [&](const size_t k) { return static_cast<uint8_t>(data[i + k]); };
-            const auto op = at(0);
-            if (op == 0xE8 || op == 0xE9)
+            none,
+            relative_branch,
+            indirect_branch,
+            rex_w,
+        };
+
+        constexpr auto displacement_opcodes = [] {
+            std::array<displacement_opcode, 256> table{};
+            table[0xE8] = table[0xE9] = displacement_opcode::relative_branch;
+            table[0xFF] = displacement_opcode::indirect_branch;
+            table[0x48] = table[0x4C] = displacement_opcode::rex_w;
+            return table;
+        }();
+
+        // Distance from `p` to the 32-bit displacement of a call/jmp rel32, call/jmp [rip+disp32], or 64-bit mov/lea
+        // with a RIP-relative operand starting there, or 0. Only opcode bytes before the displacement are inspected.
+        size_t displacement_at(const uint8_t* p)
+        {
+            switch (displacement_opcodes[p[0]])
             {
-                return i + 1;
+            case displacement_opcode::relative_branch:
+                return 1;
+            case displacement_opcode::indirect_branch:
+                return p[1] == 0x15 || p[1] == 0x25 ? 2 : 0;
+            case displacement_opcode::rex_w:
+                return (p[1] == 0x89 || p[1] == 0x8B || p[1] == 0x8D) && (p[2] & 0xC7) == 0x05 ? 3 : 0;
+            case displacement_opcode::none:
+                break;
             }
-            if (op == 0xFF && (at(1) == 0x15 || at(1) == 0x25))
-            {
-                return i + 2;
-            }
-            if ((op == 0x48 || op == 0x4C) && (at(1) == 0x89 || at(1) == 0x8B || at(1) == 0x8D) && (at(2) & 0xC7) == 0x05)
-            {
-                return i + 3;
-            }
-            return std::nullopt;
+            return 0;
         }
 
         // Turns relative displacements into block offsets (or back), so repeated targets become repeated bytes. Only
@@ -64,30 +77,37 @@ namespace sogen::ttd
         void convert_displacements(const std::span<std::byte> data, const bool encode)
         {
             constexpr size_t lookahead = 8;
-            for (size_t i = 0; i + lookahead < data.size();)
+            if (data.size() <= lookahead)
             {
-                const auto field = displacement_at(data, i);
-                if (!field)
+                return;
+            }
+            auto* bytes = reinterpret_cast<uint8_t*>(data.data());
+            const auto end = data.size() - lookahead;
+            for (size_t i = 0; i < end;)
+            {
+                const auto distance = displacement_at(bytes + i);
+                if (!distance)
                 {
                     ++i;
                     continue;
                 }
-                const auto high = static_cast<uint8_t>(data[*field + 3]);
+                const auto field = i + distance;
+                const auto high = bytes[field + 3];
                 if (high != 0x00 && high != 0xFF)
                 {
-                    i = *field + 3;
+                    i = field + 3;
                     continue;
                 }
                 uint32_t value{};
-                memcpy(&value, data.data() + *field, sizeof(value));
-                const auto position = static_cast<uint32_t>(*field);
+                memcpy(&value, bytes + field, sizeof(value));
+                const auto position = static_cast<uint32_t>(field);
                 value = (encode ? value + position : value - position) & 0x1FFFFFF;
                 if (value & 0x1000000)
                 {
                     value |= 0xFE000000;
                 }
-                memcpy(data.data() + *field, &value, sizeof(value));
-                i = *field + sizeof(value);
+                memcpy(bytes + field, &value, sizeof(value));
+                i = field + sizeof(value);
             }
         }
 

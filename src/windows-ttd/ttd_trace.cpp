@@ -795,40 +795,80 @@ namespace sogen::ttd
         {
             chain.push_back(checkpoints_.at(static_cast<size_t>(chain.back())).base);
         }
+        // A delta's reference is its base state followed by the bulk blocks in between. Each restored state is
+        // decompressed with room for the next delta's blocks, so they can be appended in place instead of copying the
+        // state into a new reference buffer.
+        const auto blocks_between = [this](const uint64_t current) {
+            std::vector<bulk_block> between{};
+            const auto base = checkpoints_.at(static_cast<size_t>(current)).base;
+            if (base != no_base_checkpoint && current - base <= bulk_reference_span)
+            {
+                for (auto block = base; block < current; ++block)
+                {
+                    between.push_back(bulk(block));
+                }
+            }
+            return between;
+        };
+        const auto total_size = [](const std::span<const bulk_block> blocks) {
+            size_t size = 0;
+            for (const auto& block : blocks)
+            {
+                size += block->size();
+            }
+            return size;
+        };
+
+        // Reserving discards a buffer's stale contents instead of copying them, with slack so slowly growing states
+        // keep their allocation.
+        const auto reserve = [](std::vector<std::byte>& buffer, const size_t size) {
+            if (buffer.capacity() < size)
+            {
+                buffer = {};
+                buffer.reserve(size + size / 16);
+            }
+        };
+
         std::vector<std::byte> state{};
+        std::vector<std::byte> next{};
+        std::vector<bulk_block> between{};
         if (state_cache_ && state_cache_->first == chain.back())
         {
-            state = state_cache_->second;
             chain.pop_back();
+            const auto& cached = state_cache_->second;
+            if (!chain.empty())
+            {
+                between = blocks_between(chain.back());
+            }
+            reserve(state, cached.size() + total_size(between));
+            state.assign(cached.begin(), cached.end());
         }
         while (!chain.empty())
         {
             const auto current = chain.back();
             const auto& entry = checkpoints_.at(static_cast<size_t>(current));
             const auto compressed = read_bytes(entry.offset, entry.size);
-            if (entry.base == no_base_checkpoint)
-            {
-                state = utils::compression::zstd::decompress(compressed);
-            }
-            else
-            {
-                std::vector<bulk_block> between{};
-                if (current - entry.base <= bulk_reference_span)
-                {
-                    for (auto block = entry.base; block < current; ++block)
-                    {
-                        between.push_back(bulk(block));
-                    }
-                }
-                const auto extended = extended_reference(state, between);
-                state = utils::compression::zstd::decompress_with_reference(compressed,
-                                                                            extended.empty() ? std::span(state) : std::span(extended));
-            }
-            if (state.empty())
+            chain.pop_back();
+            const auto size = utils::compression::zstd::decompressed_size(compressed);
+            if (!size)
             {
                 throw std::runtime_error("Cannot decompress TTD checkpoint");
             }
-            chain.pop_back();
+            if (entry.base == no_base_checkpoint)
+            {
+                state.clear();
+            }
+            for (const auto& block : between)
+            {
+                state.insert(state.end(), block->begin(), block->end());
+            }
+            between = chain.empty() ? std::vector<bulk_block>{} : blocks_between(chain.back());
+            reserve(next, *size + total_size(between));
+            if (!utils::compression::zstd::decompress_with_reference(compressed, state, next))
+            {
+                throw std::runtime_error("Cannot decompress TTD checkpoint");
+            }
+            std::swap(state, next);
         }
         state_cache_ = std::make_pair(index, state);
         return state;
