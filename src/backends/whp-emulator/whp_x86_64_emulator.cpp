@@ -1,7 +1,11 @@
 #define WHP_EMULATOR_IMPL
 #include "whp_x86_64_emulator.hpp"
 
+// Windows SDK 10.0.28000 declares an over-aligned structure in WinHvPlatformDefs.h, which trips C4324 under /WX.
+#pragma warning(push)
+#pragma warning(disable : 4324)
 #include <WinHvPlatform.h>
+#pragma warning(pop)
 #include <windows.h>
 
 #include <algorithm>
