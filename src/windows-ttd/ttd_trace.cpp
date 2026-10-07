@@ -437,7 +437,9 @@ namespace sogen::ttd
 
     void recorder::write_checkpoint(const uint64_t step)
     {
-        auto state = std::make_shared<const std::vector<std::byte>>(snapshot::create_emulator_state(emu_));
+        // A little headroom over the previous state covers ordinary growth without a reallocation.
+        const auto expected_size = base_states_.empty() ? 0 : base_states_.front()->size() + base_states_.front()->size() / 16;
+        auto state = std::make_shared<const std::vector<std::byte>>(snapshot::create_emulator_state(emu_, expected_size));
         const auto index = static_cast<uint64_t>(checkpoints_.size());
         if (!index)
         {

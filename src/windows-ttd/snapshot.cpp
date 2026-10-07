@@ -101,9 +101,10 @@ namespace sogen
             return snapshot_file;
         }
 
-        std::vector<std::byte> create_emulator_state(const windows_emulator& win_emu)
+        std::vector<std::byte> create_emulator_state(const windows_emulator& win_emu, const size_t expected_size)
         {
             utils::buffer_serializer serializer{};
+            serializer.reserve(expected_size);
             win_emu.serialize(serializer);
             return serializer.move_buffer();
         }
