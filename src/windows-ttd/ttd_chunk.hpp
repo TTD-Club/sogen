@@ -41,7 +41,19 @@ namespace sogen::ttd
     // the code table and the bulk blocks. Accesses larger than an event payload keep their bytes in a bulk block; their
     // payload holds the offset and block index, which `bulk` resolves. encode_chunk returns the frame's content; the
     // caller compresses it.
-    std::vector<std::byte> encode_chunk(std::span<const access_event> events, code_table& code, const bulk_resolver& bulk);
+    //
+    // Encoding needs no shared recorder state, so it can run on a worker: `code_ids` holds the code table id of each
+    // execute event in order, and `bulk` the bytes of every large access in the chunk, which all lie in one block.
+    struct chunk_bulk_bytes
+    {
+        uint64_t block{};
+        // Offset of bytes->front() within the block.
+        uint64_t offset{};
+        bulk_block bytes{};
+    };
+
+    std::vector<std::byte> encode_chunk(std::span<const access_event> events, std::span<const uint64_t> code_ids,
+                                        const chunk_bulk_bytes& bulk);
     decoded_chunk decode_chunk(std::span<const std::byte> compressed, std::span<const code_entry> code, const bulk_resolver& bulk);
 
     // A page block stores page deltas, chunks (as deltas while the page repeats), and kinds as three streams.

@@ -14,7 +14,7 @@
 
 namespace sogen::ttd
 {
-    // Encodes buffers on worker threads; results finish in any order. A failed encoding yields an empty result. Once
+    // Encodes buffers on worker threads; results finish in any order. A failed or throwing job yields an empty result. Once
     // max_pending jobs wait for a worker, submitting blocks.
     class background_compressor
     {

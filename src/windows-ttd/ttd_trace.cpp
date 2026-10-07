@@ -369,9 +369,25 @@ namespace sogen::ttd
         {
             return;
         }
-        auto encoded = encode_chunk(chunk_events_, code_, [this](const uint64_t block) -> bulk_block {
-            return block == bulk_table_.size() ? current_bulk_ : nullptr;
-        });
+        // Code ids follow the order of first execution across the whole trace, so they are assigned here; the rest of
+        // the encoding runs on a worker. The chunk's large accesses are the tail of the open bulk block, copied because
+        // the block keeps growing.
+        std::vector<uint64_t> code_ids{};
+        for (const auto& event : chunk_events_)
+        {
+            if (event.kind == access_kind::execute)
+            {
+                code_ids.push_back(code_.id_of(event));
+            }
+        }
+        chunk_bulk_bytes bulk{.block = bulk_table_.size(), .offset = chunk_bulk_start_};
+        if (current_bulk_->size() > chunk_bulk_start_)
+        {
+            bulk.bytes = std::make_shared<const std::vector<std::byte>>(current_bulk_->begin() + static_cast<ptrdiff_t>(chunk_bulk_start_),
+                                                                        current_bulk_->end());
+        }
+        chunk_bulk_start_ = current_bulk_->size();
+
         const auto index = static_cast<uint32_t>(chunks_.size());
         chunks_.push_back({.first_event = header_.event_count - chunk_events_.size(),
                            .event_count = chunk_events_.size(),
@@ -381,9 +397,13 @@ namespace sogen::ttd
         {
             pages_.push_back({.page = page, .chunk = index, .kinds = kinds});
         }
-        chunk_events_.clear();
+        auto events = std::make_shared<const std::vector<access_event>>(std::move(chunk_events_));
+        chunk_events_ = {};
+        chunk_events_.reserve(events_per_chunk);
         chunk_pages_.clear();
-        chunk_compressor_.submit(index, std::make_shared<const std::vector<std::byte>>(std::move(encoded)));
+        chunk_compressor_.submit_job(index, [events, code_ids = std::move(code_ids), bulk = std::move(bulk)] {
+            return utils::compression::zstd::compress(encode_chunk(*events, code_ids, bulk), chunk_compression_level);
+        });
         write_compressed(false);
     }
 
@@ -400,6 +420,7 @@ namespace sogen::ttd
             recent_bulk_.pop_front();
         }
         current_bulk_ = std::make_shared<std::vector<std::byte>>();
+        chunk_bulk_start_ = 0;
         write_compressed(false);
     }
 

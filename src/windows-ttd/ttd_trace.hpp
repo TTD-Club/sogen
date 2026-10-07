@@ -95,14 +95,15 @@ namespace sogen::ttd
         std::vector<bulk_entry> bulk_table_{};
         manifest_entries manifest_{};
         std::shared_ptr<std::vector<std::byte>> current_bulk_{std::make_shared<std::vector<std::byte>>()};
+        // Size of current_bulk_ when the open chunk started.
+        uint64_t chunk_bulk_start_{};
         // The last bulk_reference_span closed blocks, oldest first.
         std::deque<bulk_block> recent_bulk_{};
         background_compressor bulk_compressor_{
             [](const std::span<const std::byte> data) { return encode_bulk_block(data, bulk_compression_level); }, 1,
             max_pending_compressions};
-        background_compressor chunk_compressor_{
-            [](const std::span<const std::byte> data) { return utils::compression::zstd::compress(data, chunk_compression_level); },
-            chunk_workers, max_pending_compressions};
+        // Encodes and compresses chunks (see flush_chunk).
+        background_compressor chunk_compressor_{{}, chunk_workers, max_pending_compressions};
         background_compressor checkpoint_compressor_{{}, 1, max_pending_checkpoints};
         std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.

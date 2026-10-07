@@ -69,7 +69,15 @@ namespace sogen::ttd
             }
             this->space_available_.notify_one();
 
-            auto compressed = next.second();
+            std::vector<std::byte> compressed{};
+            try
+            {
+                compressed = next.second();
+            }
+            catch (...)
+            {
+                compressed.clear();
+            }
             next.second = nullptr;
 
             {

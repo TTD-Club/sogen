@@ -392,12 +392,22 @@ namespace sogen::ttd
         return id;
     }
 
-    std::vector<std::byte> encode_chunk(const std::span<const access_event> events, code_table& code, const bulk_resolver& bulk)
+    std::vector<std::byte> encode_chunk(const std::span<const access_event> events, const std::span<const uint64_t> code_ids,
+                                        const chunk_bulk_bytes& bulk)
     {
         std::array<std::vector<std::byte>, stream_count> streams{};
         streams[tag_stream].reserve(events.size());
         predictor state{};
-        bulk_cursor cursor(bulk);
+        size_t next_code_id = 0;
+        const auto bulk_data = [&](const bulk_reference& reference, const uint64_t size) {
+            const auto available = bulk.bytes ? bulk.bytes->size() : 0;
+            if (reference.block != bulk.block || reference.offset < bulk.offset || size > available ||
+                reference.offset - bulk.offset > available - size)
+            {
+                throw std::runtime_error("Invalid TTD bulk data reference");
+            }
+            return std::span(*bulk.bytes).subspan(static_cast<size_t>(reference.offset - bulk.offset), static_cast<size_t>(size));
+        };
 
         for (const auto& event : events)
         {
@@ -415,7 +425,11 @@ namespace sogen::ttd
             {
                 put_varint(streams[ip_stream], zigzag(event.ip - state.next_ip));
                 put_varint(streams[address_stream], zigzag(event.address - event.ip));
-                const auto id = code.id_of(event);
+                if (next_code_id == code_ids.size())
+                {
+                    throw std::runtime_error("Missing TTD code id");
+                }
+                const auto id = code_ids[next_code_id++];
                 const auto known = state.code_at.find(event.address);
                 if (known == state.code_at.end() || known->second != id)
                 {
@@ -435,7 +449,7 @@ namespace sogen::ttd
                 if (event.size > inline_data_limit)
                 {
                     const auto reference = bulk_reference_of(event);
-                    data = cursor.data(reference, event.size);
+                    data = bulk_data(reference, event.size);
                     put_varint(streams[bulk_stream], zigzag(reference.block - state.bulk_block_index));
                     put_varint(streams[bulk_stream], zigzag(reference.offset - state.bulk_offset_base(reference.block)));
                     state.remember_bulk(reference, event.size);
