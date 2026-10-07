@@ -319,10 +319,11 @@ found through the section table (24-byte entries `type, offset, size`):
   describe` of the Sogen tree, `-dirty` with local changes), `backend`,
   `cpuid` (the version of the CPUID results the recording depends on),
   `emulation_root` (empty in host mode), `registry` and `system_dlls`
-  (64-bit FNV-1a fingerprints over name, size, and first 4 KiB of the hive
-  files and of `ntdll`/`kernel32`/`kernelbase.dll`: a hive's base block
-  carries its write sequence numbers and checksum, a DLL's headers its link
-  timestamp), `windows_version`, `executable`, `command_line`, and
+  (XXH64, as 16 hex digits, over each file's name, 64-bit size, and full
+  contents, in order: hives `SYSTEM`, `SECURITY`, `SAM`, `SOFTWARE`,
+  `HARDWARE`, `NTUSER.DAT`; `ntdll`/`kernel32`/`kernelbase.dll` from
+  `System32`; a missing file contributes its name and `missing`),
+  `windows_version`, `executable`, `command_line`, and
   `checkpoint_interval`, then the front end's entries (`tool` is `analyzer`
   or `sogen.ttd`; Python adds the `manifest=` entries of `ttd.record`). A
   seek refuses a trace with another `backend` or `cpuid`. The emulation root,

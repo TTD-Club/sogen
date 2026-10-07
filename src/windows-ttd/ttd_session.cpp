@@ -2,11 +2,14 @@
 #include "snapshot.hpp"
 #include "ttd_build_info.hpp"
 
-#include <array>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
+
+#define XXH_INLINE_ALL
+#include <common/xxhash.h>
 
 namespace sogen::ttd
 {
@@ -18,47 +21,56 @@ namespace sogen::ttd
             return {text.begin(), text.end()};
         }
 
-        // FNV-1a over file names, sizes, and leading bytes. A registry hive's first 4 KiB is its base block, which
-        // holds the hive's write sequence numbers, timestamp, and checksum; a PE's holds its headers with the link
-        // timestamp and checksum. Hashing just those identifies a file version without reading whole hives.
+        // XXH64 over each file's name, size, and full contents (about 0.1 s for the hives; replays compute it only
+        // when asked or when they diverge). It detects changed files, not deliberate collisions.
         class file_fingerprint
         {
           public:
+            file_fingerprint()
+            {
+                XXH64_reset(&this->state_, 0);
+            }
+
             void add_file(const std::string_view name, const std::filesystem::path& file)
             {
-                this->add(std::as_bytes(std::span(name)));
+                this->add(name.data(), name.size());
                 std::error_code error{};
                 const auto size = std::filesystem::file_size(file, error);
-                if (error)
+                std::ifstream stream(file, std::ios::binary);
+                if (error || !stream)
                 {
                     constexpr std::string_view missing = "missing";
-                    this->add(std::as_bytes(std::span(missing)));
+                    this->add(missing.data(), missing.size());
                     return;
                 }
-                this->add(std::as_bytes(std::span(&size, 1)));
-                std::array<char, leading_bytes> bytes{};
-                std::ifstream stream(file, std::ios::binary);
-                stream.read(bytes.data(), bytes.size());
-                this->add(std::as_bytes(std::span(bytes).first(static_cast<size_t>(stream.gcount()))));
+                this->add(&size, sizeof(size));
+                std::vector<char> buffer(read_size);
+                while (stream)
+                {
+                    stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                    this->add(buffer.data(), static_cast<size_t>(stream.gcount()));
+                }
+                if (!stream.eof())
+                {
+                    constexpr std::string_view unreadable = "unreadable";
+                    this->add(unreadable.data(), unreadable.size());
+                }
             }
 
             std::string text() const
             {
                 std::ostringstream text;
-                text << std::hex << std::setw(16) << std::setfill('0') << this->hash_;
+                text << std::hex << std::setw(16) << std::setfill('0') << XXH64_digest(&this->state_);
                 return text.str();
             }
 
           private:
-            static constexpr size_t leading_bytes = 4096;
-            uint64_t hash_{0xcbf29ce484222325};
+            static constexpr size_t read_size = 1024 * 1024;
+            XXH64_state_t state_{};
 
-            void add(const std::span<const std::byte> bytes)
+            void add(const void* data, const size_t size)
             {
-                for (const auto byte : bytes)
-                {
-                    this->hash_ = (this->hash_ ^ static_cast<uint8_t>(byte)) * 0x100000001b3;
-                }
+                XXH64_update(&this->state_, data, size);
             }
         };
 
