@@ -192,6 +192,9 @@ namespace sogen::ttd
         std::vector<std::byte> read_bytes(uint64_t offset, uint64_t size);
         const decoded_chunk& chunk(uint32_t index);
         bulk_block bulk(uint64_t index);
+        // Blocks first to end - 1 (at most cached_bulk_blocks), decoding the uncached ones in parallel.
+        std::vector<bulk_block> bulk_range(uint64_t first, uint64_t end);
+        void remember_bulk(uint64_t index, bulk_block block);
         uint32_t chunk_of(uint64_t number) const;
         std::vector<std::byte> checkpoint_state_at(uint64_t index);
         std::vector<number_range> candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask, uint64_t first_number,

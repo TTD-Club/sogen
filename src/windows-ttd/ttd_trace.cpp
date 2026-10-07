@@ -7,6 +7,7 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <future>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -767,12 +768,51 @@ namespace sogen::ttd
                 throw std::runtime_error("Cannot decompress TTD bulk block");
             }
         }
+        remember_bulk(index, block);
+        return block;
+    }
+
+    std::vector<bulk_block> trace::bulk_range(const uint64_t first, const uint64_t end)
+    {
+        if (end < first || end - first > cached_bulk_blocks || end > bulk_table_.size())
+        {
+            throw std::runtime_error("Invalid TTD bulk block range");
+        }
+        std::vector<bulk_block> blocks(static_cast<size_t>(end - first));
+        std::vector<std::pair<uint64_t, std::future<std::vector<std::byte>>>> decoding{};
+        for (auto index = first; index < end; ++index)
+        {
+            const auto& entry = bulk_table_[static_cast<size_t>(index)];
+            if (!entry.size || std::ranges::find(bulk_cache_, index, &cached_bulk::index) != bulk_cache_.end())
+            {
+                blocks[static_cast<size_t>(index - first)] = bulk(index);
+                continue;
+            }
+            decoding.emplace_back(
+                index, std::async(std::launch::async, [compressed = read_bytes(entry.offset, entry.size), filtered = version_ >= 8] {
+                    return decode_bulk_block(compressed, filtered);
+                }));
+        }
+        for (auto& [index, decoded] : decoding)
+        {
+            auto block = std::make_shared<const std::vector<std::byte>>(decoded.get());
+            if (block->empty())
+            {
+                throw std::runtime_error("Cannot decompress TTD bulk block");
+            }
+            remember_bulk(index, block);
+            blocks[static_cast<size_t>(index - first)] = std::move(block);
+        }
+        return blocks;
+    }
+
+    void trace::remember_bulk(const uint64_t index, bulk_block block)
+    {
         if (bulk_cache_.size() == cached_bulk_blocks)
         {
             bulk_cache_.erase(bulk_cache_.begin());
         }
-        bulk_cache_.push_back({.index = index, .block = block});
-        return block;
+        bulk_cache_.push_back({.index = index, .block = std::move(block)});
     }
 
     uint32_t trace::chunk_of(const uint64_t number) const
@@ -799,16 +839,12 @@ namespace sogen::ttd
         // decompressed with room for the next delta's blocks, so they can be appended in place instead of copying the
         // state into a new reference buffer.
         const auto blocks_between = [this](const uint64_t current) {
-            std::vector<bulk_block> between{};
             const auto base = checkpoints_.at(static_cast<size_t>(current)).base;
-            if (base != no_base_checkpoint && current - base <= bulk_reference_span)
+            if (base == no_base_checkpoint || current - base > bulk_reference_span)
             {
-                for (auto block = base; block < current; ++block)
-                {
-                    between.push_back(bulk(block));
-                }
+                return std::vector<bulk_block>{};
             }
-            return between;
+            return bulk_range(base, current);
         };
         const auto total_size = [](const std::span<const bulk_block> blocks) {
             size_t size = 0;
