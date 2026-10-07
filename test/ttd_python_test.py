@@ -180,6 +180,37 @@ def main() -> None:
                 raise AssertionError("A tampered recording replayed without divergence")
             del tampered_replay
 
+        # Host writes are the environment's input: a replay takes recorded bytes over live ones (a live network answer,
+        # a host-assigned port) and counts them; strict replays report them instead. Tamper with a small host write and
+        # replay up to it (later guest reads would see the tampered value).
+        host_write = next(event for event in trace.events(kinds=ttd.HOST_WRITE)
+                          if 0 < len(event.data) <= ttd_format.INLINE_DATA_LIMIT and event.position > 1000)
+        input_trace = str(pathlib.Path(directory) / "input.sogttd")
+        shutil.copyfile(cli_trace, input_trace)
+        mirror = ttd_format.Trace(input_trace)
+        input_chunk = next(index for index, (_, _, first, last, _, _) in enumerate(mirror.chunks)
+                           if first <= host_write.position <= last)
+        chunk_events = mirror.chunk_events(input_chunk)
+        recorded_write = next(event for event in chunk_events
+                              if (event.step, event.address, event.kind) == (host_write.position, host_write.address,
+                                                                               ttd_format.HOST_WRITE))
+        recorded_write.data = bytes(byte ^ 0xFF for byte in recorded_write.data)
+        ttd_format.replace_chunk(input_trace, input_chunk, chunk_events)
+        with ttd.Trace(input_trace) as input_recording:
+            result = ttd.Replay(input_recording, emulator_for_inputs := ttd.create_emulator(sample, headless=True, **settings)).seek(
+                host_write.position)
+            assert result.substituted_inputs == 1, result.substituted_inputs
+            replaced = emulator_for_inputs.read_memory(host_write.address, len(host_write.data))
+            assert replaced == recorded_write.data, (replaced, recorded_write.data)
+            try:
+                ttd.Replay(input_recording, ttd.create_emulator(sample, headless=True, **settings), strict=True).seek(
+                    host_write.position)
+            except ttd.DivergenceError as error:
+                assert "accessed different data" in str(error), error
+            else:
+                raise AssertionError("A strict replay accepted a host write with other bytes")
+            del emulator_for_inputs
+
         # A trace recorded with other CPUID results is refused before replaying.
         ttd_format.replace_manifest(tampered, {**manifest, "cpuid": "0"})
         with ttd.Trace(tampered) as tampered_trace:

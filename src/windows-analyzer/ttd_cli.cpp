@@ -250,7 +250,7 @@ namespace sogen::ttd
         {
             trace recorded(options.replay);
             require_start_at_zero(recorded);
-            replay_verifier verifier(win_emu, recorded, win_emu.get_executed_instructions());
+            replay_verifier verifier(win_emu, recorded, win_emu.get_executed_instructions(), options.strict);
             const ui_replay ui(win_emu, recorded.ui_inputs(), 0, [&verifier] { return verifier.next_event_number(); });
             string_scanner scanner(win_emu, options.min_string_length);
             scanner.scan_initial_memory();
@@ -366,7 +366,7 @@ namespace sogen::ttd
             {
                 const auto origin = recorded.checkpoint_for_step(target.step - 1);
                 snapshot::load_emulator_state(win_emu, origin.state);
-                replay_verifier verifier(win_emu, recorded, origin.step);
+                replay_verifier verifier(win_emu, recorded, origin.step, options.strict);
                 const ui_replay ui(win_emu, recorded.ui_inputs(), recorded.checkpoint_index(origin.step),
                                    [&verifier] { return verifier.next_event_number(); });
                 win_emu.start(static_cast<size_t>(target.step - origin.step));
@@ -392,8 +392,9 @@ namespace sogen::ttd
                 const auto [observed_end, expected_end] = std::ranges::mismatch(observed, expected);
                 if (observed_end == observed.end() && expected_end == expected.end())
                 {
-                    printf("TTD checkpoint %llx:0 matches (%llu events verified)\n", static_cast<unsigned long long>(target.step),
-                           static_cast<unsigned long long>(verifier.verified_events()));
+                    printf("TTD checkpoint %llx:0 matches (%llu events verified, %llu host writes taken from the recording)\n",
+                           static_cast<unsigned long long>(target.step), static_cast<unsigned long long>(verifier.verified_events()),
+                           static_cast<unsigned long long>(verifier.substituted_inputs()));
                     continue;
                 }
                 ++mismatches;
@@ -449,13 +450,15 @@ namespace sogen::ttd
             seek_result result{};
             try
             {
-                result = ttd::seek(win_emu, recorded, options.seek);
+                result = ttd::seek(win_emu, recorded, options.seek, options.strict);
             }
             catch (const std::runtime_error& e)
             {
                 return {.failure = e.what()};
             }
-            win_emu.log.log("TTD replay verified %llu recorded events\n", static_cast<unsigned long long>(result.verified_events));
+            win_emu.log.log("TTD replay verified %llu recorded events (%llu host writes taken from the recording)\n",
+                            static_cast<unsigned long long>(result.verified_events),
+                            static_cast<unsigned long long>(result.substituted_inputs));
             win_emu.log.log("TTD checkpoint %llx:0\n", static_cast<unsigned long long>(result.checkpoint));
             win_emu.log.log("TTD position %llx:0 RIP %llx\n", static_cast<unsigned long long>(options.seek),
                             static_cast<unsigned long long>(win_emu.emu().read_instruction_pointer()));
@@ -480,6 +483,9 @@ namespace sogen::ttd
         app.add_flag("--ttd-scan-selfmod", options.scan_selfmod, "Replay a TTD trace to find written-then-executed code waves");
         app.add_flag("--ttd-verify-checkpoints", options.verify_checkpoints,
                      "Replay each TTD checkpoint interval and compare the reached state with the next checkpoint");
+        app.add_flag("--ttd-strict", options.strict,
+                     "Fail a TTD replay at host writes (syscall results, network data) whose bytes differ from the recording "
+                     "instead of taking the recorded bytes");
         app.add_option("--ttd-seek", options.seek, "Replay through this instruction position");
         app.add_option("--ttd-checkpoint-interval", options.checkpoint_interval, "Instructions between recording checkpoints")
             ->capture_default_str();
@@ -566,6 +572,10 @@ namespace sogen::ttd
         if (options.records() && !options.no_checkpoints && !options.checkpoint_interval)
         {
             throw std::runtime_error("TTD checkpoint interval must be positive");
+        }
+        if (options.strict && !options.replays())
+        {
+            throw std::runtime_error("--ttd-strict requires --ttd-replay");
         }
         if ((options.no_read_trace || options.no_write_trace || options.no_execute_trace) && !options.records())
         {

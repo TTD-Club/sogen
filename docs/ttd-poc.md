@@ -33,7 +33,8 @@ with ttd.Trace("sample.sogttd") as trace:
     print(trace.manifest)  # {'backend': ..., 'cpuid': '1', 'emulation_root': ..., 'tool': 'sogen.ttd', ...}
 
     # Replay: every recorded event is verified on the way; ttd.DivergenceError (a RuntimeError) names the first
-    # divergence.
+    # divergence. Host writes with other live bytes take the recorded ones (result.substituted_inputs counts them)
+    # unless Replay(..., strict=True).
     emu = ttd.create_emulator("c:/sample.exe", emulation_root="root")
     replay = ttd.Replay(trace, emu)
     replay.seek(store.position - 1)                 # also seeks backwards
@@ -121,9 +122,19 @@ the same points instead of live input; after a Python seek the emulator takes
 live input again, so a fork is interactive. The analyzer records with its
 normal window and replays headless; `ttd.create_emulator` shows the window
 unless `headless=True`. `ttd::require_deterministic` refuses a plain live UI
-backend. External file and network responses must also be identical for
-deterministic replay; this POC does not capture them yet. Recording is
-suitable for an isolated, self-contained sample.
+backend.
+
+Host writes (syscall results, network data, file contents) are the
+environment's input to the guest, and the trace already stores their bytes.
+A replay therefore takes the recorded bytes when a host write matches its
+recorded event in position, address, and size but carries different data (a
+live DNS answer, a host-assigned UDP port): it writes them over the live ones
+and counts them (`host writes taken from the recording` in the CLI,
+`SeekResult.substituted_inputs` in Python). `--ttd-strict` /
+`Replay(..., strict=True)` reports such writes as divergences instead, which
+is how value verification found emulator writes of uninitialized host bytes.
+A live input that changes a host write's size, a syscall's return value, or
+the guest's path still diverges; capturing return values is the next step.
 
 `--ttd-no-checkpoints` keeps just the initial snapshot for comparison. The
 default interval is 500,000 instructions. Checkpoints are taken only between
@@ -139,12 +150,14 @@ printing `matches`, the first differing state offset, or the event at which
 the interval's replay diverged, and continues with the next interval. All
 checkpoints of `ttd-step-sample` match. A complete recording of `test-sample`
 with its live window (30.18M instructions, 60 checkpoints, 4 window events
-recorded) matches in 59 intervals; the other diverges at a UDP datagram's
-sender address, whose port the host OS assigns afresh each run
-(`afd_endpoint::ioctl_receive_datagram`). Other runs can also diverge at DNS
-answers delivered over ALPC. Before window events were recorded, 56 to 58
-intervals matched: a focus event arriving at a different moment in the replay
-rewrote the shared `USER_SERVERINFO`. Value
+recorded) matches in all 60 intervals, taking 3 host writes from the
+recording: two DNS answers delivered over ALPC and a UDP datagram's sender
+address, whose port the host OS assigns afresh each run
+(`afd_endpoint::ioctl_receive_datagram`). With `--ttd-strict` exactly those
+three intervals fail. Before window events were recorded and host writes
+substituted, 56 to 58 intervals matched: besides the live network input, a
+focus event arriving at a different moment in the replay rewrote the shared
+`USER_SERVERINFO`. Value
 verification also exposed emulator writes that copied uninitialized host
 stack bytes (struct padding) into the guest, for `TokenBnoIsolation` and for
 window-message callback arguments; those are fixed.

@@ -183,26 +183,30 @@ namespace sogen::py
         class ttd_replay
         {
           public:
-            ttd_replay(ttd_trace recorded, sogen_windows_emulator& emulator)
+            ttd_replay(ttd_trace recorded, sogen_windows_emulator& emulator, const bool strict)
                 : trace_(std::move(recorded)),
-                  emulator_(&emulator)
+                  emulator_(&emulator),
+                  strict_(strict)
             {
                 ttd::require_deterministic(emulator.native());
             }
 
             ttd::seek_result seek(const uint64_t position) const
             {
-                return ttd::seek(this->emulator_->native(), this->trace_.native(), position);
+                return ttd::seek(this->emulator_->native(), this->trace_.native(), position, this->strict_);
             }
 
             std::vector<ttd::recovered_string> strings(const size_t minimum_length) const
             {
                 auto& emulator = this->emulator_->native();
                 std::optional<ttd::string_scanner> scanner{};
-                ttd::replay_to_end(emulator, this->trace_.native(), [&] {
-                    scanner.emplace(emulator, minimum_length);
-                    scanner->scan_initial_memory();
-                });
+                ttd::replay_to_end(
+                    emulator, this->trace_.native(),
+                    [&] {
+                        scanner.emplace(emulator, minimum_length);
+                        scanner->scan_initial_memory();
+                    },
+                    this->strict_);
                 scanner->finish();
                 return scanner->results();
             }
@@ -211,7 +215,8 @@ namespace sogen::py
             {
                 auto& emulator = this->emulator_->native();
                 std::optional<ttd::buffer_scanner> scanner{};
-                ttd::replay_to_end(emulator, this->trace_.native(), [&] { scanner.emplace(emulator, this->trace_.native()); });
+                ttd::replay_to_end(
+                    emulator, this->trace_.native(), [&] { scanner.emplace(emulator, this->trace_.native()); }, this->strict_);
                 scanner->finish();
                 return scanner->results();
             }
@@ -220,7 +225,8 @@ namespace sogen::py
             {
                 auto& emulator = this->emulator_->native();
                 std::optional<ttd::replay_selfmod_scanner> scanner{};
-                ttd::replay_to_end(emulator, this->trace_.native(), [&] { scanner.emplace(emulator, this->trace_.native()); });
+                ttd::replay_to_end(
+                    emulator, this->trace_.native(), [&] { scanner.emplace(emulator, this->trace_.native()); }, this->strict_);
                 scanner->finish();
                 return scanner->hits();
             }
@@ -243,6 +249,7 @@ namespace sogen::py
           private:
             ttd_trace trace_;
             sogen_windows_emulator* emulator_{};
+            bool strict_{};
         };
 
         uint64_t end_position(const std::optional<uint64_t>& end)
@@ -339,7 +346,9 @@ namespace sogen::py
 
             nb::class_<ttd::seek_result>(m, "SeekResult")
                 .def_ro("checkpoint", &ttd::seek_result::checkpoint, "Position of the checkpoint the seek restored")
-                .def_ro("verified_events", &ttd::seek_result::verified_events);
+                .def_ro("verified_events", &ttd::seek_result::verified_events)
+                .def_ro("substituted_inputs", &ttd::seek_result::substituted_inputs,
+                        "Host writes (syscall results, network data) whose live bytes differed and took the recorded ones");
         }
 
         void register_trace(nb::module_& m)
@@ -504,8 +513,12 @@ namespace sogen::py
 
             nb::class_<ttd_replay>(m, "Replay",
                                    "Moves an emulator to recorded positions. After a seek the emulator is a normal emulator at that "
-                                   "position: change registers or memory and start() it to fork the recording.")
-                .def(nb::init<ttd_trace, sogen_windows_emulator&>(), nb::arg("trace"), nb::arg("emulator"), nb::keep_alive<1, 3>())
+                                   "position: change registers or memory and start() it to fork the recording. Host writes "
+                                   "(syscall results, network data) are the environment's input: one whose live bytes differ "
+                                   "from the recording takes the recorded bytes, unless strict=True, which reports it as a "
+                                   "divergence (and exposes emulator bugs such as uninitialized host bytes).")
+                .def(nb::init<ttd_trace, sogen_windows_emulator&, bool>(), nb::arg("trace"), nb::arg("emulator"), nb::arg("strict") = false,
+                     nb::keep_alive<1, 3>())
                 .def("seek", &ttd_replay::seek, nb::arg("position"), nb::call_guard<nb::gil_scoped_release>(),
                      "Restore the last checkpoint at or before position and replay to it, verifying every recorded event. Raises "
                      "DivergenceError where the replay diverges from the recording, and RuntimeError for a trace recorded with "

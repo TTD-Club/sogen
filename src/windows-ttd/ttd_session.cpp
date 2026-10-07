@@ -276,7 +276,7 @@ namespace sogen::ttd
         trace_recorder.finish();
     }
 
-    seek_result seek(windows_emulator& win_emu, trace& recorded, const uint64_t position)
+    seek_result seek(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict)
     {
         require_deterministic(win_emu);
         check_manifest(win_emu, recorded);
@@ -284,7 +284,7 @@ namespace sogen::ttd
         snapshot::load_emulator_state(win_emu, checkpoint.state);
         try
         {
-            replay_verifier verifier(win_emu, recorded, checkpoint.step);
+            replay_verifier verifier(win_emu, recorded, checkpoint.step, strict);
             const ui_replay ui(win_emu, recorded.ui_inputs(), recorded.checkpoint_index(checkpoint.step),
                                [&verifier] { return verifier.next_event_number(); });
             if (position > checkpoint.step)
@@ -298,7 +298,9 @@ namespace sogen::ttd
                 message << "TTD replay reached position " << std::hex << reached << " instead of " << position;
                 throw divergence_error(message.str());
             }
-            return {.checkpoint = checkpoint.step, .verified_events = verifier.verified_events()};
+            return {.checkpoint = checkpoint.step,
+                    .verified_events = verifier.verified_events(),
+                    .substituted_inputs = verifier.substituted_inputs()};
         }
         catch (const divergence_error& e)
         {
@@ -306,7 +308,7 @@ namespace sogen::ttd
         }
     }
 
-    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach)
+    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach, const bool strict)
     {
         require_deterministic(win_emu);
         check_manifest(win_emu, recorded);
@@ -316,7 +318,7 @@ namespace sogen::ttd
         attach();
         try
         {
-            replay_verifier verifier(win_emu, recorded, start);
+            replay_verifier verifier(win_emu, recorded, start, strict);
             const ui_replay ui(win_emu, recorded.ui_inputs(), 0, [&verifier] { return verifier.next_event_number(); });
             // One start() per checkpoint interval, as the recording ran: the UI is pumped at each boundary.
             const auto run_to = [&](const uint64_t position) {
@@ -344,7 +346,8 @@ namespace sogen::ttd
                 message << "TTD replay reached position " << std::hex << win_emu.get_executed_instructions() << " instead of " << end;
                 throw divergence_error(message.str());
             }
-            return {.checkpoint = start, .verified_events = verifier.verified_events()};
+            return {
+                .checkpoint = start, .verified_events = verifier.verified_events(), .substituted_inputs = verifier.substituted_inputs()};
         }
         catch (const divergence_error& e)
         {

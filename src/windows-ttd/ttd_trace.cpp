@@ -4,6 +4,7 @@
 #include <disassembler.hpp>
 
 #include <utils/compression.hpp>
+#include <utils/finally.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1579,12 +1580,13 @@ namespace sogen::ttd
         }
     }
 
-    replay_verifier::replay_verifier(windows_emulator& emu, trace& recorded, const uint64_t from_step)
+    replay_verifier::replay_verifier(windows_emulator& emu, trace& recorded, const uint64_t from_step, const bool strict)
         : emu_(emu),
           trace_(recorded),
           first_number_(recorded.first_event_after(from_step)),
           reader_(recorded, first_number_),
-          access_mask_(recorded.access_mask())
+          access_mask_(recorded.access_mask()),
+          strict_(strict)
     {
         auto& cpu = emu_.emu();
         if (access_mask_ & static_cast<uint64_t>(access_kind::write))
@@ -1618,7 +1620,7 @@ namespace sogen::ttd
 
     void replay_verifier::verify(const access_kind kind, const uint64_t address, const size_t size, const std::span<const std::byte> data)
     {
-        if (error_ || !size)
+        if (error_ || !size || substituting_)
         {
             return;
         }
@@ -1647,6 +1649,16 @@ namespace sogen::ttd
             stream << access_kind_name(event.kind) << " step=" << std::hex << event.step << " ip=" << event.ip
                    << " address=" << event.address << std::dec << " size=" << event.size;
         };
+        if (same_event && same_instruction && kind == access_kind::host_write && !strict_)
+        {
+            const auto recorded = trace_.access_data(*expected);
+            substituting_ = true;
+            const auto restore = utils::finally([this] { substituting_ = false; });
+            emu_.emu().write_memory(address, recorded.data(), recorded.size());
+            ++substituted_inputs_;
+            ++verified_events_;
+            return;
+        }
         if (same_event && same_instruction)
         {
             std::ostringstream message;

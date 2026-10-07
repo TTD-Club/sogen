@@ -70,16 +70,19 @@ namespace sogen::ttd
     {
         uint64_t checkpoint{};
         uint64_t verified_events{};
+        // Host writes whose live bytes differed from the recording and were replaced by the recorded ones.
+        uint64_t substituted_inputs{};
     };
 
     // Restores the last checkpoint at or before `position` and replays to it, verifying every recorded event. Throws
     // divergence_error when the replay diverges from the recording or stops before `position`, naming the manifest
     // settings this replay does not share with the recording, and refuses a trace recorded with another backend or
     // other CPUID results.
-    seek_result seek(windows_emulator& win_emu, trace& recorded, uint64_t position);
+    // Unless `strict`, host writes carrying other bytes than recorded take the recorded ones (see replay_verifier).
+    seek_result seek(windows_emulator& win_emu, trace& recorded, uint64_t position, bool strict = false);
 
     // Restores the trace's initial state, calls `attach` (to hook analyses such as the replay scans onto the restored
     // emulator), and replays the whole trace, one checkpoint interval at a time as it was recorded, verifying every
     // recorded event. Throws like seek.
-    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach);
+    seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach, bool strict = false);
 }

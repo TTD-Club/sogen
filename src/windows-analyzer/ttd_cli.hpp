@@ -22,6 +22,8 @@ namespace sogen::ttd
         std::filesystem::path replay{};
         bool scan_selfmod{false};
         bool verify_checkpoints{false};
+        // Report host writes whose bytes differ from the recording instead of taking the recorded bytes.
+        bool strict{false};
         uint64_t seek{};
         uint64_t checkpoint_interval{500000};
         uint64_t max_instructions{};

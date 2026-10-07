@@ -307,10 +307,17 @@ namespace sogen::ttd
         uint64_t last_number_{};
     };
 
+    // Checks every event a replay produces against the recording and stops the emulator at the first difference.
+    //
+    // Host writes are the environment's input to the guest (syscall results, network data, file contents). Unless
+    // `strict`, a host write that matches its recorded event in position, address, and size but carries other bytes
+    // (a live network answer, a host-assigned port) is overwritten with the recorded bytes, so the replay follows the
+    // recording; substituted_inputs() counts them. Strict replays report them as divergences instead, which also
+    // exposes emulator bugs such as uninitialized host bytes copied into the guest.
     class replay_verifier
     {
       public:
-        replay_verifier(windows_emulator& emu, trace& recorded, uint64_t from_step);
+        replay_verifier(windows_emulator& emu, trace& recorded, uint64_t from_step, bool strict = false);
         replay_verifier(const replay_verifier&) = delete;
         replay_verifier& operator=(const replay_verifier&) = delete;
         void finish();
@@ -326,6 +333,11 @@ namespace sogen::ttd
             return first_number_ + verified_events_;
         }
 
+        uint64_t substituted_inputs() const
+        {
+            return substituted_inputs_;
+        }
+
       private:
         windows_emulator& emu_;
         trace& trace_;
@@ -338,6 +350,10 @@ namespace sogen::ttd
         scoped_hook host_write_hook_{};
         std::optional<std::string> error_{};
         uint64_t verified_events_{};
+        bool strict_{};
+        // Set while writing recorded bytes over a host write, whose own notification is not an event.
+        bool substituting_{};
+        uint64_t substituted_inputs_{};
         void verify(access_kind kind, uint64_t address, size_t size, std::span<const std::byte> data = {});
     };
 

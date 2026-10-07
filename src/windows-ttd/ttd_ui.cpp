@@ -84,9 +84,10 @@ namespace sogen::ttd
         {
             return;
         }
-        const auto position = this->replay_clock_();
+        // The clock is read for every input: events one input causes (its host writes) come before the next input of
+        // the same pump in the recording.
         while (this->next_replay_input_ < this->replay_inputs_.size() &&
-               this->replay_inputs_[this->next_replay_input_].event_number <= position)
+               this->replay_inputs_[this->next_replay_input_].event_number <= this->replay_clock_())
         {
             const auto& input = this->replay_inputs_[this->next_replay_input_++];
             if (this->sink_)
