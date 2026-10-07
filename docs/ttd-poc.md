@@ -459,15 +459,17 @@ a general performance claim.
 
 Measured on 2026-10-07 on one Windows 11 26200 machine (24 logical processors): Microsoft TTD 1.11.611 recording
 natively (`tools/msttd_record.ps1`, run elevated) against Sogen's recorder in host mode. Replay-side numbers for
-Microsoft TTD come from WinDbg 1.2610's `cdb` (`tools/msttd_cdb.ps1`, no elevation); its instruction counts from
-`tools/msttd_count_instructions.js`, which sums the last step of every sequence (one step is one instruction). Times
+Microsoft TTD come from WinDbg 1.2610's `cdb` (`tools/msttd_cdb.ps1`, no elevation). Its instruction counts come
+from the TTD Replay SDK (0.9.5): an execute watchpoint over the whole address space fires once per executed step on
+every thread (a `rep` iteration is a step; `ReplayResult::InstructionsExecuted` covers only the cursor's thread).
+`tools/msttd_count_instructions.js` estimates the same from `sequence:step` positions in cdb, within 0.0005%. Times
 are wall clock, including process start; cdb's start (~0.3 s) is subtracted from its operations, so anything under
 ~0.05 s is noise. Single runs unless noted.
 
 | | `ttd-step-sample` Microsoft | `ttd-step-sample` Sogen | `test-sample` Microsoft | `test-sample` Sogen |
 |---|---|---|---|---|
 | Native run (no recording) | 0.005 s | | 0.10 s | |
-| Instructions recorded | 942,566 | 3,692,281 | 6,873,653 | 30,183,325 |
+| Instructions recorded | 942,561 (2 threads) | 3,692,281 | 6,873,623 (12 threads) | 30,183,325 |
 | Recording time | 0.12 s (3 runs) | 1.91 s | 0.68–0.77 s (3 runs) | 20.6 s |
 | Trace file | 24.0 MiB | 5.8 MiB | 76.0 MiB | 34.1 MiB |
 | Trace after zstd 19 | 4.0 MiB | 5.75 MiB | 17.9 MiB | 33.4 MiB |
