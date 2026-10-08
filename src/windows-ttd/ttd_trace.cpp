@@ -34,7 +34,7 @@ namespace sogen::ttd
         // The length of an instruction the backend executed without decoding it (size 0: it raises an exception), as
         // capstone decodes it, or 1 when capstone cannot decode it either. Recording and replay both use this, so the
         // execute event matches.
-        uint64_t executed_size(windows_emulator& emu, const uint64_t address, const size_t reported)
+        size_t executed_size(windows_emulator& emu, const uint64_t address, const size_t reported)
         {
             if (reported)
             {
@@ -50,7 +50,7 @@ namespace sogen::ttd
             const disassembler decoder{};
             const auto decoded =
                 decoder.disassemble(cpu, cpu.reg<uint16_t>(x86_register::cs), std::span(bytes).first(readable), 1, address);
-            return decoded.empty() ? 1 : decoded[0].size;
+            return decoded.empty() ? 1 : static_cast<size_t>(decoded[0].size);
         }
 
         // A checkpoint delta's zstd reference is its base state followed by the bulk blocks recorded in between. This
@@ -86,7 +86,7 @@ namespace sogen::ttd
         // per-event page index. They remain readable.
         struct v1_header
         {
-            char magic[8]{};
+            std::array<char, 8> magic{};
             uint64_t snapshot_size{};
             uint64_t instruction_count{};
             uint64_t write_count{};
@@ -96,7 +96,7 @@ namespace sogen::ttd
 
         struct v4_header
         {
-            char magic[8]{};
+            std::array<char, 8> magic{};
             uint64_t snapshot_size{};
             uint64_t instruction_count{};
             uint64_t event_count{};
@@ -789,7 +789,7 @@ namespace sogen::ttd
             throw std::runtime_error("Truncated TTD trace");
         }
         const std::string_view name(magic.data(), magic.size());
-        if (name.substr(0, 6) != "SOGTTD" || magic[7] != '\0' || magic[6] < '1' || magic[6] > '9')
+        if (!name.starts_with("SOGTTD") || magic[7] != '\0' || magic[6] < '1' || magic[6] > '9')
         {
             throw std::runtime_error("Unsupported TTD trace format");
         }
@@ -1082,7 +1082,15 @@ namespace sogen::ttd
         {
             access_mask_ = static_cast<uint64_t>(access_kind::write);
         }
-        legacy_event_size_ = version_ <= 2 ? sizeof(v1_event) : version_ == 3 ? sizeof(v3_event) : sizeof(access_event);
+        legacy_event_size_ = sizeof(access_event);
+        if (version_ <= 2)
+        {
+            legacy_event_size_ = sizeof(v1_event);
+        }
+        else if (version_ == 3)
+        {
+            legacy_event_size_ = sizeof(v3_event);
+        }
         legacy_event_offset_ = header_size + snapshot_size;
         const auto index_entry_size = version_ <= 2 ? sizeof(v1_index_entry) : sizeof(v3_index_entry);
         if (length < header_size || snapshot_size > length - header_size)
@@ -1785,10 +1793,10 @@ namespace sogen::ttd
             return std::nullopt;
         }
         const auto end_number = last_number == UINT64_MAX ? metadata_.event_count : last_number + 1;
-        const auto ranges = candidates(page, page, static_cast<uint64_t>(access_kind::write), first_number, end_number);
-        for (auto range = ranges.rbegin(); range != ranges.rend(); ++range)
+        for (const auto& range :
+             std::views::reverse(candidates(page, page, static_cast<uint64_t>(access_kind::write), first_number, end_number)))
         {
-            for (auto number = range->end; number-- > range->begin;)
+            for (auto number = range.end; number-- > range.begin;)
             {
                 const auto event = event_at(number);
                 if (event.kind == access_kind::write && event.address <= address && address - event.address < event.size)
@@ -1854,9 +1862,9 @@ namespace sogen::ttd
         }
         const auto last = last_byte(address, size);
         const auto ranges = candidates(address / page_size, last / page_size, kind_mask, 0, first_event_after(step - 1));
-        for (auto range = ranges.rbegin(); range != ranges.rend(); ++range)
+        for (const auto& range : std::views::reverse(ranges))
         {
-            for (auto number = range->end; number-- > range->begin;)
+            for (auto number = range.end; number-- > range.begin;)
             {
                 const auto event = event_at(number);
                 if ((kind_mask & static_cast<uint64_t>(event.kind)) && overlaps(event.address, event.size, address, size))
@@ -2310,7 +2318,8 @@ namespace sogen::ttd
                 }
                 else if (is_written(address))
                 {
-                    auto [it, inserted] = hits.try_emplace(event->address, pending_hit{*event, 0, 0});
+                    auto [it, inserted] =
+                        hits.try_emplace(event->address, pending_hit{.execution = *event, .writer_number = 0, .count = 0});
                     if (inserted)
                     {
                         const auto writer = latest_write_to_byte(address / page_size, address, 0, reader.last_number());
@@ -2334,7 +2343,13 @@ namespace sogen::ttd
         for (const auto& [address, hit] : hits)
         {
             const auto write = event_at(hit.writer_number);
-            result.push_back({address, hit.execution.size, write.step, write.ip, hit.execution.step, hit.execution.ip, hit.count});
+            result.push_back({.address = address,
+                              .size = hit.execution.size,
+                              .write_step = write.step,
+                              .write_ip = write.ip,
+                              .execute_step = hit.execution.step,
+                              .execute_ip = hit.execution.ip,
+                              .executions = hit.count});
         }
         return result;
     }
@@ -2447,8 +2462,13 @@ namespace sogen::ttd
                     }
                     reported_page_writes_[byte / page_size] = latest;
                     const auto writer = recorded_writes_.event_at(*writer_number);
-                    const auto hit = self_modifying_hit{
-                        address, size, writer.step, writer.ip, emu_.get_executed_instructions(), emu_.emu().read_instruction_pointer(), 1};
+                    const auto hit = self_modifying_hit{.address = address,
+                                                        .size = size,
+                                                        .write_step = writer.step,
+                                                        .write_ip = writer.ip,
+                                                        .execute_step = emu_.get_executed_instructions(),
+                                                        .execute_ip = emu_.emu().read_instruction_pointer(),
+                                                        .executions = 1};
                     if (!first_hit_)
                     {
                         first_hit_ = hit;

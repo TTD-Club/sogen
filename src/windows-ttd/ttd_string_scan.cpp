@@ -141,7 +141,7 @@ namespace sogen::ttd
                 return;
             }
         }
-        entries.push_back({address, step, std::move(encoding), std::move(value)});
+        entries.push_back({.address = address, .step = step, .encoding = std::move(encoding), .value = std::move(value)});
     }
 
     void string_scanner::flush_pending()

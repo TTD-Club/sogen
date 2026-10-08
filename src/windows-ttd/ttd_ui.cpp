@@ -99,7 +99,7 @@ namespace sogen::ttd
 
     void recordable_ui_backend::reset()
     {
-        this->inner_->reset();
+        (*this->inner_).reset();
         this->injected_.clear();
         this->windows_.clear();
     }

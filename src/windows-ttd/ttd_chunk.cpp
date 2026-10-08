@@ -204,6 +204,37 @@ namespace sogen::ttd
             return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
         }
 
+        // `prefix`, the stream sizes as little-endian uint64 values, and the streams, as one buffer. It is sized up front
+        // and filled with memcpy: GCC 13 misreads appending byte ranges to a vector as writing past its end.
+        std::vector<std::byte> join_streams(const std::span<const std::byte> prefix, const std::span<const std::vector<std::byte>> streams)
+        {
+            size_t total = prefix.size() + streams.size() * sizeof(uint64_t);
+            for (const auto& stream : streams)
+            {
+                total += stream.size();
+            }
+            std::vector<std::byte> raw(total);
+            size_t offset = 0;
+            const auto append = [&](const void* data, const size_t size) {
+                if (size)
+                {
+                    memcpy(raw.data() + offset, data, size);
+                    offset += size;
+                }
+            };
+            append(prefix.data(), prefix.size());
+            for (const auto& stream : streams)
+            {
+                const uint64_t size = stream.size();
+                append(&size, sizeof(size));
+            }
+            for (const auto& stream : streams)
+            {
+                append(stream.data(), stream.size());
+            }
+            return raw;
+        }
+
         std::vector<std::byte> compress_table(const std::span<const std::byte> raw, const std::string_view name)
         {
             auto compressed = utils::compression::zstd::compress(raw, syscall_compression_level);
@@ -403,9 +434,9 @@ namespace sogen::ttd
         const auto latest = this->latest_version_.find(execute.address);
         if (latest != this->latest_version_.end())
         {
-            for (auto id = latest->second; id != no_previous_version; id = this->previous_version_[id])
+            for (auto id = latest->second; id != no_previous_version; id = this->previous_version_[static_cast<size_t>(id)])
             {
-                const auto& entry = this->entries_[id];
+                const auto& entry = this->entries_[static_cast<size_t>(id)];
                 if (entry.size == execute.size && entry.bytes == execute.payload)
                 {
                     return id;
@@ -653,17 +684,7 @@ namespace sogen::ttd
             chunk = entry.chunk;
         }
 
-        std::vector<std::byte> raw{};
-        for (const auto& bytes : streams)
-        {
-            const uint64_t size = bytes.size();
-            const auto* size_bytes = reinterpret_cast<const std::byte*>(&size);
-            raw.insert(raw.end(), size_bytes, size_bytes + sizeof(size));
-        }
-        for (const auto& bytes : streams)
-        {
-            raw.insert(raw.end(), bytes.begin(), bytes.end());
-        }
+        const auto raw = join_streams({}, streams);
         auto compressed = utils::compression::zstd::compress(raw, page_block_compression_level);
         if (compressed.empty())
         {
@@ -748,19 +769,7 @@ namespace sogen::ttd
         }
 
         const std::array<uint64_t, 2> counts{table.entries.size(), table.names.size()};
-        std::vector<std::byte> raw(reinterpret_cast<const std::byte*>(counts.data()),
-                                   reinterpret_cast<const std::byte*>(counts.data() + counts.size()));
-        for (const auto& bytes : streams)
-        {
-            const uint64_t size = bytes.size();
-            const auto* size_bytes = reinterpret_cast<const std::byte*>(&size);
-            raw.insert(raw.end(), size_bytes, size_bytes + sizeof(size));
-        }
-        for (const auto& bytes : streams)
-        {
-            raw.insert(raw.end(), bytes.begin(), bytes.end());
-        }
-        return compress_table(raw, "syscalls");
+        return compress_table(join_streams(std::as_bytes(std::span(counts)), streams), "syscalls");
     }
 
     syscall_table decode_syscalls(const std::span<const std::byte> compressed)
@@ -928,18 +937,7 @@ namespace sogen::ttd
         }
 
         const uint64_t count = modules.size();
-        std::vector<std::byte> raw(reinterpret_cast<const std::byte*>(&count), reinterpret_cast<const std::byte*>(&count + 1));
-        for (const auto& bytes : streams)
-        {
-            const uint64_t size = bytes.size();
-            const auto* size_bytes = reinterpret_cast<const std::byte*>(&size);
-            raw.insert(raw.end(), size_bytes, size_bytes + sizeof(size));
-        }
-        for (const auto& bytes : streams)
-        {
-            raw.insert(raw.end(), bytes.begin(), bytes.end());
-        }
-        return compress_table(raw, "exports");
+        return compress_table(join_streams(std::as_bytes(std::span(&count, 1)), streams), "exports");
     }
 
     void decode_exports(const std::span<const std::byte> compressed, const std::span<module_entry> modules)

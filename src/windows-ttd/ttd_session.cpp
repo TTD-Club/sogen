@@ -68,6 +68,10 @@ namespace sogen::ttd
             static constexpr size_t read_size = 1024 * 1024;
             XXH64_state_t state_{};
 
+            // Not inlined: GCC 13 then reports out-of-bounds accesses inside XXH64_update for small objects passed here.
+#if defined(__GNUC__) && !defined(__clang__)
+            __attribute__((noinline))
+#endif
             void add(const void* data, const size_t size)
             {
                 XXH64_update(&this->state_, data, size);

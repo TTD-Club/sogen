@@ -173,7 +173,7 @@ namespace sogen::ttd
                               value.known.begin() + static_cast<ptrdiff_t>(clear_end), uint8_t{0});
                     std::fill(value.executed.begin() + static_cast<ptrdiff_t>(clear_begin),
                               value.executed.begin() + static_cast<ptrdiff_t>(clear_end), uint8_t{0});
-                    if (std::none_of(value.known.begin(), value.known.end(), [](uint8_t byte) { return byte != 0; }))
+                    if (std::ranges::none_of(value.known, [](uint8_t byte) { return byte != 0; }))
                     {
                         it = active_.erase(it);
                     }
@@ -210,7 +210,7 @@ namespace sogen::ttd
                     emu_.stop();
                     return;
                 }
-                pending_.push_back({address, size, step, ip});
+                pending_.push_back({.address = address, .size = size, .step = step, .ip = ip});
                 ++verified_writes_;
             }));
         execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
@@ -257,7 +257,7 @@ namespace sogen::ttd
                 std::vector<uint8_t> bytes(length);
                 if (emu_.emu().try_read_memory(write.address + offset, bytes.data(), length))
                 {
-                    ingest({write.address + offset, length, write.step, write.ip}, bytes);
+                    ingest({.address = write.address + offset, .size = length, .step = write.step, .ip = write.ip}, bytes);
                 }
                 else
                 {
@@ -330,7 +330,7 @@ namespace sogen::ttd
                 current.known.resize(current.bytes.size());
                 current.executed.resize(current.bytes.size());
                 const auto offset = static_cast<size_t>(write.address - combined_begin);
-                std::copy(bytes.begin(), bytes.end(), current.bytes.begin() + static_cast<ptrdiff_t>(offset));
+                std::ranges::copy(bytes, current.bytes.begin() + static_cast<ptrdiff_t>(offset));
                 std::fill_n(current.known.begin() + static_cast<ptrdiff_t>(offset), bytes.size(), uint8_t{1});
                 std::fill_n(current.executed.begin() + static_cast<ptrdiff_t>(offset), bytes.size(), uint8_t{0});
                 current.last_step = write.step;
@@ -366,7 +366,7 @@ namespace sogen::ttd
 
     void buffer_scanner::evict_oldest()
     {
-        const auto oldest = std::min_element(active_.begin(), active_.end(), [](const auto& a, const auto& b) {
+        const auto oldest = std::ranges::min_element(active_, [](const auto& a, const auto& b) {
             const auto a_small = a.second.bytes.size() < 512;
             const auto b_small = b.second.bytes.size() < 512;
             return a_small != b_small ? a_small : a.second.last_step < b.second.last_step;
@@ -392,8 +392,14 @@ namespace sogen::ttd
                     display.push_back(static_cast<char>(bytes[i]));
                 }
             }
-            recovered_buffer result{value.base + begin, bytes.size(), value.first_step, value.last_step,
-                                    value.writer_ip,    value.writes, std::move(kind),  std::move(display)};
+            recovered_buffer result{.address = value.base + begin,
+                                    .size = bytes.size(),
+                                    .first_step = value.first_step,
+                                    .last_step = value.last_step,
+                                    .writer_ip = value.writer_ip,
+                                    .writes = value.writes,
+                                    .kind = std::move(kind),
+                                    .preview = std::move(display)};
             if (bytes.size() <= maximum_retained_bytes - retained_bytes_)
             {
                 result.data.assign(bytes.begin(), bytes.end());
