@@ -83,8 +83,8 @@ namespace
         window_class.hInstance = GetModuleHandleA(nullptr);
         window_class.lpszClassName = "ttd-step-sample";
         RegisterClassA(&window_class);
-        const auto window = CreateWindowExA(0, window_class.lpszClassName, "ttd-step-sample", WS_OVERLAPPEDWINDOW, 0, 0, 200, 100, nullptr,
-                                            nullptr, window_class.hInstance, nullptr);
+        auto* const window = CreateWindowExA(0, window_class.lpszClassName, "ttd-step-sample", WS_OVERLAPPEDWINDOW, 0, 0, 200, 100, nullptr,
+                                             nullptr, window_class.hInstance, nullptr);
         printf("ttd-window %p\n", static_cast<void*>(window));
         printf("ttd-ui %p\n", static_cast<void*>(const_cast<uint64_t*>(&ttd_ui_value)));
         fflush(stdout);
