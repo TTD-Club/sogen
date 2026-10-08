@@ -43,6 +43,13 @@ with ttd.Trace("sample.sogttd") as trace:
     print(trace.thread_switches, trace.thread_names)
     main_executes = trace.events(kinds=ttd.EXECUTE, thread=trace.thread_switches[0].thread_id)
 
+    # Exports, recorded at each module load: name addresses and find the calls of a function (execute events of
+    # its first instruction while its module was mapped; "module!name" or just "name", module case-insensitive).
+    print(trace.symbol(store.ip, store.position))   # "sample.exe+0x1234", "kernel32.dll!VirtualQuery+0x5", or None
+    for call in trace.calls("ntdll!NtCreateFile", start=0, end=None):
+        print(call.position, trace.thread_at(call.position))
+    module, export = trace.find_exports("kernel32!CreateFileW")[0]   # address: module.base + export.rva
+
     # Replay: every recorded event is verified on the way; ttd.DivergenceError (a RuntimeError) names the first
     # divergence. Syscalls whose live writes or result differ (a network answer, a missing file) and host writes with
     # other live bytes take the recorded ones (result.substituted_inputs counts them) unless Replay(..., strict=True).
@@ -431,6 +438,16 @@ found through the section table (24-byte entries `type, offset, size`):
   A switch is noted at the new thread's first execute event (any event when
   executes are not recorded); the first entry is the thread running at the
   start. `test-sample`: 16 threads, 190 switches, 627 bytes.
+- Exports (type 11, size = compressed bytes; absent in older traces): the
+  export directory of each module in the modules section, as the recording
+  emulator parsed it at load. One zstd frame of the module count and three
+  `uint64_t` stream sizes, then three streams over each module's exports in
+  ordinal order: per module the export count and per export the ordinal delta
+  (varints); the RVAs (`uint32_t`); and the names, each the varint length of
+  the prefix shared with the previous name of the module, then the rest as a
+  varint length and UTF-8 bytes (empty for an export by ordinal only, read as
+  `#<ordinal>`). `test-sample`: 27,250 exports of 50 modules, 150 KB (0.4% of
+  the trace; 208 KB as one varint stream in RVA order).
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host

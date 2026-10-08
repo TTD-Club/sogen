@@ -1,4 +1,5 @@
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/pair.h>
 
 #include "sogen_internal.hpp"
 
@@ -400,6 +401,16 @@ namespace sogen::py
                         "registers): events event_number to event_number + event_count - 1")
                 .def("__repr__", &ttd_syscall::repr);
 
+            nb::class_<ttd::module_export>(m, "Export", "A symbol a module's export directory lists")
+                .def_ro("rva", &ttd::module_export::rva)
+                .def_ro("ordinal", &ttd::module_export::ordinal)
+                .def_ro("name", &ttd::module_export::name, "#<ordinal> for an export by ordinal only")
+                .def("__repr__", [](const ttd::module_export& self) {
+                    std::ostringstream text;
+                    text << "Export(name=" << self.name << ", rva=0x" << std::hex << self.rva << ")";
+                    return text.str();
+                });
+
             nb::class_<ttd::module_entry>(m, "Module", "A module mapped while recording")
                 .def_ro("name", &ttd::module_entry::name)
                 .def_ro("path", &ttd::module_entry::path, "Guest path")
@@ -409,6 +420,10 @@ namespace sogen::py
                 .def_ro("load_event_number", &ttd::module_entry::load_event_number, "Number of events recorded before the load")
                 .def_ro("unload_position", &ttd::module_entry::unload_step, "None while still mapped at the end")
                 .def_ro("unload_event_number", &ttd::module_entry::unload_event_number)
+                .def_prop_ro(
+                    "exports",
+                    [](const ttd::module_entry& self) { return self.exports ? *self.exports : std::vector<ttd::module_export>{}; },
+                    "Sorted by RVA; empty for traces recorded before exports were recorded")
                 .def("__repr__", [](const ttd::module_entry& self) {
                     std::ostringstream text;
                     text << std::hex << "Module(name=" << self.name << ", base=0x" << self.base << ", size=0x" << self.size
@@ -573,6 +588,50 @@ namespace sogen::py
                         return mod ? std::optional(*mod) : std::nullopt;
                     },
                     nb::arg("address"), nb::arg("position"), "The module whose image holds address at position, or None")
+                .def(
+                    "symbol",
+                    [](const ttd_trace& self, const uint64_t address, const uint64_t position) -> std::optional<std::string> {
+                        const auto location = self.native().symbol_at(address, position);
+                        if (!location)
+                        {
+                            return std::nullopt;
+                        }
+                        std::ostringstream text;
+                        text << location->module->name;
+                        if (location->symbol)
+                        {
+                            text << '!' << location->symbol->name;
+                        }
+                        if (location->offset)
+                        {
+                            text << "+0x" << std::hex << location->offset;
+                        }
+                        return text.str();
+                    },
+                    nb::arg("address"), nb::arg("position"),
+                    "address at position as module!export+0xoffset (module+0xoffset below the first export), or None outside "
+                    "every module")
+                .def(
+                    "find_exports",
+                    [](const ttd_trace& self, const std::string& name) {
+                        std::vector<std::pair<ttd::module_entry, ttd::module_export>> found{};
+                        for (const auto& [mod, symbol] : self.native().find_exports(name))
+                        {
+                            found.emplace_back(*mod, *symbol);
+                        }
+                        return found;
+                    },
+                    nb::arg("name"),
+                    "(Module, Export) pairs for name or module!name (the module ignoring case, .dll optional), in load order; "
+                    "the address is module.base + export.rva")
+                .def(
+                    "calls",
+                    [](const ttd_trace& self, const std::string& name, const uint64_t start, const std::optional<uint64_t> end) {
+                        return self.events(self.native().calls(name, start, end_position(end)));
+                    },
+                    nb::arg("name"), nb::arg("start") = 0, nb::arg("end") = nb::none(),
+                    "Execute events of the first instruction of the exports find_exports(name) returns, at positions start "
+                    "through end while their module was mapped, in order: calls of the function, and jumps to it")
                 .def_prop_ro(
                     "thread_switches", [](const ttd_trace& self) { return self.native().threads().switches; },
                     "Where another thread starts running, in order (the first entry is the thread running at the start); "

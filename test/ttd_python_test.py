@@ -274,6 +274,23 @@ def main() -> None:
         assert [(s.position, s.event_number, s.thread_id) for s in switches] == mirror_trace.thread_switches
         assert trace.thread_names == mirror_trace.thread_names
 
+        # Exports name addresses and find the calls of a function: the sample calls VirtualQuery once.
+        assert [[(e.rva, e.ordinal, e.name) for e in m.exports] for m in modules] == [m["exports"] for m in mirror_trace.modules]
+        assert all([(e.rva, e.name) for e in m.exports] == sorted((e.rva, e.name) for e in m.exports) for m in modules)
+        assert sum(len(m.exports) for m in modules) > 1000
+        found = trace.find_exports("kernel32!VirtualQuery")
+        assert [module.name.lower() for module, _ in found] == ["kernel32.dll"], found
+        assert len(trace.find_exports("VirtualQuery")) >= len(found)
+        calls = trace.calls("kernel32!VirtualQuery")
+        assert len(calls) == 1 and calls[0].kind == ttd.EXECUTE, calls
+        assert calls[0].address == found[0][0].base + found[0][1].rva and calls[0].position < trace.instruction_count
+        assert [c.position for c in trace.calls("KERNEL32.DLL!VirtualQuery")] == [calls[0].position]
+        assert trace.calls("kernel32!VirtualQuery", start=calls[0].position + 1) == []
+        assert trace.symbol(calls[0].address, calls[0].position).lower() == "kernel32.dll!virtualquery"
+        assert trace.symbol(calls[0].address + 1, calls[0].position).lower() == "kernel32.dll!virtualquery+0x1"
+        assert trace.symbol(store.ip, store.position).lower().startswith(sample_name)
+        assert trace.symbol(0x10, store.position) is None and trace.find_exports("kernel32!NoSuchExport") == []
+
         # Live input that changes a syscall's outcome: ttd-input.txt exists while recording and is gone for the replay,
         # so NtQueryAttributesFile fails and writes nothing. A strict replay names the syscall; others undo its live
         # effects, give the guest the recorded output and status, and go on to the end.

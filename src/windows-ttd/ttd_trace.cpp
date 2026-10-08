@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <cstring>
 #include <future>
 #include <map>
@@ -344,13 +345,21 @@ namespace sogen::ttd
 
     void recorder::add_module(const mapped_module& mod)
     {
+        auto exports = std::make_shared<std::vector<module_export>>();
+        exports->reserve(mod.exports.size());
+        for (const auto& symbol : mod.exports)
+        {
+            exports->push_back({.rva = symbol.rva, .ordinal = symbol.ordinal, .name = symbol.name});
+        }
+        std::ranges::sort(*exports, {}, [](const module_export& symbol) { return std::tie(symbol.rva, symbol.name); });
         loaded_modules_[mod.image_base] = modules_.size();
         modules_.push_back({.base = mod.image_base,
                             .size = mod.size_of_image,
                             .load_step = emu_.get_executed_instructions(),
                             .load_event_number = header_.event_count,
                             .name = mod.name,
-                            .path = mod.module_path.string()});
+                            .path = mod.module_path.string(),
+                            .exports = std::move(exports)});
     }
 
     void recorder::note_thread(const access_event& event)
@@ -740,6 +749,7 @@ namespace sogen::ttd
         const auto syscalls = encode_syscalls(syscalls_);
         const auto modules = encode_modules(modules_);
         const auto threads = encode_threads(threads_);
+        const auto exports = encode_exports(modules_);
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -752,6 +762,7 @@ namespace sogen::ttd
             section_entry{.type = section_type::syscalls, .offset = append_to_file(syscalls), .size = syscalls.size()},
             section_entry{.type = section_type::modules, .offset = append_to_file(modules), .size = modules.size()},
             section_entry{.type = section_type::threads, .offset = append_to_file(threads), .size = threads.size()},
+            section_entry{.type = section_type::exports, .offset = append_to_file(exports), .size = exports.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -827,6 +838,8 @@ namespace sogen::ttd
         {
             section = read_object<section_entry>(file_);
         }
+        // Decoded once the modules they belong to are.
+        std::optional<std::vector<std::byte>> exports{};
         for (const auto& section : sections)
         {
             if (section.type == section_type::chunk_table)
@@ -933,22 +946,31 @@ namespace sogen::ttd
                 }
                 syscalls_ = decode_syscalls(read_bytes(section.offset, section.size));
             }
-            else if (section.type == section_type::modules || section.type == section_type::threads)
+            else if (section.type == section_type::modules || section.type == section_type::threads ||
+                     section.type == section_type::exports)
             {
                 if (!fits(section.offset, section.size, 1))
                 {
                     throw std::runtime_error("Invalid TTD trace offsets");
                 }
-                const auto bytes = read_bytes(section.offset, section.size);
+                auto bytes = read_bytes(section.offset, section.size);
                 if (section.type == section_type::modules)
                 {
                     modules_ = decode_modules(bytes);
                 }
-                else
+                else if (section.type == section_type::threads)
                 {
                     threads_ = decode_threads(bytes);
                 }
+                else
+                {
+                    exports = std::move(bytes);
+                }
             }
+        }
+        if (exports)
+        {
+            decode_exports(*exports, modules_);
         }
 
         uint64_t next_event = 0;
@@ -1347,6 +1369,94 @@ namespace sogen::ttd
             }
         }
         return nullptr;
+    }
+
+    std::optional<symbol_location> trace::symbol_at(const uint64_t address, const uint64_t step) const
+    {
+        const auto* mod = module_at(address, step);
+        if (!mod)
+        {
+            return std::nullopt;
+        }
+        const auto rva = address - mod->base;
+        if (!mod->exports)
+        {
+            return symbol_location{.module = mod, .offset = rva};
+        }
+        const auto& exports = *mod->exports;
+        const auto next = std::ranges::upper_bound(exports, rva, {}, &module_export::rva);
+        if (next == exports.begin())
+        {
+            return symbol_location{.module = mod, .offset = rva};
+        }
+        // Of several names for one address, the first by name, preferring a real name over "#<ordinal>".
+        const auto aliases = std::ranges::equal_range(exports, std::prev(next)->rva, {}, &module_export::rva);
+        const auto named = std::ranges::find_if(aliases, [](const module_export& symbol) { return !symbol.name.starts_with('#'); });
+        const auto& symbol = named == aliases.end() ? aliases.front() : *named;
+        return symbol_location{.module = mod, .symbol = &symbol, .offset = rva - symbol.rva};
+    }
+
+    std::vector<module_symbol> trace::find_exports(const std::string_view name) const
+    {
+        const auto separator = name.find('!');
+        const auto module_name = separator == std::string_view::npos ? std::string_view{} : name.substr(0, separator);
+        const auto symbol_name = separator == std::string_view::npos ? name : name.substr(separator + 1);
+        const auto equal_ignoring_case = [](const std::string_view a, const std::string_view b) {
+            return std::ranges::equal(a, b, [](const char x, const char y) {
+                return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
+            });
+        };
+        const auto module_matches = [&](const module_entry& mod) {
+            if (module_name.empty() || equal_ignoring_case(mod.name, module_name))
+            {
+                return true;
+            }
+            constexpr std::string_view extension = ".dll";
+            return mod.name.size() == module_name.size() + extension.size() &&
+                   equal_ignoring_case(std::string_view(mod.name).substr(0, module_name.size()), module_name) &&
+                   equal_ignoring_case(std::string_view(mod.name).substr(module_name.size()), extension);
+        };
+
+        std::vector<module_symbol> found{};
+        for (const auto& mod : modules_)
+        {
+            if (!mod.exports || !module_matches(mod))
+            {
+                continue;
+            }
+            for (const auto& symbol : *mod.exports)
+            {
+                if (symbol.name == symbol_name)
+                {
+                    found.push_back({.module = &mod, .symbol = &symbol});
+                }
+            }
+        }
+        return found;
+    }
+
+    std::vector<access_event> trace::calls(const std::string_view name, const uint64_t start, const uint64_t end)
+    {
+        std::vector<access_event> found{};
+        for (const auto& [mod, symbol] : find_exports(name))
+        {
+            const auto address = mod->base + symbol->rva;
+            const auto first = std::max(start, mod->load_step);
+            const auto last = mod->unload_step ? std::min(end, *mod->unload_step) : end;
+            if (first > last)
+            {
+                continue;
+            }
+            for (const auto& event : accesses(address, 1, first, last, static_cast<uint64_t>(access_kind::execute)))
+            {
+                if (event.address == address)
+                {
+                    found.push_back(event);
+                }
+            }
+        }
+        std::ranges::stable_sort(found, {}, &access_event::step);
+        return found;
     }
 
     std::optional<uint32_t> trace::thread_at(const uint64_t step) const

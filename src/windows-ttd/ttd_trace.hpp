@@ -43,6 +43,21 @@ namespace sogen::ttd
         uint64_t event_count{};
     };
 
+    struct module_symbol
+    {
+        const module_entry* module{};
+        const module_export* symbol{};
+    };
+
+    struct symbol_location
+    {
+        const module_entry* module{};
+        // Null when no export of the module is at or below the address.
+        const module_export* symbol{};
+        // From the export, or from the image base without one.
+        uint64_t offset{};
+    };
+
     struct checkpoint_state
     {
         uint64_t step{};
@@ -281,6 +296,17 @@ namespace sogen::ttd
 
         // The module whose image holds `address` at position `step`.
         const module_entry* module_at(uint64_t address, uint64_t step) const;
+
+        // `address` at position `step` as a module and its closest export at or below it.
+        std::optional<symbol_location> symbol_at(uint64_t address, uint64_t step) const;
+
+        // The exports called `name`, or "module!name" (the module name ignoring case, ".dll" optional), in module load
+        // order. Exports by ordinal only are called "#<ordinal>".
+        std::vector<module_symbol> find_exports(std::string_view name) const;
+
+        // The execute events of the first instruction of each export find_exports(name) returns, at positions start
+        // through end while its module was mapped, in order: the calls of a function, and jumps to it.
+        std::vector<access_event> calls(std::string_view name, uint64_t start, uint64_t end);
 
         // Thread switches and names; empty for traces recorded before threads were recorded.
         const thread_table& threads() const

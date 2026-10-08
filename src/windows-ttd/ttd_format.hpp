@@ -86,6 +86,9 @@ namespace sogen::ttd
         modules = 9,
         // The running thread over the recording, encoded as described at encode_threads; size = compressed bytes.
         threads = 10,
+        // The export directories of the modules in the modules section, encoded as described at encode_exports;
+        // size = compressed bytes.
+        exports = 11,
     };
 
     // A syscall instruction the emulator dispatched: its handler ran after `event_number` events had been recorded,

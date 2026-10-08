@@ -76,6 +76,14 @@ namespace sogen::ttd
     std::vector<std::byte> encode_syscalls(const syscall_table& table);
     syscall_table decode_syscalls(std::span<const std::byte> compressed);
 
+    // A symbol a module's export directory lists; `name` is "#<ordinal>" for one exported by ordinal only.
+    struct module_export
+    {
+        uint64_t rva{};
+        uint64_t ordinal{};
+        std::string name{};
+    };
+
     // A module mapped into the process: present from load_step (after load_event_number events; the start of the trace
     // for modules mapped before it) until unload_step, if it was unmapped while recording.
     struct module_entry
@@ -88,6 +96,8 @@ namespace sogen::ttd
         std::optional<uint64_t> unload_event_number{};
         std::string name{};
         std::string path{};
+        // Sorted by RVA, then name; null for traces without the exports section. Shared, so copies stay cheap.
+        std::shared_ptr<const std::vector<module_export>> exports{};
     };
 
     // From event `event_number` (at step `step`) on, thread `thread_id` runs: with execute events recorded, the event is
@@ -111,6 +121,15 @@ namespace sogen::ttd
     // varint length and UTF-8 bytes.
     std::vector<std::byte> encode_modules(std::span<const module_entry> modules);
     std::vector<module_entry> decode_modules(std::span<const std::byte> compressed);
+
+    // The exports section is a zstd frame of the module count (that of the modules section, whose order it follows) and
+    // three stream sizes as little-endian uint64 values, then three streams over each module's exports in ordinal
+    // order: per module the export count and per export the ordinal delta as varints; the RVAs as little-endian uint32
+    // values; and the names as the varint length of the prefix shared with the previous name of the module, then the
+    // rest as a varint length and UTF-8 bytes (empty for an export by ordinal only). decode_exports fills in the exports
+    // of the decoded modules.
+    std::vector<std::byte> encode_exports(std::span<const module_entry> modules);
+    void decode_exports(std::span<const std::byte> compressed, std::span<module_entry> modules);
 
     // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
     // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.

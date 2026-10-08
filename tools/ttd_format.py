@@ -18,7 +18,7 @@ BULK_REFERENCE = struct.Struct("<2Q")
 MAGIC = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
 CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS, SYSCALLS = 1, 2, 3, 4, 5, 6, 7, 8
-MODULES, THREADS = 9, 10
+MODULES, THREADS, EXPORTS = 9, 10, 11
 SYSCALL_HEADER = struct.Struct("<8Q")
 # checkpoint, event_number, step, window, message, reserved, wparam, lparam
 UI_INPUT = struct.Struct("<4QII2Q")
@@ -336,6 +336,32 @@ def decode_modules(compressed):
     return modules
 
 
+def decode_exports(compressed, modules):
+    """Mirror of decode_exports in src/windows-ttd/ttd_chunk.cpp: sets each module dict's "exports" to (rva, ordinal,
+    name) tuples sorted by RVA, then name."""
+    raw = zstandard.ZstdDecompressor().decompress(compressed)
+    count, *sizes = struct.unpack_from("<4Q", raw)
+    assert count == len(modules), "TTD exports do not match the modules"
+    offset = struct.calcsize("<4Q")
+    streams = []
+    for size in sizes:
+        streams.append(_Stream(raw[offset:offset + size]))
+        offset += size
+    assert offset == len(raw), "invalid exports"
+    counts, rvas, names = streams
+    for module in modules:
+        exports, ordinal, previous = [], 0, ""
+        for _ in range(counts.varint()):
+            ordinal += counts.varint()
+            rva = struct.unpack("<I", rvas.bytes(4))[0]
+            shared = names.varint()
+            name = previous[:shared] + _text(names)
+            exports.append((rva, ordinal, name or f"#{ordinal}"))
+            previous = name
+        module["exports"] = sorted(exports, key=lambda symbol: (symbol[0], symbol[2]))
+    assert all(stream.offset == len(stream.data) for stream in streams), "invalid exports"
+
+
 def decode_threads(compressed):
     """Mirror of decode_threads in src/windows-ttd/ttd_chunk.cpp: (step, event_number, thread_id) switches and the
     names by thread id."""
@@ -384,6 +410,9 @@ class Trace:
         self.syscalls = decode_syscalls(self.bytes[offset:offset + size]) if SYSCALLS in self.sections else None
         offset, size = self.sections.get(MODULES, (0, 0))
         self.modules = decode_modules(self.bytes[offset:offset + size]) if MODULES in self.sections else []
+        if EXPORTS in self.sections:
+            offset, size = self.sections[EXPORTS]
+            decode_exports(self.bytes[offset:offset + size], self.modules)
         offset, size = self.sections.get(THREADS, (0, 0))
         self.thread_switches, self.thread_names = (decode_threads(self.bytes[offset:offset + size])
                                                    if THREADS in self.sections else ([], {}))

@@ -881,6 +881,133 @@ namespace sogen::ttd
         return modules;
     }
 
+    namespace
+    {
+        constexpr size_t export_stream_count = 3;
+
+        std::string ordinal_name(const uint64_t ordinal)
+        {
+            return "#" + std::to_string(ordinal);
+        }
+    }
+
+    std::vector<std::byte> encode_exports(const std::span<const module_entry> modules)
+    {
+        std::array<std::vector<std::byte>, export_stream_count> streams{};
+        for (const auto& mod : modules)
+        {
+            std::vector<const module_export*> exports{};
+            if (mod.exports)
+            {
+                for (const auto& symbol : *mod.exports)
+                {
+                    exports.push_back(&symbol);
+                }
+            }
+            std::ranges::sort(exports, {}, &module_export::ordinal);
+            put_varint(streams[0], exports.size());
+            uint64_t ordinal = 0;
+            std::string_view previous{};
+            for (const auto* symbol : exports)
+            {
+                if (symbol->ordinal < ordinal || symbol->rva > UINT32_MAX)
+                {
+                    throw std::runtime_error("Invalid TTD module export");
+                }
+                put_varint(streams[0], symbol->ordinal - ordinal);
+                const auto rva = static_cast<uint32_t>(symbol->rva);
+                const auto* rva_bytes = reinterpret_cast<const std::byte*>(&rva);
+                streams[1].insert(streams[1].end(), rva_bytes, rva_bytes + sizeof(rva));
+                const auto name = symbol->name == ordinal_name(symbol->ordinal) ? std::string_view{} : std::string_view(symbol->name);
+                const auto shared = static_cast<size_t>(std::ranges::mismatch(previous, name).in2 - name.begin());
+                put_varint(streams[2], shared);
+                put_text(streams[2], name.substr(shared));
+                ordinal = symbol->ordinal;
+                previous = name;
+            }
+        }
+
+        const uint64_t count = modules.size();
+        std::vector<std::byte> raw(reinterpret_cast<const std::byte*>(&count), reinterpret_cast<const std::byte*>(&count + 1));
+        for (const auto& bytes : streams)
+        {
+            const uint64_t size = bytes.size();
+            const auto* size_bytes = reinterpret_cast<const std::byte*>(&size);
+            raw.insert(raw.end(), size_bytes, size_bytes + sizeof(size));
+        }
+        for (const auto& bytes : streams)
+        {
+            raw.insert(raw.end(), bytes.begin(), bytes.end());
+        }
+        return compress_table(raw, "exports");
+    }
+
+    void decode_exports(const std::span<const std::byte> compressed, const std::span<module_entry> modules)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        uint64_t count{};
+        std::array<uint64_t, export_stream_count> sizes{};
+        if (raw.size() < sizeof(count) + sizeof(sizes))
+        {
+            throw std::runtime_error("Invalid TTD exports");
+        }
+        memcpy(&count, raw.data(), sizeof(count));
+        memcpy(sizes.data(), raw.data() + sizeof(count), sizeof(sizes));
+        if (count != modules.size())
+        {
+            throw std::runtime_error("TTD exports do not match the modules");
+        }
+        auto rest = std::span(raw).subspan(sizeof(count) + sizeof(sizes));
+        std::array<stream_reader, export_stream_count> streams{};
+        for (size_t i = 0; i < streams.size(); ++i)
+        {
+            if (sizes[i] > rest.size())
+            {
+                throw std::runtime_error("Invalid TTD exports");
+            }
+            streams[i] = stream_reader(rest.first(static_cast<size_t>(sizes[i])));
+            rest = rest.subspan(static_cast<size_t>(sizes[i]));
+        }
+
+        for (auto& mod : modules)
+        {
+            const auto export_count = streams[0].varint();
+            // Every export takes four bytes of the RVA stream.
+            if (export_count > sizes[1] / sizeof(uint32_t))
+            {
+                throw std::runtime_error("Invalid TTD exports");
+            }
+            auto exports = std::make_shared<std::vector<module_export>>(static_cast<size_t>(export_count));
+            uint64_t ordinal = 0;
+            std::string previous{};
+            for (auto& symbol : *exports)
+            {
+                const auto delta = streams[0].varint();
+                if (delta > UINT64_MAX - ordinal)
+                {
+                    throw std::runtime_error("Invalid TTD export");
+                }
+                ordinal += delta;
+                uint32_t rva{};
+                memcpy(&rva, streams[1].bytes(sizeof(rva)).data(), sizeof(rva));
+                const auto shared = streams[2].varint();
+                if (shared > previous.size())
+                {
+                    throw std::runtime_error("Invalid TTD export");
+                }
+                auto name = previous.substr(0, static_cast<size_t>(shared)) + read_text(streams[2]);
+                symbol = {.rva = rva, .ordinal = ordinal, .name = name.empty() ? ordinal_name(ordinal) : name};
+                previous = std::move(name);
+            }
+            std::ranges::sort(*exports, {}, [](const module_export& symbol) { return std::tie(symbol.rva, symbol.name); });
+            mod.exports = std::move(exports);
+        }
+        if (!rest.empty() || !std::ranges::all_of(streams, [](const stream_reader& stream) { return stream.done(); }))
+        {
+            throw std::runtime_error("Invalid TTD exports");
+        }
+    }
+
     std::vector<std::byte> encode_threads(const thread_table& threads)
     {
         std::vector<std::byte> raw{};
