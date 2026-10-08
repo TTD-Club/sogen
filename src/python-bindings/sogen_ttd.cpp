@@ -239,7 +239,23 @@ namespace sogen::py
 
             ttd::seek_result seek(const uint64_t position) const
             {
-                return ttd::seek(this->emulator_->native(), this->trace_.native(), position, this->strict_);
+                this->replayed_.reset();
+                const auto result = ttd::seek(this->emulator_->native(), this->trace_.native(), position, this->strict_);
+                this->replayed_ = position;
+                return result;
+            }
+
+            ttd::seek_result run_to(const uint64_t position) const
+            {
+                if (this->replayed_ != this->emulator_->native().get_executed_instructions())
+                {
+                    throw std::runtime_error("Replay.run_to continues where the last seek or run_to stopped, but the emulator ran "
+                                             "since; seek instead");
+                }
+                this->replayed_.reset();
+                const auto result = ttd::run_to(this->emulator_->native(), this->trace_.native(), position, this->strict_);
+                this->replayed_ = position;
+                return result;
             }
 
             std::vector<ttd::recovered_string> strings(const size_t minimum_length) const
@@ -296,6 +312,8 @@ namespace sogen::py
             ttd_trace trace_;
             sogen_windows_emulator* emulator_{};
             bool strict_{};
+            // The position the last successful seek or run_to reached; run_to checks the emulator is still there.
+            mutable std::optional<uint64_t> replayed_{};
         };
 
         uint64_t end_position(const std::optional<uint64_t>& end)
@@ -652,6 +670,12 @@ namespace sogen::py
                      "Restore the last checkpoint at or before position and replay to it, verifying every recorded event. Raises "
                      "DivergenceError where the replay diverges from the recording, and RuntimeError for a trace recorded with "
                      "another backend or other CPUID results.")
+                .def("run_to", &ttd_replay::run_to, nb::arg("position"), nb::call_guard<nb::gil_scoped_release>(),
+                     "Replay forward from where the last seek or run_to stopped to position, verifying every recorded event, "
+                     "without restoring a checkpoint: much faster than seek for short moves forward. Raises RuntimeError when "
+                     "the emulator ran since, and IndexError for a position before the current one. Changes made to the "
+                     "emulator in between that the replay does not observe before position go unnoticed; seek after "
+                     "changing it.")
                 .def("strings", &ttd_replay::strings, nb::arg("minimum_length") = 6, nb::call_guard<nb::gil_scoped_release>(),
                      "Replay the whole trace (verified) and return the ASCII and UTF-16LE strings that appeared in memory, "
                      "including transient ones, ordered by address. Leaves the emulator at the end of the trace.")

@@ -68,6 +68,7 @@ namespace sogen::ttd
 
     struct seek_result
     {
+        // Where the replay started: the restored checkpoint for seek, the emulator's position for run_to.
         uint64_t checkpoint{};
         uint64_t verified_events{};
         // Syscalls whose live writes or result, and host writes outside syscalls whose live bytes, differed from the
@@ -82,6 +83,12 @@ namespace sogen::ttd
     // Unless `strict`, syscalls and host writes with other results than recorded take the recorded ones (see
     // replay_verifier).
     seek_result seek(windows_emulator& win_emu, trace& recorded, uint64_t position, bool strict = false);
+
+    // Replays forward from the emulator's current position to `position` without restoring a checkpoint, verifying
+    // like seek. The emulator must hold the recorded state at its position (where a seek or run_to left it, unchanged
+    // since); changes the replay does not observe before `position` go unnoticed. Much cheaper than seek for short
+    // moves forward.
+    seek_result run_to(windows_emulator& win_emu, trace& recorded, uint64_t position, bool strict = false);
 
     // Restores the trace's initial state, calls `attach` (to hook analyses such as the replay scans onto the restored
     // emulator), and replays the whole trace, one checkpoint interval at a time as it was recorded, verifying every

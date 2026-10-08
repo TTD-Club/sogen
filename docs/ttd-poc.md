@@ -50,6 +50,9 @@ with ttd.Trace("sample.sogttd") as trace:
     replay = ttd.Replay(trace, emu)
     replay.seek(store.position - 1)                 # also seeks backwards
     rip = emu.read_register(sogen.Register.rip)
+    # Forward from where the replay stopped, without restoring a checkpoint (a single step takes ~0.03 ms instead of
+    # a seek's 0.06-0.2 s). Refuses to move back or to go on after the emulator ran; seek after changing it.
+    replay.run_to(replay.position + 1)
 
     # Replay scans: each replays the whole trace with verification and leaves the emulator at its end.
     strings = replay.strings(minimum_length=6)       # RecoveredString: address, position, encoding, value
@@ -486,10 +489,12 @@ Without bulk data in the delta references the checkpoints took 46.4 MiB.
 Chunks (on four threads) and bulk blocks (on one) are compressed at zstd
 level 19 in the background (level 6 bulk blocks would take 22.5 MiB
 unfiltered). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take
-0.02 s for a next-access lookup and about 2 s for a scan of every chunk; a
-late seek including the checkpoint delta chain takes 0.4 s
-(a chain of 15 deltas, each decompressed with its base state and bulk
-blocks as the reference; the bulk blocks of a delta decode in parallel).
+0.02 s for a next-access lookup and about 2 s for a scan of every chunk. A
+seek to a checkpoint takes 0.03-0.2 s (0.12 s on average over random
+checkpoints; up to 18 deltas, each decompressed with its base state and bulk
+blocks as the reference; all bulk blocks of a chain decode in parallel up
+front), plus up to 0.15 s to replay to a position between checkpoints.
+`Replay.run_to` moves forward without restoring: about 0.03 ms per step.
 
 Because every written and read value is recorded, a range's value history is
 available offline: `--ttd-history TRACE --ttd-address A --ttd-size N`

@@ -72,11 +72,25 @@ namespace sogen::ttd
       public:
         ui_replay(windows_emulator& win_emu, std::span<const ui_input_entry> inputs, uint64_t checkpoint,
                   recordable_ui_backend::replay_clock clock);
+
+        // The first `count` recorded events, for a replay that continues from a position that is not a checkpoint.
+        struct after_events
+        {
+            uint64_t count{};
+        };
+
+        // Delivers the inputs that reached the guest after `start`.
+        ui_replay(windows_emulator& win_emu, std::span<const ui_input_entry> inputs, after_events start,
+                  recordable_ui_backend::replay_clock clock);
         ~ui_replay();
         ui_replay(const ui_replay&) = delete;
         ui_replay& operator=(const ui_replay&) = delete;
 
       private:
         recordable_ui_backend* backend_{};
+
+        // Delivers inputs[first..]; a trace with any input needs a recordable UI.
+        void start(windows_emulator& win_emu, std::span<const ui_input_entry> inputs, size_t first,
+                   recordable_ui_backend::replay_clock clock);
     };
 }

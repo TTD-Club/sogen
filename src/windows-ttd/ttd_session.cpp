@@ -276,36 +276,96 @@ namespace sogen::ttd
         trace_recorder.finish();
     }
 
+    namespace
+    {
+        // Runs the emulator to `position` with one start() per checkpoint interval, as the recording ran: window input
+        // is pumped at each boundary. Returns whether it got there.
+        bool run_intervals(windows_emulator& win_emu, trace& recorded, const uint64_t position)
+        {
+            const auto run_to = [&](const uint64_t target) {
+                const auto before = win_emu.get_executed_instructions();
+                if (target > before)
+                {
+                    win_emu.start(static_cast<size_t>(target - before));
+                }
+                return win_emu.get_executed_instructions() == target;
+            };
+            for (const auto& checkpoint : recorded.checkpoints())
+            {
+                if (checkpoint.step >= position)
+                {
+                    break;
+                }
+                if (checkpoint.step > win_emu.get_executed_instructions() && !run_to(checkpoint.step))
+                {
+                    return false;
+                }
+            }
+            return run_to(position);
+        }
+
+        // Replays from `from`, where the emulator holds the recorded state, to `position`.
+        seek_result replay_range(windows_emulator& win_emu, trace& recorded, const uint64_t from, const uint64_t position,
+                                 const bool strict, const bool from_checkpoint)
+        {
+            try
+            {
+                replay_verifier verifier(win_emu, recorded, from, strict);
+                const auto clock = [&verifier] { return verifier.next_event_number(); };
+                std::optional<ui_replay> ui{};
+                if (from_checkpoint)
+                {
+                    ui.emplace(win_emu, recorded.ui_inputs(), recorded.checkpoint_index(from), clock);
+                }
+                else
+                {
+                    ui.emplace(win_emu, recorded.ui_inputs(), ui_replay::after_events{verifier.next_event_number()}, clock);
+                }
+                run_intervals(win_emu, recorded, position);
+                verifier.finish();
+                if (const auto reached = win_emu.get_executed_instructions(); reached != position)
+                {
+                    std::ostringstream message;
+                    message << "TTD replay reached position " << std::hex << reached << " instead of " << position;
+                    throw divergence_error(message.str());
+                }
+                return {
+                    .checkpoint = from, .verified_events = verifier.verified_events(), .substituted_inputs = verifier.substituted_inputs()};
+            }
+            catch (const divergence_error& e)
+            {
+                throw divergence_error(e.what() + difference_suffix(manifest_differences(win_emu, recorded)));
+            }
+        }
+    }
+
     seek_result seek(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict)
     {
         require_deterministic(win_emu);
         check_manifest(win_emu, recorded);
         const auto checkpoint = recorded.checkpoint_for_step(position);
         snapshot::load_emulator_state(win_emu, *checkpoint.state);
-        try
+        return replay_range(win_emu, recorded, checkpoint.step, position, strict, true);
+    }
+
+    seek_result run_to(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict)
+    {
+        require_deterministic(win_emu);
+        check_manifest(win_emu, recorded);
+        const auto from = win_emu.get_executed_instructions();
+        if (from < recorded.start_position() || from > recorded.metadata().instruction_count)
         {
-            replay_verifier verifier(win_emu, recorded, checkpoint.step, strict);
-            const ui_replay ui(win_emu, recorded.ui_inputs(), recorded.checkpoint_index(checkpoint.step),
-                               [&verifier] { return verifier.next_event_number(); });
-            if (position > checkpoint.step)
-            {
-                win_emu.start(static_cast<size_t>(position - checkpoint.step));
-            }
-            verifier.finish();
-            if (const auto reached = win_emu.get_executed_instructions(); reached != position)
-            {
-                std::ostringstream message;
-                message << "TTD replay reached position " << std::hex << reached << " instead of " << position;
-                throw divergence_error(message.str());
-            }
-            return {.checkpoint = checkpoint.step,
-                    .verified_events = verifier.verified_events(),
-                    .substituted_inputs = verifier.substituted_inputs()};
+            throw std::out_of_range("The emulator is not at a position of the TTD trace");
         }
-        catch (const divergence_error& e)
+        if (position < from)
         {
-            throw divergence_error(e.what() + difference_suffix(manifest_differences(win_emu, recorded)));
+            throw std::out_of_range("TTD run_to cannot move backwards; seek instead");
         }
+        if (position > recorded.metadata().instruction_count)
+        {
+            throw std::out_of_range("TTD position is beyond end of trace");
+        }
+        return replay_range(win_emu, recorded, from, position, strict, false);
     }
 
     seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach, const bool strict,
@@ -334,25 +394,7 @@ namespace sogen::ttd
         {
             replay_verifier verifier(win_emu, recorded, start, strict);
             const ui_replay ui(win_emu, recorded.ui_inputs(), 0, [&verifier] { return verifier.next_event_number(); });
-            // One start() per checkpoint interval, as the recording ran: the UI is pumped at each boundary.
-            const auto run_to = [&](const uint64_t position) {
-                const auto before = win_emu.get_executed_instructions();
-                if (position > before)
-                {
-                    win_emu.start(static_cast<size_t>(position - before));
-                }
-                return win_emu.get_executed_instructions() == position;
-            };
-            auto reached = true;
-            for (const auto& checkpoint : recorded.checkpoints())
-            {
-                reached = run_to(checkpoint.step);
-                if (!reached)
-                {
-                    break;
-                }
-            }
-            reached = reached && run_to(end);
+            const auto reached = run_intervals(win_emu, recorded, end);
             verifier.finish();
             if (!reached)
             {

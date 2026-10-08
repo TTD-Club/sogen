@@ -158,8 +158,26 @@ namespace sogen::ttd
 
     ui_replay::ui_replay(windows_emulator& win_emu, const std::span<const ui_input_entry> inputs, const uint64_t checkpoint,
                          recordable_ui_backend::replay_clock clock)
-        : backend_(dynamic_cast<recordable_ui_backend*>(&win_emu.ui()))
     {
+        // Inputs delivered before the checkpoint are part of its state.
+        const auto first = std::ranges::partition_point(inputs, [&](const ui_input_entry& input) { return input.checkpoint < checkpoint; });
+        this->start(win_emu, inputs, static_cast<size_t>(first - inputs.begin()), std::move(clock));
+    }
+
+    ui_replay::ui_replay(windows_emulator& win_emu, const std::span<const ui_input_entry> inputs, const after_events start,
+                         recordable_ui_backend::replay_clock clock)
+    {
+        // A budgeted start() returns at its target without pumping window input, so an input recorded after exactly
+        // start.count events was not delivered yet.
+        const auto first =
+            std::ranges::partition_point(inputs, [&](const ui_input_entry& input) { return input.event_number < start.count; });
+        this->start(win_emu, inputs, static_cast<size_t>(first - inputs.begin()), std::move(clock));
+    }
+
+    void ui_replay::start(windows_emulator& win_emu, const std::span<const ui_input_entry> inputs, const size_t first,
+                          recordable_ui_backend::replay_clock clock)
+    {
+        this->backend_ = dynamic_cast<recordable_ui_backend*>(&win_emu.ui());
         if (!this->backend_)
         {
             if (!inputs.empty())
@@ -168,9 +186,7 @@ namespace sogen::ttd
             }
             return;
         }
-        // Inputs delivered before the checkpoint are part of its state.
-        const auto first = std::ranges::partition_point(inputs, [&](const ui_input_entry& input) { return input.checkpoint < checkpoint; });
-        this->backend_->start_replay(inputs.subspan(static_cast<size_t>(first - inputs.begin())), std::move(clock));
+        this->backend_->start_replay(inputs.subspan(first), std::move(clock));
     }
 
     ui_replay::~ui_replay()

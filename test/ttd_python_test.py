@@ -89,6 +89,32 @@ def main() -> None:
         replay.seek(load.position)
         assert read_u64(emulator, address) == NEW_VALUE
 
+        # run_to moves forward from where the replay stopped without restoring a checkpoint, across checkpoints too,
+        # and reaches the same state as a seek. It refuses to move back, or to go on after the emulator ran.
+        replay.seek(store.position - 1)
+        result = replay.run_to(store.position)
+        assert result.checkpoint == store.position - 1 and result.verified_events > 0, result
+        assert read_u64(emulator, address) == NEW_VALUE
+        later = min(trace.instruction_count, trace.checkpoints[-1] + 10)
+        assert any(store.position < checkpoint < later for checkpoint in trace.checkpoints), trace.checkpoints
+        replay.run_to(later)
+        stepped = emulator.serialize_state()
+        replay.seek(later)
+        assert emulator.serialize_state() == stepped
+        try:
+            replay.run_to(later - 1)
+        except IndexError as error:
+            assert "backwards" in str(error), error
+        else:
+            raise AssertionError("run_to moved backwards")
+        emulator.start(10)
+        try:
+            replay.run_to(later + 20)
+        except RuntimeError as error:
+            assert "ran since" in str(error), error
+        else:
+            raise AssertionError("run_to went on after the emulator ran")
+
         # The manifest says how a trace was recorded; tools/ttd_format.py reads the same entries.
         manifest = trace.manifest
         assert manifest["tool"] == "analyzer" and manifest["cpuid"] == "1", manifest
@@ -334,6 +360,12 @@ def main() -> None:
             assert read_u64(ui_replay.emulator, ui_address) == UI_VALUE
             ui_replay.seek(ui_writes[-1].position - 1)
             assert read_u64(ui_replay.emulator, ui_address) == 0
+            # run_to delivers the recorded input like a seek does, also from before the checkpoint after which the input
+            # arrived.
+            input_checkpoint = ui_recorded.checkpoints[inputs[0].checkpoint]
+            ui_replay.seek(max(input_checkpoint - 1, 0))
+            ui_replay.run_to(ui_writes[-1].position)
+            assert read_u64(ui_replay.emulator, ui_address) == UI_VALUE
             assert ui_replay.strings()
             try:
                 ttd.Replay(ui_recorded, sogen.windows.create_application(sample, backend=sogen.Backend.unicorn,
