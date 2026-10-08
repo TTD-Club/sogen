@@ -551,7 +551,7 @@ namespace sogen::ttd
     }
 
     decoded_chunk decode_chunk(const std::span<const std::byte> compressed, const std::span<const code_entry> code,
-                               const bulk_resolver& bulk)
+                               const bulk_resolver& bulk, const bool with_data)
     {
         bulk_cursor cursor(bulk);
         const auto raw = utils::compression::zstd::decompress(compressed);
@@ -637,14 +637,18 @@ namespace sogen::ttd
                     bulk_reference reference{};
                     reference.block = state.bulk_block_index + unzigzag(streams[bulk_stream].varint());
                     reference.offset = state.bulk_offset_base(reference.block) + unzigzag(streams[bulk_stream].varint());
-                    data = cursor.data(reference, event.size);
+                    if (with_data)
+                    {
+                        data = cursor.data(reference, event.size);
+                    }
                     state.remember_bulk(reference, event.size);
                     memcpy(event.payload.data(), &reference.offset, sizeof(reference.offset));
                     memcpy(event.payload.data() + sizeof(reference.offset), &reference.block, sizeof(reference.block));
                 }
                 else if (tag & tag_extra)
                 {
-                    if (event.kind != access_kind::read || !state.memory.load(event.address, output.first(static_cast<size_t>(event.size))))
+                    if (event.kind != access_kind::read ||
+                        (with_data && !state.memory.load(event.address, output.first(static_cast<size_t>(event.size)))))
                     {
                         throw std::runtime_error("Invalid TTD known-value read");
                     }
@@ -655,7 +659,7 @@ namespace sogen::ttd
                     data = streams[data_stream].bytes(event.size);
                     memcpy(event.payload.data(), data.data(), data.size());
                 }
-                state.remember_access(event, data);
+                state.remember_access(event, with_data ? data : std::span<const std::byte>{});
             }
             state.ip = event.ip;
         }

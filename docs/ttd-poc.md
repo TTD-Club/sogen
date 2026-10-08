@@ -506,7 +506,11 @@ Without bulk data in the delta references the checkpoints took 46.4 MiB.
 Chunks (on four threads) and bulk blocks (on one) are compressed at zstd
 level 19 in the background (level 6 bulk blocks would take 22.5 MiB
 unfiltered). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take
-0.02 s for a next-access lookup and about 2 s for a scan of every chunk. A
+0.02 s for a next-access lookup and about 2 s for a scan of every chunk.
+Address queries decode their candidate chunks on all cores, and queries for
+execute events only (`Trace.calls`) skip the chunks' data: the calls of a hot
+ntdll function (`RtlAllocateHeap`, 3,144 calls on a page most chunks touch)
+take 0.16 s, all accesses of that page 0.31 s (1.4 s and 1.2 s on one thread). A
 seek to a checkpoint takes 0.03-0.2 s (0.12 s on average over random
 checkpoints; up to 18 deltas, each decompressed with its base state and bulk
 blocks as the reference; all bulk blocks of a chain decode in parallel up

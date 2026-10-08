@@ -57,7 +57,10 @@ namespace sogen::ttd
 
     std::vector<std::byte> encode_chunk(std::span<const access_event> events, std::span<const uint64_t> code_ids,
                                         const chunk_bulk_bytes& bulk);
-    decoded_chunk decode_chunk(std::span<const std::byte> compressed, std::span<const code_entry> code, const bulk_resolver& bulk);
+    // Without `with_data`, reads and writes keep their positions, addresses, and sizes but not their bytes: no bulk block
+    // is resolved, and reads predicted from known memory come out as zeros. Execute events are complete either way.
+    decoded_chunk decode_chunk(std::span<const std::byte> compressed, std::span<const code_entry> code, const bulk_resolver& bulk,
+                               bool with_data = true);
 
     // A page block stores page deltas, chunks (as deltas while the page repeats), and kinds as three streams.
     std::vector<std::byte> encode_page_block(std::span<const page_entry> entries);

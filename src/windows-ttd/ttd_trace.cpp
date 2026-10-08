@@ -13,9 +13,11 @@
 #include <cstring>
 #include <future>
 #include <map>
+#include <mutex>
 #include <ranges>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 namespace sogen::ttd
@@ -1709,6 +1711,87 @@ namespace sogen::ttd
         return ranges;
     }
 
+    std::vector<access_event> trace::matching_events(const std::span<const number_range> ranges,
+                                                     const std::function<bool(const access_event&)>& matches, const bool with_data)
+    {
+        std::vector<access_event> result{};
+        const auto collect = [&](std::vector<access_event>& output, const std::span<const access_event> events, const uint64_t first_event,
+                                 const number_range& range) {
+            for (auto number = range.begin; number < range.end; ++number)
+            {
+                const auto& event = events[static_cast<size_t>(number - first_event)];
+                if (matches(event))
+                {
+                    output.push_back(event);
+                }
+            }
+        };
+
+        // Workers resolve bulk blocks through the trace's cache and file, one at a time; the main thread waits meanwhile.
+        std::mutex bulk_mutex{};
+        const bulk_resolver shared_bulk = [&](const uint64_t block) {
+            const std::scoped_lock lock(bulk_mutex);
+            return bulk(block);
+        };
+        const auto batch_size = static_cast<size_t>(std::max(1U, std::thread::hardware_concurrency()));
+        for (size_t first = 0; first < ranges.size(); first += batch_size)
+        {
+            const auto batch = ranges.subspan(first, std::min(batch_size, ranges.size() - first));
+            std::vector<std::future<std::vector<access_event>>> decoding(batch.size());
+            for (size_t i = 0; i < batch.size(); ++i)
+            {
+                const auto index = chunk_of(batch[i].begin);
+                if (batch[i].end > chunks_[index].first_event + chunks_[index].event_count)
+                {
+                    throw std::runtime_error("TTD event range crosses a chunk");
+                }
+                if (std::ranges::find(chunk_cache_, index, &cached_chunk::index) != chunk_cache_.end())
+                {
+                    continue;
+                }
+                const auto entry = chunks_[index];
+                decoding[i] =
+                    std::async(std::launch::async, [&, entry, compressed = read_bytes(entry.offset, entry.size), range = batch[i]] {
+                        const auto decoded = decode_chunk(compressed, code_, shared_bulk, with_data);
+                        if (decoded.events.size() != entry.event_count)
+                        {
+                            throw std::runtime_error("Invalid TTD event chunk");
+                        }
+                        std::vector<access_event> found{};
+                        collect(found, decoded.events, entry.first_event, range);
+                        return found;
+                    });
+            }
+            // Every worker finishes before the batch is left, also when one throws: they reference this frame.
+            std::exception_ptr error{};
+            for (size_t i = 0; i < batch.size(); ++i)
+            {
+                if (decoding[i].valid())
+                {
+                    try
+                    {
+                        auto found = decoding[i].get();
+                        result.insert(result.end(), found.begin(), found.end());
+                    }
+                    catch (...)
+                    {
+                        error = error ? error : std::current_exception();
+                    }
+                }
+                else if (!error)
+                {
+                    const auto index = chunk_of(batch[i].begin);
+                    collect(result, chunk(index).events, chunks_[index].first_event, batch[i]);
+                }
+            }
+            if (error)
+            {
+                std::rethrow_exception(error);
+            }
+        }
+        return result;
+    }
+
     std::vector<trace::number_range> trace::legacy_candidates(const uint64_t first_page, const uint64_t last_page, const uint64_t kind_mask,
                                                               const uint64_t first_number, const uint64_t end_number)
     {
@@ -1818,12 +1901,21 @@ namespace sogen::ttd
         const auto first_number = first_event_at_or_after(first_step);
         const auto end_number = last_step == UINT64_MAX ? metadata_.event_count : first_event_after(last_step);
         const auto last = last_byte(address, size);
-        for (const auto& range : candidates(address / page_size, last / page_size, kind_mask, first_number, end_number))
+        const auto ranges = candidates(address / page_size, last / page_size, kind_mask, first_number, end_number);
+        const auto matches = [&](const access_event& event) {
+            return (kind_mask & static_cast<uint64_t>(event.kind)) && overlaps(event.address, event.size, address, size);
+        };
+        if (this->chunked())
+        {
+            // Execute events carry their bytes from the code table; only data accesses need the chunk's values.
+            return matching_events(ranges, matches, (kind_mask & ~static_cast<uint64_t>(access_kind::execute)) != 0);
+        }
+        for (const auto& range : ranges)
         {
             for (auto number = range.begin; number < range.end; ++number)
             {
                 const auto event = event_at(number);
-                if ((kind_mask & static_cast<uint64_t>(event.kind)) && overlaps(event.address, event.size, address, size))
+                if (matches(event))
                 {
                     result.push_back(event);
                 }

@@ -404,6 +404,11 @@ namespace sogen::ttd
         std::vector<number_range> candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask, uint64_t first_number,
                                              uint64_t end_number);
         std::vector<number_range> chunked_candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask);
+        // The events of `ranges` (in order, each within one chunk) for which `matches` holds, in order. Uncached chunks
+        // decode on worker threads, a batch at a time; without `with_data`, reads and writes come without their bytes
+        // (see decode_chunk).
+        std::vector<access_event> matching_events(std::span<const number_range> ranges,
+                                                  const std::function<bool(const access_event&)>& matches, bool with_data);
         std::vector<number_range> legacy_candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask, uint64_t first_number,
                                                     uint64_t end_number);
         uint64_t first_event_at_or_after(uint64_t step);
