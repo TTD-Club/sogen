@@ -539,6 +539,7 @@ namespace sogen
         this->instrumentation_callback = 0;
         this->zw_callback_return = ntdll.find_export("ZwCallbackReturn");
         this->gdi_default_dc_handle = 0;
+        this->gdi_memory_dc_default_bitmap_handle = 0;
         this->gdi_dc_states.clear();
         this->gdi_dc_save_states.clear();
         this->gdi_bitmap_surfaces.clear();
@@ -701,6 +702,8 @@ namespace sogen
         buffer.write(this->zw_callback_return);
         buffer.write(this->dispatch_client_message);
         buffer.write(this->gdi_default_dc_handle);
+        buffer.write(this->gdi_memory_dc_default_bitmap_handle);
+        buffer.write_map(this->pending_alpc_reply_views);
         buffer.write_map(this->gdi_dc_states);
         buffer.write_map(this->gdi_dc_save_states);
         buffer.write_map(this->gdi_bitmap_surfaces);
@@ -737,13 +740,16 @@ namespace sogen
         buffer.write(this->io_completions);
         buffer.write(this->wait_completion_packets);
         buffer.write(this->worker_factories);
+        buffer.write(this->jobs);
         buffer.write(this->ports);
         buffer.write(this->mutants);
         buffer.write(this->default_desktop);
         buffer.write(this->desktops);
         buffer.write(this->windows);
+        buffer.write(this->menus);
         buffer.write(this->timers);
         buffer.write(this->accelerator_tables);
+        buffer.write(this->deferred_window_position_batches);
         buffer.write(this->registry_keys);
         buffer.write(this->private_namespaces);
         buffer.write(this->processes);
@@ -800,6 +806,8 @@ namespace sogen
         buffer.read(this->zw_callback_return);
         buffer.read(this->dispatch_client_message);
         buffer.read(this->gdi_default_dc_handle);
+        buffer.read(this->gdi_memory_dc_default_bitmap_handle);
+        buffer.read_map(this->pending_alpc_reply_views);
         buffer.read_map(this->gdi_dc_states);
         buffer.read_map(this->gdi_dc_save_states);
         buffer.read_map(this->gdi_bitmap_surfaces);
@@ -836,13 +844,16 @@ namespace sogen
         buffer.read(this->io_completions);
         buffer.read(this->wait_completion_packets);
         buffer.read(this->worker_factories);
+        buffer.read(this->jobs);
         buffer.read(this->ports);
         buffer.read(this->mutants);
         buffer.read(this->default_desktop);
         buffer.read(this->desktops);
         buffer.read(this->windows);
+        buffer.read(this->menus);
         buffer.read(this->timers);
         buffer.read(this->accelerator_tables);
+        buffer.read(this->deferred_window_position_batches);
         buffer.read(this->registry_keys);
         buffer.read(this->private_namespaces);
         buffer.read(this->processes);
@@ -894,6 +905,11 @@ namespace sogen
     void process_context::restore_after_state_restore(windows_emulator& win_emu)
     {
         restore_windows_after_state_restore(win_emu);
+
+        for (auto& device : this->devices | std::views::values)
+        {
+            device.restore_after_state_restore(win_emu);
+        }
 
         for (auto& port : this->ports | std::views::values)
         {
@@ -1029,6 +1045,8 @@ namespace sogen
             return &wait_completion_packets;
         case handle_types::worker_factory:
             return &worker_factories;
+        case handle_types::job:
+            return &jobs;
         case handle_types::registry:
             return &registry_keys;
         case handle_types::mutant:
@@ -1043,6 +1061,8 @@ namespace sogen
             return &sections;
         case handle_types::private_namespace:
             return &private_namespaces;
+        case handle_types::deferred_window_positions:
+            return &deferred_window_position_batches;
         default:
             return nullptr;
         }
