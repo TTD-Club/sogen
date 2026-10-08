@@ -27,18 +27,35 @@ namespace
     constexpr std::string_view transient_text = "SOGEN_TTD_TRANSIENT_STRING_FOR_RECOVERY";
     std::array<volatile char, transient_text.size() + 1> transient{};
 
+    volatile bool illegal_instruction_raised = false;
+
+    // Skips the two-byte ud2. A vectored handler instead of __try/__except, which MinGW does not support.
+    LONG WINAPI skip_illegal_instruction(EXCEPTION_POINTERS* exception)
+    {
+        if (exception->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION)
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        illegal_instruction_raised = true;
+#ifdef _WIN64
+        exception->ContextRecord->Rip += 2;
+#else
+        exception->ContextRecord->Eip += 2;
+#endif
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     // Unicorn cannot decode ud2 and reports no instruction size for it.
     bool raises_illegal_instruction(void* address)
     {
-        __try
+        auto* handler = AddVectoredExceptionHandler(1, skip_illegal_instruction);
+        if (!handler)
         {
-            reinterpret_cast<void (*)()>(address)();
+            return false;
         }
-        __except (GetExceptionCode() == STATUS_ILLEGAL_INSTRUCTION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
-        {
-            return true;
-        }
-        return false;
+        reinterpret_cast<void (*)()>(address)();
+        RemoveVectoredExceptionHandler(handler);
+        return illegal_instruction_raised;
     }
 
     // Live host input: ttd-input.txt next to the executable exists only when a test creates it.
@@ -69,7 +86,7 @@ namespace
         const auto window = CreateWindowExA(0, window_class.lpszClassName, "ttd-step-sample", WS_OVERLAPPEDWINDOW, 0, 0, 200, 100, nullptr,
                                             nullptr, window_class.hInstance, nullptr);
         printf("ttd-window %p\n", static_cast<void*>(window));
-        printf("ttd-ui %p\n", const_cast<uint64_t*>(&ttd_ui_value));
+        printf("ttd-ui %p\n", static_cast<void*>(const_cast<uint64_t*>(&ttd_ui_value)));
         fflush(stdout);
         for (int i = 0; i < 20 && !ttd_ui_value; ++i)
         {
@@ -100,11 +117,11 @@ int main()
         return 4;
     }
 
-    printf("ttd-value %p\n", const_cast<uint64_t*>(&ttd_value));
-    printf("ttd-info %p\n", &ttd_info);
-    printf("ttd-code %p\n", code);
-    printf("ttd-ud2 %p\n", illegal);
-    printf("ttd-input %p\n", const_cast<DWORD*>(&ttd_input_attributes));
+    printf("ttd-value %p\n", static_cast<void*>(const_cast<uint64_t*>(&ttd_value)));
+    printf("ttd-info %p\n", static_cast<void*>(&ttd_info));
+    printf("ttd-code %p\n", static_cast<void*>(code));
+    printf("ttd-ud2 %p\n", static_cast<void*>(illegal));
+    printf("ttd-input %p\n", static_cast<void*>(const_cast<DWORD*>(&ttd_input_attributes)));
     std::array<int, 4> cpu_info{};
     __cpuid(cpu_info.data(), 1);
     printf("ttd-rdrand %d\n", (cpu_info[2] >> 30) & 1);
@@ -123,8 +140,10 @@ int main()
         return 3;
     }
 
+    // ud2; ret
     illegal[0] = 0x0F;
     illegal[1] = 0x0B;
+    illegal[2] = 0xC3;
     if (!raises_illegal_instruction(illegal))
     {
         return 5;
