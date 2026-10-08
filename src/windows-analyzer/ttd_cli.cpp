@@ -331,7 +331,7 @@ namespace sogen::ttd
             for (const auto& target : recorded.checkpoints())
             {
                 const auto origin = recorded.checkpoint_for_step(target.step - 1);
-                snapshot::load_emulator_state(win_emu, origin.state);
+                snapshot::load_emulator_state(win_emu, *origin.state);
                 replay_verifier verifier(win_emu, recorded, origin.step, options.strict);
                 const ui_replay ui(win_emu, recorded.ui_inputs(), recorded.checkpoint_index(origin.step),
                                    [&verifier] { return verifier.next_event_number(); });
@@ -354,7 +354,8 @@ namespace sogen::ttd
                     return {.failure = message.str()};
                 }
                 const auto observed = snapshot::create_emulator_state(win_emu);
-                const auto expected = recorded.checkpoint_for_step(target.step).state;
+                const auto expected_state = recorded.checkpoint_for_step(target.step).state;
+                const auto& expected = *expected_state;
                 const auto [observed_end, expected_end] = std::ranges::mismatch(observed, expected);
                 if (observed_end == observed.end() && expected_end == expected.end())
                 {
@@ -586,7 +587,7 @@ namespace sogen::ttd
             return;
         }
         trace recorded(options.replay);
-        snapshot::load_emulator_state(win_emu, recorded.checkpoint_for_step(options.seek).state);
+        snapshot::load_emulator_state(win_emu, *recorded.checkpoint_for_step(options.seek).state);
     }
 
     replay_result replay(windows_emulator& win_emu, const cli_options& options)

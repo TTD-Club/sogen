@@ -281,7 +281,7 @@ namespace sogen::ttd
         require_deterministic(win_emu);
         check_manifest(win_emu, recorded);
         const auto checkpoint = recorded.checkpoint_for_step(position);
-        snapshot::load_emulator_state(win_emu, checkpoint.state);
+        snapshot::load_emulator_state(win_emu, *checkpoint.state);
         try
         {
             replay_verifier verifier(win_emu, recorded, checkpoint.step, strict);
@@ -317,7 +317,7 @@ namespace sogen::ttd
         if (restore)
         {
             check_manifest(win_emu, recorded);
-            snapshot::load_emulator_state(win_emu, recorded.checkpoint_for_step(start).state);
+            snapshot::load_emulator_state(win_emu, *recorded.checkpoint_for_step(start).state);
         }
         else
         {

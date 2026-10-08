@@ -46,7 +46,7 @@ namespace sogen::ttd
     struct checkpoint_state
     {
         uint64_t step{};
-        std::vector<std::byte> state{};
+        std::shared_ptr<const std::vector<std::byte>> state{};
     };
 
     struct self_modifying_hit
@@ -353,7 +353,7 @@ namespace sogen::ttd
         std::vector<bulk_entry> bulk_table_{};
         std::vector<cached_bulk> bulk_cache_{};
         std::vector<cached_chunk> chunk_cache_{};
-        std::optional<std::pair<uint64_t, std::vector<std::byte>>> state_cache_{};
+        std::optional<std::pair<uint64_t, std::shared_ptr<const std::vector<std::byte>>>> state_cache_{};
 
         uint64_t legacy_event_offset_{};
         uint64_t legacy_event_size_{};
@@ -370,11 +370,11 @@ namespace sogen::ttd
         std::vector<std::byte> read_bytes(uint64_t offset, uint64_t size);
         const decoded_chunk& chunk(uint32_t index);
         bulk_block bulk(uint64_t index);
-        // Blocks first to end - 1 (at most cached_bulk_blocks), decoding the uncached ones in parallel.
-        std::vector<bulk_block> bulk_range(uint64_t first, uint64_t end);
+        // The given blocks by index, decoding the uncached ones in parallel.
+        std::unordered_map<uint64_t, bulk_block> bulk_blocks(std::span<const uint64_t> indexes);
         void remember_bulk(uint64_t index, bulk_block block);
         uint32_t chunk_of(uint64_t number) const;
-        std::vector<std::byte> checkpoint_state_at(uint64_t index);
+        std::shared_ptr<const std::vector<std::byte>> checkpoint_state_at(uint64_t index);
         std::vector<number_range> candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask, uint64_t first_number,
                                              uint64_t end_number);
         std::vector<number_range> chunked_candidates(uint64_t first_page, uint64_t last_page, uint64_t kind_mask);

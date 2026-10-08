@@ -1151,20 +1151,24 @@ namespace sogen::ttd
         return block;
     }
 
-    std::vector<bulk_block> trace::bulk_range(const uint64_t first, const uint64_t end)
+    std::unordered_map<uint64_t, bulk_block> trace::bulk_blocks(const std::span<const uint64_t> indexes)
     {
-        if (end < first || end - first > cached_bulk_blocks || end > bulk_table_.size())
-        {
-            throw std::runtime_error("Invalid TTD bulk block range");
-        }
-        std::vector<bulk_block> blocks(static_cast<size_t>(end - first));
+        std::unordered_map<uint64_t, bulk_block> blocks{};
         std::vector<std::pair<uint64_t, std::future<std::vector<std::byte>>>> decoding{};
-        for (auto index = first; index < end; ++index)
+        for (const auto index : indexes)
         {
+            if (index >= bulk_table_.size())
+            {
+                throw std::runtime_error("Invalid TTD bulk block reference");
+            }
+            if (blocks.contains(index) || std::ranges::find(decoding, index, &decltype(decoding)::value_type::first) != decoding.end())
+            {
+                continue;
+            }
             const auto& entry = bulk_table_[static_cast<size_t>(index)];
             if (!entry.size || std::ranges::find(bulk_cache_, index, &cached_bulk::index) != bulk_cache_.end())
             {
-                blocks[static_cast<size_t>(index - first)] = bulk(index);
+                blocks[index] = bulk(index);
                 continue;
             }
             decoding.emplace_back(
@@ -1180,7 +1184,7 @@ namespace sogen::ttd
                 throw std::runtime_error("Cannot decompress TTD bulk block");
             }
             remember_bulk(index, block);
-            blocks[static_cast<size_t>(index - first)] = std::move(block);
+            blocks[index] = std::move(block);
         }
         return blocks;
     }
@@ -1200,12 +1204,16 @@ namespace sogen::ttd
         return static_cast<uint32_t>(next - chunks_.begin() - 1);
     }
 
-    std::vector<std::byte> trace::checkpoint_state_at(const uint64_t index)
+    std::shared_ptr<const std::vector<std::byte>> trace::checkpoint_state_at(const uint64_t index)
     {
         if (!this->chunked())
         {
             const auto& entry = checkpoints_.at(static_cast<size_t>(index));
-            return snapshot::get_emulator_state(read_bytes(entry.offset, entry.size));
+            return std::make_shared<const std::vector<std::byte>>(snapshot::get_emulator_state(read_bytes(entry.offset, entry.size)));
+        }
+        if (state_cache_ && state_cache_->first == index)
+        {
+            return state_cache_->second;
         }
 
         std::vector<uint64_t> chain{index};
@@ -1214,16 +1222,34 @@ namespace sogen::ttd
         {
             chain.push_back(checkpoints_.at(static_cast<size_t>(chain.back())).base);
         }
+        const auto from_cache = state_cache_ && state_cache_->first == chain.back();
+
         // A delta's reference is its base state followed by the bulk blocks in between. Each restored state is
         // decompressed with room for the next delta's blocks, so they can be appended in place instead of copying the
         // state into a new reference buffer.
-        const auto blocks_between = [this](const uint64_t current) {
+        const auto referenced_blocks = [this](const uint64_t current) {
             const auto base = checkpoints_.at(static_cast<size_t>(current)).base;
             if (base == no_base_checkpoint || current - base > bulk_reference_span)
             {
-                return std::vector<bulk_block>{};
+                return std::views::iota(uint64_t{0}, uint64_t{0});
             }
-            return bulk_range(base, current);
+            return std::views::iota(base, current);
+        };
+        // All deltas' blocks are decoded in parallel up front; decoding them one delta at a time took about half of a
+        // restore.
+        std::vector<uint64_t> needed{};
+        for (const auto current : std::span(chain).first(chain.size() - (from_cache ? 1 : 0)))
+        {
+            std::ranges::copy(referenced_blocks(current), std::back_inserter(needed));
+        }
+        const auto decoded = bulk_blocks(needed);
+        const auto blocks_between = [&](const uint64_t current) {
+            std::vector<bulk_block> blocks{};
+            for (const auto block : referenced_blocks(current))
+            {
+                blocks.push_back(decoded.at(block));
+            }
+            return blocks;
         };
         const auto total_size = [](const std::span<const bulk_block> blocks) {
             size_t size = 0;
@@ -1247,10 +1273,10 @@ namespace sogen::ttd
         std::vector<std::byte> state{};
         std::vector<std::byte> next{};
         std::vector<bulk_block> between{};
-        if (state_cache_ && state_cache_->first == chain.back())
+        if (from_cache)
         {
             chain.pop_back();
-            const auto& cached = state_cache_->second;
+            const auto& cached = *state_cache_->second;
             if (!chain.empty())
             {
                 between = blocks_between(chain.back());
@@ -1285,8 +1311,9 @@ namespace sogen::ttd
             }
             std::swap(state, next);
         }
-        state_cache_ = std::make_pair(index, state);
-        return state;
+        auto restored = std::make_shared<const std::vector<std::byte>>(std::move(state));
+        state_cache_ = std::make_pair(index, restored);
+        return restored;
     }
 
     std::optional<std::string_view> trace::manifest_value(const std::string_view key) const
