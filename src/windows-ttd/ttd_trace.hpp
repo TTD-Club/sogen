@@ -24,6 +24,7 @@
 #include "ttd_chunk.hpp"
 #include "ttd_compressor.hpp"
 #include "ttd_format.hpp"
+#include "ttd_keyframes.hpp"
 #include "ttd_ui.hpp"
 
 namespace sogen::ttd
@@ -330,7 +331,27 @@ namespace sogen::ttd
             return this->chunked();
         }
 
+        // The position of the checkpoint that checkpoint_for_step(step) restores, without decoding it.
+        uint64_t checkpoint_step_for(uint64_t step) const;
         checkpoint_state checkpoint_for_step(uint64_t step);
+
+        // States that replays of this trace reached, for later seeks to restore.
+        keyframe_store& keyframes()
+        {
+            return *keyframes_;
+        }
+
+        // Makes this reader use (and add to) the keyframes of another reader of the same file.
+        void share_keyframes(const trace& other)
+        {
+            keyframes_ = other.keyframes_;
+        }
+
+        const std::filesystem::path& path() const
+        {
+            return path_;
+        }
+
         std::vector<access_event> accesses(uint64_t address, uint64_t size, uint64_t first_step = 0, uint64_t last_step = UINT64_MAX,
                                            uint64_t kind_mask = all_access_kinds);
         std::optional<access_event> next_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = all_access_kinds);
@@ -380,6 +401,8 @@ namespace sogen::ttd
         std::vector<cached_bulk> bulk_cache_{};
         std::vector<cached_chunk> chunk_cache_{};
         std::optional<std::pair<uint64_t, std::shared_ptr<const std::vector<std::byte>>>> state_cache_{};
+        std::filesystem::path path_{};
+        std::shared_ptr<keyframe_store> keyframes_ = std::make_shared<keyframe_store>(default_keyframe_budget);
 
         uint64_t legacy_event_offset_{};
         uint64_t legacy_event_size_{};
@@ -482,6 +505,25 @@ namespace sogen::ttd
             return substituted_inputs_;
         }
 
+        // Whether the replay differed from the recording; finish() then throws.
+        bool diverged() const
+        {
+            return error_.has_value();
+        }
+
+        // Whether `observe_writes` sees every change to guest memory: the trace records guest and host writes.
+        bool observes_all_writes() const
+        {
+            constexpr auto writes = static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::host_write);
+            return (access_mask_ & writes) == writes;
+        }
+
+        // Called with the range of every replayed guest or host write (and so of every substitution).
+        void observe_writes(std::function<void(uint64_t address, size_t size)> observer)
+        {
+            write_observer_ = std::move(observer);
+        }
+
       private:
         windows_emulator& emu_;
         trace& trace_;
@@ -512,6 +554,7 @@ namespace sogen::ttd
         size_t next_syscall_{};
         // While a syscall's handler runs: its events, checked when it returns.
         bool in_syscall_{};
+        std::function<void(uint64_t, size_t)> write_observer_{};
         std::vector<live_event> syscall_events_{};
         std::vector<std::byte> previous_bytes_{};
         scoped_hook host_write_before_hook_{};

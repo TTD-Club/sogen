@@ -763,11 +763,30 @@ namespace sogen
 
             if (has_handle)
             {
+                const auto open = [this](const std::u16string& mode) {
 #if defined(OS_WINDOWS)
-                FILE* native_file = _wfopen(this->host_path.c_str(), reinterpret_cast<const wchar_t*>(this->open_mode.c_str()));
+                    return _wfopen(this->host_path.c_str(), reinterpret_cast<const wchar_t*>(mode.c_str()));
 #else
-                FILE* native_file = fopen(u16_to_u8(this->host_path.u16string()).c_str(), u16_to_u8(this->open_mode).c_str());
+                    return fopen(u16_to_u8(this->host_path.u16string()).c_str(), u16_to_u8(mode).c_str());
 #endif
+                };
+
+                // Reopening must not truncate the file as its "w" mode would, nor fail because a later part of the run
+                // deleted it (a replay seeking backwards); the handle then sees the host file as it is now.
+                auto reopen_mode = this->open_mode;
+                if (!reopen_mode.empty() && reopen_mode.front() == u'w')
+                {
+                    reopen_mode = u"r+" + reopen_mode.substr(reopen_mode.find(u'+') == std::u16string::npos ? 1 : 2);
+                }
+                FILE* native_file = open(reopen_mode);
+                if (!native_file)
+                {
+                    if (FILE* created = open(u"ab"))
+                    {
+                        fclose(created);
+                    }
+                    native_file = open(reopen_mode);
+                }
 
                 if (native_file)
                 {

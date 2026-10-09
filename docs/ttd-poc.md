@@ -58,8 +58,17 @@ with ttd.Trace("sample.sogttd") as trace:
     replay.seek(store.position - 1)                 # also seeks backwards
     rip = emu.read_register(sogen.Register.rip)
     # Forward from where the replay stopped, without restoring a checkpoint (a single step takes ~0.03 ms instead of
-    # a seek's 0.06-0.2 s). Refuses to move back or to go on after the emulator ran; seek after changing it.
+    # a seek's). Refuses to move back or to go on after the emulator ran; seek after changing it.
     replay.run_to(replay.position + 1)
+
+    # Keyframes: replayed states kept in memory (pages shared between them, ~0.15 MiB each), which later seeks restore
+    # instead of decoding a checkpoint and replaying from it. A seek keeps one at the last multiple of 25,000 before
+    # its target, so moving back from there is cheap. prepare_seeks replays the whole trace on extra emulators in
+    # parallel and keeps one at every multiple; afterwards a seek anywhere takes about 30 ms. Keyframes belong to the
+    # Trace object (all its replays share them) and the least recently used are dropped beyond keyframe_budget (1 GiB;
+    # 0 turns them off).
+    trace.prepare_seeks([ttd.create_emulator("c:/sample.exe", emulation_root="root") for _ in range(8)])
+    print(trace.keyframe_count, trace.keyframe_memory >> 20, "MiB")
 
     # Replay scans: each replays the whole trace with verification and leaves the emulator at its end.
     strings = replay.strings(minimum_length=6)       # RecoveredString: address, position, encoding, value
@@ -510,12 +519,33 @@ unfiltered). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take
 Address queries decode their candidate chunks on all cores, and queries for
 execute events only (`Trace.calls`) skip the chunks' data: the calls of a hot
 ntdll function (`RtlAllocateHeap`, 3,144 calls on a page most chunks touch)
-take 0.16 s, all accesses of that page 0.31 s (1.4 s and 1.2 s on one thread). A
-seek to a checkpoint takes 0.03-0.2 s (0.12 s on average over random
-checkpoints; up to 18 deltas, each decompressed with its base state and bulk
-blocks as the reference; all bulk blocks of a chain decode in parallel up
-front), plus up to 0.15 s to replay to a position between checkpoints.
-`Replay.run_to` moves forward without restoring: about 0.03 ms per step.
+take 0.16 s, all accesses of that page 0.31 s (1.4 s and 1.2 s on one thread).
+
+Seeks restore the nearest earlier state and replay from it with full verification
+(about 2.5-3M instructions/s). Without keyframes that state is a checkpoint:
+decoding one takes up to 18 zstd deltas against 64-98 MB states (about 0.1 s),
+loading it about 0.03 s (mappings that stay the same are kept and only changed
+pages written), and the replay up to 0.2 s (500,000 instructions). Keyframes
+(`ttd_keyframes.hpp`) are replayed states kept in memory: guest memory as 4 KiB
+pages shared by content across keyframes, the rest of the state (handles,
+threads, modules) as a zstd delta against an earlier keyframe's. Restoring one
+writes only the pages that differ from what the emulator holds; after a seek the
+emulator's state is known (keyframe plus the pages the replay wrote, checked by
+a memory generation counter that any other change to the emulator advances), so
+the next restore neither compares nor writes the rest. Measured on a full
+`test-sample` trace (30.2M instructions, 61 checkpoints at 500,000) with 60
+random positions each, same machine and load:
+
+| | Mean | Median | p90 |
+|---|---|---|---|
+| Random position, before keyframes | 256 ms | 259 ms | 388 ms |
+| Random position, cold (no keyframes yet) | 215 ms | 224 ms | 390 ms |
+| Random position after `prepare_seeks` (8 emulators, 5.6 s, 1,257 keyframes, 184 MiB) | 36 ms | 30 ms | 62 ms |
+| Checkpoint position after `prepare_seeks` | 25 ms | 23 ms | 44 ms |
+
+After preparation a seek spends about 20 ms restoring (mostly Unicorn
+remapping regions whose layout differs) and the rest replaying up to 25,000
+instructions. `Replay.run_to` moves forward without restoring: about 0.03 ms per step.
 
 Because every written and read value is recorded, a range's value history is
 available offline: `--ttd-history TRACE --ttd-address A --ttd-size N`
@@ -599,7 +629,8 @@ are wall clock, including process start; cdb's start (~0.3 s) is subtracted from
 | Trace after zstd 19 | 4.0 MiB | 5.75 MiB | 17.9 MiB | 33.4 MiB |
 | Bits per instruction, as stored | 214 | 13.1 | 92.7 | 9.5 |
 | Index | 30.4 MiB, built in ~0.2 s | in the trace | 87.5 MiB, ~0.2 s | in the trace (0.06 MiB) |
-| Seek to the middle / end | < 0.05 s | | < 0.05 s | 0.29 / 0.40 s |
+| Seek to the middle / end | < 0.05 s | | 0.031 / 0.068 s | 0.29 / 0.40 s; 0.012 / 0.042 s after `prepare_seeks` |
+| Seek to 40 random positions, mean / median | | | 34–40 / 30–35 ms, with or without the index | 215 / 224 ms; 36 / 30 ms after `prepare_seeks` |
 | Writes / reads in the main image | | | 38 / 3,515, ~0.07 s each | 280 / 19,648, 0.06 / 0.48 s |
 
 Caveats: Sogen's runs execute about 4× the instructions of the native ones (its emulated loader and environment
@@ -613,8 +644,37 @@ Summary: Microsoft TTD records about 7× slower than native (≈10M instructions
 instructions/s (1.5M before the recorder work in `3ce3b19d`..`da4cc31f`), roughly 3× slower than its own untraced
 emulation (3.9 s) and over 100× slower than native. Per
 instruction, Sogen's traces are 10–16× smaller than Microsoft's files as written and 2.3–2.7× smaller than
-Microsoft's after zstd, before counting Microsoft's index. Microsoft seeks faster (its keyframes are much denser than
-Sogen's 500,000-instruction checkpoints); address queries are comparable.
+Microsoft's after zstd, before counting Microsoft's index. Microsoft's seeks are fast on a fresh trace and do not use
+the index (timed with `!tt` in cdb from a WinDbg script, `.run` alone or with its `.idx`: the same 34–40 ms mean); its
+keyframes are in the trace and much denser than Sogen's 500,000-instruction checkpoints. Sogen's seeks match them only
+after `Trace.prepare_seeks` (5.6 s on eight emulators for `test-sample`, a step Microsoft does not need) and are
+about 6× slower before that. Address queries are comparable.
+
+### Memory queries and watchpoints
+
+Measured on 2026-10-08 with `tools/msttd_query_times.js` (cdb, Microsoft's `.run` with and without its `.idx`) and
+`tools/ttd_query_times.py` (Sogen, cold and after `prepare_seeks` with eight emulators) on the `test-sample` traces
+above. Targets come from each trace's main image: its entry point, its first IAT slot, the start and the most accessed
+qword of `.data`, and `ntdll!RtlAllocateHeap` (the same host DLL in both). Microsoft's watchpoints are `ba` plus
+`g`/`g-` from the trace's start/end, continuing past the exceptions test-sample raises on purpose (each stops the
+replay); Sogen's are `next_access`/`previous_access`, which answer offline, plus a seek to the hit. Microsoft's trace
+has 6.9M instructions, Sogen's 30.2M, so Sogen's queries cover over 4× more events. Single runs, milliseconds.
+
+| | Microsoft, no index | Microsoft, index | Sogen, cold | Sogen, prepared |
+|---|---|---|---|---|
+| All accesses to `.data` (1,584 bytes) | 89 | 89 | 72 | 77 |
+| All accesses to a qword (2-170 hits) | 81-99 | 71-84 | 22-99 | 17-117 |
+| All executions of `RtlAllocateHeap` (6,520 / 16,915) | 100 | 97 | 383 | 303 |
+| Execute watchpoint, forward (entry / `RtlAllocateHeap`) | 159 / 4 | 160 / 2 | 7 + 198 / 18 + 51 seek | 6 + 17 / 18 + 30 seek |
+| Execute watchpoint, backward | 568 / 614 | 406 / 621 | 164 + 12 / 2 + 390 seek | 124 + 12 / 2 + 85 seek |
+| Read/write watchpoints, forward | 7-426 | 6-439 | 6-58 + 12-224 seek | 0-49 + 12-33 seek |
+| Read/write watchpoints, backward | 71-615 | 70-598 | 5-193 + 11-312 seek | 2-193 + 11-86 seek |
+| Value of a qword at a random position (seek + read) | 31-39 | 32-38 | 139-208 | 26-32 |
+| The same offline, from `Trace.history` (bytes accessed so far) | | | 22-42 | 6-17 |
+
+The index changes little at this size: Microsoft's unindexed queries scan the 76 MiB trace in under 0.1 s. Where Sogen
+answers a query offline it is as fast or faster; where the answer needs the emulator at a position (a value at a
+position, landing on a watchpoint hit), Sogen pays a seek, which is 4-6× Microsoft's until the trace is prepared.
 
 ## Binary Ninja TTD adapter comparison
 

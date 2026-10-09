@@ -778,7 +778,8 @@ namespace sogen::ttd
     }
 
     trace::trace(const std::filesystem::path& path)
-        : file_(path, std::ios::binary)
+        : file_(path, std::ios::binary),
+          path_(path)
     {
         if (!file_)
         {
@@ -1490,7 +1491,7 @@ namespace sogen::ttd
         return static_cast<uint64_t>(entry - checkpoints_.begin());
     }
 
-    checkpoint_state trace::checkpoint_for_step(const uint64_t step)
+    uint64_t trace::checkpoint_step_for(const uint64_t step) const
     {
         if (step > metadata_.instruction_count)
         {
@@ -1500,8 +1501,12 @@ namespace sogen::ttd
         {
             throw std::out_of_range("TTD position is before the start of the trace");
         }
-        const auto next = std::ranges::upper_bound(checkpoints_, step, {}, &checkpoint_entry::step);
-        const auto index = static_cast<uint64_t>(next - checkpoints_.begin() - 1);
+        return std::prev(std::ranges::upper_bound(checkpoints_, step, {}, &checkpoint_entry::step))->step;
+    }
+
+    checkpoint_state trace::checkpoint_for_step(const uint64_t step)
+    {
+        const auto index = this->checkpoint_index(this->checkpoint_step_for(step));
         return {.step = checkpoints_[static_cast<size_t>(index)].step, .state = checkpoint_state_at(index)};
     }
 
@@ -2241,6 +2246,10 @@ namespace sogen::ttd
         if (error_ || !size || substituting_)
         {
             return;
+        }
+        if (write_observer_ && (kind == access_kind::write || kind == access_kind::host_write))
+        {
+            write_observer_(address, size);
         }
         access_event observed{.step = emu_.get_executed_instructions(),
                               .ip = emu_.emu().read_instruction_pointer(),

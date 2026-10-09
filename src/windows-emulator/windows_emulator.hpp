@@ -434,6 +434,10 @@ namespace sogen
         void serialize(utils::buffer_serializer& buffer) const;
         void deserialize(utils::buffer_deserializer& buffer);
 
+        // The same state without the contents of committed guest memory, which a restore takes from `pages`.
+        void serialize_without_memory_contents(utils::buffer_serializer& buffer) const;
+        void deserialize_without_memory_contents(utils::buffer_deserializer& buffer, const restored_page_source& pages);
+
         void save_snapshot();
         void restore_snapshot();
 
@@ -524,6 +528,8 @@ namespace sogen
         void track_section_first_execution(uint64_t address);
 
         void register_factories(utils::buffer_deserializer& buffer);
+        void serialize_state(utils::buffer_serializer& buffer, bool memory_contents) const;
+        void deserialize_state(utils::buffer_deserializer& buffer, const std::function<void()>& restore_memory);
     };
 
 } // namespace sogen

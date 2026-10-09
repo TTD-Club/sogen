@@ -1814,6 +1814,26 @@ namespace sogen
 
     void windows_emulator::serialize(utils::buffer_serializer& buffer) const
     {
+        this->serialize_state(buffer, true);
+    }
+
+    void windows_emulator::serialize_without_memory_contents(utils::buffer_serializer& buffer) const
+    {
+        this->serialize_state(buffer, false);
+    }
+
+    void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
+    {
+        this->deserialize_state(buffer, [&] { this->memory.deserialize_memory_state(buffer, false); });
+    }
+
+    void windows_emulator::deserialize_without_memory_contents(utils::buffer_deserializer& buffer, const restored_page_source& pages)
+    {
+        this->deserialize_state(buffer, [&] { this->memory.deserialize_memory_state(buffer, pages); });
+    }
+
+    void windows_emulator::serialize_state(utils::buffer_serializer& buffer, const bool memory_contents) const
+    {
         buffer.write(this->application_settings_);
         buffer.write(this->setup_completed_);
         buffer.write(this->executed_instructions_);
@@ -1826,13 +1846,13 @@ namespace sogen
 
         // Backend snapshot mode is not used here; Unicorn's in-place snapshot path is broken.
         this->emu().serialize_state(buffer, false);
-        this->memory.serialize_memory_state(buffer, false);
+        this->memory.serialize_memory_state(buffer, !memory_contents);
         this->mod_manager.serialize(buffer);
         this->dispatcher.serialize(buffer);
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
     }
 
-    void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
+    void windows_emulator::deserialize_state(utils::buffer_deserializer& buffer, const std::function<void()>& restore_memory)
     {
         this->register_factories(buffer);
 
@@ -1854,7 +1874,6 @@ namespace sogen
         this->registry.deserialize_runtime_state(buffer);
 
         this->process.prepare_for_state_restore(*this);
-        this->memory.unmap_all_memory();
         this->clear_section_first_execution_hooks();
         this->ui().reset();
         this->audio().stop();
@@ -1862,7 +1881,7 @@ namespace sogen
 
         // Match raw serialize() above; do not use backend snapshot mode here.
         this->emu().deserialize_state(buffer, false);
-        this->memory.deserialize_memory_state(buffer, false);
+        restore_memory();
         this->mod_manager.deserialize(buffer);
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
@@ -1913,7 +1932,6 @@ namespace sogen
         this->registry.deserialize_runtime_state(buffer);
 
         this->process.prepare_for_state_restore(*this);
-        this->memory.unmap_all_memory();
         this->clear_section_first_execution_hooks();
         this->ui().reset();
         this->audio().stop();

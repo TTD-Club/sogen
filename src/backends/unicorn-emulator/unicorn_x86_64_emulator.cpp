@@ -2,6 +2,7 @@
 #include "unicorn_x86_64_emulator.hpp"
 
 #include <array>
+#include <atomic>
 #include <ranges>
 #include <optional>
 
@@ -233,6 +234,7 @@ namespace sogen::unicorn
                 this->violation_ip_ = std::nullopt;
 
                 constexpr auto end = std::numeric_limits<uint64_t>::max();
+                this->touch_memory();
                 const auto res = uc_emu_start(*this, start, end, 0, count);
                 if (res == UC_ERR_OK)
                 {
@@ -377,6 +379,7 @@ namespace sogen::unicorn
                     .write = mmio_callbacks::write_wrapper(std::move(write_wrapper)),
                 };
 
+                this->touch_memory();
                 uce(uc_mmio_map(*this, address, size, cb.read.get_c_function(), cb.read.get_user_data(), cb.write.get_c_function(),
                                 cb.write.get_user_data()));
 
@@ -385,16 +388,19 @@ namespace sogen::unicorn
 
             void map_memory(const uint64_t address, const size_t size, memory_permission permissions) override
             {
+                this->touch_memory();
                 uce(uc_mem_map(*this, address, size, static_cast<uint32_t>(permissions)));
             }
 
             void map_host_memory(const uint64_t address, const size_t size, void* host_pointer, memory_permission permissions) override
             {
+                this->touch_memory();
                 uce(uc_mem_map_ptr(*this, address, size, static_cast<uint32_t>(permissions), host_pointer));
             }
 
             void unmap_memory(const uint64_t address, const size_t size) override
             {
+                this->touch_memory();
                 uce(uc_mem_unmap(*this, address, size));
 
                 const auto mmio_entry = this->mmio_.find(address);
@@ -416,6 +422,7 @@ namespace sogen::unicorn
 
             bool try_write_memory(const uint64_t address, const void* data, const size_t size) override
             {
+                this->touch_memory();
                 this->notify_host_write(address, data, size, true);
                 if (uc_mem_write(*this, address, data, size) != UC_ERR_OK)
                 {
@@ -427,6 +434,7 @@ namespace sogen::unicorn
 
             void write_memory(const uint64_t address, const void* data, const size_t size) override
             {
+                this->touch_memory();
                 this->notify_host_write(address, data, size, true);
                 uce(uc_mem_write(*this, address, data, size));
                 this->notify_host_write(address, data, size, false);
@@ -455,6 +463,7 @@ namespace sogen::unicorn
 
             void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
             {
+                this->touch_memory();
                 uce(uc_mem_protect(*this, address, size, static_cast<uint32_t>(permissions)));
             }
 
@@ -806,8 +815,14 @@ namespace sogen::unicorn
                     throw std::runtime_error("Unable to deserialize after snapshot was taken!");
                 }
 
+                this->touch_memory();
                 const uc_context_serializer serializer(this->uc_, is_snapshot);
                 serializer.deserialize(buffer);
+            }
+
+            std::optional<uint64_t> get_memory_generation() const override
+            {
+                return this->memory_generation_;
             }
 
             std::vector<std::byte> save_registers() const override
@@ -857,6 +872,18 @@ namespace sogen::unicorn
             std::vector<std::unique_ptr<hook_object>> hooks_{};
             std::vector<host_write_hook*> host_write_hooks_{};
             std::unordered_map<uint64_t, mmio_callbacks> mmio_{};
+            uint64_t memory_generation_{next_memory_generation()};
+
+            static uint64_t next_memory_generation()
+            {
+                static std::atomic<uint64_t> generation{};
+                return ++generation;
+            }
+
+            void touch_memory()
+            {
+                this->memory_generation_ = next_memory_generation();
+            }
 
             static uint64_t calc_end_address(const uint64_t address, uint64_t size)
             {
