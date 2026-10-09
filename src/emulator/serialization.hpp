@@ -107,6 +107,12 @@ namespace sogen
                 this->write(buffer.data(), buffer.size());
             }
 
+            // Appends the output of another serializer as if its writes had been made here.
+            void append_serialized(const std::span<const std::byte> serialized)
+            {
+                this->buffer_.insert(this->buffer_.end(), serialized.begin(), serialized.end());
+            }
+
             template <typename T>
                 requires(!is_optional<T>::value)
             void write(const T& object)
@@ -349,6 +355,24 @@ namespace sogen
             {
                 const auto span = this->read_data(length);
                 memcpy(data, span.data(), length);
+            }
+
+            // The bytes read since get_offset() returned `offset`.
+            std::span<const std::byte> read_since(const size_t offset) const
+            {
+                return this->buffer_.subspan(offset, this->offset_ - offset);
+            }
+
+            // Consumes `serialized` (the output of a serializer) if the buffer continues with exactly those bytes.
+            bool skip_serialized(const std::span<const std::byte> serialized)
+            {
+                const auto remaining = this->buffer_.subspan(this->offset_);
+                if (remaining.size() < serialized.size() || memcmp(remaining.data(), serialized.data(), serialized.size()) != 0)
+                {
+                    return false;
+                }
+                this->offset_ += serialized.size();
+                return true;
             }
 
             template <typename T>
