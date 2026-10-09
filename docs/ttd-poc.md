@@ -629,7 +629,8 @@ are wall clock, including process start; cdb's start (~0.3 s) is subtracted from
 | Trace after zstd 19 | 4.0 MiB | 5.75 MiB | 17.9 MiB | 33.4 MiB |
 | Bits per instruction, as stored | 214 | 13.1 | 92.7 | 9.5 |
 | Index | 30.4 MiB, built in ~0.2 s | in the trace | 87.5 MiB, ~0.2 s | in the trace (0.06 MiB) |
-| Seek to the middle / end | < 0.05 s | | < 0.05 s | 0.29 / 0.40 s; 0.012 / 0.042 s after `prepare_seeks` |
+| Seek to the middle / end | < 0.05 s | | 0.031 / 0.068 s | 0.29 / 0.40 s; 0.012 / 0.042 s after `prepare_seeks` |
+| Seek to 40 random positions, mean / median | | | 34–40 / 30–35 ms, with or without the index | 215 / 224 ms; 36 / 30 ms after `prepare_seeks` |
 | Writes / reads in the main image | | | 38 / 3,515, ~0.07 s each | 280 / 19,648, 0.06 / 0.48 s |
 
 Caveats: Sogen's runs execute about 4× the instructions of the native ones (its emulated loader and environment
@@ -643,10 +644,11 @@ Summary: Microsoft TTD records about 7× slower than native (≈10M instructions
 instructions/s (1.5M before the recorder work in `3ce3b19d`..`da4cc31f`), roughly 3× slower than its own untraced
 emulation (3.9 s) and over 100× slower than native. Per
 instruction, Sogen's traces are 10–16× smaller than Microsoft's files as written and 2.3–2.7× smaller than
-Microsoft's after zstd, before counting Microsoft's index. Microsoft seeks fast on a fresh trace (its keyframes are much
-denser than Sogen's 500,000-instruction checkpoints); Sogen's seeks match it once `Trace.prepare_seeks` has built
-keyframes (5.6 s on eight emulators for `test-sample`, where Microsoft builds its index in ~0.2 s), and are 4-8×
-slower before that. Address queries are comparable.
+Microsoft's after zstd, before counting Microsoft's index. Microsoft's seeks are fast on a fresh trace and do not use
+the index (timed with `!tt` in cdb from a WinDbg script, `.run` alone or with its `.idx`: the same 34–40 ms mean); its
+keyframes are in the trace and much denser than Sogen's 500,000-instruction checkpoints. Sogen's seeks match them only
+after `Trace.prepare_seeks` (5.6 s on eight emulators for `test-sample`, a step Microsoft does not need) and are
+about 6× slower before that. Address queries are comparable.
 
 ## Binary Ninja TTD adapter comparison
 
