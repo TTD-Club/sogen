@@ -58,6 +58,7 @@ namespace sogen
     // `size` is the instruction's length, or 0 when the backend cannot decode it (the instruction then raises an exception).
     using memory_execution_metadata_callback = std::function<void(cpu_interface& cpu, uint64_t address, size_t size)>;
     using memory_execution_hook_callback = std::function<void(cpu_interface& cpu, uint64_t address)>;
+    using memory_access_range_callback = std::function<void(cpu_interface& cpu, uint64_t address, size_t size)>;
 
     using memory_violation_hook_callback = std::function<memory_violation_continuation(
         cpu_interface& cpu, uint64_t address, size_t size, memory_operation operation, memory_violation_type type)>;
@@ -109,6 +110,13 @@ namespace sogen
         virtual emulator_hook* hook_memory_execution_metadata(memory_execution_metadata_callback /*callback*/)
         {
             throw std::runtime_error("This backend cannot report instruction execution metadata");
+        }
+
+        // Called before each guest read of the range (in the same pieces hook_memory_read_data reports), so the callback
+        // can still change the memory the read returns.
+        virtual emulator_hook* hook_memory_read_before(uint64_t /*address*/, uint64_t /*size*/, memory_access_range_callback /*callback*/)
+        {
+            throw std::runtime_error("This backend cannot report reads before they happen");
         }
 
         // Reports writes made through the memory interface (syscall handlers, loaders, exception dispatch), which

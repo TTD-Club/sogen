@@ -320,6 +320,7 @@ namespace sogen::unicorn
             size_t write_raw_register(const int reg, const void* value, const size_t size) override
             {
                 auto result_size = size;
+                ++this->register_generation_;
                 uce(uc_reg_write2(*this, reg, value, &result_size));
 
                 if (size < result_size)
@@ -704,6 +705,25 @@ namespace sogen::unicorn
                 return this->hook_memory_data(UC_HOOK_MEM_READ_AFTER, memory_operation::read, address, size, std::move(callback));
             }
 
+            emulator_hook* hook_memory_read_before(const uint64_t address, const uint64_t size,
+                                                   memory_access_range_callback callback) override
+            {
+                auto read_wrapper = [c = std::move(callback), this](uc_engine*, const uc_mem_type type, const uint64_t addr,
+                                                                    const int length, const int64_t) {
+                    if (map_memory_operation(type) == memory_operation::read && length > 0)
+                    {
+                        c(*this, addr, static_cast<size_t>(length));
+                    }
+                };
+                function_wrapper<void, uc_engine*, uc_mem_type, uint64_t, int, int64_t> wrapper(std::move(read_wrapper));
+                unicorn_hook hook{*this};
+                uce(uc_hook_add(*this, hook.make_reference(), UC_HOOK_MEM_READ, wrapper.get_function(), wrapper.get_user_data(), address,
+                                calc_end_address(address, size)));
+                auto* container = this->create_hook_container();
+                container->add(std::move(wrapper), std::move(hook));
+                return container->as_opaque_hook();
+            }
+
             emulator_hook* hook_memory_write_data(const uint64_t address, const uint64_t size,
                                                   memory_access_data_callback callback) override
             {
@@ -816,6 +836,7 @@ namespace sogen::unicorn
                 }
 
                 this->touch_memory();
+                ++this->register_generation_;
                 const uc_context_serializer serializer(this->uc_, is_snapshot);
                 serializer.deserialize(buffer);
             }
@@ -823,6 +844,11 @@ namespace sogen::unicorn
             std::optional<uint64_t> get_memory_generation() const override
             {
                 return this->memory_generation_;
+            }
+
+            std::optional<uint64_t> get_register_generation() const override
+            {
+                return this->register_generation_;
             }
 
             std::vector<std::byte> save_registers() const override
@@ -836,6 +862,7 @@ namespace sogen::unicorn
             void restore_registers(const std::vector<std::byte>& register_data) override
             {
                 utils::buffer_deserializer buffer{register_data};
+                ++this->register_generation_;
                 const uc_context_serializer serializer(this->uc_, false);
                 serializer.deserialize(buffer);
             }
@@ -873,6 +900,7 @@ namespace sogen::unicorn
             std::vector<host_write_hook*> host_write_hooks_{};
             std::unordered_map<uint64_t, mmio_callbacks> mmio_{};
             uint64_t memory_generation_{next_memory_generation()};
+            uint64_t register_generation_{};
 
             static uint64_t next_memory_generation()
             {

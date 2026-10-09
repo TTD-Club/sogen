@@ -40,6 +40,13 @@ namespace sogen
         {
             return std::nullopt;
         }
+
+        // A value that changes whenever the host sets CPU registers (a register write, a register or state restore);
+        // guest instructions leave it alone. Nothing when the backend does not track it.
+        virtual std::optional<uint64_t> get_register_generation() const
+        {
+            return std::nullopt;
+        }
     };
 
 } // namespace sogen
