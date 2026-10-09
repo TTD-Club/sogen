@@ -514,6 +514,14 @@ namespace sogen
         std::string last_stop_detail_{};
 
         std::map<uint64_t, std::vector<emulator_hook*>> section_first_execution_hooks_{};
+        // A section that already executed, so instructions in it skip first-execution tracking until modules change.
+        uint64_t executed_section_start_{};
+        uint64_t executed_section_size_{};
+
+        void forget_executed_section()
+        {
+            this->executed_section_size_ = 0;
+        }
 
         void setup_hooks();
         void setup_process();

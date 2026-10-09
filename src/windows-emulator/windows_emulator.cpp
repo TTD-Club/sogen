@@ -967,9 +967,10 @@ namespace sogen
 
         ++this->executed_instructions_;
         thread.previous_ip = thread.current_ip;
-        thread.current_ip = vcpu.cpu.read_instruction_pointer();
+        // The backend reports instructions with the instruction pointer at their address.
+        thread.current_ip = address;
 
-        if (!this->uses_section_first_execution_hooks())
+        if (!this->uses_section_first_execution_hooks() && address - this->executed_section_start_ >= this->executed_section_size_)
         {
             this->track_section_first_execution(address);
         }
@@ -1005,6 +1006,9 @@ namespace sogen
 
             if (section.first_execute.has_value())
             {
+                // Instructions in this section need no tracking until modules change.
+                this->executed_section_start_ = section.region.start;
+                this->executed_section_size_ = section.region.length;
                 return;
             }
 
@@ -1025,6 +1029,7 @@ namespace sogen
 
     void windows_emulator::clear_section_first_execution_hooks()
     {
+        this->forget_executed_section();
         for (const auto& hooks : this->section_first_execution_hooks_ | std::views::values)
         {
             for (auto* hook : hooks)
@@ -1089,6 +1094,7 @@ namespace sogen
     void windows_emulator::setup_hooks()
     {
         this->callbacks.on_module_load.add([this](mapped_module& mod) {
+            this->forget_executed_section();
             for (size_t i = 0; i < mod.sections.size(); ++i)
             {
                 this->install_section_first_execution_hook(mod, i);
@@ -1096,6 +1102,7 @@ namespace sogen
         });
 
         this->callbacks.on_module_unload.add([this](mapped_module& mod) {
+            this->forget_executed_section();
             const auto hooks = this->section_first_execution_hooks_.extract(mod.image_base);
             if (hooks)
             {

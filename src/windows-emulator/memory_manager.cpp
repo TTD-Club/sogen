@@ -179,8 +179,6 @@ namespace sogen
             return;
         }
 
-        std::vector<uint8_t> data{};
-
         for (const auto& reserved_region : this->reserved_regions_)
         {
             if (reserved_region.second.kind == memory_region_kind::mmio)
@@ -190,11 +188,8 @@ namespace sogen
 
             for (const auto& region : reserved_region.second.committed_regions)
             {
-                data.resize(region.second.length);
-
-                this->read_memory(region.first, data.data(), region.second.length);
-
-                buffer.write(data.data(), region.second.length);
+                buffer.write_in_place(region.second.length,
+                                      [&](std::byte* data) { this->read_memory(region.first, data, region.second.length); });
             }
         }
     }

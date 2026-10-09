@@ -109,6 +109,25 @@ namespace sogen
                 this->buffer_.insert(this->buffer_.end(), byte_buffer, byte_buffer + length);
             }
 
+            // Like write() of `length` bytes, which `fill` stores straight into the buffer, saving a copy of large data.
+            template <typename F>
+            void write_in_place(const size_t length, F&& fill)
+            {
+                const auto old_size_remainder = static_cast<uint8_t>(length);
+                constexpr auto check_size = sizeof(old_size_remainder);
+
+                if (this->break_offset_ && this->buffer_.size() <= *this->break_offset_ &&
+                    this->buffer_.size() + length + check_size > *this->break_offset_)
+                {
+                    throw std::runtime_error("Break offset reached!");
+                }
+
+                this->buffer_.push_back(static_cast<std::byte>(old_size_remainder));
+                const auto offset = this->buffer_.size();
+                this->buffer_.resize(offset + length);
+                std::forward<F>(fill)(this->buffer_.data() + offset);
+            }
+
             void write(const buffer_serializer& object)
             {
                 const auto& buffer = object.get_buffer();
