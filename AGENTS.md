@@ -54,3 +54,17 @@ perfectly good change; a change that sprinkles comments over otherwise readable 
 
 - Run clang-format on changed files to ensure consistent formatting
 - Do not use shortcuts or workarounds. Always prefer clean and idiomatic solutions.
+
+## Issues and pull requests
+
+These apply whenever GitHub tooling (e.g. the `gh` CLI or a GitHub integration) is available.
+
+- When you identify a problem, open item, or follow-up you are not fixing in the current change, open a GitHub
+  issue for it instead of only noting it locally. Check existing issues first to avoid duplicates, and close or
+  update issues that your change resolves.
+- New code changes go through a pull request before they are merged. Do not push changes directly to `main`;
+  work on a branch, open a PR against `main`, and merge only after CI passes. Bringing upstream
+  (`momo5502/sogen`) changes into `main` is the exception when it is a fast-forward; a sync that needs a merge
+  commit or conflict resolution goes through a PR too.
+- A PR description names every issue it resolves with a closing keyword (`Fixes #12`, `Closes #34`) so the issue
+  closes on merge, and links issues it only touches (`Related to #56`).
