@@ -49,6 +49,8 @@ with ttd.Trace("sample.sogttd") as trace:
     for call in trace.calls("ntdll!NtCreateFile", start=0, end=None):
         print(call.position, trace.thread_at(call.position))
     module, export = trace.find_exports("kernel32!CreateFileW")[0]   # address: module.base + export.rva
+    # A forwarded export names its target (export.forwarder, e.g. "ntdll.dll!RtlAllocateHeap" for kernel32's
+    # HeapAlloc), and calls() of it are the target's calls while both modules are mapped.
 
     # Replay: every recorded event is verified on the way; ttd.DivergenceError (a RuntimeError) names the first
     # divergence. Syscalls whose live writes or result differ (a network answer, a missing file) and host writes with
@@ -448,6 +450,15 @@ found through the section table (24-byte entries `type, offset, size`):
   varint length and UTF-8 bytes (empty for an export by ordinal only, read as
   `#<ordinal>`). `test-sample`: 27,250 exports of 50 modules, 150 KB (0.4% of
   the trace; 208 KB as one varint stream in RVA order).
+- Export forwarders (type 12, size = compressed bytes; absent in older
+  traces): the targets of forwarded exports, whose RVA points at a forwarder
+  string inside the export directory. One zstd frame of varints: the module
+  count, then per module the number of forwarded exports and per forwarded
+  export, in ordinal order, the ordinal delta and the target as a length and
+  UTF-8 bytes. The target is `module.dll!name` or `module.dll!#<ordinal>`, the
+  module lower case and an API set contract resolved to its host module with
+  the recording's API set schema (left as written when the schema has no
+  host). `test-sample`: 1,566 forwarders, 9 KB.
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host

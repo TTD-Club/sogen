@@ -291,6 +291,22 @@ def main() -> None:
         assert trace.symbol(store.ip, store.position).lower().startswith(sample_name)
         assert trace.symbol(0x10, store.position) is None and trace.find_exports("kernel32!NoSuchExport") == []
 
+        # Forwarded exports name their targets, API sets resolved, and their calls are the target's.
+        assert [{e.ordinal: e.forwarder for e in m.exports if e.forwarder} for m in modules] == [
+            m.get("forwarders", {}) for m in mirror_trace.modules]
+        forwarded = [e for m in modules for e in m.exports if e.forwarder]
+        assert len(forwarded) > 100 and all("!" in e.forwarder for e in forwarded), forwarded[:5]
+        assert sum(e.forwarder.startswith(("api-", "ext-")) for e in forwarded) < len(forwarded) // 10, forwarded[:5]
+        (kernel32, heap_alloc), = trace.find_exports("kernel32!HeapAlloc")
+        assert heap_alloc.forwarder == "ntdll.dll!RtlAllocateHeap", heap_alloc
+        # Before kernel32 loads, ntdll's function runs but kernel32's name for it does not exist yet.
+        positions = lambda name, start=0: [(c.position, c.address) for c in trace.calls(name, start=start)]
+        allocations = positions("ntdll!RtlAllocateHeap", kernel32.load_position)
+        assert allocations and positions("kernel32!HeapAlloc") == allocations
+        assert positions("HeapAlloc") == positions("RtlAllocateHeap", kernel32.load_position) == allocations
+        assert not (trace.symbol(kernel32.base + heap_alloc.rva, allocations[0][0]) or "").lower().endswith("!heapalloc")
+        assert [(m.name, e.name) for m, e in trace.find_exports(f"kernel32!#{heap_alloc.ordinal}")] == [(kernel32.name, "HeapAlloc")]
+
         # Live input that changes a syscall's outcome: ttd-input.txt exists while recording and is gone for the replay,
         # so NtQueryAttributesFile fails and writes nothing. A strict replay names the syscall; others undo its live
         # effects, give the guest the recorded output and status, and go on to the end.

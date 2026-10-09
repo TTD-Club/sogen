@@ -85,6 +85,10 @@ namespace sogen::ttd
         uint64_t rva{};
         uint64_t ordinal{};
         std::string name{};
+        // For an export the loader resolves in another module, that export as "module.dll!name" or
+        // "module.dll!#<ordinal>", with an API set name already resolved to its host module; then `rva` points at the
+        // forwarder string. Empty otherwise.
+        std::string forwarder{};
     };
 
     // A module mapped into the process: present from load_step (after load_event_number events; the start of the trace
@@ -133,6 +137,12 @@ namespace sogen::ttd
     // of the decoded modules.
     std::vector<std::byte> encode_exports(std::span<const module_entry> modules);
     void decode_exports(std::span<const std::byte> compressed, std::span<module_entry> modules);
+
+    // The export forwarders section is a zstd frame of varints: the module count (that of the modules section), then
+    // per module the number of forwarded exports and per forwarded export, in ordinal order, the ordinal delta and the
+    // forwarder as a length and UTF-8 bytes. decode_export_forwarders fills them into the decoded exports.
+    std::vector<std::byte> encode_export_forwarders(std::span<const module_entry> modules);
+    void decode_export_forwarders(std::span<const std::byte> compressed, std::span<module_entry> modules);
 
     // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
     // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.

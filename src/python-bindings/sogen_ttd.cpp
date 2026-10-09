@@ -405,9 +405,19 @@ namespace sogen::py
                 .def_ro("rva", &ttd::module_export::rva)
                 .def_ro("ordinal", &ttd::module_export::ordinal)
                 .def_ro("name", &ttd::module_export::name, "#<ordinal> for an export by ordinal only")
+                .def_prop_ro(
+                    "forwarder",
+                    [](const ttd::module_export& self) { return self.forwarder.empty() ? std::nullopt : std::optional(self.forwarder); },
+                    "For a forwarded export, its target as module.dll!name (API sets resolved), or None; rva then points "
+                    "at the forwarder string")
                 .def("__repr__", [](const ttd::module_export& self) {
                     std::ostringstream text;
-                    text << "Export(name=" << self.name << ", rva=0x" << std::hex << self.rva << ")";
+                    text << "Export(name=" << self.name << ", rva=0x" << std::hex << self.rva;
+                    if (!self.forwarder.empty())
+                    {
+                        text << ", forwarder=" << self.forwarder;
+                    }
+                    text << ")";
                     return text.str();
                 });
 
