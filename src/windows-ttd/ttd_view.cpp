@@ -6,7 +6,6 @@
 #include <cstring>
 #include <optional>
 #include <ranges>
-#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -24,37 +23,304 @@ namespace sogen::ttd
             return text.str();
         }
 
-        // Maps every page the events touch, merging adjacent pages into one mapping.
-        void map_touched_pages(memory_manager& memory, const std::span<const access_event> events)
+        std::unique_ptr<x86_64_emulator> cpu_with_registers(const std::vector<std::byte>& registers)
         {
-            std::set<uint64_t> pages{};
-            for (const auto& event : events)
+            auto cpu = create_x86_64_emulator(backend_type::unicorn);
+            cpu->restore_registers(registers);
+            // Snapshots are taken while the recording CPU runs, where the backend keeps the arithmetic and direction flags
+            // outside the flags register; starting the CPU would rebuild them from the flags register and lose them.
+            cpu->reg<uint64_t>(x86_register::rflags, cpu->reg<uint64_t>(x86_register::rflags));
+            return cpu;
+        }
+    }
+
+    // The standalone CPU that replays a trace's snapshot intervals, kept with the trace. Its pages stay mapped from one
+    // replay to the next and only bytes that differ are rewritten, so the code it translated once is reused (the backend
+    // drops translations whose bytes change).
+    class view_engine
+    {
+      public:
+        view_engine()
+            : cpu_(create_x86_64_emulator(backend_type::unicorn)),
+              memory_(*cpu_)
+        {
+            auto& cpu = *cpu_;
+            cpu.hook_memory_execution_metadata([this](cpu_interface&, const uint64_t address, const size_t size) {
+                // The backend can abandon an instruction before its effects land and run it again (when a store looks
+                // like it could change translated code). Its events then repeat; any difference still shows as a
+                // divergence.
+                const auto restarted =
+                    this->running_ && this->events_[*this->running_].address == address &&
+                    (this->cursor_ >= this->events_.size() || this->events_[this->cursor_].kind != access_kind::execute ||
+                     this->events_[this->cursor_].address != address);
+                if (restarted)
+                {
+                    this->cursor_ = *this->running_;
+                }
+                if (this->expect(access_kind::execute, address, size))
+                {
+                    this->running_ = this->cursor_++;
+                }
+            });
+            cpu.hook_memory_read_before(0, UINT64_MAX, [this](cpu_interface&, const uint64_t address, const size_t size) {
+                const auto* event = this->expect(access_kind::read, address, size);
+                if (!event)
+                {
+                    return;
+                }
+                // The read then returns exactly the recorded bytes, so it needs no check afterwards. Memory was filled
+                // with these bytes up front, so this only writes memory that changed without a write (such as the shared
+                // user data); a write would make the CPU retranslate code that shares the page.
+                std::array<uint8_t, inline_data_limit> current{};
+                if (!this->cpu_->try_read_memory(address, current.data(), size) || memcmp(current.data(), event->payload.data(), size) != 0)
+                {
+                    this->cpu_->write_memory(address, event->payload.data(), size);
+                }
+                ++this->cursor_;
+            });
+            cpu.hook_memory_write_data(
+                0, UINT64_MAX, [this](cpu_interface&, const uint64_t address, const std::span<const std::byte> data) {
+                    const auto* event = this->expect(access_kind::write, address, data.size());
+                    if (!event)
+                    {
+                        return;
+                    }
+                    if (memcmp(data.data(), event->payload.data(), data.size()) != 0)
+                    {
+                        this->divergence_ = describe("TTD replay produced other bytes for", event->kind, event->address, data.size());
+                        this->cpu_->stop();
+                        return;
+                    }
+                    ++this->cursor_;
+                });
+        }
+
+        // Whether the engine replayed before.
+        bool used() const
+        {
+            return this->used_;
+        }
+
+        // Runs `events` (the instructions after a snapshot, up to a position, all without host writes) from
+        // `registers` and returns the registers at the end. `following` is the instruction after them, if any.
+        std::vector<std::byte> replay(const std::span<const access_event> events, const std::optional<access_event>& following,
+                                      const std::vector<std::byte>& registers, const uint64_t position)
+        {
+            this->used_ = true;
+            this->prepare_memory(events, following);
+            auto& cpu = *this->cpu_;
+            cpu.restore_registers(registers);
+            cpu.reg<uint64_t>(x86_register::rflags, cpu.reg<uint64_t>(x86_register::rflags));
+
+            this->events_ = events;
+            this->cursor_ = 0;
+            this->running_.reset();
+            this->divergence_.reset();
+
+            // The backend's instruction count stops the CPU where its state is complete (a stop from a hook can leave the
+            // flags uncomputed). A restarted instruction counts twice, so the rest runs again until every one ran.
+            std::vector<size_t> instructions_from(events.size() + 1);
+            for (auto i = events.size(); i-- > 0;)
             {
+                instructions_from[i] = instructions_from[i + 1] + (events[i].kind == access_kind::execute ? 1 : 0);
+            }
+            while (!this->divergence_)
+            {
+                // An instruction abandoned just before the count ran out has to run again.
+                if (!instructions_from[this->cursor_] && following && this->running_ &&
+                    cpu.read_instruction_pointer() != following->address &&
+                    cpu.read_instruction_pointer() == events[*this->running_].address)
+                {
+                    this->cursor_ = *this->running_;
+                }
+                if (!instructions_from[this->cursor_])
+                {
+                    break;
+                }
+                const auto before = this->cursor_;
+                cpu.start(instructions_from[this->cursor_]);
+                if (this->cursor_ == before)
+                {
+                    break;
+                }
+            }
+            this->events_ = {};
+
+            if (this->divergence_)
+            {
+                std::string context{};
+                const auto cursor = this->cursor_;
+                for (auto i = cursor > 8 ? cursor - 8 : 0; i < std::min(cursor + 2, events.size()); ++i)
+                {
+                    context += "\n  " + std::string(i == cursor ? "> " : "  ") +
+                               describe("", events[i].kind, events[i].address, events[i].size) + " step=" + std::to_string(events[i].step);
+                }
+                throw divergence_error(*this->divergence_ + " replaying to position " + std::to_string(position) + context);
+            }
+            if (this->cursor_ != events.size())
+            {
+                throw divergence_error("TTD replay to position " + std::to_string(position) + " stopped after " +
+                                       std::to_string(this->cursor_) + " of " + std::to_string(events.size()) + " recorded events");
+            }
+            return cpu.save_registers();
+        }
+
+      private:
+        std::unique_ptr<x86_64_emulator> cpu_{};
+        memory_manager memory_;
+        // Sorted page numbers mapped so far.
+        std::vector<uint64_t> mapped_{};
+
+        std::span<const access_event> events_{};
+        size_t cursor_{};
+        bool used_{};
+        // The execute event of the instruction running now.
+        std::optional<size_t> running_{};
+        std::optional<std::string> divergence_{};
+
+        const access_event* expect(const access_kind kind, const uint64_t address, const size_t size)
+        {
+            if (this->divergence_)
+            {
+                return nullptr;
+            }
+            if (this->cursor_ >= this->events_.size())
+            {
+                this->divergence_ = describe("TTD replay produced an unrecorded", kind, address, size);
+            }
+            else if (const auto& event = this->events_[this->cursor_];
+                     event.kind != kind || event.address != address || (size && event.size != size))
+            {
+                this->divergence_ = describe("TTD replay produced", kind, address, size) + " where the recording has " +
+                                    describe("", event.kind, event.address, static_cast<size_t>(event.size));
+            }
+            else
+            {
+                return &event;
+            }
+            this->cpu_->stop();
+            return nullptr;
+        }
+
+        // Maps the pages the events touch and gives each byte the first value an instruction executed or read there.
+        // Guest writes in the interval change bytes later, as they did while recording.
+        void prepare_memory(const std::span<const access_event> events, const std::optional<access_event>& following)
+        {
+            const auto touched = [&](const auto& visit) {
+                for (const auto& event : events)
+                {
+                    visit(event);
+                }
+                if (following)
+                {
+                    visit(*following);
+                }
+            };
+
+            std::vector<uint64_t> pages{};
+            pages.reserve(events.size() + 1);
+            touched([&](const access_event& event) {
                 // The CPU decodes ahead of the instructions it runs, possibly into the next page.
                 const auto ahead = event.kind == access_kind::execute ? page_size : 0;
                 const auto last = event.address + std::max<uint64_t>(event.size, 1) - 1 + ahead;
                 for (auto page = event.address / page_size; page <= last / page_size; ++page)
                 {
-                    pages.insert(page);
+                    pages.push_back(page);
                 }
-            }
-            for (auto page = pages.begin(); page != pages.end();)
+            });
+            std::ranges::sort(pages);
+            pages.erase(std::ranges::unique(pages).begin(), pages.end());
+            this->map_pages(pages);
+
+            // Walking backwards, earlier events overwrite later ones.
+            std::vector<std::byte> contents(pages.size() * page_size);
+            std::vector<bool> known(contents.size());
+            size_t page_index = 0;
+            const auto fill = [&](const access_event& event) {
+                if (event.kind != access_kind::execute && event.kind != access_kind::read)
+                {
+                    return;
+                }
+                const auto* bytes = reinterpret_cast<const std::byte*>(event.payload.data());
+                for (uint64_t i = 0; i < event.size; ++i)
+                {
+                    const auto address = event.address + i;
+                    if (pages[page_index] != address / page_size)
+                    {
+                        page_index = static_cast<size_t>(std::ranges::lower_bound(pages, address / page_size) - pages.begin());
+                    }
+                    const auto offset = page_index * page_size + address % page_size;
+                    contents[offset] = bytes[i];
+                    known[offset] = true;
+                }
+            };
+            if (following)
             {
-                const auto first = *page;
-                auto count = uint64_t{1};
-                ++page;
-                while (page != pages.end() && *page == first + count)
+                fill(*following);
+            }
+            for (const auto& event : std::views::reverse(events))
+            {
+                fill(event);
+            }
+
+            // Only bytes that differ are written, and translations of a page that changed are dropped (code translated in
+            // an earlier replay can include bytes that were not known then); the rest stay translated.
+            std::array<std::byte, page_size> current{};
+            for (size_t index = 0; index < pages.size(); ++index)
+            {
+                const auto base = pages[index] * page_size;
+                this->cpu_->read_memory(base, current.data(), current.size());
+                bool changed = false;
+                for (size_t offset = 0; offset < page_size;)
                 {
-                    ++count;
-                    ++page;
+                    const auto at = index * page_size + offset;
+                    if (!known[at] || contents[at] == current[offset])
+                    {
+                        ++offset;
+                        continue;
+                    }
+                    auto end = offset + 1;
+                    while (end < page_size && known[index * page_size + end] && contents[index * page_size + end] != current[end])
+                    {
+                        ++end;
+                    }
+                    this->cpu_->write_memory(base + offset, contents.data() + at, end - offset);
+                    changed = true;
+                    offset = end;
                 }
-                if (!memory.allocate_memory(first * page_size, static_cast<size_t>(count * page_size), memory_permission::all))
+                if (changed)
                 {
-                    throw std::runtime_error("Cannot map memory for a TTD CPU view");
+                    this->cpu_->flush_translations(base, page_size);
                 }
             }
         }
-    }
+
+        void map_pages(const std::span<const uint64_t> pages)
+        {
+            std::vector<uint64_t> missing{};
+            std::ranges::set_difference(pages, this->mapped_, std::back_inserter(missing));
+            for (size_t first = 0; first < missing.size();)
+            {
+                auto count = size_t{1};
+                while (first + count < missing.size() && missing[first + count] == missing[first] + count)
+                {
+                    ++count;
+                }
+                if (!this->memory_.allocate_memory(missing[first] * page_size, count * page_size, memory_permission::all))
+                {
+                    throw std::runtime_error("Cannot map memory for a TTD CPU view");
+                }
+                first += count;
+            }
+            if (!missing.empty())
+            {
+                std::vector<uint64_t> merged{};
+                merged.reserve(this->mapped_.size() + missing.size());
+                std::ranges::merge(this->mapped_, missing, std::back_inserter(merged));
+                this->mapped_ = std::move(merged);
+            }
+        }
+    };
 
     cpu_view::cpu_view(trace& recorded, const uint64_t position)
         : position_(position)
@@ -76,180 +342,53 @@ namespace sogen::ttd
         const auto index = static_cast<size_t>(next - snapshots.begin() - 1);
         const auto& snapshot = snapshots[index];
         replayed_instructions_ = position - snapshot.step;
-
-        // The events of the instructions after the snapshot, up to and including instruction `position`.
-        std::vector<access_event> events{};
-        // The instruction after `position`: the CPU decodes it before it stops, so its bytes must be there too.
-        std::optional<access_event> following{};
-        if (replayed_instructions_)
-        {
-            event_reader reader(recorded, snapshot.event_number);
-            while (const auto event = reader.next())
-            {
-                if (event->kind == access_kind::execute && event->step > position)
-                {
-                    following = event;
-                    break;
-                }
-                if (event->kind == access_kind::host_write || event->size > inline_data_limit)
-                {
-                    throw std::runtime_error("TTD register snapshot interval contains a host write");
-                }
-                events.push_back(*event);
-            }
-        }
-
-        cpu_ = create_x86_64_emulator(backend_type::unicorn);
-        auto& cpu = *cpu_;
-        memory_ = std::make_unique<memory_manager>(cpu);
-        std::vector<access_event> touched = events;
-        if (following)
-        {
-            touched.push_back(*following);
-        }
-        map_touched_pages(*memory_, touched);
-        // Each byte starts with the first value an instruction executed or read there (walking backwards, earlier events
-        // overwrite later ones); guest writes in the interval change it later as they did while recording. Reads still
-        // get their recorded bytes as they happen, but rewriting memory then would make the CPU retranslate code that
-        // shares the page, so it only happens for memory that changed without a write (such as the shared user data).
-        for (const auto& event : std::views::reverse(touched))
-        {
-            if (event.kind == access_kind::execute || event.kind == access_kind::read)
-            {
-                cpu.write_memory(event.address, event.payload.data(), static_cast<size_t>(event.size));
-            }
-        }
-        cpu.restore_registers(recorded.snapshot_registers(index));
-        // Snapshots are taken while the recording CPU runs, where the backend keeps the arithmetic and direction flags
-        // outside the flags register; starting the CPU would rebuild them from the flags register and lose them.
-        cpu.reg<uint64_t>(x86_register::rflags, cpu.reg<uint64_t>(x86_register::rflags));
+        auto registers = recorded.snapshot_registers(index);
         if (!replayed_instructions_)
         {
+            cpu_ = cpu_with_registers(registers);
             return;
         }
 
-        size_t cursor = 0;
-        std::optional<std::string> divergence{};
-        const auto expect = [&](const access_kind kind, const uint64_t address, const size_t size) -> const access_event* {
-            if (divergence)
-            {
-                return nullptr;
-            }
-            if (cursor >= events.size())
-            {
-                divergence = describe("TTD replay produced an unrecorded", kind, address, size);
-            }
-            else if (const auto& event = events[cursor]; event.kind != kind || event.address != address || (size && event.size != size))
-            {
-                divergence = describe("TTD replay produced", kind, address, size) + " where the recording has " +
-                             describe("", event.kind, event.address, static_cast<size_t>(event.size));
-            }
-            else
-            {
-                return &event;
-            }
-            cpu.stop();
-            return nullptr;
-        };
-        const auto matches = [&](const access_event& event, const std::span<const std::byte> data) {
-            if (data.size() == event.size && memcmp(data.data(), event.payload.data(), data.size()) == 0)
-            {
-                ++cursor;
-                return;
-            }
-            divergence = describe("TTD replay produced other bytes for", event.kind, event.address, data.size());
-            cpu.stop();
-        };
-
-        // The execute event of the instruction running now.
-        std::optional<size_t> running{};
-        std::vector<emulator_hook*> hooks{};
-        hooks.push_back(cpu.hook_memory_execution_metadata([&](cpu_interface&, const uint64_t address, const size_t size) {
-            // The backend can abandon an instruction before its effects land and run it again (when a store looks like
-            // it could change translated code). Its events then repeat; any difference still shows as a divergence.
-            const auto restarted =
-                running && events[*running].address == address &&
-                (cursor >= events.size() || events[cursor].kind != access_kind::execute || events[cursor].address != address);
-            if (restarted)
-            {
-                cursor = *running;
-            }
-            if (expect(access_kind::execute, address, size))
-            {
-                running = cursor++;
-            }
-        }));
-        hooks.push_back(cpu.hook_memory_read_before(0, UINT64_MAX, [&](cpu_interface&, const uint64_t address, const size_t size) {
-            const auto* event = expect(access_kind::read, address, size);
-            if (!event)
-            {
-                return;
-            }
-            std::array<uint8_t, inline_data_limit> current{};
-            if (!cpu.try_read_memory(address, current.data(), size) || memcmp(current.data(), event->payload.data(), size) != 0)
-            {
-                cpu.write_memory(address, event->payload.data(), size);
-            }
-        }));
-        hooks.push_back(
-            cpu.hook_memory_read_data(0, UINT64_MAX, [&](cpu_interface&, const uint64_t address, const std::span<const std::byte> data) {
-                if (const auto* event = expect(access_kind::read, address, data.size()))
-                {
-                    matches(*event, data);
-                }
-            }));
-        hooks.push_back(
-            cpu.hook_memory_write_data(0, UINT64_MAX, [&](cpu_interface&, const uint64_t address, const std::span<const std::byte> data) {
-                if (const auto* event = expect(access_kind::write, address, data.size()))
-                {
-                    matches(*event, data);
-                }
-            }));
-
-        // The backend's instruction count stops the CPU where its state is complete (a stop from a hook can leave the
-        // flags uncomputed). A restarted instruction counts twice, so the rest runs again until every one ran.
-        std::vector<size_t> instructions_from(events.size() + 1);
-        for (auto i = events.size(); i-- > 0;)
+        // The events of the instructions after the snapshot, up to and including instruction `position`, and the
+        // instruction after it, which the CPU decodes before it stops.
+        std::vector<access_event> events{};
+        std::optional<access_event> following{};
+        event_reader reader(recorded, snapshot.event_number);
+        while (const auto event = reader.next())
         {
-            instructions_from[i] = instructions_from[i + 1] + (events[i].kind == access_kind::execute ? 1 : 0);
-        }
-        while (!divergence)
-        {
-            // An instruction abandoned just before the count ran out has to run again.
-            if (!instructions_from[cursor] && following && running && cpu.read_instruction_pointer() != following->address &&
-                cpu.read_instruction_pointer() == events[*running].address)
+            if (event->kind == access_kind::execute && event->step > position)
             {
-                cursor = *running;
-            }
-            if (!instructions_from[cursor])
-            {
+                following = event;
                 break;
             }
-            const auto before = cursor;
-            cpu.start(instructions_from[cursor]);
-            if (cursor == before)
+            if (event->kind == access_kind::host_write || event->size > inline_data_limit)
             {
-                break;
+                throw std::runtime_error("TTD register snapshot interval contains a host write");
             }
+            events.push_back(*event);
         }
-        for (auto* hook : hooks)
+
+        auto& engine = recorded.view_engine_slot();
+        if (!engine)
         {
-            cpu.delete_hook(hook);
+            engine = std::make_shared<view_engine>();
         }
-        if (divergence)
+        const auto reused = engine->used();
+        try
         {
-            std::string context{};
-            for (auto i = cursor > 8 ? cursor - 8 : 0; i < std::min(cursor + 2, events.size()); ++i)
+            cpu_ = cpu_with_registers(engine->replay(events, following, registers, position));
+        }
+        catch (const divergence_error&)
+        {
+            // Code an engine translated in earlier replays can make the backend take a store for self-modifying code and
+            // rerun the instruction without reporting its stores again. A fresh engine settles whether the replay really
+            // diverges.
+            if (!reused)
             {
-                context += "\n  " + std::string(i == cursor ? "> " : "  ") +
-                           describe("", events[i].kind, events[i].address, events[i].size) + " step=" + std::to_string(events[i].step);
+                throw;
             }
-            throw divergence_error(*divergence + " replaying to position " + std::to_string(position) + context);
-        }
-        if (cursor != events.size())
-        {
-            throw divergence_error("TTD replay to position " + std::to_string(position) + " stopped after " + std::to_string(cursor) +
-                                   " of " + std::to_string(events.size()) + " recorded events");
+            engine = std::make_shared<view_engine>();
+            cpu_ = cpu_with_registers(engine->replay(events, following, registers, position));
         }
     }
 }

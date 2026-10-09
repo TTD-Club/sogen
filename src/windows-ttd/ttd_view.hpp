@@ -33,8 +33,8 @@ namespace sogen::ttd
         }
 
       private:
+        // Holds only the registers at the position.
         std::unique_ptr<x86_64_emulator> cpu_{};
-        std::unique_ptr<memory_manager> memory_{};
         uint64_t position_{};
         uint64_t replayed_instructions_{};
     };

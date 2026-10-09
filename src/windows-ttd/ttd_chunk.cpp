@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
@@ -245,7 +246,104 @@ namespace sogen::ttd
             return compressed;
         }
 
-        // Guest memory as far as the chunk's own accesses have shown it, in pages with one validity byte per byte.
+        // A map from uint64 keys to uint64 values that only grows: open addressing with linear probing. The predictor looks
+        // keys up for every event, where std::unordered_map's node allocations and pointer chasing dominated decoding.
+        class flat_map
+        {
+          public:
+            const uint64_t* find(const uint64_t key) const
+            {
+                if (key == empty_key)
+                {
+                    return this->has_empty_key_ ? &this->empty_key_value_ : nullptr;
+                }
+                if (this->slots_.empty())
+                {
+                    return nullptr;
+                }
+                for (auto index = this->home(key);; index = (index + 1) & this->mask_)
+                {
+                    const auto& slot = this->slots_[index];
+                    if (slot.key == key)
+                    {
+                        return &slot.value;
+                    }
+                    if (slot.key == empty_key)
+                    {
+                        return nullptr;
+                    }
+                }
+            }
+
+            void set(const uint64_t key, const uint64_t value)
+            {
+                if (key == empty_key)
+                {
+                    this->has_empty_key_ = true;
+                    this->empty_key_value_ = value;
+                    return;
+                }
+                if ((this->size_ + 1) * 2 > this->slots_.size())
+                {
+                    this->grow();
+                }
+                for (auto index = this->home(key);; index = (index + 1) & this->mask_)
+                {
+                    auto& slot = this->slots_[index];
+                    if (slot.key == key)
+                    {
+                        slot.value = value;
+                        return;
+                    }
+                    if (slot.key == empty_key)
+                    {
+                        slot = {.key = key, .value = value};
+                        ++this->size_;
+                        return;
+                    }
+                }
+            }
+
+          private:
+            static constexpr uint64_t empty_key = UINT64_MAX;
+
+            struct slot
+            {
+                uint64_t key{empty_key};
+                uint64_t value{};
+            };
+
+            std::vector<slot> slots_{};
+            size_t mask_{};
+            size_t shift_{};
+            size_t size_{};
+            bool has_empty_key_{};
+            uint64_t empty_key_value_{};
+
+            size_t home(const uint64_t key) const
+            {
+                return static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> this->shift_);
+            }
+
+            void grow()
+            {
+                const auto old = std::move(this->slots_);
+                const size_t capacity = old.empty() ? 1024 : old.size() * 2;
+                this->slots_.assign(capacity, {});
+                this->mask_ = capacity - 1;
+                this->shift_ = 64 - static_cast<size_t>(std::countr_zero(capacity));
+                this->size_ = 0;
+                for (const auto& entry : old)
+                {
+                    if (entry.key != empty_key)
+                    {
+                        this->set(entry.key, entry.value);
+                    }
+                }
+            }
+        };
+
+        // Guest memory as far as the chunk's own accesses have shown it, in pages with one validity bit per byte.
         class known_memory
         {
           public:
@@ -257,7 +355,7 @@ namespace sogen::ttd
                     const auto offset = static_cast<size_t>(address % known_page_size);
                     const auto count = std::min(data.size(), known_page_size - offset);
                     memcpy(page.bytes.data() + offset, data.data(), count);
-                    memset(page.valid.data() + offset, 1, count);
+                    page.mark_valid(offset, count);
                     address += count;
                     data = data.subspan(count);
                 }
@@ -270,7 +368,7 @@ namespace sogen::ttd
                     const auto* page = this->find_page(address);
                     const auto offset = static_cast<size_t>(address % known_page_size);
                     const auto count = std::min(output.size(), known_page_size - offset);
-                    if (!page || std::memchr(page->valid.data() + offset, 0, count))
+                    if (!page || !page->all_valid(offset, count))
                     {
                         return false;
                     }
@@ -286,11 +384,41 @@ namespace sogen::ttd
 
             struct page
             {
-                std::array<std::byte, known_page_size> bytes{};
-                std::array<uint8_t, known_page_size> valid{};
+                // Only bytes marked valid are ever read, so the bytes need no initialization.
+                std::array<std::byte, known_page_size> bytes;
+                std::array<uint64_t, known_page_size / 64> valid{};
+
+                void mark_valid(size_t offset, const size_t count)
+                {
+                    const auto end = offset + count;
+                    while (offset < end)
+                    {
+                        const auto bits = std::min<size_t>(64 - offset % 64, end - offset);
+                        this->valid[offset / 64] |= (bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1)) << (offset % 64);
+                        offset += bits;
+                    }
+                }
+
+                bool all_valid(size_t offset, const size_t count) const
+                {
+                    const auto end = offset + count;
+                    while (offset < end)
+                    {
+                        const auto bits = std::min<size_t>(64 - offset % 64, end - offset);
+                        const auto mask = (bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1)) << (offset % 64);
+                        if ((this->valid[offset / 64] & mask) != mask)
+                        {
+                            return false;
+                        }
+                        offset += bits;
+                    }
+                    return true;
+                }
             };
 
-            std::unordered_map<uint64_t, std::unique_ptr<page>> pages_{};
+            std::vector<std::unique_ptr<page>> pages_{};
+            // Index in pages_ by page number.
+            flat_map page_index_{};
             uint64_t last_number_{UINT64_MAX};
             page* last_page_{};
 
@@ -299,13 +427,13 @@ namespace sogen::ttd
                 const auto number = address / known_page_size;
                 if (number != this->last_number_)
                 {
-                    const auto entry = this->pages_.find(number);
-                    if (entry == this->pages_.end())
+                    const auto* index = this->page_index_.find(number);
+                    if (!index)
                     {
                         return nullptr;
                     }
                     this->last_number_ = number;
-                    this->last_page_ = entry->second.get();
+                    this->last_page_ = this->pages_[static_cast<size_t>(*index)].get();
                 }
                 return this->last_page_;
             }
@@ -317,11 +445,11 @@ namespace sogen::ttd
                     return *existing;
                 }
                 const auto number = address / known_page_size;
-                auto& slot = this->pages_[number];
-                slot = std::make_unique<page>();
+                this->page_index_.set(number, this->pages_.size());
+                this->pages_.push_back(std::make_unique_for_overwrite<page>());
                 this->last_number_ = number;
-                this->last_page_ = slot.get();
-                return *slot;
+                this->last_page_ = this->pages_.back().get();
+                return *this->last_page_;
             }
         };
 
@@ -346,9 +474,9 @@ namespace sogen::ttd
             uint64_t ip{};
             uint64_t next_ip{};
             uint64_t next_code{};
-            std::unordered_map<uint64_t, uint64_t> code_at{};
+            flat_map code_at{};
             std::array<uint64_t, 16> last_address_of_kind{};
-            std::unordered_map<uint64_t, uint64_t> last_address_at{};
+            flat_map last_address_at{};
             known_memory memory{};
             uint64_t bulk_block_index{};
             uint64_t bulk_next_offset{};
@@ -371,13 +499,13 @@ namespace sogen::ttd
 
             uint64_t address_base(const access_event& event) const
             {
-                const auto entry = this->last_address_at.find(site(event));
-                return entry != this->last_address_at.end() ? entry->second : this->last_address_of_kind[static_cast<size_t>(event.kind)];
+                const auto* entry = this->last_address_at.find(site(event));
+                return entry ? *entry : this->last_address_of_kind[static_cast<size_t>(event.kind)];
             }
 
             void remember_access(const access_event& event, const std::span<const std::byte> data)
             {
-                this->last_address_at[site(event)] = event.address;
+                this->last_address_at.set(site(event), event.address);
                 this->last_address_of_kind[static_cast<size_t>(event.kind)] = event.address;
                 this->memory.store(event.address, data);
             }
@@ -488,12 +616,12 @@ namespace sogen::ttd
                     throw std::runtime_error("Missing TTD code id");
                 }
                 const auto id = code_ids[next_code_id++];
-                const auto known = state.code_at.find(event.address);
-                if (known == state.code_at.end() || known->second != id)
+                const auto* known = state.code_at.find(event.address);
+                if (!known || *known != id)
                 {
                     tag |= tag_extra;
                     put_varint(streams[code_stream], zigzag(id - state.next_code));
-                    state.code_at[event.address] = id;
+                    state.code_at.set(event.address, id);
                     state.next_code = id + 1;
                 }
                 state.next_ip = event.ip + event.size;
@@ -601,17 +729,17 @@ namespace sogen::ttd
                 if (tag & tag_extra)
                 {
                     id = state.next_code + unzigzag(streams[code_stream].varint());
-                    state.code_at[event.address] = id;
+                    state.code_at.set(event.address, id);
                     state.next_code = id + 1;
                 }
                 else
                 {
-                    const auto known = state.code_at.find(event.address);
-                    if (known == state.code_at.end())
+                    const auto* known = state.code_at.find(event.address);
+                    if (!known)
                     {
                         throw std::runtime_error("TTD execute event has no code entry");
                     }
-                    id = known->second;
+                    id = *known;
                 }
                 if (id >= code.size() || code[static_cast<size_t>(id)].address != event.address)
                 {

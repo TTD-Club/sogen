@@ -851,6 +851,14 @@ namespace sogen::unicorn
                 return this->register_generation_;
             }
 
+            void flush_translations(const uint64_t address, const uint64_t size) override
+            {
+                if (size)
+                {
+                    uce(uc_ctl_remove_cache(this->uc_, address, calc_end_address(address, size)));
+                }
+            }
+
             std::vector<std::byte> save_registers() const override
             {
                 utils::buffer_serializer buffer{};

@@ -47,6 +47,12 @@ namespace sogen
         {
             return std::nullopt;
         }
+
+        // Drops whatever the backend translated from code in [address, address + size), for callers that change code
+        // bytes in ways the backend might not notice. Backends without a translation cache ignore it.
+        virtual void flush_translations(uint64_t /*address*/, uint64_t /*size*/)
+        {
+        }
     };
 
 } // namespace sogen

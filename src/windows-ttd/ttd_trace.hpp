@@ -254,6 +254,8 @@ namespace sogen::ttd
         uint64_t append_to_file(std::span<const std::byte> bytes);
     };
 
+    class view_engine;
+
     class trace
     {
       public:
@@ -344,6 +346,12 @@ namespace sogen::ttd
         // The registers of register snapshot `index`, as the backend's save_registers returned them.
         std::vector<std::byte> snapshot_registers(size_t index);
 
+        // The standalone CPU cpu_view replays on (see ttd_view.cpp), created on first use and kept with the reader.
+        std::shared_ptr<view_engine>& view_engine_slot()
+        {
+            return view_engine_;
+        }
+
         // Index of the checkpoint at `step` (0 for the initial state); throws if no checkpoint is there.
         uint64_t checkpoint_index(uint64_t step) const;
 
@@ -430,6 +438,7 @@ namespace sogen::ttd
         std::vector<mapping_change> mapping_changes_{};
         // Whether a mapping change covering `address` came after event `after_number` and before event `through_number`.
         bool remapped(uint64_t address, uint64_t after_number, uint64_t through_number) const;
+        std::shared_ptr<view_engine> view_engine_{};
         // The last decoded snapshot base: its index and registers.
         std::optional<std::pair<uint64_t, std::vector<std::byte>>> register_base_cache_{};
 
