@@ -68,11 +68,10 @@ namespace sogen::ttd
                 {
                     return;
                 }
-                // The read then returns exactly the recorded bytes, so it needs no check afterwards. Memory was filled
-                // with these bytes up front, so this only writes memory that changed without a write (such as the shared
-                // user data); a write would make the CPU retranslate code that shares the page.
-                std::array<uint8_t, inline_data_limit> current{};
-                if (!this->cpu_->try_read_memory(address, current.data(), size) || memcmp(current.data(), event->payload.data(), size) != 0)
+                // The read then returns exactly the recorded bytes, so it needs no check afterwards. Memory already holds
+                // them unless prepare_memory found otherwise; writing memory needlessly would make the CPU retranslate
+                // code that shares the page.
+                if (this->inject_[this->cursor_])
                 {
                     this->cpu_->write_memory(address, event->payload.data(), size);
                 }
@@ -172,6 +171,8 @@ namespace sogen::ttd
         std::vector<uint64_t> mapped_{};
 
         std::span<const access_event> events_{};
+        // Per event, whether a read must be given its recorded bytes as it happens (see prepare_memory).
+        std::vector<bool> inject_{};
         size_t cursor_{};
         bool used_{};
         // The execute event of the instruction running now.
@@ -291,6 +292,34 @@ namespace sogen::ttd
                 if (changed)
                 {
                     this->cpu_->flush_translations(base, page_size);
+                }
+            }
+
+            // Following the recorded writes from there shows which reads find bytes memory would not hold by then
+            // (memory that changed without a write, such as the shared user data); only those get their recorded bytes
+            // written as they happen.
+            this->inject_.assign(events.size(), false);
+            for (size_t i = 0; i < events.size(); ++i)
+            {
+                const auto& event = events[i];
+                if (event.kind != access_kind::read && event.kind != access_kind::write)
+                {
+                    continue;
+                }
+                const auto* bytes = reinterpret_cast<const std::byte*>(event.payload.data());
+                for (uint64_t k = 0; k < event.size; ++k)
+                {
+                    const auto address = event.address + k;
+                    if (pages[page_index] != address / page_size)
+                    {
+                        page_index = static_cast<size_t>(std::ranges::lower_bound(pages, address / page_size) - pages.begin());
+                    }
+                    auto& value = contents[page_index * page_size + address % page_size];
+                    if (event.kind == access_kind::read && value != bytes[k])
+                    {
+                        this->inject_[i] = true;
+                    }
+                    value = bytes[k];
                 }
             }
         }

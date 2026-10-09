@@ -7,6 +7,7 @@
 #include <bit>
 #include <cstring>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string_view>
 
@@ -246,7 +247,17 @@ namespace sogen::ttd
             return compressed;
         }
 
-        // Guest memory as far as the chunk's own accesses have shown it, in pages with one validity bit per byte.
+        struct bulk_reference
+        {
+            uint64_t offset{};
+            uint64_t block{};
+        };
+
+        // Resolves `size` bytes of a bulk block.
+        using bulk_bytes = std::function<std::span<const std::byte>(const bulk_reference& reference, uint64_t size)>;
+
+        // Guest memory as far as the chunk's own accesses have shown it, in pages with one validity bit per byte. Large
+        // accesses can be stored as deferred ranges, whose bytes come from their bulk block only if a load needs them.
         class known_memory
         {
           public:
@@ -264,7 +275,24 @@ namespace sogen::ttd
                 }
             }
 
-            bool load(uint64_t address, std::span<std::byte> output)
+            // Like store() of the bulk bytes `reference` names, which load() resolves through `resolve` when it needs
+            // them: decoding a chunk then only decompresses bulk blocks whose bytes a later known-value read uses.
+            void store_deferred(const uint64_t address, const uint64_t size, const bulk_reference& reference)
+            {
+                const auto last = address + size - 1;
+                for (auto number = address / known_page_size; number <= last / known_page_size; ++number)
+                {
+                    if (auto* page = this->find_page(number * known_page_size))
+                    {
+                        const auto first_byte = std::max(address, number * known_page_size);
+                        const auto end_byte = std::min(address + size, (number + 1) * known_page_size);
+                        page->mark_invalid(static_cast<size_t>(first_byte % known_page_size), static_cast<size_t>(end_byte - first_byte));
+                    }
+                }
+                this->deferred_.push_back({.address = address, .size = size, .reference = reference});
+            }
+
+            bool load(uint64_t address, std::span<std::byte> output, const bulk_bytes* resolve = nullptr)
             {
                 while (!output.empty())
                 {
@@ -273,7 +301,7 @@ namespace sogen::ttd
                     const auto count = std::min(output.size(), known_page_size - offset);
                     if (!page || !page->all_valid(offset, count))
                     {
-                        return false;
+                        return this->load_slow(address, output, resolve);
                     }
                     memcpy(output.data(), page->bytes.data() + offset, count);
                     address += count;
@@ -283,6 +311,41 @@ namespace sogen::ttd
             }
 
           private:
+            struct deferred_range
+            {
+                uint64_t address{};
+                uint64_t size{};
+                bulk_reference reference{};
+            };
+
+            // In storing order: a later range covers earlier ones.
+            std::vector<deferred_range> deferred_{};
+
+            // Byte by byte: from the pages where valid, else from the latest deferred range holding it.
+            bool load_slow(const uint64_t address, const std::span<std::byte> output, const bulk_bytes* resolve)
+            {
+                for (size_t i = 0; i < output.size(); ++i)
+                {
+                    const auto byte = address + i;
+                    const auto* page = this->find_page(byte);
+                    const auto offset = static_cast<size_t>(byte % known_page_size);
+                    if (page && page->all_valid(offset, 1))
+                    {
+                        output[i] = page->bytes[offset];
+                        continue;
+                    }
+                    const auto range = std::ranges::find_if(std::views::reverse(this->deferred_),
+                                                            [&](const deferred_range& r) { return byte - r.address < r.size; });
+                    if (!resolve || range == std::views::reverse(this->deferred_).end())
+                    {
+                        return false;
+                    }
+                    const auto bytes = (*resolve)(range->reference, range->size);
+                    output[i] = bytes[static_cast<size_t>(byte - range->address)];
+                }
+                return true;
+            }
+
             static constexpr size_t known_page_size = 4096;
 
             struct page
@@ -298,6 +361,17 @@ namespace sogen::ttd
                     {
                         const auto bits = std::min<size_t>(64 - offset % 64, end - offset);
                         this->valid[offset / 64] |= (bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1)) << (offset % 64);
+                        offset += bits;
+                    }
+                }
+
+                void mark_invalid(size_t offset, const size_t count)
+                {
+                    const auto end = offset + count;
+                    while (offset < end)
+                    {
+                        const auto bits = std::min<size_t>(64 - offset % 64, end - offset);
+                        this->valid[offset / 64] &= ~((bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1)) << (offset % 64));
                         offset += bits;
                     }
                 }
@@ -356,12 +430,6 @@ namespace sogen::ttd
             }
         };
 
-        struct bulk_reference
-        {
-            uint64_t offset{};
-            uint64_t block{};
-        };
-
         bulk_reference bulk_reference_of(const access_event& event)
         {
             bulk_reference reference{};
@@ -411,6 +479,14 @@ namespace sogen::ttd
                 this->last_address_at.set(site(event), event.address);
                 this->last_address_of_kind[static_cast<size_t>(event.kind)] = event.address;
                 this->memory.store(event.address, data);
+            }
+
+            // remember_access for a large access, whose bytes stay in their bulk block until a load needs them.
+            void remember_deferred_access(const access_event& event, const bulk_reference& reference)
+            {
+                this->last_address_at.set(site(event), event.address);
+                this->last_address_of_kind[static_cast<size_t>(event.kind)] = event.address;
+                this->memory.store_deferred(event.address, event.size, reference);
             }
         };
 
@@ -585,6 +661,9 @@ namespace sogen::ttd
                                const bulk_resolver& bulk, const bool with_data)
     {
         bulk_cursor cursor(bulk);
+        const bulk_bytes resolve_bulk = [&cursor](const bulk_reference& reference, const uint64_t size) {
+            return cursor.data(reference, size);
+        };
         const auto raw = utils::compression::zstd::decompress(compressed);
         chunk_header header{};
         if (raw.size() < sizeof(header))
@@ -668,18 +747,24 @@ namespace sogen::ttd
                     bulk_reference reference{};
                     reference.block = state.bulk_block_index + unzigzag(streams[bulk_stream].varint());
                     reference.offset = state.bulk_offset_base(reference.block) + unzigzag(streams[bulk_stream].varint());
-                    if (with_data)
-                    {
-                        data = cursor.data(reference, event.size);
-                    }
                     state.remember_bulk(reference, event.size);
                     memcpy(event.payload.data(), &reference.offset, sizeof(reference.offset));
                     memcpy(event.payload.data() + sizeof(reference.offset), &reference.block, sizeof(reference.block));
+                    if (with_data)
+                    {
+                        state.remember_deferred_access(event, reference);
+                    }
+                    else
+                    {
+                        state.remember_access(event, {});
+                    }
+                    state.ip = event.ip;
+                    continue;
                 }
-                else if (tag & tag_extra)
+                if (tag & tag_extra)
                 {
                     if (event.kind != access_kind::read ||
-                        (with_data && !state.memory.load(event.address, output.first(static_cast<size_t>(event.size)))))
+                        (with_data && !state.memory.load(event.address, output.first(static_cast<size_t>(event.size)), &resolve_bulk)))
                     {
                         throw std::runtime_error("Invalid TTD known-value read");
                     }
