@@ -314,15 +314,16 @@ namespace sogen::ttd
         // The module whose image holds `address` at position `step`.
         const module_entry* module_at(uint64_t address, uint64_t step) const;
 
-        // `address` at position `step` as a module and its closest export at or below it.
+        // `address` at position `step` as a module and its closest export at or below it, forwarded exports aside.
         std::optional<symbol_location> symbol_at(uint64_t address, uint64_t step) const;
 
         // The exports called `name`, or "module!name" (the module name ignoring case, ".dll" optional), in module load
-        // order. Exports by ordinal only are called "#<ordinal>".
+        // order. Exports by ordinal only are called "#<ordinal>", and "#<ordinal>" also finds a named export.
         std::vector<module_symbol> find_exports(std::string_view name) const;
 
         // The execute events of the first instruction of each export find_exports(name) returns, at positions start
-        // through end while its module was mapped, in order: the calls of a function, and jumps to it.
+        // through end while its module was mapped, in order: the calls of a function, and jumps to it. A forwarded
+        // export stands for its target while both modules are mapped, so this includes calls through other names.
         std::vector<access_event> calls(std::string_view name, uint64_t start, uint64_t end);
 
         // Thread switches and names; empty for traces recorded before threads were recorded.

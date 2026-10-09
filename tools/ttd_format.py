@@ -18,7 +18,7 @@ BULK_REFERENCE = struct.Struct("<2Q")
 MAGIC = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
 CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS, SYSCALLS = 1, 2, 3, 4, 5, 6, 7, 8
-MODULES, THREADS, EXPORTS = 9, 10, 11
+MODULES, THREADS, EXPORTS, EXPORT_FORWARDERS = 9, 10, 11, 12
 REGISTER_SNAPSHOTS, MAPPING_CHANGES = 13, 14
 SYSCALL_HEADER = struct.Struct("<8Q")
 # checkpoint, event_number, step, window, message, reserved, wparam, lparam
@@ -363,6 +363,20 @@ def decode_exports(compressed, modules):
     assert all(stream.offset == len(stream.data) for stream in streams), "invalid exports"
 
 
+def decode_export_forwarders(compressed, modules):
+    """Mirror of decode_export_forwarders in src/windows-ttd/ttd_chunk.cpp: sets each module dict's "forwarders" to
+    {ordinal: "module.dll!name"} for its forwarded exports."""
+    stream = _Stream(zstandard.ZstdDecompressor().decompress(compressed))
+    assert stream.varint() == len(modules), "TTD export forwarders do not match the modules"
+    for module in modules:
+        forwarders, ordinal = {}, 0
+        for _ in range(stream.varint()):
+            ordinal += stream.varint()
+            forwarders[ordinal] = _text(stream)
+        module["forwarders"] = forwarders
+    assert stream.offset == len(stream.data), "invalid export forwarders"
+
+
 def decode_threads(compressed):
     """Mirror of decode_threads in src/windows-ttd/ttd_chunk.cpp: (step, event_number, thread_id) switches and the
     names by thread id."""
@@ -443,6 +457,9 @@ class Trace:
         if EXPORTS in self.sections:
             offset, size = self.sections[EXPORTS]
             decode_exports(self.bytes[offset:offset + size], self.modules)
+            if EXPORT_FORWARDERS in self.sections:
+                offset, size = self.sections[EXPORT_FORWARDERS]
+                decode_export_forwarders(self.bytes[offset:offset + size], self.modules)
         offset, size = self.sections.get(THREADS, (0, 0))
         self.thread_switches, self.thread_names = (decode_threads(self.bytes[offset:offset + size])
                                                    if THREADS in self.sections else ([], {}))

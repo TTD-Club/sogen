@@ -1010,6 +1010,80 @@ namespace sogen::ttd
         }
     }
 
+    std::vector<std::byte> encode_export_forwarders(const std::span<const module_entry> modules)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, modules.size());
+        for (const auto& mod : modules)
+        {
+            std::vector<const module_export*> forwarded{};
+            if (mod.exports)
+            {
+                for (const auto& symbol : *mod.exports)
+                {
+                    if (!symbol.forwarder.empty())
+                    {
+                        forwarded.push_back(&symbol);
+                    }
+                }
+            }
+            std::ranges::sort(forwarded, {}, &module_export::ordinal);
+            put_varint(raw, forwarded.size());
+            uint64_t ordinal = 0;
+            for (const auto* symbol : forwarded)
+            {
+                put_varint(raw, symbol->ordinal - ordinal);
+                put_text(raw, symbol->forwarder);
+                ordinal = symbol->ordinal;
+            }
+        }
+        return compress_table(raw, "export forwarders");
+    }
+
+    void decode_export_forwarders(const std::span<const std::byte> compressed, const std::span<module_entry> modules)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        if (reader.varint() != modules.size())
+        {
+            throw std::runtime_error("TTD export forwarders do not match the modules");
+        }
+        for (auto& mod : modules)
+        {
+            const auto count = reader.varint();
+            if (count == 0)
+            {
+                continue;
+            }
+            if (!mod.exports || count > mod.exports->size())
+            {
+                throw std::runtime_error("Invalid TTD export forwarders");
+            }
+            auto exports = std::make_shared<std::vector<module_export>>(*mod.exports);
+            uint64_t ordinal = 0;
+            for (uint64_t i = 0; i < count; ++i)
+            {
+                const auto delta = reader.varint();
+                if (delta > UINT64_MAX - ordinal)
+                {
+                    throw std::runtime_error("Invalid TTD export forwarders");
+                }
+                ordinal += delta;
+                const auto symbol = std::ranges::find(*exports, ordinal, &module_export::ordinal);
+                if (symbol == exports->end())
+                {
+                    throw std::runtime_error("TTD export forwarder for an unknown ordinal");
+                }
+                symbol->forwarder = read_text(reader);
+            }
+            mod.exports = std::move(exports);
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD export forwarders");
+        }
+    }
+
     std::vector<std::byte> encode_threads(const thread_table& threads)
     {
         std::vector<std::byte> raw{};

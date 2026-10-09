@@ -89,6 +89,9 @@ namespace sogen::ttd
         // The export directories of the modules in the modules section, encoded as described at encode_exports;
         // size = compressed bytes.
         exports = 11,
+        // The targets of the forwarded exports in the exports section, encoded as described at
+        // encode_export_forwarders; size = compressed bytes.
+        export_forwarders = 12,
         // The register snapshots (see register_snapshot_entry), encoded as described at encode_register_snapshots;
         // size = compressed bytes.
         register_snapshots = 13,

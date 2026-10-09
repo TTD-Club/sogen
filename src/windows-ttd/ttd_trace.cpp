@@ -55,6 +55,91 @@ namespace sogen::ttd
             return decoded.empty() ? 1 : static_cast<size_t>(decoded[0].size);
         }
 
+        template <typename T>
+        std::optional<PEDirectory_t2> read_export_directory(const memory_manager& memory, const uint64_t base, const uint64_t offset)
+        {
+            PENTHeaders_t<T> headers{};
+            if (!memory.try_read_memory(base + offset, &headers, sizeof(headers)) ||
+                headers.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT)
+            {
+                return std::nullopt;
+            }
+            return headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        }
+
+        // The export directory of a mapped image, which holds the forwarder strings of its forwarded exports.
+        std::optional<PEDirectory_t2> export_directory(const memory_manager& memory, const mapped_module& mod)
+        {
+            PEDosHeader_t dos{};
+            uint16_t magic{};
+            const auto magic_offset = sizeof(uint32_t) + sizeof(PEFileHeader_t);
+            if (!memory.try_read_memory(mod.image_base, &dos, sizeof(dos)) ||
+                !memory.try_read_memory(mod.image_base + dos.e_lfanew + magic_offset, &magic, sizeof(magic)))
+            {
+                return std::nullopt;
+            }
+            if (magic == PEOptionalHeader_t<uint64_t>::k_Magic)
+            {
+                return read_export_directory<uint64_t>(memory, mod.image_base, dos.e_lfanew);
+            }
+            if (magic == PEOptionalHeader_t<uint32_t>::k_Magic)
+            {
+                return read_export_directory<uint32_t>(memory, mod.image_base, dos.e_lfanew);
+            }
+            return std::nullopt;
+        }
+
+        std::string read_c_string(const memory_manager& memory, const uint64_t address, const uint64_t end)
+        {
+            std::string text{};
+            char c{};
+            while (address + text.size() < end && memory.try_read_memory(address + text.size(), &c, 1) && c)
+            {
+                text.push_back(c);
+            }
+            return text;
+        }
+
+        // "MODULE.name" or "MODULE.#ordinal" as "module.dll!name", with an API set name resolved to its host module.
+        std::string resolve_forwarder(const std::string_view forwarder, const apiset_map& apiset)
+        {
+            const auto dot = forwarder.rfind('.');
+            if (dot == std::string_view::npos || dot == 0 || dot + 1 == forwarder.size())
+            {
+                return std::string(forwarder);
+            }
+            std::u16string module_name{};
+            for (const auto c : forwarder.substr(0, dot))
+            {
+                module_name.push_back(static_cast<char16_t>(std::tolower(static_cast<unsigned char>(c))));
+            }
+            module_name += u".dll";
+            if (module_name.starts_with(u"api-") || module_name.starts_with(u"ext-"))
+            {
+                auto host = apiset.find(module_name);
+                if (host == apiset.end())
+                {
+                    // The loader ignores the last version number: "-l1-1-0" also finds the contract the schema lists as
+                    // "-l1-1-1".
+                    const auto prefix = module_name.substr(0, module_name.rfind(u'-') + 1);
+                    host = apiset.lower_bound(prefix);
+                    if (host != apiset.end() && !host->first.starts_with(prefix))
+                    {
+                        host = apiset.end();
+                    }
+                }
+                if (host != apiset.end() && !host->second.empty())
+                {
+                    module_name = host->second;
+                }
+            }
+            for (auto& c : module_name)
+            {
+                c = static_cast<char16_t>(c < 0x80 ? std::tolower(static_cast<int>(c)) : c);
+            }
+            return u16_to_u8(module_name) + "!" + std::string(forwarder.substr(dot + 1));
+        }
+
         // A checkpoint delta's zstd reference is its base state followed by the bulk blocks recorded in between. This
         // returns that concatenation, or nothing when those blocks are empty and the base state alone is the reference.
         std::vector<std::byte> extended_reference(const std::span<const std::byte> base, const std::span<const bulk_block> between)
@@ -356,9 +441,15 @@ namespace sogen::ttd
     {
         auto exports = std::make_shared<std::vector<module_export>>();
         exports->reserve(mod.exports.size());
+        const auto directory = export_directory(emu_.memory, mod);
         for (const auto& symbol : mod.exports)
         {
-            exports->push_back({.rva = symbol.rva, .ordinal = symbol.ordinal, .name = symbol.name});
+            auto& entry = exports->emplace_back(module_export{.rva = symbol.rva, .ordinal = symbol.ordinal, .name = symbol.name});
+            if (directory && symbol.rva - directory->VirtualAddress < directory->Size)
+            {
+                const auto end = mod.image_base + directory->VirtualAddress + directory->Size;
+                entry.forwarder = resolve_forwarder(read_c_string(emu_.memory, mod.image_base + symbol.rva, end), emu_.process.apiset);
+            }
         }
         std::ranges::sort(*exports, {}, [](const module_export& symbol) { return std::tie(symbol.rva, symbol.name); });
         loaded_modules_[mod.image_base] = modules_.size();
@@ -811,6 +902,7 @@ namespace sogen::ttd
         const auto modules = encode_modules(modules_);
         const auto threads = encode_threads(threads_);
         const auto exports = encode_exports(modules_);
+        const auto forwarders = encode_export_forwarders(modules_);
         const auto snapshots = encode_register_snapshots(register_snapshots_);
         const auto mappings = encode_mapping_changes(mapping_changes_);
         const std::array sections{
@@ -826,6 +918,7 @@ namespace sogen::ttd
             section_entry{.type = section_type::modules, .offset = append_to_file(modules), .size = modules.size()},
             section_entry{.type = section_type::threads, .offset = append_to_file(threads), .size = threads.size()},
             section_entry{.type = section_type::exports, .offset = append_to_file(exports), .size = exports.size()},
+            section_entry{.type = section_type::export_forwarders, .offset = append_to_file(forwarders), .size = forwarders.size()},
             section_entry{.type = section_type::register_snapshots, .offset = append_to_file(snapshots), .size = snapshots.size()},
             section_entry{.type = section_type::mapping_changes, .offset = append_to_file(mappings), .size = mappings.size()},
         };
@@ -906,6 +999,7 @@ namespace sogen::ttd
         }
         // Decoded once the modules they belong to are.
         std::optional<std::vector<std::byte>> exports{};
+        std::optional<std::vector<std::byte>> forwarders{};
         for (const auto& section : sections)
         {
             if (section.type == section_type::chunk_table)
@@ -1037,7 +1131,7 @@ namespace sogen::ttd
                 mapping_changes_ = decode_mapping_changes(read_bytes(section.offset, section.size));
             }
             else if (section.type == section_type::modules || section.type == section_type::threads ||
-                     section.type == section_type::exports)
+                     section.type == section_type::exports || section.type == section_type::export_forwarders)
             {
                 if (!fits(section.offset, section.size, 1))
                 {
@@ -1052,15 +1146,23 @@ namespace sogen::ttd
                 {
                     threads_ = decode_threads(bytes);
                 }
-                else
+                else if (section.type == section_type::exports)
                 {
                     exports = std::move(bytes);
+                }
+                else
+                {
+                    forwarders = std::move(bytes);
                 }
             }
         }
         if (exports)
         {
             decode_exports(*exports, modules_);
+            if (forwarders)
+            {
+                decode_export_forwarders(*forwarders, modules_);
+            }
         }
 
         uint64_t next_event = 0;
@@ -1482,13 +1584,16 @@ namespace sogen::ttd
             return symbol_location{.module = mod, .offset = rva};
         }
         const auto& exports = *mod->exports;
-        const auto next = std::ranges::upper_bound(exports, rva, {}, &module_export::rva);
-        if (next == exports.begin())
+        // Forwarded exports point at their forwarder strings, not at code.
+        const auto below = std::ranges::find_if(
+            std::ranges::subrange(exports.begin(), std::ranges::upper_bound(exports, rva, {}, &module_export::rva)) | std::views::reverse,
+            [](const module_export& symbol) { return symbol.forwarder.empty(); });
+        if (below.base() == exports.begin())
         {
             return symbol_location{.module = mod, .offset = rva};
         }
         // Of several names for one address, the first by name, preferring a real name over "#<ordinal>".
-        const auto aliases = std::ranges::equal_range(exports, std::prev(next)->rva, {}, &module_export::rva);
+        const auto aliases = std::ranges::equal_range(exports, below->rva, {}, &module_export::rva);
         const auto named = std::ranges::find_if(aliases, [](const module_export& symbol) { return !symbol.name.starts_with('#'); });
         const auto& symbol = named == aliases.end() ? aliases.front() : *named;
         return symbol_location{.module = mod, .symbol = &symbol, .offset = rva - symbol.rva};
@@ -1524,7 +1629,8 @@ namespace sogen::ttd
             }
             for (const auto& symbol : *mod.exports)
             {
-                if (symbol.name == symbol_name)
+                // A forwarder can name a function by ordinal that also has a name.
+                if (symbol.name == symbol_name || (symbol_name.starts_with('#') && symbol_name.substr(1) == std::to_string(symbol.ordinal)))
                 {
                     found.push_back({.module = &mod, .symbol = &symbol});
                 }
@@ -1535,16 +1641,44 @@ namespace sogen::ttd
 
     std::vector<access_event> trace::calls(const std::string_view name, const uint64_t start, const uint64_t end)
     {
-        std::vector<access_event> found{};
-        for (const auto& [mod, symbol] : find_exports(name))
+        struct target
         {
-            const auto address = mod->base + symbol->rva;
-            const auto first = std::max(start, mod->load_step);
-            const auto last = mod->unload_step ? std::min(end, *mod->unload_step) : end;
+            uint64_t address{};
+            uint64_t first{};
+            uint64_t last{};
+        };
+
+        std::vector<target> targets{};
+        // A forwarded export runs as its target, in the window where both modules are loaded; forwarders can chain.
+        constexpr size_t max_forwarder_depth = 8;
+        const auto add = [&](const auto& self, const module_symbol& found, uint64_t first, uint64_t last, const size_t depth) -> void {
+            first = std::max(first, found.module->load_step);
+            last = found.module->unload_step ? std::min(last, *found.module->unload_step) : last;
             if (first > last)
             {
-                continue;
+                return;
             }
+            if (found.symbol->forwarder.empty())
+            {
+                targets.push_back({.address = found.module->base + found.symbol->rva, .first = first, .last = last});
+                return;
+            }
+            if (depth < max_forwarder_depth)
+            {
+                for (const auto& forwarded : find_exports(found.symbol->forwarder))
+                {
+                    self(self, forwarded, first, last, depth + 1);
+                }
+            }
+        };
+        for (const auto& symbol : find_exports(name))
+        {
+            add(add, symbol, start, end, 0);
+        }
+
+        std::vector<access_event> found{};
+        for (const auto& [address, first, last] : targets)
+        {
             for (const auto& event : accesses(address, 1, first, last, static_cast<uint64_t>(access_kind::execute)))
             {
                 if (event.address == address)
@@ -1553,7 +1687,11 @@ namespace sogen::ttd
                 }
             }
         }
-        std::ranges::stable_sort(found, {}, &access_event::step);
+        // Several names (an export and the forwarders to it) can lead to the same function.
+        std::ranges::sort(found, {}, [](const access_event& event) { return std::tie(event.step, event.address); });
+        const auto duplicates =
+            std::ranges::unique(found, {}, [](const access_event& event) { return std::tie(event.step, event.address); });
+        found.erase(duplicates.begin(), duplicates.end());
         return found;
     }
 
