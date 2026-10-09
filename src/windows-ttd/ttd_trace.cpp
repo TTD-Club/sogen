@@ -377,9 +377,22 @@ namespace sogen::ttd
         }
         if (access_mask & static_cast<uint64_t>(access_kind::execute))
         {
-            execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
+            const auto record_execute = [this](const uint64_t address, const size_t size) {
                 append_event(access_kind::execute, address, executed_size(emu_, address, size));
-            }));
+            };
+            // With instruction precision the emulator already handles every instruction; its callback saves the backend
+            // a second hook call per instruction.
+            if (emu_.uses_instruction_precision())
+            {
+                instruction_callback_ = instruction_callback(emu_.callbacks.on_instruction_executed, record_execute);
+            }
+            else
+            {
+                execute_hook_ = scoped_hook(
+                    cpu, cpu.hook_memory_execution_metadata([record_execute](cpu_interface&, const uint64_t address, const size_t size) {
+                        record_execute(address, size);
+                    }));
+            }
         }
         if (access_mask & static_cast<uint64_t>(access_kind::host_write))
         {
@@ -920,6 +933,7 @@ namespace sogen::ttd
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();
+        instruction_callback_.reset();
         host_write_hook_.remove();
         block_hook_.remove();
         emu_.memory.set_mapping_change_callback({});

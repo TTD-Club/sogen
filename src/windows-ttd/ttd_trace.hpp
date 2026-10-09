@@ -129,6 +129,7 @@ namespace sogen::ttd
 
     using syscall_callback = scoped_callback<void(uint32_t syscall_id)>;
     using module_callback = scoped_callback<void(mapped_module& mod)>;
+    using instruction_callback = scoped_callback<void(uint64_t address, size_t size)>;
 
     class recorder
     {
@@ -273,6 +274,7 @@ namespace sogen::ttd
         scoped_hook write_hook_{};
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};
+        instruction_callback instruction_callback_{};
         scoped_hook host_write_hook_{};
         bool finished_{};
 

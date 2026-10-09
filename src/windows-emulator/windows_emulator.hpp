@@ -53,6 +53,9 @@ namespace sogen
         utils::callback_list<void(std::string_view message)> on_debug_string{};
         utils::callback_list<void(const mapped_module& mod, const mapped_section& section, uint64_t address)> on_section_first_execution{};
         opt_func<void(uint64_t address)> on_instruction{};
+        // Each counted instruction with instruction precision, as it is about to run: its address and length (0 when the
+        // backend cannot tell).
+        utils::callback_list<void(uint64_t address, size_t size)> on_instruction_executed{};
         opt_func<void(io_device& device, std::u16string_view device_name, ULONG code)> on_ioctrl{};
         opt_func<void(uint32_t fail_code)> on_fast_fail{};
     };
@@ -526,7 +529,7 @@ namespace sogen
         void setup_hooks();
         void setup_process();
         void vcpu_worker(vcpu_context& vcpu);
-        void on_instruction_execution(vcpu_context& vcpu, uint64_t address);
+        void on_instruction_execution(vcpu_context& vcpu, uint64_t address, size_t size);
         void on_basic_block_execution(vcpu_context& vcpu, const basic_block& block);
 
         bool uses_section_first_execution_hooks() const;

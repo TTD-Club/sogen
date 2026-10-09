@@ -949,7 +949,7 @@ namespace sogen
         return switch_to_thread(*this, vcpu, *thread, true);
     }
 
-    void windows_emulator::on_instruction_execution(vcpu_context& vcpu, const uint64_t address)
+    void windows_emulator::on_instruction_execution(vcpu_context& vcpu, const uint64_t address, const size_t size)
     {
         auto& thread = vcpu.thread();
 
@@ -976,6 +976,7 @@ namespace sogen
         }
 
         this->callbacks.on_instruction(address);
+        this->callbacks.on_instruction_executed(address, size);
     }
 
     bool windows_emulator::uses_section_first_execution_hooks() const
@@ -1286,12 +1287,22 @@ namespace sogen
 
         if (this->uses_instruction_precision())
         {
-            this->emu().hook_memory_execution([&](cpu_interface& cpu, const uint64_t address) {
+            const auto on_instruction = [&](cpu_interface& cpu, const uint64_t address, const size_t size) {
                 const std::scoped_lock lock(this->kernel_lock_);
                 auto& vcpu = this->vcpu(cpu.index());
                 const scoped_dispatch dispatch(*this, vcpu);
-                this->on_instruction_execution(vcpu, address); //
-            });
+                this->on_instruction_execution(vcpu, address, size); //
+            };
+            // The metadata hook also gives instruction sizes to on_instruction_executed; backends without one report 0.
+            try
+            {
+                this->emu().hook_memory_execution_metadata(on_instruction);
+            }
+            catch (const std::runtime_error&)
+            {
+                this->emu().hook_memory_execution(
+                    [on_instruction](cpu_interface& cpu, const uint64_t address) { on_instruction(cpu, address, 0); });
+            }
         }
         else if (!this->emu().is_stop_thread_safe())
         {

@@ -742,7 +742,19 @@ namespace sogen::unicorn
                     // Unicorn leaves this placeholder when the translator cannot decode the instruction (ud2, invalid
                     // or unsupported opcodes).
                     constexpr uint32_t unknown_instruction_size = 0xF1F1F1F1;
+                    const auto generation = this->register_generation_;
                     c(*this, addr, size == unknown_instruction_size ? 0 : size);
+                    // A callback that moved the instruction pointer (like the emulator's thread switches) takes effect
+                    // as with hook_memory_execution.
+                    if (this->register_generation_ != generation)
+                    {
+                        const auto new_ip = this->read_instruction_pointer();
+                        if (new_ip != addr)
+                        {
+                            this->violation_ip_ = new_ip;
+                            uce(uc_emu_stop(*this));
+                        }
+                    }
                 };
                 function_wrapper<void, uc_engine*, uint64_t, uint32_t> wrapper(std::move(exec_wrapper));
                 unicorn_hook hook{*this};
