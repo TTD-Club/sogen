@@ -178,6 +178,22 @@ namespace sogen::ttd
         // Encodes and compresses chunks (see flush_chunk).
         background_compressor chunk_compressor_{{}, chunk_workers, max_pending_compressions};
         background_compressor checkpoint_compressor_{{}, 1, max_pending_checkpoints};
+
+        // Register snapshots (see register_snapshot_entry), taken when every access kind is recorded and the backend
+        // reports host register changes.
+        static constexpr uint64_t register_snapshot_interval = 25000;
+        static constexpr size_t register_snapshots_per_base = 64;
+        static constexpr size_t max_pending_register_snapshots = 64;
+        bool snapshots_registers_{};
+        std::vector<register_snapshot_entry> register_snapshots_{};
+        std::optional<uint64_t> snapshot_register_generation_{};
+        bool host_changed_memory_{};
+        std::shared_ptr<const std::vector<std::byte>> register_base_{};
+        background_compressor register_compressor_{{}, 1, max_pending_register_snapshots};
+        bool at_block_start_{};
+        scoped_hook block_hook_{};
+        std::vector<mapping_change> mapping_changes_{};
+        void snapshot_registers(uint64_t position);
         std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
         static constexpr uint64_t no_recent_page = UINT64_MAX;
         // Per access kind, the last single page entered into chunk_pages_, so repeated accesses skip the map.
@@ -318,6 +334,15 @@ namespace sogen::ttd
         // The thread running instruction `step`, or nothing before the first switch.
         std::optional<uint32_t> thread_at(uint64_t step) const;
 
+        // Empty for traces recorded without register snapshots.
+        std::span<const register_snapshot_entry> register_snapshots() const
+        {
+            return register_snapshots_;
+        }
+
+        // The registers of register snapshot `index`, as the backend's save_registers returned them.
+        std::vector<std::byte> snapshot_registers(size_t index);
+
         // Index of the checkpoint at `step` (0 for the initial state); throws if no checkpoint is there.
         uint64_t checkpoint_index(uint64_t step) const;
 
@@ -356,6 +381,12 @@ namespace sogen::ttd
                                            uint64_t kind_mask = all_access_kinds);
         std::optional<access_event> next_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = all_access_kinds);
         std::optional<access_event> previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = all_access_kinds);
+        // The bytes of [address, address + size) at `position` (before instruction position + 1 runs, like cpu_view):
+        // each from the latest access at or before the position that shows it (a read, a write, a host write, or
+        // executed bytes), else from the first later access if that one reads or executes it; an access counts only
+        // when the memory was not mapped or unmapped between it and the position. Nothing for bytes no access shows.
+        // Traces without mapping changes cannot tell remapped memory apart.
+        std::vector<std::optional<uint8_t>> memory_at(uint64_t position, uint64_t address, uint64_t size);
         std::vector<self_modifying_hit> self_modifying_code();
         access_event event_at(uint64_t number);
         size_t read_events(uint64_t first_number, std::span<access_event> output);
@@ -393,6 +424,13 @@ namespace sogen::ttd
         std::optional<syscall_table> syscalls_{};
         std::vector<module_entry> modules_{};
         thread_table threads_{};
+        std::vector<register_snapshot_entry> register_snapshots_{};
+        // Empty for traces recorded before mapping changes were, whose memory_at cannot notice remapped memory.
+        std::vector<mapping_change> mapping_changes_{};
+        // Whether a mapping change covering `address` came after event `after_number` and before event `through_number`.
+        bool remapped(uint64_t address, uint64_t after_number, uint64_t through_number) const;
+        // The last decoded snapshot base: its index and registers.
+        std::optional<std::pair<uint64_t, std::vector<std::byte>>> register_base_cache_{};
 
         std::vector<chunk_entry> chunks_{};
         std::vector<code_entry> code_{};

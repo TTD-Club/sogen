@@ -89,6 +89,36 @@ namespace sogen::ttd
         // The export directories of the modules in the modules section, encoded as described at encode_exports;
         // size = compressed bytes.
         exports = 11,
+        // The register snapshots (see register_snapshot_entry), encoded as described at encode_register_snapshots;
+        // size = compressed bytes.
+        register_snapshots = 13,
+        // Every mapping and unmapping of guest memory (see mapping_change), encoded as described at
+        // encode_mapping_changes; size = compressed bytes.
+        mapping_changes = 14,
+    };
+
+    // Guest memory [address, address + size) was mapped or unmapped at position `step`, after `event_number` events,
+    // so its bytes no longer hold what earlier accesses showed.
+    struct mapping_change
+    {
+        uint64_t step{};
+        uint64_t event_number{};
+        uint64_t address{};
+        uint64_t size{};
+    };
+
+    // The CPU registers (the backend's save_registers, zstd-compressed) at position `step`, after `event_number` events.
+    // The recorder takes one before the first instruction, after anything but a guest instruction changed registers or
+    // memory (syscalls, thread switches, exception dispatch, instruction hooks, host writes), and at least every so many
+    // instructions, so the instructions up to the next snapshot depend only on these registers and the bytes the trace
+    // records for them. A snapshot with a base is a zstd delta against the base's registers; a base has none.
+    struct register_snapshot_entry
+    {
+        uint64_t step{};
+        uint64_t event_number{};
+        uint64_t offset{};
+        uint64_t size{};
+        uint64_t base{UINT64_MAX};
     };
 
     // A syscall instruction the emulator dispatched: its handler ran after `event_number` events had been recorded,
@@ -197,4 +227,5 @@ namespace sogen::ttd
     static_assert(sizeof(page_entry) == 16);
     static_assert(sizeof(page_block) == 32);
     static_assert(sizeof(ui_input_entry) == 56);
+    static_assert(sizeof(register_snapshot_entry) == 40);
 }

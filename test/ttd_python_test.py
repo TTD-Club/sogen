@@ -116,6 +116,59 @@ def main() -> None:
         else:
             raise AssertionError("run_to went on after the emulator ran")
 
+        # cpu_at: the registers at a position from the nearest register snapshot and a replay on a standalone CPU. They
+        # equal a full replay's everywhere but right before a thread switch, where cpu_at already has the next
+        # thread's registers. memory_at and read_memory: the bytes at a position from the recorded accesses.
+        assert trace.has_register_snapshots
+        mirror = ttd_format.Trace(cli_trace)
+        snapshot_positions = [entry[0] for entry in mirror.register_snapshots]
+        assert snapshot_positions[0] == 0 and snapshot_positions[-1] == trace.instruction_count, snapshot_positions[:3]
+        assert snapshot_positions == sorted(snapshot_positions) and mirror.mapping_changes, len(mirror.mapping_changes)
+        assert all(base is None or mirror.register_snapshots[base][4] is None for *_, base in mirror.register_snapshots)
+        names = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                 "rip", "rflags"]
+        before_switch = {switch.position - 1 for switch in trace.thread_switches}
+        rng = random.Random(4)
+        positions = {store.position - 1, store.position, load.position, trace.instruction_count}
+        for syscall in trace.syscalls[:15]:
+            positions.update(syscall.position + delta for delta in (-1, 0, 1))
+        for switch in trace.thread_switches[1:8]:
+            positions.update({switch.position, switch.position + 1})
+        positions.update(rng.randrange(1, trace.instruction_count + 1) for _ in range(25))
+        compared = 0
+        for position in sorted(p for p in positions - before_switch if 0 < p <= trace.instruction_count):
+            view = trace.cpu_at(position)
+            assert view.position == position and view.replayed_instructions < 30000, view
+            replay.seek(position)
+            for name in names:
+                register = getattr(sogen.Register, name)
+                assert view.read_register(register) == emulator.read_register(register), (position, name)
+            rsp = view.read_register(sogen.Register.rsp)
+            for index, byte in enumerate(trace.memory_at(position, rsp, 64)):
+                assert byte is None or byte == emulator.read_memory(rsp + index, 1)[0], (position, hex(rsp + index))
+            compared += 1
+        assert compared > 40, compared
+        for position in sorted(before_switch)[:5]:
+            trace.cpu_at(position)
+        assert len(trace.cpu_at(store.position).read_register_bytes(sogen.Register.xmm0)) == 16
+        # The global's old value comes from the image, and no access shows it before the store changes it.
+        assert trace.memory_at(store.position - 1, address, 8) == [None] * 8
+        assert trace.read_memory(store.position, address, 8) == NEW_VALUE.to_bytes(8, "little")
+        assert trace.read_memory(load.position - 1, address, 8) == NEW_VALUE.to_bytes(8, "little")
+        assert trace.memory_at(store.position, 0x10, 4) == [None] * 4
+        try:
+            trace.read_memory(store.position, 0x10, 4)
+        except ValueError as error:
+            assert "0x10" in str(error), error
+        else:
+            raise AssertionError("read_memory returned bytes no access shows")
+        try:
+            trace.cpu_at(trace.instruction_count + 1)
+        except IndexError:
+            pass
+        else:
+            raise AssertionError("cpu_at went beyond the end of the trace")
+
         # Keyframes: seeks keep states on the way that later seeks restore, and prepare_seeks keeps them over the whole
         # trace on several emulators at once. Every state reached from a keyframe equals the one a full replay from the
         # checkpoint reaches (a second reader with no keyframe budget), including after a fork and in strict seeks.

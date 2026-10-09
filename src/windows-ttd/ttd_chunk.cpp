@@ -1081,6 +1081,119 @@ namespace sogen::ttd
         return threads;
     }
 
+    std::vector<std::byte> encode_register_snapshots(const std::span<const register_snapshot_entry> entries)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, entries.size());
+        register_snapshot_entry previous{};
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            const auto& entry = entries[i];
+            if (entry.step < previous.step || entry.event_number < previous.event_number || (entry.base != UINT64_MAX && entry.base >= i))
+            {
+                throw std::runtime_error("Invalid TTD register snapshot");
+            }
+            put_varint(raw, entry.step - previous.step);
+            put_varint(raw, entry.event_number - previous.event_number);
+            put_varint(raw, zigzag(entry.offset - (previous.offset + previous.size)));
+            put_varint(raw, entry.size);
+            put_varint(raw, entry.base == UINT64_MAX ? 0 : i - entry.base);
+            previous = entry;
+        }
+        return compress_table(raw, "register snapshots");
+    }
+
+    std::vector<register_snapshot_entry> decode_register_snapshots(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        // Every entry takes at least five bytes.
+        if (count > raw.size() / 5)
+        {
+            throw std::runtime_error("Invalid TTD register snapshots");
+        }
+        std::vector<register_snapshot_entry> entries(static_cast<size_t>(count));
+        register_snapshot_entry previous{};
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            const auto step_delta = reader.varint();
+            const auto event_delta = reader.varint();
+            const auto offset_delta = unzigzag(reader.varint());
+            const auto size = reader.varint();
+            const auto base_distance = reader.varint();
+            if (step_delta > UINT64_MAX - previous.step || event_delta > UINT64_MAX - previous.event_number || base_distance > i)
+            {
+                throw std::runtime_error("Invalid TTD register snapshot");
+            }
+            auto& entry = entries[i];
+            entry = {.step = previous.step + step_delta,
+                     .event_number = previous.event_number + event_delta,
+                     .offset = previous.offset + previous.size + offset_delta,
+                     .size = size,
+                     .base = base_distance ? i - base_distance : UINT64_MAX};
+            previous = entry;
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD register snapshots");
+        }
+        return entries;
+    }
+
+    std::vector<std::byte> encode_mapping_changes(const std::span<const mapping_change> changes)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, changes.size());
+        mapping_change previous{};
+        for (const auto& change : changes)
+        {
+            if (change.step < previous.step || change.event_number < previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD mapping change");
+            }
+            put_varint(raw, change.step - previous.step);
+            put_varint(raw, change.event_number - previous.event_number);
+            put_varint(raw, zigzag(change.address - previous.address));
+            put_varint(raw, change.size);
+            previous = change;
+        }
+        return compress_table(raw, "mapping changes");
+    }
+
+    std::vector<mapping_change> decode_mapping_changes(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        // Every change takes at least four bytes.
+        if (count > raw.size() / 4)
+        {
+            throw std::runtime_error("Invalid TTD mapping changes");
+        }
+        std::vector<mapping_change> changes(static_cast<size_t>(count));
+        mapping_change previous{};
+        for (auto& change : changes)
+        {
+            const auto step_delta = reader.varint();
+            const auto event_delta = reader.varint();
+            if (step_delta > UINT64_MAX - previous.step || event_delta > UINT64_MAX - previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD mapping change");
+            }
+            change.step = previous.step + step_delta;
+            change.event_number = previous.event_number + event_delta;
+            change.address = previous.address + unzigzag(reader.varint());
+            change.size = reader.varint();
+            previous = change;
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD mapping changes");
+        }
+        return changes;
+    }
+
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)
     {
         std::vector<std::byte> filtered(data.begin(), data.end());

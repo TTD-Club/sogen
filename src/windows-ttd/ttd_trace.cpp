@@ -303,12 +303,19 @@ namespace sogen::ttd
                     append_data_event(access_kind::host_write, address, data);
                 }));
         }
-        // Last, so a constructor that throws never leaves a callback behind.
-        if (caches_instructions_)
+        snapshots_registers_ = header_.access_mask == all_access_kinds && cpu.get_register_generation().has_value();
+        if (snapshots_registers_)
         {
-            emu_.memory.set_mapping_change_callback(
-                [this](const uint64_t address, const size_t size) { forget_instructions(address, size); });
+            // Within a translated block the backend may keep part of the CPU state (such as how to compute the flags)
+            // outside the registers it saves, so snapshots are only taken where a block starts.
+            block_hook_ = scoped_hook(cpu, cpu.hook_basic_block([this](cpu_interface&, const basic_block&) { at_block_start_ = true; }));
         }
+        // Last, so a constructor that throws never leaves a callback behind.
+        emu_.memory.set_mapping_change_callback([this](const uint64_t address, const size_t size) {
+            mapping_changes_.push_back(
+                {.step = emu_.get_executed_instructions(), .event_number = header_.event_count, .address = address, .size = size});
+            forget_instructions(address, size);
+        });
         ui_ = dynamic_cast<recordable_ui_backend*>(&emu_.ui());
         if (ui_)
         {
@@ -427,6 +434,22 @@ namespace sogen::ttd
         // The backend reports an instruction before running it, with the instruction pointer at its address.
         instruction_ip_ = address;
         access_event event{.step = emu_.get_executed_instructions(), .ip = address, .address = address, .size = size, .kind = kind};
+        if (snapshots_registers_)
+        {
+            // Anything but a guest instruction that changed registers or memory ends the snapshot interval right away.
+            // Those changes come from backend helpers (syscalls, CPUID, RDTSC) that bring the CPU state up to date first,
+            // so the snapshot is complete even inside a translated block. A periodic snapshot waits for a block start,
+            // where the backend has the whole state in its registers.
+            const auto changed = register_snapshots_.empty() || host_changed_memory_ ||
+                                 emu_.emu().get_register_generation() != snapshot_register_generation_;
+            const auto due = !register_snapshots_.empty() && event.step - 1 - register_snapshots_.back().step >= register_snapshot_interval;
+            if (changed || (due && at_block_start_))
+            {
+                // The instruction is about to run, so the registers are those of the position before it.
+                snapshot_registers(event.step - 1);
+            }
+            at_block_start_ = false;
+        }
         if (size < inline_data_limit)
         {
             const auto cached = caches_instructions_ ? instruction_cache_.find(address) : instruction_cache_.end();
@@ -489,6 +512,7 @@ namespace sogen::ttd
         {
             forget_instructions(address, data.size());
         }
+        host_changed_memory_ |= kind == access_kind::host_write;
         access_event event{.step = emu_.get_executed_instructions(), .ip = ip, .address = address, .size = data.size(), .kind = kind};
         if (data.size() <= inline_data_limit)
         {
@@ -503,6 +527,27 @@ namespace sogen::ttd
             memcpy(event.payload.data() + sizeof(offset), &block, sizeof(block));
         }
         push_event(event);
+    }
+
+    void recorder::snapshot_registers(const uint64_t position)
+    {
+        host_changed_memory_ = false;
+        snapshot_register_generation_ = emu_.emu().get_register_generation();
+        auto registers = std::make_shared<const std::vector<std::byte>>(emu_.emu().save_registers());
+        const auto index = static_cast<uint64_t>(register_snapshots_.size());
+        register_snapshot_entry entry{.step = position, .event_number = header_.event_count};
+        if (index % register_snapshots_per_base == 0)
+        {
+            register_base_ = registers;
+            register_compressor_.submit_job(index, [registers] { return utils::compression::zstd::compress(*registers, 3); });
+        }
+        else
+        {
+            entry.base = index - index % register_snapshots_per_base;
+            register_compressor_.submit_job(
+                index, [registers, base = register_base_] { return utils::compression::zstd::compress_with_reference(*registers, *base); });
+        }
+        register_snapshots_.push_back(entry);
     }
 
     void recorder::push_event(const access_event& event)
@@ -623,6 +668,16 @@ namespace sogen::ttd
             entry.offset = append_to_file(compressed);
             entry.size = compressed.size();
         }
+        for (const auto& [index, compressed] : register_compressor_.take_finished(wait))
+        {
+            if (compressed.empty())
+            {
+                throw std::runtime_error("Cannot compress TTD register snapshot");
+            }
+            auto& entry = register_snapshots_.at(static_cast<size_t>(index));
+            entry.offset = append_to_file(compressed);
+            entry.size = compressed.size();
+        }
     }
 
     void recorder::write_checkpoint(const uint64_t step)
@@ -714,17 +769,21 @@ namespace sogen::ttd
         read_hook_.remove();
         execute_hook_.remove();
         host_write_hook_.remove();
-        if (caches_instructions_)
-        {
-            emu_.memory.set_mapping_change_callback({});
-        }
+        block_hook_.remove();
+        emu_.memory.set_mapping_change_callback({});
         if (ui_)
         {
             ui_->stop();
         }
+        // The registers at the end, where no further instruction takes a snapshot.
+        if (snapshots_registers_ && (register_snapshots_.empty() || register_snapshots_.back().step < emu_.get_executed_instructions()))
+        {
+            snapshot_registers(emu_.get_executed_instructions());
+        }
         flush_chunk();
         close_bulk_block();
         write_compressed(true);
+        register_base_.reset();
         base_states_.clear();
         recent_bulk_.clear();
         header_.instruction_count = emu_.get_executed_instructions();
@@ -752,6 +811,8 @@ namespace sogen::ttd
         const auto modules = encode_modules(modules_);
         const auto threads = encode_threads(threads_);
         const auto exports = encode_exports(modules_);
+        const auto snapshots = encode_register_snapshots(register_snapshots_);
+        const auto mappings = encode_mapping_changes(mapping_changes_);
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -765,6 +826,8 @@ namespace sogen::ttd
             section_entry{.type = section_type::modules, .offset = append_to_file(modules), .size = modules.size()},
             section_entry{.type = section_type::threads, .offset = append_to_file(threads), .size = threads.size()},
             section_entry{.type = section_type::exports, .offset = append_to_file(exports), .size = exports.size()},
+            section_entry{.type = section_type::register_snapshots, .offset = append_to_file(snapshots), .size = snapshots.size()},
+            section_entry{.type = section_type::mapping_changes, .offset = append_to_file(mappings), .size = mappings.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -948,6 +1011,30 @@ namespace sogen::ttd
                     throw std::runtime_error("Invalid TTD trace offsets");
                 }
                 syscalls_ = decode_syscalls(read_bytes(section.offset, section.size));
+            }
+            else if (section.type == section_type::register_snapshots)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                register_snapshots_ = decode_register_snapshots(read_bytes(section.offset, section.size));
+                for (const auto& entry : register_snapshots_)
+                {
+                    if (!fits(entry.offset, entry.size, 1) ||
+                        (entry.base != UINT64_MAX && register_snapshots_[static_cast<size_t>(entry.base)].base != UINT64_MAX))
+                    {
+                        throw std::runtime_error("Invalid TTD register snapshot entry");
+                    }
+                }
+            }
+            else if (section.type == section_type::mapping_changes)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                mapping_changes_ = decode_mapping_changes(read_bytes(section.offset, section.size));
             }
             else if (section.type == section_type::modules || section.type == section_type::threads ||
                      section.type == section_type::exports)
@@ -1481,6 +1568,22 @@ namespace sogen::ttd
         return std::prev(next)->thread_id;
     }
 
+    std::vector<std::byte> trace::snapshot_registers(const size_t index)
+    {
+        const auto& entry = register_snapshots_.at(index);
+        const auto base = entry.base == UINT64_MAX ? index : entry.base;
+        if (!register_base_cache_ || register_base_cache_->first != base)
+        {
+            const auto& base_entry = register_snapshots_[static_cast<size_t>(base)];
+            register_base_cache_.emplace(base, utils::compression::zstd::decompress(read_bytes(base_entry.offset, base_entry.size)));
+        }
+        if (base == index)
+        {
+            return register_base_cache_->second;
+        }
+        return utils::compression::zstd::decompress_with_reference(read_bytes(entry.offset, entry.size), register_base_cache_->second);
+    }
+
     uint64_t trace::checkpoint_index(const uint64_t step) const
     {
         const auto entry = std::ranges::lower_bound(checkpoints_, step, {}, &checkpoint_entry::step);
@@ -1971,6 +2074,118 @@ namespace sogen::ttd
             }
         }
         return std::nullopt;
+    }
+
+    std::vector<std::optional<uint8_t>> trace::memory_at(const uint64_t position, const uint64_t address, const uint64_t size)
+    {
+        if (position > metadata_.instruction_count)
+        {
+            throw std::out_of_range("TTD position is beyond end of trace");
+        }
+        std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
+        if (!size)
+        {
+            return value;
+        }
+        // Per byte: whether an access settled it, and whether the latest access up to the position was found (an older
+        // one says less).
+        std::vector<bool> settled(value.size());
+        std::vector<bool> seen_before(value.size());
+        auto unsettled = value.size();
+        auto unseen_before = value.size();
+        const auto boundary = first_event_after(position);
+        const auto event_bytes = [&](const access_event& event) {
+            if (event.kind != access_kind::execute)
+            {
+                return access_data(event);
+            }
+            const auto* bytes = reinterpret_cast<const std::byte*>(event.payload.data());
+            return std::vector<std::byte>(bytes, bytes + event.size);
+        };
+        const auto last = last_byte(address, size);
+
+        // The latest access up to the position shows a byte, unless its memory was mapped or unmapped since.
+        for (const auto& range : std::views::reverse(candidates(address / page_size, last / page_size, all_access_kinds, 0, boundary)))
+        {
+            for (auto number = range.end; unseen_before && number-- > range.begin;)
+            {
+                const auto event = event_at(number);
+                if (!overlaps(event.address, event.size, address, size))
+                {
+                    continue;
+                }
+                std::vector<std::byte> data{};
+                for (auto byte = std::max(event.address, address); byte < std::min(event.address + event.size, address + size); ++byte)
+                {
+                    const auto index = static_cast<size_t>(byte - address);
+                    if (seen_before[index])
+                    {
+                        continue;
+                    }
+                    seen_before[index] = true;
+                    --unseen_before;
+                    if (remapped(byte, number, boundary))
+                    {
+                        continue;
+                    }
+                    if (data.empty())
+                    {
+                        data = event_bytes(event);
+                    }
+                    value[index] = static_cast<uint8_t>(data.at(static_cast<size_t>(byte - event.address)));
+                    settled[index] = true;
+                    --unsettled;
+                }
+            }
+        }
+
+        // Other bytes still hold what the first later access reads or executes, unless something changed them before.
+        for (const auto& range : candidates(address / page_size, last / page_size, all_access_kinds, boundary, metadata_.event_count))
+        {
+            for (auto number = range.begin; unsettled && number < range.end; ++number)
+            {
+                const auto event = event_at(number);
+                if (!overlaps(event.address, event.size, address, size))
+                {
+                    continue;
+                }
+                const auto shows = event.kind == access_kind::read || event.kind == access_kind::execute;
+                std::vector<std::byte> data{};
+                for (auto byte = std::max(event.address, address); byte < std::min(event.address + event.size, address + size); ++byte)
+                {
+                    const auto index = static_cast<size_t>(byte - address);
+                    if (settled[index])
+                    {
+                        continue;
+                    }
+                    settled[index] = true;
+                    --unsettled;
+                    if (!shows || remapped(byte, boundary, number))
+                    {
+                        continue;
+                    }
+                    if (data.empty())
+                    {
+                        data = event_bytes(event);
+                    }
+                    value[index] = static_cast<uint8_t>(data.at(static_cast<size_t>(byte - event.address)));
+                }
+            }
+        }
+        return value;
+    }
+
+    bool trace::remapped(const uint64_t address, const uint64_t after_number, const uint64_t through_number) const
+    {
+        const auto first = std::ranges::upper_bound(mapping_changes_, after_number, {}, &mapping_change::event_number);
+        for (auto change = first; change != mapping_changes_.end() && change->event_number <= through_number; ++change)
+        {
+            if (address - change->address < change->size)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     event_reader::event_reader(trace& recorded, const uint64_t first_number)

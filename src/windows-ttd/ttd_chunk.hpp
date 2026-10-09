@@ -136,6 +136,17 @@ namespace sogen::ttd
 
     // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
     // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.
+    // The register snapshots section is a zstd frame of varints: the entry count, then per entry the step and
+    // event_number deltas, the offset relative to the end of the previous entry's bytes (zigzag), the size, and the
+    // distance back to the base entry (0 for an entry without a base).
+    std::vector<std::byte> encode_register_snapshots(std::span<const register_snapshot_entry> entries);
+    std::vector<register_snapshot_entry> decode_register_snapshots(std::span<const std::byte> compressed);
+
+    // The mapping changes section is a zstd frame of varints: the count, then per change the step and event_number
+    // deltas, the address relative to the previous change's (zigzag), and the size.
+    std::vector<std::byte> encode_mapping_changes(std::span<const mapping_change> changes);
+    std::vector<mapping_change> decode_mapping_changes(std::span<const std::byte> compressed);
+
     std::vector<std::byte> encode_threads(const thread_table& threads);
     thread_table decode_threads(std::span<const std::byte> compressed);
 

@@ -50,6 +50,16 @@ with ttd.Trace("sample.sogttd") as trace:
         print(call.position, trace.thread_at(call.position))
     module, export = trace.find_exports("kernel32!CreateFileW")[0]   # address: module.base + export.rva
 
+    # The CPU and memory at a position without an emulated process (~6 ms cold): registers from the nearest register
+    # snapshot, then at most 25,000 instructions replayed on a standalone CPU fed the recorded reads and verified
+    # against the recording. Like a debugger, the state is the one the next instruction starts from; it differs from
+    # Replay.seek only right before a thread switch, where cpu_at already has the next thread's registers.
+    cpu = trace.cpu_at(store.position)
+    rsp = cpu.read_register(sogen.Register.rsp)
+    xmm0 = cpu.read_register_bytes(sogen.Register.xmm0)
+    stack = trace.memory_at(store.position, rsp, 64)  # each byte from the nearest access showing it; None if none does
+    data = trace.read_memory(store.position, rsp, 8)  # bytes, or ValueError when a byte is unknown
+
     # Replay: every recorded event is verified on the way; ttd.DivergenceError (a RuntimeError) names the first
     # divergence. Syscalls whose live writes or result differ (a network answer, a missing file) and host writes with
     # other live bytes take the recorded ones (result.substituted_inputs counts them) unless Replay(..., strict=True).
@@ -457,6 +467,24 @@ found through the section table (24-byte entries `type, offset, size`):
   varint length and UTF-8 bytes (empty for an export by ordinal only, read as
   `#<ordinal>`). `test-sample`: 27,250 exports of 50 modules, 150 KB (0.4% of
   the trace; 208 KB as one varint stream in RVA order).
+- Register snapshots (type 13, size = compressed bytes; absent in older traces
+  and in traces without every access kind): the CPU registers as the backend
+  saves them (Unicorn's context), one zstd frame each, every 64th one whole and
+  the rest deltas against it. The recorder takes one before the first
+  instruction, right after anything but a guest instruction changed registers
+  or memory (a syscall, a thread switch, exception dispatch, CPUID or RDTSC, a
+  host write), at least every 25,000 instructions (at a translated block's
+  start), and at the end, so the instructions between two snapshots depend
+  only on registers and recorded bytes. The table is a zstd frame of varints:
+  count, then per snapshot the position and event-number deltas, the offset
+  relative to the end of the previous snapshot's bytes (zigzag), the size, and
+  the distance back to its base (0 for a whole one). `test-sample`: 5,768
+  snapshots, 0.7 MB (1.9%).
+- Mapping changes (type 14, size = compressed bytes; absent in older traces):
+  every guest memory mapping and unmapping, so `memory_at` knows when earlier
+  accesses stop showing a byte. A zstd frame of varints: count, then per
+  change the position and event-number deltas, the address relative to the
+  previous change's (zigzag), and the size. `test-sample`: 2.3 KB.
 
 Unknown section types are ignored, so sections can be added without a new
 version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
@@ -631,6 +659,8 @@ are wall clock, including process start; cdb's start (~0.3 s) is subtracted from
 | Index | 30.4 MiB, built in ~0.2 s | in the trace | 87.5 MiB, ~0.2 s | in the trace (0.06 MiB) |
 | Seek to the middle / end | < 0.05 s | | 0.031 / 0.068 s | 0.29 / 0.40 s; 0.012 / 0.042 s after `prepare_seeks` |
 | Seek to 40 random positions, mean / median | | | 34–40 / 30–35 ms, with or without the index | 215 / 224 ms; 36 / 30 ms after `prepare_seeks` |
+| Registers at 200 random positions (`Trace.cpu_at`, cold, random order), mean / median | | | | 7.0–8.0 / 6.0–6.5 ms |
+| Memory at a position (`Trace.memory_at`, stack and recently used addresses), mean / median | | | 31–39 ms (value at a random position) | 5.7 / 0.08 ms |
 | Writes / reads in the main image | | | 38 / 3,515, ~0.07 s each | 280 / 19,648, 0.06 / 0.48 s |
 
 Caveats: Sogen's runs execute about 4× the instructions of the native ones (its emulated loader and environment
@@ -648,7 +678,10 @@ Microsoft's after zstd, before counting Microsoft's index. Microsoft's seeks are
 the index (timed with `!tt` in cdb from a WinDbg script, `.run` alone or with its `.idx`: the same 34–40 ms mean); its
 keyframes are in the trace and much denser than Sogen's 500,000-instruction checkpoints. Sogen's seeks match them only
 after `Trace.prepare_seeks` (5.6 s on eight emulators for `test-sample`, a step Microsoft does not need) and are
-about 6× slower before that. Address queries are comparable.
+about 6× slower before that. Looking at a position the way Microsoft's replay does, registers and memory without a
+replayable process (`Trace.cpu_at`, `Trace.memory_at`), takes about 6–8 ms on a fresh trace: Microsoft's model of
+keyframes holding only CPU registers, with the replay fed recorded memory, applied to Sogen's traces, which already
+hold every value read. Address queries are comparable.
 
 ### Memory queries and watchpoints
 

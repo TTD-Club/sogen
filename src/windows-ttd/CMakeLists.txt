@@ -14,6 +14,7 @@ target_link_libraries(windows-ttd PUBLIC
 )
 
 target_link_libraries(windows-ttd PRIVATE
+  backend-selection
   disassembler
 )
 

@@ -19,6 +19,7 @@ MAGIC = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
 CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS, SYSCALLS = 1, 2, 3, 4, 5, 6, 7, 8
 MODULES, THREADS, EXPORTS = 9, 10, 11
+REGISTER_SNAPSHOTS, MAPPING_CHANGES = 13, 14
 SYSCALL_HEADER = struct.Struct("<8Q")
 # checkpoint, event_number, step, window, message, reserved, wparam, lparam
 UI_INPUT = struct.Struct("<4QII2Q")
@@ -379,6 +380,35 @@ def decode_threads(compressed):
     return switches, names
 
 
+def decode_register_snapshots(compressed):
+    """Mirror of decode_register_snapshots in src/windows-ttd/ttd_chunk.cpp: (step, event_number, offset, size, base)
+    tuples, base None for an entry without one."""
+    stream = _Stream(zstandard.ZstdDecompressor().decompress(compressed))
+    entries, step, event_number, end = [], 0, 0, 0
+    for index in range(stream.varint()):
+        step += stream.varint()
+        event_number += stream.varint()
+        offset = (end + _unzigzag(stream.varint())) & MASK64
+        size, distance = stream.varint(), stream.varint()
+        entries.append((step, event_number, offset, size, index - distance if distance else None))
+        end = offset + size
+    assert stream.offset == len(stream.data), "invalid register snapshots"
+    return entries
+
+
+def decode_mapping_changes(compressed):
+    """Mirror of decode_mapping_changes in src/windows-ttd/ttd_chunk.cpp: (step, event_number, address, size) tuples."""
+    stream = _Stream(zstandard.ZstdDecompressor().decompress(compressed))
+    changes, step, event_number, address = [], 0, 0, 0
+    for _ in range(stream.varint()):
+        step += stream.varint()
+        event_number += stream.varint()
+        address = (address + _unzigzag(stream.varint())) & MASK64
+        changes.append((step, event_number, address, stream.varint()))
+    assert stream.offset == len(stream.data), "invalid mapping changes"
+    return changes
+
+
 class Trace:
     def __init__(self, path):
         self.path = path
@@ -416,6 +446,11 @@ class Trace:
         offset, size = self.sections.get(THREADS, (0, 0))
         self.thread_switches, self.thread_names = (decode_threads(self.bytes[offset:offset + size])
                                                    if THREADS in self.sections else ([], {}))
+        offset, size = self.sections.get(REGISTER_SNAPSHOTS, (0, 0))
+        self.register_snapshots = (decode_register_snapshots(self.bytes[offset:offset + size])
+                                   if REGISTER_SNAPSHOTS in self.sections else [])
+        offset, size = self.sections.get(MAPPING_CHANGES, (0, 0))
+        self.mapping_changes = decode_mapping_changes(self.bytes[offset:offset + size]) if MAPPING_CHANGES in self.sections else []
         self._bulk_cache = {}
 
     def bulk(self, index):

@@ -8,6 +8,7 @@
 #include <ttd_string_scan.hpp>
 #include <ttd_trace.hpp>
 #include <ttd_ui.hpp>
+#include <ttd_view.hpp>
 
 #include <sstream>
 
@@ -664,11 +665,79 @@ namespace sogen::py
                     "thread_at", [](const ttd_trace& self, const uint64_t position) { return self.native().thread_at(position); },
                     nb::arg("position"), "Id of the thread executing the instruction at position, or None before the first switch")
                 .def(
+                    "cpu_at",
+                    [](const ttd_trace& self, const uint64_t position) {
+                        auto& native = self.native();
+                        const nb::gil_scoped_release release{};
+                        return ttd::cpu_view(native, position);
+                    },
+                    nb::arg("position"),
+                    "The registers at position, replayed from the nearest register snapshot without an emulated process "
+                    "(verified against the recording; DivergenceError otherwise). Needs a trace with register snapshots")
+                .def(
+                    "memory_at",
+                    [](const ttd_trace& self, const uint64_t position, const uint64_t address, const uint64_t size) {
+                        auto& native = self.native();
+                        const nb::gil_scoped_release release{};
+                        return native.memory_at(position, address, size);
+                    },
+                    nb::arg("position"), nb::arg("address"), nb::arg("size"),
+                    "Each byte of [address, address + size) at position (as cpu_at sees it), from the nearest recorded access "
+                    "that shows it; None for bytes no access shows")
+                .def(
+                    "read_memory",
+                    [](const ttd_trace& self, const uint64_t position, const uint64_t address, const uint64_t size) {
+                        std::vector<std::optional<uint8_t>> value{};
+                        {
+                            auto& native = self.native();
+                            const nb::gil_scoped_release release{};
+                            value = native.memory_at(position, address, size);
+                        }
+                        std::vector<std::byte> bytes{};
+                        bytes.reserve(value.size());
+                        for (size_t i = 0; i < value.size(); ++i)
+                        {
+                            if (!value[i])
+                            {
+                                std::ostringstream text;
+                                text << "No recorded access shows the byte at 0x" << std::hex << address + i << " at this position";
+                                throw nb::value_error(text.str().c_str());
+                            }
+                            bytes.push_back(static_cast<std::byte>(*value[i]));
+                        }
+                        return to_bytes(bytes);
+                    },
+                    nb::arg("position"), nb::arg("address"), nb::arg("size"), "memory_at as bytes; ValueError when a byte is unknown")
+                .def_prop_ro(
+                    "has_register_snapshots", [](const ttd_trace& self) { return !self.native().register_snapshots().empty(); },
+                    "Whether cpu_at works on this trace (recorded with every access kind by a recorder that takes snapshots)")
+                .def(
                     "event", [](const ttd_trace& self, const uint64_t number) { return self.event(self.native().event_at(number)); },
                     nb::arg("number"))
                 .def(
                     "self_modifying_code", [](const ttd_trace& self) { return self.native().self_modifying_code(); },
                     "Executed instructions whose bytes a guest instruction wrote earlier");
+
+            nb::class_<ttd::cpu_view>(m, "CpuView", "The CPU at a trace position, from Trace.cpu_at")
+                .def_prop_ro("position", &ttd::cpu_view::position)
+                .def_prop_ro("replayed_instructions", &ttd::cpu_view::replayed_instructions,
+                             "Instructions replayed from the register snapshot to the position")
+                .def(
+                    "read_register", [](ttd::cpu_view& self, const x86_register reg) { return self.cpu().reg<uint64_t>(reg); },
+                    nb::arg("register"), "The low 64 bits of a register")
+                .def(
+                    "read_register_bytes",
+                    [](ttd::cpu_view& self, const x86_register reg) {
+                        std::array<std::byte, 64> value{};
+                        const auto size = self.cpu().read_register(reg, value.data(), value.size());
+                        return to_bytes(std::span(value).first(size));
+                    },
+                    nb::arg("register"), "A register's full value, little-endian (16 bytes for xmm registers)")
+                .def("__repr__", [](const ttd::cpu_view& self) {
+                    std::ostringstream text;
+                    text << "CpuView(position=0x" << std::hex << self.position() << ")";
+                    return text.str();
+                });
 
             nb::class_<ttd_difference>(m, "Difference", "The first event two traces record differently")
                 .def_ro("first", &ttd_difference::first, "The first trace's event; None when it has no further event")
