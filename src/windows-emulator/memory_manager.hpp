@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <set>
 #include <vector>
 
 #include "memory_permission_ext.hpp"
@@ -54,6 +55,16 @@ namespace sogen
         uint64_t reserved_memory = 0;
         uint64_t committed_memory = 0;
     };
+
+    struct restored_page
+    {
+        // Null for a page of zeros.
+        const std::byte* data{};
+        // The caller knows the page is mapped and already holds these bytes.
+        bool unchanged{};
+    };
+
+    using restored_page_source = std::function<restored_page(uint64_t page_address)>;
 
     class memory_manager : public memory_interface
     {
@@ -139,8 +150,6 @@ namespace sogen
 
         bool release_memory(uint64_t address, size_t size);
 
-        void unmap_all_memory();
-
         uint64_t allocate_memory(size_t size, nt_memory_permission permissions, bool reserve_only = false, uint64_t start = 0,
                                  memory_region_kind kind = memory_region_kind::private_allocation);
 
@@ -192,6 +201,8 @@ namespace sogen
 
         void serialize_memory_state(utils::buffer_serializer& buffer, bool is_snapshot) const;
         void deserialize_memory_state(utils::buffer_deserializer& buffer, bool is_snapshot);
+        // Restores a layout written with is_snapshot and fills its committed pages from `pages`.
+        void deserialize_memory_state(utils::buffer_deserializer& buffer, const restored_page_source& pages);
 
         memory_stats compute_memory_stats() const;
 
@@ -210,6 +221,10 @@ namespace sogen
         bool dep_enabled_{true};
         std::vector<uint64_t> host_reserved_addresses_{};
         std::function<void(uint64_t, size_t)> mapping_change_callback_{};
+
+        // Returns the committed regions that stayed mapped; the others are mapped anew.
+        std::set<uint64_t> restore_memory_layout(utils::buffer_deserializer& buffer);
+        void restore_region_contents(uint64_t address, size_t length, bool kept, const restored_page_source& pages);
 
         void map_mmio(uint64_t address, size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) final;
         void map_memory(uint64_t address, size_t size, memory_permission permissions) final;
