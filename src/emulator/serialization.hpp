@@ -253,6 +253,11 @@ namespace sogen
                 return std::move(this->buffer_);
             }
 
+            void reserve(const size_t size)
+            {
+                this->buffer_.reserve(size);
+            }
+
             void set_break_offset(const size_t break_offset)
             {
                 this->break_offset_ = break_offset;

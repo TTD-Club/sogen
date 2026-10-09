@@ -29,6 +29,8 @@ namespace sogen
         bool skip_syscalls{false};
         bool skip_generic_activity{false};
         bool reproducible{false};
+        // Analysis must not change what the guest does (TTD recordings must not depend on the tool that made them).
+        bool observe_only{false};
         bool log_first_section_execution{false};
 
         string_set modules{};

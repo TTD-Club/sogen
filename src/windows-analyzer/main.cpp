@@ -17,6 +17,9 @@
 #include "jsonl_reporter.hpp"
 #include "stdout_file_reporter.hpp"
 #include "tenet_tracer.hpp"
+#include "ttd_cli.hpp"
+#include "ttd_session.hpp"
+#include "ttd_ui.hpp"
 #include <subprocess_process_manager.hpp>
 
 #include <utils/finally.hpp>
@@ -30,6 +33,7 @@
 #ifndef _WIN32
 #include <csignal>
 #endif
+#include <fstream>
 
 namespace sogen
 {
@@ -60,6 +64,7 @@ namespace sogen
             bool log_executable_access{false};
             bool log_foreign_module_access{false};
             bool tenet_trace{false};
+            ttd::cli_options ttd{};
             bool prepend_call_count{false};
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
             bool pause_before_start{false};
@@ -467,7 +472,29 @@ namespace sogen
                         debugger::enter_breakpoint(win_emu, win_emu.mod_manager.executable->entry_point);
                     }
 #endif
-                    win_emu.start();
+                    if (options.ttd.replays())
+                    {
+                        const auto result = ttd::replay(win_emu, options.ttd);
+                        if (result.failure)
+                        {
+                            return emit_failure(*result.failure);
+                        }
+                        do_post_emulation_work(c);
+                        c.emit_summary<run_finished_event>([&](auto& event) {
+                            event.success = true;
+                            event.exit_status = result.exit_status;
+                        });
+                        flush_reporters(c);
+                        return true;
+                    }
+                    if (options.ttd.records())
+                    {
+                        ttd::record(win_emu, options.ttd, [&] { return signals_received > 0; });
+                    }
+                    else
+                    {
+                        win_emu.start();
+                    }
                 }
 
                 if (signals_received > 0)
@@ -501,6 +528,17 @@ namespace sogen
             exit_status = win_emu.process.exit_status;
             if (!exit_status.has_value())
             {
+                if (options.ttd.records() && options.ttd.max_instructions &&
+                    win_emu.get_executed_instructions() >= options.ttd.max_instructions)
+                {
+                    do_post_emulation_work(c);
+                    c.emit_summary<run_finished_event>([&](auto& event) {
+                        event.success = true;
+                        event.exit_status = std::nullopt;
+                    });
+                    flush_reporters(c);
+                    return true;
+                }
                 return emit_failure("Emulation terminated without status");
             }
 
@@ -679,7 +717,19 @@ namespace sogen
             }
 #endif
             const auto concise_logging = options.concise_logging;
-            const auto win_emu = setup_emulator(options, args, emulator_interfaces{.processes = manager.get()});
+            // Host window events are input a replay cannot repeat: a recording shows the window and logs its events,
+            // a replay runs headless and delivers the logged ones.
+            std::unique_ptr<ui_backend> ui{};
+            if (options.ttd.records())
+            {
+                ui = std::make_unique<ttd::recordable_ui_backend>(create_default_ui_backend());
+            }
+            else if (options.ttd.replays())
+            {
+                ui = std::make_unique<ttd::recordable_ui_backend>(std::make_unique<null_ui_backend>());
+            }
+            const auto win_emu = setup_emulator(options, args, emulator_interfaces{.ui = std::move(ui), .processes = manager.get()});
+            ttd::prepare_replay(*win_emu, options.ttd);
             apply_registry_files(*win_emu, options);
 #ifndef OS_EMSCRIPTEN
             std::unique_ptr<emulator_process_target> managed_target{};
@@ -784,40 +834,17 @@ namespace sogen
                         context.emit_observation<cpuid_event>([&](auto& event) { event.leaf = leaf; });
                     }
 
-                    if (leaf == 1 && !is_whp)
+                    const auto result = is_whp ? std::optional<ttd::cpuid_result>{} : ttd::cpuid_override(leaf, options.reproducible);
+                    if (!result)
                     {
-                        // NOTE: We hard-code these values to disable SSE4.x and AVX
-                        //       See: https://github.com/momo5502/sogen/issues/560
-                        emu.reg<uint32_t>(x86_register::eax, 0x000906EA);
-                        emu.reg<uint32_t>(x86_register::ebx, 0x00100800);
-                        emu.reg<uint32_t>(x86_register::ecx, 0xEFE2F38F);
-                        emu.reg<uint32_t>(x86_register::edx, 0xBFEBFBFF);
-
-                        return instruction_hook_continuation::skip_instruction;
+                        return instruction_hook_continuation::run_instruction;
                     }
 
-                    if (leaf == 0x40000000 && !is_whp)
-                    {
-                        // Microsoft Hv vendor string
-                        emu.reg<uint32_t>(x86_register::eax, 0x40000003);
-                        emu.reg<uint32_t>(x86_register::ebx, 0x7263694d);
-                        emu.reg<uint32_t>(x86_register::ecx, 0x666f736f);
-                        emu.reg<uint32_t>(x86_register::edx, 0x76482074);
-
-                        return instruction_hook_continuation::skip_instruction;
-                    }
-
-                    if (leaf == 0x40000003 && !is_whp)
-                    {
-                        emu.reg<uint32_t>(x86_register::eax, 0x00000000);
-                        emu.reg<uint32_t>(x86_register::ebx, 0x00000001);
-                        emu.reg<uint32_t>(x86_register::ecx, 0x00000000);
-                        emu.reg<uint32_t>(x86_register::edx, 0x00000000);
-
-                        return instruction_hook_continuation::skip_instruction;
-                    }
-
-                    return instruction_hook_continuation::run_instruction;
+                    emu.reg<uint32_t>(x86_register::eax, result->eax);
+                    emu.reg<uint32_t>(x86_register::ebx, result->ebx);
+                    emu.reg<uint32_t>(x86_register::ecx, result->ecx);
+                    emu.reg<uint32_t>(x86_register::edx, result->edx);
+                    return instruction_hook_continuation::skip_instruction;
                 });
             });
 
@@ -986,6 +1013,7 @@ namespace sogen
                 "Very concise logging");
             app.add_flag("-x,--exec", options.log_executable_access, "Log r/w access to executable memory");
             app.add_flag("-t,--tenet-trace", options.tenet_trace, "Enable Tenet tracer");
+            ttd::add_options(app, options.ttd);
             app.add_flag("--first-exec", options.log_first_section_execution, "Print first executions of sections");
             app.add_flag("--inst-summary", options.instruction_summary, "Print a summary of executed instructions of the analyzed modules");
             app.add_flag("--skip-syscalls", options.skip_syscalls, "Skip the logging of regular syscalls");
@@ -1047,6 +1075,23 @@ namespace sogen
 #endif
             try
             {
+                if (const auto exit_code = ttd::run_offline(options.ttd))
+                {
+                    return *exit_code;
+                }
+                ttd::validate(options.ttd, {
+                                               .vcpu_count = options.vcpu_count,
+                                               .gdb = options.use_gdb,
+                                               .snapshot_input = !options.dump.empty() || !options.minidump_path.empty(),
+                                               .instruction_precision = !options.disable_instruction_precision,
+                                               .backend_name = backend_name,
+                                           });
+                if (options.ttd.records() || options.ttd.replays())
+                {
+                    options.backend = backend_type::unicorn;
+                    options.reproducible = true;
+                    options.observe_only = true;
+                }
                 if (options.use_gdb && options.vcpu_count > 1)
                 {
                     throw std::runtime_error("GDB debugging requires --vcpus 1");

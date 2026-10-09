@@ -812,6 +812,44 @@ jobs:
           EMULATOR_ROOT: ${{github.workspace}}/build/release/artifacts/root
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
 
+  ttd-test:
+    name: TTD Test
+    runs-on: windows-latest
+    needs: [create-emulation-root, build]
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            test
+            tools
+
+      - name: Download Artifacts
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: Windows x86_64 Release Artifacts
+          path: build/release/artifacts
+
+      - name: Download Emulation Root
+        uses: pyTooling/download-artifact@v8
+        with:
+          name: Windows 2025 Emulation Root
+          path: build/release/artifacts/root
+
+      - name: Copy TTD Sample
+        run: cp build/release/artifacts/ttd-step-sample.exe build/release/artifacts/root/filesys/c/
+
+      - name: Install Python Dependencies
+        run: python -m pip install "capstone>=5,<6" zstandard
+
+      - name: Trace Format Tests
+        run: |
+          python test/ttd_trace_query_test.py build/release/artifacts/analyzer.exe
+          python test/ttd_taint_test.py build/release/artifacts/analyzer.exe
+
+      - name: Recorded Trace Tests
+        run: python test/ttd_step_test.py build/release/artifacts/analyzer.exe c:/ttd-step-sample.exe -e root
+
   smoke-test-kvm:
     name: Smoke Test KVM x86_64
     runs-on: ubuntu-24.04
@@ -1238,6 +1276,13 @@ jobs:
           EMULATOR_VERBOSE: ${{ inputs.verbose }}
           ANALYSIS_SAMPLE: ${{github.workspace}}/build/release/artifacts/test-sample.exe
 
+      - name: Run Python TTD Test Script
+        if: ${{ startsWith(matrix.runner, 'windows') }}
+        run: |
+          cp build/release/artifacts/ttd-step-sample.exe build/release/artifacts/root/filesys/c/
+          python -m pip install zstandard
+          python test/ttd_python_test.py build/release/artifacts/analyzer.exe c:/ttd-step-sample.exe -e ${{github.workspace}}/build/release/artifacts/root
+
       - name: Run Python Linux Unicorn Test Script
         if: ${{ startsWith(matrix.runner, 'ubuntu') }}
         run: python src/python-bindings/test_linux.py
@@ -1349,6 +1394,7 @@ jobs:
         build-isolate,
         test,
         win-test,
+        ttd-test,
         verify-formatting,
         workflow_metadata,
       ]

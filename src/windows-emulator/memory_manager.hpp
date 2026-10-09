@@ -3,6 +3,7 @@
 #include <map>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -80,6 +81,15 @@ namespace sogen
         };
 
         using reserved_region_map = std::map<uint64_t, reserved_region>;
+
+        void set_mapping_change_callback(std::function<void(uint64_t, size_t)> callback)
+        {
+            if (callback && mapping_change_callback_)
+            {
+                throw std::logic_error("A memory mapping change callback is already installed");
+            }
+            mapping_change_callback_ = std::move(callback);
+        }
 
         using memory_interface::read_memory;
 
@@ -199,6 +209,7 @@ namespace sogen
         std::uint64_t default_allocation_address_{0x100000000ULL};
         bool dep_enabled_{true};
         std::vector<uint64_t> host_reserved_addresses_{};
+        std::function<void(uint64_t, size_t)> mapping_change_callback_{};
 
         void map_mmio(uint64_t address, size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) final;
         void map_memory(uint64_t address, size_t size, memory_permission permissions) final;

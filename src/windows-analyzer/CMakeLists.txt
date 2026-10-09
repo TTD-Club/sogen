@@ -21,6 +21,7 @@ target_link_libraries(windows-analyzer PRIVATE
   windows-emulator
   process-manager
   windows-gdb-stub
+  windows-ttd
   backend-selection
   cli11
 )

@@ -291,9 +291,17 @@ namespace sogen::py
             nb::object callback_;
         };
 
-        emulator_interfaces make_emulator_interfaces(const nb::kwargs& kwargs)
+        emulator_interfaces make_emulator_interfaces(const nb::kwargs& kwargs, const ui_wrapper& wrap_ui = {})
         {
             emulator_interfaces interfaces{};
+            if (get_kwarg<bool>(kwargs, "headless", false))
+            {
+                interfaces.ui = std::make_unique<null_ui_backend>();
+            }
+            if (wrap_ui)
+            {
+                interfaces.ui = wrap_ui(interfaces.ui ? std::move(interfaces.ui) : create_default_ui_backend());
+            }
             if (kwargs.contains("dns_resolver"))
             {
                 nb::object resolver = kwargs["dns_resolver"];
@@ -315,8 +323,15 @@ namespace sogen::py
     std::unique_ptr<windows_emulator> create_application_emulator(const nb::object& application, const nb::object& args,
                                                                   const nb::kwargs& kwargs)
     {
+        return create_application_emulator(application, args, kwargs, {});
+    }
+
+    std::unique_ptr<windows_emulator> create_application_emulator(const nb::object& application, const nb::object& args,
+                                                                  const nb::kwargs& kwargs, const ui_wrapper& wrap_ui)
+    {
         auto app_settings = make_application_settings(application, args, kwargs);
         return std::make_unique<windows_emulator>(create_x86_64_emulator(get_backend_type(kwargs)), std::move(app_settings),
-                                                  make_emulator_settings(kwargs), emulator_callbacks{}, make_emulator_interfaces(kwargs));
+                                                  make_emulator_settings(kwargs), emulator_callbacks{},
+                                                  make_emulator_interfaces(kwargs, wrap_ui));
     }
 }

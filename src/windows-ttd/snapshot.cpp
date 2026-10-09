@@ -47,16 +47,7 @@ namespace sogen
 
             std::vector<std::byte> get_compressed_emulator_state(const windows_emulator& win_emu)
             {
-                utils::buffer_serializer serializer{};
-                win_emu.serialize(serializer);
-
-                return utils::compression::zstd::compress(serializer.get_buffer());
-            }
-
-            std::vector<std::byte> get_decompressed_emulator_state(const std::span<const std::byte> snapshot)
-            {
-                const auto data = validate_header(snapshot);
-                return utils::compression::zstd::decompress(data);
+                return utils::compression::zstd::compress(create_emulator_state(win_emu));
             }
 
             std::string get_main_executable_name(const windows_emulator& win_emu)
@@ -86,6 +77,12 @@ namespace sogen
             return snapshot;
         }
 
+        std::vector<std::byte> get_emulator_state(const std::span<const std::byte> snapshot)
+        {
+            const auto data = validate_header(snapshot);
+            return utils::compression::zstd::decompress(data);
+        }
+
         std::filesystem::path write_emulator_snapshot(const windows_emulator& win_emu, const bool log)
         {
             std::filesystem::path snapshot_file = get_main_executable_name(win_emu) + "-" + std::to_string(time(nullptr)) + ".snap";
@@ -104,12 +101,23 @@ namespace sogen
             return snapshot_file;
         }
 
+        std::vector<std::byte> create_emulator_state(const windows_emulator& win_emu, const size_t expected_size)
+        {
+            utils::buffer_serializer serializer{};
+            serializer.reserve(expected_size);
+            win_emu.serialize(serializer);
+            return serializer.move_buffer();
+        }
+
+        void load_emulator_state(windows_emulator& win_emu, const std::span<const std::byte> state)
+        {
+            utils::buffer_deserializer deserializer{state};
+            win_emu.deserialize(deserializer);
+        }
+
         void load_emulator_snapshot(windows_emulator& win_emu, const std::span<const std::byte> snapshot)
         {
-            const auto data = get_decompressed_emulator_state(snapshot);
-
-            utils::buffer_deserializer deserializer{data};
-            win_emu.deserialize(deserializer);
+            load_emulator_state(win_emu, get_emulator_state(snapshot));
         }
 
         void load_emulator_snapshot(windows_emulator& win_emu, const std::filesystem::path& snapshot_file)

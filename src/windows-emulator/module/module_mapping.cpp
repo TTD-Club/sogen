@@ -643,7 +643,10 @@ namespace sogen
         const bool is_32bit = (nt_headers.FileHeader.Machine == PEMachineType::I386);
         const auto is_dll = nt_headers.FileHeader.Characteristics & IMAGE_FILE_DLL;
         const auto has_dynamic_base = optional_header.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
-        const auto is_relocatable = is_dll || has_dynamic_base;
+        const auto& relocations = optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        const bool has_relocations =
+            relocations.VirtualAddress && relocations.Size && !(nt_headers.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED);
+        const auto is_relocatable = is_dll || has_dynamic_base || has_relocations;
 
         if (!binary.image_base || !try_map_module_at_current_base(memory, binary, buffer, nt_headers, nt_headers_offset, optional_header,
                                                                   relocation_base ? relocation_base : binary.image_base))

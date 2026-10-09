@@ -61,13 +61,17 @@ namespace sogen
             uint64_t data{};
         };
 
+        // These structures are copied byte for byte onto the guest stack, so their padding is spelled out as zeroed members;
+        // implicit padding would carry host stack bytes into the guest and make runs irreproducible.
         struct user_callback_capture_buffer
         {
             DWORD cbCallback{};
             DWORD cbCapture{};
             DWORD cCapturedPointers{};
+            DWORD padding0{};
             pointer pbFree{};
             DWORD offPointers{};
+            DWORD padding1{};
             pointer pvVirtualAddress{};
         };
 
@@ -75,6 +79,7 @@ namespace sogen
         {
             pointer pwnd{};
             UINT msg{};
+            UINT msg_padding{};
             wparam wParam{};
             lparam lParam{};
             pointer xParam{};
@@ -86,6 +91,7 @@ namespace sogen
             user_callback_capture_buffer captureBuffer{};
             pointer pwnd{};
             UINT msg{};
+            UINT msg_padding{};
             wparam wParam{};
             lparam lParam{};
             EMU_CREATESTRUCT cs{};
@@ -116,6 +122,7 @@ namespace sogen
         {
             pointer pwnd{};
             UINT msg{};
+            UINT msg_padding{};
             wparam wParam{};
             EMU_WINDOWPOS wp{};
             pointer xParam{};
@@ -126,6 +133,7 @@ namespace sogen
         {
             pointer pwnd{};
             UINT msg{};
+            UINT msg_padding{};
             wparam wParam{};
 
             union
@@ -139,6 +147,10 @@ namespace sogen
             pointer xpfnProc{};
         };
 
+        static_assert(std::has_unique_object_representations_v<user_callback_capture_buffer>);
+        static_assert(std::has_unique_object_representations_v<fn_dword_message>);
+        static_assert(std::has_unique_object_representations_v<fn_in_lp_window_pos_message>);
+
         struct EMU_NCCALCSIZE_PARAMS
         {
             std::array<RECT, 3> rgrc{};
@@ -149,6 +161,7 @@ namespace sogen
         {
             pointer pwnd{};
             UINT msg{};
+            UINT msg_padding{};
             wparam wParam{};
             pointer xParam{};
             pointer xpfnProc{};

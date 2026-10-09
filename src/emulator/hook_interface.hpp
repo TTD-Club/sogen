@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cassert>
 #include <functional>
+#include <span>
 #include <stdexcept>
 
 namespace sogen
@@ -53,6 +54,9 @@ namespace sogen
     using interrupt_hook_callback = std::function<void(cpu_interface& cpu, int interrupt)>;
 
     using memory_access_hook_callback = std::function<void(cpu_interface& cpu, uint64_t address, const void* data, size_t size)>;
+    using memory_access_data_callback = std::function<void(cpu_interface& cpu, uint64_t address, std::span<const std::byte> data)>;
+    // `size` is the instruction's length, or 0 when the backend cannot decode it (the instruction then raises an exception).
+    using memory_execution_metadata_callback = std::function<void(cpu_interface& cpu, uint64_t address, size_t size)>;
     using memory_execution_hook_callback = std::function<void(cpu_interface& cpu, uint64_t address)>;
 
     using memory_violation_hook_callback = std::function<memory_violation_continuation(
@@ -87,6 +91,41 @@ namespace sogen
         virtual emulator_hook* hook_memory_range_execution(uint64_t address, uint64_t size, memory_execution_hook_callback callback) = 0;
         virtual emulator_hook* hook_memory_read(uint64_t address, uint64_t size, memory_access_hook_callback callback) = 0;
         virtual emulator_hook* hook_memory_write(uint64_t address, uint64_t size, memory_access_hook_callback callback) = 0;
+
+        // These hooks report the exact bytes of every access and the size of every instruction, which the hooks above
+        // cannot (they cap widths at eight bytes and do not report instruction sizes). Backends that cannot provide
+        // them refuse instead of approximating, so trace recording cannot silently record wrong data.
+        // NOLINTBEGIN(performance-unnecessary-value-param)
+        virtual emulator_hook* hook_memory_write_data(uint64_t /*address*/, uint64_t /*size*/, memory_access_data_callback /*callback*/)
+        {
+            throw std::runtime_error("This backend cannot report written memory");
+        }
+
+        virtual emulator_hook* hook_memory_read_data(uint64_t /*address*/, uint64_t /*size*/, memory_access_data_callback /*callback*/)
+        {
+            throw std::runtime_error("This backend cannot report read memory");
+        }
+
+        virtual emulator_hook* hook_memory_execution_metadata(memory_execution_metadata_callback /*callback*/)
+        {
+            throw std::runtime_error("This backend cannot report instruction execution metadata");
+        }
+
+        // Reports writes made through the memory interface (syscall handlers, loaders, exception dispatch), which
+        // bypass the guest memory hooks above. Called after the write succeeded.
+        virtual emulator_hook* hook_host_memory_write(memory_access_data_callback /*callback*/)
+        {
+            throw std::runtime_error("This backend cannot report host memory writes");
+        }
+
+        // Like hook_host_memory_write, but called before each write, while the memory still holds the bytes it replaces;
+        // the write can still fail afterwards.
+        virtual emulator_hook* hook_host_memory_write_before(memory_access_data_callback /*callback*/)
+        {
+            throw std::runtime_error("This backend cannot report host memory writes");
+        }
+
+        // NOLINTEND(performance-unnecessary-value-param)
 
         virtual emulator_hook* hook_instruction(int instruction_type, instruction_hook_callback callback) = 0;
 
