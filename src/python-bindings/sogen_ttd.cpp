@@ -481,6 +481,27 @@ namespace sogen::py
                 .def("__enter__", [](nb::handle self) { return self; })
                 .def(
                     "__exit__", [](ttd_trace& self, const nb::args&) { self.close(); }, nb::arg("args"))
+                .def(
+                    "prepare_seeks",
+                    [](const ttd_trace& self, const std::vector<sogen_windows_emulator*>& emulators) {
+                        std::vector<windows_emulator*> natives{};
+                        natives.reserve(emulators.size());
+                        for (auto* emulator : emulators)
+                        {
+                            natives.push_back(&emulator->native());
+                        }
+                        const nb::gil_scoped_release release{};
+                        ttd::prepare_keyframes(self.native(), natives);
+                    },
+                    nb::arg("emulators"),
+                    "Replay the whole trace on these emulators in parallel (from ttd.create_emulator, one thread each) and keep "
+                    "keyframes, so that seeks anywhere become fast; the emulators end up at arbitrary positions")
+                .def_prop_rw(
+                    "keyframe_budget", [](const ttd_trace& self) { return self.native().keyframes().memory_budget(); },
+                    [](const ttd_trace& self, const size_t budget) { self.native().keyframes().set_memory_budget(budget); },
+                    "Bytes of memory the keyframes of seeks may use; the least recently used are dropped beyond it")
+                .def_prop_ro("keyframe_count", [](const ttd_trace& self) { return self.native().keyframes().size(); })
+                .def_prop_ro("keyframe_memory", [](const ttd_trace& self) { return self.native().keyframes().memory_usage(); })
                 .def_prop_ro("instruction_count", [](const ttd_trace& self) { return self.native().metadata().instruction_count; })
                 .def_prop_ro("event_count", [](const ttd_trace& self) { return self.native().metadata().event_count; })
                 .def_prop_ro("access_mask", [](const ttd_trace& self) { return static_cast<access_kind>(self.native().access_mask()); })

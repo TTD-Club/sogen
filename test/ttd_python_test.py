@@ -6,6 +6,7 @@ directory. SAMPLE is a host path (host mode), or a guest path when EMULATOR_ARGS
 
 import gc
 import pathlib
+import random
 import re
 import shutil
 import subprocess
@@ -114,6 +115,39 @@ def main() -> None:
             assert "ran since" in str(error), error
         else:
             raise AssertionError("run_to went on after the emulator ran")
+
+        # Keyframes: seeks keep states on the way that later seeks restore, and prepare_seeks keeps them over the whole
+        # trace on several emulators at once. Every state reached from a keyframe equals the one a full replay from the
+        # checkpoint reaches (a second reader with no keyframe budget), including after a fork and in strict seeks.
+        plain = ttd.Trace(cli_trace)
+        plain.keyframe_budget = 0
+        plain_replay = ttd.Replay(plain, ttd.create_emulator(sample, **settings))
+        keyed = ttd.Trace(cli_trace)
+        keyed_replay = ttd.Replay(keyed, keyed_emulator := ttd.create_emulator(sample, **settings))
+        positions = [load.position, load.position - 30000, load.position - 1, store.position, keyed.instruction_count]
+        for position in positions:
+            keyed_replay.seek(position)
+            plain_replay.seek(position)
+            assert keyed_emulator.serialize_state() == plain_replay.emulator.serialize_state(), position
+        assert plain.keyframe_count == 0 and 0 < keyed.keyframe_count <= len(positions), keyed.keyframe_count
+        keyed.prepare_seeks([ttd.create_emulator(sample, **settings) for _ in range(3)])
+        assert keyed.keyframe_count > len(keyed.checkpoints) and keyed.keyframe_memory > 0, keyed.keyframe_count
+        rng = random.Random(1)
+        for position in [rng.randrange(1, keyed.instruction_count + 1) for _ in range(8)] + [store.position - 1]:
+            result = keyed_replay.seek(position)
+            plain_replay.seek(position)
+            assert 0 < position - result.checkpoint < 25000 or position == result.checkpoint, (position, result.checkpoint)
+            assert keyed_emulator.serialize_state() == plain_replay.emulator.serialize_state(), position
+        keyed_emulator.write_memory(address, FORKED_VALUE.to_bytes(8, "little"))
+        keyed_emulator.start(1000)
+        for strict_replay in (keyed_replay, ttd.Replay(keyed, keyed_emulator, strict=True)):
+            strict_replay.seek(load.position)
+            plain_replay.seek(load.position)
+            assert read_u64(keyed_emulator, address) == NEW_VALUE
+            assert keyed_emulator.serialize_state() == plain_replay.emulator.serialize_state()
+        del plain_replay, keyed_replay, strict_replay
+        plain.close()
+        keyed.close()
 
         # The manifest says how a trace was recorded; tools/ttd_format.py reads the same entries.
         manifest = trace.manifest

@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -68,7 +69,7 @@ namespace sogen::ttd
 
     struct seek_result
     {
-        // Where the replay started: the restored checkpoint for seek, the emulator's position for run_to.
+        // Where the replay started: the restored checkpoint or keyframe for seek, the emulator's position for run_to.
         uint64_t checkpoint{};
         uint64_t verified_events{};
         // Syscalls whose live writes or result, and host writes outside syscalls whose live bytes, differed from the
@@ -76,13 +77,18 @@ namespace sogen::ttd
         uint64_t substituted_inputs{};
     };
 
-    // Restores the last checkpoint at or before `position` and replays to it, verifying every recorded event. Throws
-    // divergence_error when the replay diverges from the recording or stops before `position`, naming the manifest
-    // settings this replay does not share with the recording, and refuses a trace recorded with another backend or
-    // other CPUID results.
+    // Restores the last checkpoint at or before `position`, or a later keyframe (see trace::keyframes) up to it, and
+    // replays to `position`, verifying every recorded event and keeping keyframes on the way. Throws divergence_error
+    // when the replay diverges from the recording or stops before `position`, naming the manifest settings this replay
+    // does not share with the recording, and refuses a trace recorded with another backend or other CPUID results.
     // Unless `strict`, syscalls and host writes with other results than recorded take the recorded ones (see
     // replay_verifier).
     seek_result seek(windows_emulator& win_emu, trace& recorded, uint64_t position, bool strict = false);
+
+    // Replays the whole trace on `emulators` in parallel (each on its own share of the checkpoint intervals) to fill
+    // the trace's keyframes, so that later seeks anywhere restore a nearby state. The emulators are left at arbitrary
+    // positions. Throws like seek.
+    void prepare_keyframes(trace& recorded, std::span<windows_emulator* const> emulators);
 
     // Replays forward from the emulator's current position to `position` without restoring a checkpoint, verifying
     // like seek. The emulator must hold the recorded state at its position (where a seek or run_to left it, unchanged
