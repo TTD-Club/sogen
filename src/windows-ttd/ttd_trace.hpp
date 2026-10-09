@@ -380,6 +380,18 @@ namespace sogen::ttd
         // The registers of register snapshot `index`, as the backend's save_registers returned them.
         std::vector<std::byte> snapshot_registers(size_t index);
 
+        // Every mapping and unmapping of guest memory, in order; nothing for traces that predate recording them.
+        std::span<const mapping_change> mapping_changes() const
+        {
+            return mapping_changes_;
+        }
+
+        // Whether the trace records mapping changes (an empty list then means there were none).
+        bool has_mapping_changes() const
+        {
+            return has_mapping_changes_;
+        }
+
         // The standalone CPU cpu_view replays on (see ttd_view.cpp), created on first use and kept with the reader.
         std::shared_ptr<view_engine>& view_engine_slot()
         {
@@ -470,6 +482,7 @@ namespace sogen::ttd
         std::vector<register_snapshot_entry> register_snapshots_{};
         // Empty for traces recorded before mapping changes were, whose memory_at cannot notice remapped memory.
         std::vector<mapping_change> mapping_changes_{};
+        bool has_mapping_changes_{};
         // Whether a mapping change covering `address` came after event `after_number` and before event `through_number`.
         bool remapped(uint64_t address, uint64_t after_number, uint64_t through_number) const;
         std::shared_ptr<view_engine> view_engine_{};
@@ -615,6 +628,32 @@ namespace sogen::ttd
         scoped_hook write_hook_{};
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};
+        instruction_callback instruction_callback_{};
+        // The address of the instruction the replay runs now, which guest accesses share.
+        uint64_t instruction_ip_{};
+
+        // Executed instruction bytes by address, so most executes skip reading guest memory. An entry holds while no
+        // write touched its page (page_epochs_) and no mapping changed (layout_epoch_, advanced as the replay passes the
+        // trace's recorded mapping changes); traces without recorded mapping changes read every time.
+        struct cached_code
+        {
+            uint64_t size{};
+            std::array<uint8_t, inline_data_limit> bytes{};
+            uint64_t page_epoch{};
+            uint64_t layout_epoch{};
+        };
+
+        bool caches_code_{};
+        flat_map code_index_{};
+        std::vector<cached_code> code_cache_{};
+        flat_map page_epochs_{};
+        uint64_t write_epoch_{};
+        uint64_t layout_epoch_{};
+        std::span<const mapping_change> pending_mapping_changes_{};
+        std::array<uint8_t, inline_data_limit> instruction_bytes(uint64_t address, size_t size);
+        uint64_t page_epoch(uint64_t address, size_t size) const;
+        void note_write(uint64_t address, uint64_t size);
+
         scoped_hook host_write_hook_{};
         std::optional<std::string> error_{};
         uint64_t verified_events_{};

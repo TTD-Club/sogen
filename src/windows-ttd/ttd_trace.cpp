@@ -1204,6 +1204,7 @@ namespace sogen::ttd
                     throw std::runtime_error("Invalid TTD trace offsets");
                 }
                 mapping_changes_ = decode_mapping_changes(read_bytes(section.offset, section.size));
+                has_mapping_changes_ = true;
             }
             else if (section.type == section_type::modules || section.type == section_type::threads ||
                      section.type == section_type::exports || section.type == section_type::export_forwarders)
@@ -2441,6 +2442,10 @@ namespace sogen::ttd
           access_mask_(recorded.access_mask()),
           strict_(strict)
     {
+        caches_code_ = recorded.has_mapping_changes() && recorded.has_instruction_bytes();
+        const auto changes = recorded.mapping_changes();
+        pending_mapping_changes_ = changes.subspan(
+            static_cast<size_t>(std::ranges::upper_bound(changes, first_number_, {}, &mapping_change::event_number) - changes.begin()));
         auto& cpu = emu_.emu();
         if (access_mask_ & static_cast<uint64_t>(access_kind::write))
         {
@@ -2458,9 +2463,21 @@ namespace sogen::ttd
         }
         if (access_mask_ & static_cast<uint64_t>(access_kind::execute))
         {
-            execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
+            const auto verify_execute = [this](const uint64_t address, const size_t size) {
                 verify(access_kind::execute, address, executed_size(emu_, address, size));
-            }));
+            };
+            // As in the recorder: with instruction precision, the emulator's own per-instruction callback.
+            if (emu_.uses_instruction_precision())
+            {
+                instruction_callback_ = instruction_callback(emu_.callbacks.on_instruction_executed, verify_execute);
+            }
+            else
+            {
+                execute_hook_ = scoped_hook(
+                    cpu, cpu.hook_memory_execution_metadata([verify_execute](cpu_interface&, const uint64_t address, const size_t size) {
+                        verify_execute(address, size);
+                    }));
+            }
         }
         if (access_mask_ & static_cast<uint64_t>(access_kind::host_write))
         {
@@ -2671,6 +2688,11 @@ namespace sogen::ttd
 
     void replay_verifier::verify(const access_kind kind, const uint64_t address, const size_t size, const std::span<const std::byte> data)
     {
+        // Every write counts for the instruction cache, also the replay's own substitutions.
+        if (caches_code_ && (kind == access_kind::write || kind == access_kind::host_write))
+        {
+            note_write(address, size);
+        }
         if (error_ || !size || substituting_)
         {
             return;
@@ -2679,17 +2701,23 @@ namespace sogen::ttd
         {
             write_observer_(address, size);
         }
-        access_event observed{.step = emu_.get_executed_instructions(),
-                              .ip = emu_.emu().read_instruction_pointer(),
-                              .address = address,
-                              .size = size,
-                              .kind = kind};
-        if (kind == access_kind::execute && trace_.has_instruction_bytes() && size < inline_data_limit)
+        // An instruction runs with the instruction pointer at its address, and guest accesses belong to the instruction
+        // reported last; host writes happen outside instructions.
+        if (kind == access_kind::execute)
         {
-            emu_.emu().try_read_memory(address, observed.payload.data(), size);
+            instruction_ip_ = address;
         }
+        const auto ip = kind == access_kind::host_write || !(access_mask_ & static_cast<uint64_t>(access_kind::execute))
+                            ? emu_.emu().read_instruction_pointer()
+                            : instruction_ip_;
+        access_event observed{.step = emu_.get_executed_instructions(), .ip = ip, .address = address, .size = size, .kind = kind};
+        const auto has_bytes = kind == access_kind::execute && trace_.has_instruction_bytes() && size < inline_data_limit;
         if (in_syscall_)
         {
+            if (has_bytes)
+            {
+                emu_.emu().try_read_memory(address, observed.payload.data(), size);
+            }
             syscall_events_.push_back({.event = observed,
                                        .previous = kind == access_kind::host_write ? std::move(previous_bytes_) : std::vector<std::byte>{},
                                        .data = {data.begin(), data.end()}});
@@ -2697,12 +2725,26 @@ namespace sogen::ttd
             return;
         }
         const auto expected = reader_.next(access_mask_);
+        if (has_bytes)
+        {
+            // Mapping changes recorded before this event have happened by now.
+            while (!pending_mapping_changes_.empty() && pending_mapping_changes_.front().event_number <= reader_.last_number())
+            {
+                ++layout_epoch_;
+                pending_mapping_changes_ = pending_mapping_changes_.subspan(1);
+            }
+            observed.payload = instruction_bytes(address, size);
+        }
         const auto same_event = expected && expected->kind == observed.kind && expected->step == observed.step &&
                                 expected->ip == observed.ip && expected->address == observed.address && expected->size == observed.size;
         const auto same_instruction =
             kind != access_kind::execute || !trace_.has_instruction_bytes() || (same_event && expected->payload == observed.payload);
-        const auto same_data = kind == access_kind::execute || !trace_.has_access_data() ||
-                               (same_event && std::ranges::equal(trace_.access_data(*expected), data));
+        const auto same_data =
+            kind == access_kind::execute || !trace_.has_access_data() ||
+            (same_event &&
+             (expected->size <= inline_data_limit
+                  ? std::ranges::equal(std::as_bytes(std::span(expected->payload)).first(static_cast<size_t>(expected->size)), data)
+                  : std::ranges::equal(trace_.access_data(*expected), data)));
         if (same_event && same_instruction && same_data)
         {
             ++verified_events_;
@@ -2743,6 +2785,59 @@ namespace sogen::ttd
         diverge(message.str());
     }
 
+    uint64_t replay_verifier::page_epoch(const uint64_t address, const size_t size) const
+    {
+        const auto* first = page_epochs_.find(address / page_size);
+        const auto* last = page_epochs_.find(last_byte(address, size) / page_size);
+        return std::max(first ? *first : 0, last ? *last : 0);
+    }
+
+    void replay_verifier::note_write(const uint64_t address, const uint64_t size)
+    {
+        if (!size)
+        {
+            return;
+        }
+        ++write_epoch_;
+        const auto last = last_byte(address, size);
+        for (auto page = address / page_size; page <= last / page_size; ++page)
+        {
+            page_epochs_.set(page, write_epoch_);
+        }
+    }
+
+    std::array<uint8_t, inline_data_limit> replay_verifier::instruction_bytes(const uint64_t address, const size_t size)
+    {
+        if (caches_code_)
+        {
+            if (const auto* index = code_index_.find(address))
+            {
+                const auto& entry = code_cache_[static_cast<size_t>(*index)];
+                if (entry.size == size && entry.layout_epoch == layout_epoch_ && entry.page_epoch == page_epoch(address, size))
+                {
+                    return entry.bytes;
+                }
+            }
+        }
+        std::array<uint8_t, inline_data_limit> bytes{};
+        emu_.emu().try_read_memory(address, bytes.data(), size);
+        if (caches_code_)
+        {
+            const auto* index = code_index_.find(address);
+            const cached_code entry{.size = size, .bytes = bytes, .page_epoch = page_epoch(address, size), .layout_epoch = layout_epoch_};
+            if (index)
+            {
+                code_cache_[static_cast<size_t>(*index)] = entry;
+            }
+            else
+            {
+                code_index_.set(address, code_cache_.size());
+                code_cache_.push_back(entry);
+            }
+        }
+        return bytes;
+    }
+
     void replay_verifier::finish()
     {
         syscall_enter_.reset();
@@ -2751,6 +2846,7 @@ namespace sogen::ttd
         write_hook_.remove();
         read_hook_.remove();
         execute_hook_.remove();
+        instruction_callback_.reset();
         host_write_hook_.remove();
         if (error_)
         {
