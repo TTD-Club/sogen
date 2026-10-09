@@ -5,6 +5,9 @@
 
 #include "serialization.hpp"
 
+#include <cstdint>
+#include <optional>
+
 namespace sogen
 {
 
@@ -29,6 +32,14 @@ namespace sogen
 
         virtual void serialize_state(utils::buffer_serializer& buffer, bool is_snapshot) const = 0;
         virtual void deserialize_state(utils::buffer_deserializer& buffer, bool is_snapshot) = 0;
+
+        // A value that changes, to one no emulator in the process had before, whenever guest memory may have changed
+        // through this backend: a write, a mapping or protection change, a state restore, or running guest code.
+        // Nothing when the backend does not track it.
+        virtual std::optional<uint64_t> get_memory_generation() const
+        {
+            return std::nullopt;
+        }
     };
 
 } // namespace sogen
