@@ -620,11 +620,17 @@ namespace sogen::unicorn
                                                        memory_execution_hook_callback callback) override
             {
                 auto exec_wrapper = [c = std::move(callback), this](uc_engine*, const uint64_t address, const uint32_t /*size*/) {
-                    const auto old_ip = this->read_instruction_pointer();
+                    // Unicorn syncs the instruction pointer to the instruction before code hooks, and only a register
+                    // write can move it, so it is read again only after one.
+                    const auto generation = this->register_generation_;
                     c(*this, address);
+                    if (this->register_generation_ == generation)
+                    {
+                        return;
+                    }
 
                     const auto new_ip = this->read_instruction_pointer();
-                    if (new_ip != old_ip)
+                    if (new_ip != address)
                     {
                         this->violation_ip_ = new_ip;
                         uce(uc_emu_stop(*this));
