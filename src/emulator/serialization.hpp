@@ -83,6 +83,14 @@ namespace sogen
           public:
             buffer_serializer() = default;
 
+            // Serializes into `storage`'s allocation (its contents are dropped), which saves allocating and touching fresh
+            // memory when large states are serialized repeatedly.
+            explicit buffer_serializer(std::vector<std::byte> storage)
+                : buffer_(std::move(storage))
+            {
+                this->buffer_.clear();
+            }
+
             void write(const void* buffer, const size_t length)
             {
                 const auto old_size_remainder = static_cast<uint8_t>(length);

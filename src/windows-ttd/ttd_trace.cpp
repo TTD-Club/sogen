@@ -543,10 +543,12 @@ namespace sogen::ttd
         }
         if (size < inline_data_limit)
         {
-            const auto cached = caches_instructions_ ? instruction_cache_.find(address) : instruction_cache_.end();
-            if (cached != instruction_cache_.end() && cached->second.size == size)
+            const auto* cached = caches_instructions_ ? instruction_cache_.find(address) : nullptr;
+            if (cached && cached_instructions_[static_cast<size_t>(*cached)].size == size)
             {
-                event.payload = cached->second.bytes;
+                const auto& entry = cached_instructions_[static_cast<size_t>(*cached)];
+                event.payload = entry.bytes;
+                chunk_code_ids_.push_back(entry.code_id);
             }
             else
             {
@@ -554,39 +556,58 @@ namespace sogen::ttd
                 {
                     throw std::runtime_error("Cannot read executed instruction bytes");
                 }
+                // Code ids follow the order of first execution across the whole trace.
+                const auto code_id = code_.id_of(event);
+                chunk_code_ids_.push_back(code_id);
                 if (caches_instructions_)
                 {
-                    instruction_cache_[address] = {.size = size, .bytes = event.payload};
+                    instruction_cache_.set(address, cached_instructions_.size());
+                    cached_instructions_.push_back({.size = size, .bytes = event.payload, .code_id = code_id});
                     const auto last = last_byte(address, size);
                     for (auto page = address / page_size; page <= last / page_size; ++page)
                     {
-                        cached_instructions_by_page_[page].push_back(address);
+                        const auto* list = cached_instructions_by_page_.find(page);
+                        if (!list)
+                        {
+                            cached_instructions_by_page_.set(page, cached_pages_.size());
+                            cached_pages_.emplace_back();
+                            list = cached_instructions_by_page_.find(page);
+                        }
+                        cached_pages_[static_cast<size_t>(*list)].push_back(address);
                     }
                 }
             }
+        }
+        else
+        {
+            chunk_code_ids_.push_back(code_.id_of(event));
         }
         push_event(event);
     }
 
     void recorder::forget_instructions(const uint64_t address, const uint64_t size)
     {
-        if (cached_instructions_by_page_.empty() || !size)
+        if (cached_pages_.empty() || !size)
         {
             return;
         }
         const auto last = last_byte(address, size);
         for (auto page = address / page_size; page <= last / page_size; ++page)
         {
-            const auto entry = cached_instructions_by_page_.find(page);
-            if (entry == cached_instructions_by_page_.end())
+            const auto* list = cached_instructions_by_page_.find(page);
+            if (!list)
             {
                 continue;
             }
-            for (const auto instruction : entry->second)
+            auto& instructions = cached_pages_[static_cast<size_t>(*list)];
+            for (const auto instruction : instructions)
             {
-                instruction_cache_.erase(instruction);
+                if (const auto* index = instruction_cache_.find(instruction))
+                {
+                    cached_instructions_[static_cast<size_t>(*index)].size = 0;
+                }
             }
-            cached_instructions_by_page_.erase(entry);
+            instructions.clear();
         }
     }
 
@@ -657,7 +678,12 @@ namespace sogen::ttd
         {
             for (auto page = first_page; page <= last_page; ++page)
             {
-                chunk_pages_[page] |= static_cast<uint32_t>(event.kind);
+                const auto* kinds = chunk_pages_.find(page);
+                if (!kinds)
+                {
+                    chunk_page_list_.push_back(page);
+                }
+                chunk_pages_.set(page, (kinds ? *kinds : 0) | static_cast<uint64_t>(event.kind));
             }
             recent_page = first_page == last_page ? first_page : no_recent_page;
         }
@@ -673,17 +699,11 @@ namespace sogen::ttd
         {
             return;
         }
-        // Code ids follow the order of first execution across the whole trace, so they are assigned here; the rest of
-        // the encoding runs on a worker. The chunk's large accesses are the tail of the open bulk block, copied because
-        // the block keeps growing.
-        std::vector<uint64_t> code_ids{};
-        for (const auto& event : chunk_events_)
-        {
-            if (event.kind == access_kind::execute)
-            {
-                code_ids.push_back(code_.id_of(event));
-            }
-        }
+        // The execute events' code ids were assigned as they were recorded; the rest of the encoding runs on a worker.
+        // The chunk's large accesses are the tail of the open bulk block, copied because the block keeps growing.
+        auto code_ids = std::move(chunk_code_ids_);
+        chunk_code_ids_ = {};
+        chunk_code_ids_.reserve(code_ids.size());
         chunk_bulk_bytes bulk{.block = bulk_table_.size(), .offset = chunk_bulk_start_};
         if (current_bulk_->size() > chunk_bulk_start_)
         {
@@ -697,14 +717,36 @@ namespace sogen::ttd
                            .event_count = chunk_events_.size(),
                            .first_step = chunk_events_.front().step,
                            .last_step = chunk_events_.back().step});
-        for (const auto& [page, kinds] : chunk_pages_)
+        for (const auto page : chunk_page_list_)
         {
-            pages_.push_back({.page = page, .chunk = index, .kinds = kinds});
+            pages_.push_back({.page = page, .chunk = index, .kinds = static_cast<uint32_t>(*chunk_pages_.find(page))});
         }
-        auto events = std::make_shared<const std::vector<access_event>>(std::move(chunk_events_));
-        chunk_events_ = {};
-        chunk_events_.reserve(events_per_chunk);
+        // The next chunk fills an allocation an earlier chunk's encoding released, if there is one: a fresh one costs a page
+        // fault per page as it fills.
+        std::vector<access_event> next_events{};
+        {
+            const std::lock_guard lock{event_pool_->mutex};
+            if (!event_pool_->free.empty())
+            {
+                next_events = std::move(event_pool_->free.back());
+                event_pool_->free.pop_back();
+            }
+        }
+        next_events.clear();
+        next_events.reserve(events_per_chunk);
+        auto owned = std::make_unique<std::vector<access_event>>(std::move(chunk_events_));
+        const std::shared_ptr<const std::vector<access_event>> events(owned.release(),
+                                                                      [pool = event_pool_](std::vector<access_event>* released) {
+                                                                          const std::unique_ptr<std::vector<access_event>> freed(released);
+                                                                          const std::lock_guard lock{pool->mutex};
+                                                                          if (pool->free.size() < chunk_workers + 2)
+                                                                          {
+                                                                              pool->free.push_back(std::move(*freed));
+                                                                          }
+                                                                      });
+        chunk_events_ = std::move(next_events);
         chunk_pages_.clear();
+        chunk_page_list_.clear();
         recent_page_of_kind_.fill(no_recent_page);
         chunk_compressor_.submit_job(index, [events, code_ids = std::move(code_ids), bulk = std::move(bulk)] {
             return utils::compression::zstd::compress(encode_chunk(*events, code_ids, bulk), chunk_compression_level);
@@ -775,7 +817,26 @@ namespace sogen::ttd
     {
         // A little headroom over the previous state covers ordinary growth without a reallocation.
         const auto expected_size = base_states_.empty() ? 0 : base_states_.front()->size() + base_states_.front()->size() / 16;
-        auto state = std::make_shared<const std::vector<std::byte>>(snapshot::create_emulator_state(emu_, expected_size));
+        std::vector<std::byte> storage{};
+        {
+            const std::lock_guard lock{state_pool_->mutex};
+            if (!state_pool_->free.empty())
+            {
+                storage = std::move(state_pool_->free.back());
+                state_pool_->free.pop_back();
+            }
+        }
+        // A released state returns its allocation to the pool, which keeps a couple.
+        constexpr size_t kept_allocations = 2;
+        auto owned = std::make_unique<std::vector<std::byte>>(snapshot::create_emulator_state(emu_, expected_size, std::move(storage)));
+        const std::shared_ptr<const std::vector<std::byte>> state(owned.release(), [pool = state_pool_](std::vector<std::byte>* released) {
+            const std::unique_ptr<std::vector<std::byte>> freed(released);
+            const std::lock_guard lock{pool->mutex};
+            if (pool->free.size() < kept_allocations)
+            {
+                pool->free.push_back(std::move(*freed));
+            }
+        });
         const auto index = static_cast<uint64_t>(checkpoints_.size());
         if (!index)
         {

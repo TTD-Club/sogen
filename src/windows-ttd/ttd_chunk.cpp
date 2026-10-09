@@ -246,103 +246,6 @@ namespace sogen::ttd
             return compressed;
         }
 
-        // A map from uint64 keys to uint64 values that only grows: open addressing with linear probing. The predictor looks
-        // keys up for every event, where std::unordered_map's node allocations and pointer chasing dominated decoding.
-        class flat_map
-        {
-          public:
-            const uint64_t* find(const uint64_t key) const
-            {
-                if (key == empty_key)
-                {
-                    return this->has_empty_key_ ? &this->empty_key_value_ : nullptr;
-                }
-                if (this->slots_.empty())
-                {
-                    return nullptr;
-                }
-                for (auto index = this->home(key);; index = (index + 1) & this->mask_)
-                {
-                    const auto& slot = this->slots_[index];
-                    if (slot.key == key)
-                    {
-                        return &slot.value;
-                    }
-                    if (slot.key == empty_key)
-                    {
-                        return nullptr;
-                    }
-                }
-            }
-
-            void set(const uint64_t key, const uint64_t value)
-            {
-                if (key == empty_key)
-                {
-                    this->has_empty_key_ = true;
-                    this->empty_key_value_ = value;
-                    return;
-                }
-                if ((this->size_ + 1) * 2 > this->slots_.size())
-                {
-                    this->grow();
-                }
-                for (auto index = this->home(key);; index = (index + 1) & this->mask_)
-                {
-                    auto& slot = this->slots_[index];
-                    if (slot.key == key)
-                    {
-                        slot.value = value;
-                        return;
-                    }
-                    if (slot.key == empty_key)
-                    {
-                        slot = {.key = key, .value = value};
-                        ++this->size_;
-                        return;
-                    }
-                }
-            }
-
-          private:
-            static constexpr uint64_t empty_key = UINT64_MAX;
-
-            struct slot
-            {
-                uint64_t key{empty_key};
-                uint64_t value{};
-            };
-
-            std::vector<slot> slots_{};
-            size_t mask_{};
-            size_t shift_{};
-            size_t size_{};
-            bool has_empty_key_{};
-            uint64_t empty_key_value_{};
-
-            size_t home(const uint64_t key) const
-            {
-                return static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> this->shift_);
-            }
-
-            void grow()
-            {
-                const auto old = std::move(this->slots_);
-                const size_t capacity = old.empty() ? 1024 : old.size() * 2;
-                this->slots_.assign(capacity, {});
-                this->mask_ = capacity - 1;
-                this->shift_ = 64 - static_cast<size_t>(std::countr_zero(capacity));
-                this->size_ = 0;
-                for (const auto& entry : old)
-                {
-                    if (entry.key != empty_key)
-                    {
-                        this->set(entry.key, entry.value);
-                    }
-                }
-            }
-        };
-
         // Guest memory as far as the chunk's own accesses have shown it, in pages with one validity bit per byte.
         class known_memory
         {
@@ -559,10 +462,10 @@ namespace sogen::ttd
 
     uint64_t code_table::id_of(const access_event& execute)
     {
-        const auto latest = this->latest_version_.find(execute.address);
-        if (latest != this->latest_version_.end())
+        const auto* latest = this->latest_version_.find(execute.address);
+        if (latest)
         {
-            for (auto id = latest->second; id != no_previous_version; id = this->previous_version_[static_cast<size_t>(id)])
+            for (auto id = *latest; id != no_previous_version; id = this->previous_version_[static_cast<size_t>(id)])
             {
                 const auto& entry = this->entries_[static_cast<size_t>(id)];
                 if (entry.size == execute.size && entry.bytes == execute.payload)
@@ -573,8 +476,8 @@ namespace sogen::ttd
         }
         const auto id = static_cast<uint64_t>(this->entries_.size());
         this->entries_.push_back({.address = execute.address, .size = execute.size, .bytes = execute.payload});
-        this->previous_version_.push_back(latest != this->latest_version_.end() ? latest->second : no_previous_version);
-        this->latest_version_[execute.address] = id;
+        this->previous_version_.push_back(latest ? *latest : no_previous_version);
+        this->latest_version_.set(execute.address, id);
         return id;
     }
 

@@ -153,8 +153,10 @@ namespace sogen::ttd
         static constexpr size_t chunk_workers = 4;
         static constexpr size_t bulk_workers = 4;
         static constexpr size_t max_pending_compressions = 16;
-        // Each pending checkpoint holds a full emulator state, so at most one waits while another compresses.
-        static constexpr size_t max_pending_checkpoints = 1;
+        // A checkpoint delta takes about 120 ms at full size, longer than recording the 500,000 instructions between
+        // checkpoints once events are cheap, so several compress at once. Each pending one holds a full emulator state.
+        static constexpr size_t checkpoint_workers = 4;
+        static constexpr size_t max_pending_checkpoints = 2;
 
         windows_emulator& emu_;
         std::filesystem::path path_;
@@ -177,7 +179,7 @@ namespace sogen::ttd
             max_pending_compressions};
         // Encodes and compresses chunks (see flush_chunk).
         background_compressor chunk_compressor_{{}, chunk_workers, max_pending_compressions};
-        background_compressor checkpoint_compressor_{{}, 1, max_pending_checkpoints};
+        background_compressor checkpoint_compressor_{{}, checkpoint_workers, max_pending_checkpoints};
 
         // Register snapshots (see register_snapshot_entry), taken when every access kind is recorded and the backend
         // reports host register changes.
@@ -194,7 +196,18 @@ namespace sogen::ttd
         scoped_hook block_hook_{};
         std::vector<mapping_change> mapping_changes_{};
         void snapshot_registers(uint64_t position);
-        std::unordered_map<uint64_t, uint32_t> chunk_pages_{};
+        // The access kinds of each page the open chunk touches, and those pages in first-touch order.
+        flat_map chunk_pages_{};
+        std::vector<uint64_t> chunk_page_list_{};
+
+        // Event allocations released by encoded chunks, reused for later chunks.
+        struct event_pool
+        {
+            std::mutex mutex{};
+            std::vector<std::vector<access_event>> free{};
+        };
+
+        std::shared_ptr<event_pool> event_pool_{std::make_shared<event_pool>()};
         static constexpr uint64_t no_recent_page = UINT64_MAX;
         // Per access kind, the last single page entered into chunk_pages_, so repeated accesses skip the map.
         std::array<uint64_t, 16> recent_page_of_kind_{};
@@ -208,7 +221,12 @@ namespace sogen::ttd
         {
             uint64_t size{};
             std::array<uint8_t, inline_data_limit> bytes{};
+            // The instruction's id in code_.
+            uint64_t code_id{};
         };
+
+        // The code id of each execute event in the open chunk, in order.
+        std::vector<uint64_t> chunk_code_ids_{};
 
         // Host window events, when the emulator has a recordable UI backend.
         recordable_ui_backend* ui_{};
@@ -233,11 +251,25 @@ namespace sogen::ttd
         void note_thread(const access_event& event);
 
         bool caches_instructions_{};
-        std::unordered_map<uint64_t, cached_instruction> instruction_cache_{};
-        std::unordered_map<uint64_t, std::vector<uint64_t>> cached_instructions_by_page_{};
+        // Index in cached_instructions_ by address; a forgotten instruction keeps its entry with size 0.
+        flat_map instruction_cache_{};
+        std::vector<cached_instruction> cached_instructions_{};
+        // Index in cached_pages_ by page number: the cached instruction addresses in each page.
+        flat_map cached_instructions_by_page_{};
+        std::vector<std::vector<uint64_t>> cached_pages_{};
         void forget_instructions(uint64_t address, uint64_t size);
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
+
+        // Allocations of released checkpoint states, reused for later ones: a fresh allocation of a whole state costs
+        // a page fault per page while serializing.
+        struct state_pool
+        {
+            std::mutex mutex{};
+            std::vector<std::vector<std::byte>> free{};
+        };
+
+        std::shared_ptr<state_pool> state_pool_{std::make_shared<state_pool>()};
         scoped_hook write_hook_{};
         scoped_hook read_hook_{};
         scoped_hook execute_hook_{};

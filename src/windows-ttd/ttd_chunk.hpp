@@ -2,6 +2,8 @@
 
 #include "ttd_format.hpp"
 
+#include <algorithm>
+#include <bit>
 #include <functional>
 #include <map>
 #include <memory>
@@ -21,6 +23,111 @@ namespace sogen::ttd
     using bulk_block = std::shared_ptr<const std::vector<std::byte>>;
     using bulk_resolver = std::function<bulk_block(uint64_t index)>;
 
+    // A map from uint64 keys to uint64 values that only grows: open addressing with linear probing. The recorder and the
+    // chunk codec look keys up for every event, where std::unordered_map's node allocations and pointer chasing dominated.
+    class flat_map
+    {
+      public:
+        const uint64_t* find(const uint64_t key) const
+        {
+            if (key == empty_key)
+            {
+                return this->has_empty_key_ ? &this->empty_key_value_ : nullptr;
+            }
+            if (this->slots_.empty())
+            {
+                return nullptr;
+            }
+            for (auto index = this->home(key);; index = (index + 1) & this->mask_)
+            {
+                const auto& slot = this->slots_[index];
+                if (slot.key == key)
+                {
+                    return &slot.value;
+                }
+                if (slot.key == empty_key)
+                {
+                    return nullptr;
+                }
+            }
+        }
+
+        void set(const uint64_t key, const uint64_t value)
+        {
+            if (key == empty_key)
+            {
+                this->has_empty_key_ = true;
+                this->empty_key_value_ = value;
+                return;
+            }
+            if ((this->size_ + 1) * 2 > this->slots_.size())
+            {
+                this->grow();
+            }
+            for (auto index = this->home(key);; index = (index + 1) & this->mask_)
+            {
+                auto& slot = this->slots_[index];
+                if (slot.key == key)
+                {
+                    slot.value = value;
+                    return;
+                }
+                if (slot.key == empty_key)
+                {
+                    slot = {.key = key, .value = value};
+                    ++this->size_;
+                    return;
+                }
+            }
+        }
+
+        // Removes every key and keeps the allocation.
+        void clear()
+        {
+            std::ranges::fill(this->slots_, slot{});
+            this->size_ = 0;
+            this->has_empty_key_ = false;
+        }
+
+      private:
+        static constexpr uint64_t empty_key = UINT64_MAX;
+
+        struct slot
+        {
+            uint64_t key{empty_key};
+            uint64_t value{};
+        };
+
+        std::vector<slot> slots_{};
+        size_t mask_{};
+        size_t shift_{};
+        size_t size_{};
+        bool has_empty_key_{};
+        uint64_t empty_key_value_{};
+
+        size_t home(const uint64_t key) const
+        {
+            return static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> this->shift_);
+        }
+
+        void grow()
+        {
+            const auto old = std::move(this->slots_);
+            const size_t capacity = old.empty() ? 1024 : old.size() * 2;
+            this->slots_.assign(capacity, {});
+            this->mask_ = capacity - 1;
+            this->shift_ = 64 - static_cast<size_t>(std::countr_zero(capacity));
+            this->size_ = 0;
+            for (const auto& entry : old)
+            {
+                if (entry.key != empty_key)
+                {
+                    this->set(entry.key, entry.value);
+                }
+            }
+        }
+    };
+
     // Distinct executed instructions of a whole recording, in order of first execution.
     class code_table
     {
@@ -35,7 +142,7 @@ namespace sogen::ttd
       private:
         std::vector<code_entry> entries_{};
         std::vector<uint64_t> previous_version_{};
-        std::unordered_map<uint64_t, uint64_t> latest_version_{};
+        flat_map latest_version_{};
     };
 
     // A chunk is a zstd frame of a header and eight streams: one tag byte per event (kind, irregular step, and new code
