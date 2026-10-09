@@ -650,6 +650,32 @@ keyframes are in the trace and much denser than Sogen's 500,000-instruction chec
 after `Trace.prepare_seeks` (5.6 s on eight emulators for `test-sample`, a step Microsoft does not need) and are
 about 6× slower before that. Address queries are comparable.
 
+### Memory queries and watchpoints
+
+Measured on 2026-10-08 with `tools/msttd_query_times.js` (cdb, Microsoft's `.run` with and without its `.idx`) and
+`tools/ttd_query_times.py` (Sogen, cold and after `prepare_seeks` with eight emulators) on the `test-sample` traces
+above. Targets come from each trace's main image: its entry point, its first IAT slot, the start and the most accessed
+qword of `.data`, and `ntdll!RtlAllocateHeap` (the same host DLL in both). Microsoft's watchpoints are `ba` plus
+`g`/`g-` from the trace's start/end, continuing past the exceptions test-sample raises on purpose (each stops the
+replay); Sogen's are `next_access`/`previous_access`, which answer offline, plus a seek to the hit. Microsoft's trace
+has 6.9M instructions, Sogen's 30.2M, so Sogen's queries cover over 4× more events. Single runs, milliseconds.
+
+| | Microsoft, no index | Microsoft, index | Sogen, cold | Sogen, prepared |
+|---|---|---|---|---|
+| All accesses to `.data` (1,584 bytes) | 89 | 89 | 72 | 77 |
+| All accesses to a qword (2-170 hits) | 81-99 | 71-84 | 22-99 | 17-117 |
+| All executions of `RtlAllocateHeap` (6,520 / 16,915) | 100 | 97 | 383 | 303 |
+| Execute watchpoint, forward (entry / `RtlAllocateHeap`) | 159 / 4 | 160 / 2 | 7 + 198 / 18 + 51 seek | 6 + 17 / 18 + 30 seek |
+| Execute watchpoint, backward | 568 / 614 | 406 / 621 | 164 + 12 / 2 + 390 seek | 124 + 12 / 2 + 85 seek |
+| Read/write watchpoints, forward | 7-426 | 6-439 | 6-58 + 12-224 seek | 0-49 + 12-33 seek |
+| Read/write watchpoints, backward | 71-615 | 70-598 | 5-193 + 11-312 seek | 2-193 + 11-86 seek |
+| Value of a qword at a random position (seek + read) | 31-39 | 32-38 | 139-208 | 26-32 |
+| The same offline, from `Trace.history` (bytes accessed so far) | | | 22-42 | 6-17 |
+
+The index changes little at this size: Microsoft's unindexed queries scan the 76 MiB trace in under 0.1 s. Where Sogen
+answers a query offline it is as fast or faster; where the answer needs the emulator at a position (a value at a
+position, landing on a watchpoint hit), Sogen pays a seek, which is 4-6× Microsoft's until the trace is prepared.
+
 ## Binary Ninja TTD adapter comparison
 
 The current `DbgEngTTDAdapter` exposes reverse go/step into/step over/step
