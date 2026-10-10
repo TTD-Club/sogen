@@ -37,6 +37,29 @@ namespace sogen::py
         {
             nb::setattr(root, name, windows.attr(name));
         }
+
+        // Callbacks and hooks often refer back to their emulator; these slots let the garbage collector free such cycles.
+        int emulator_tp_traverse(PyObject* self, const visitproc visit, void* arg)
+        {
+            Py_VISIT(Py_TYPE(self));
+            if (!nb::inst_ready(self))
+            {
+                return 0;
+            }
+            return nb::inst_ptr<sogen_windows_emulator>(self)->traverse(visit, arg);
+        }
+
+        int emulator_tp_clear(PyObject* self)
+        {
+            nb::inst_ptr<sogen_windows_emulator>(self)->clear_python_references();
+            return 0;
+        }
+
+        PyType_Slot emulator_slots[] = {
+            {Py_tp_traverse, reinterpret_cast<void*>(emulator_tp_traverse)},
+            {Py_tp_clear, reinterpret_cast<void*>(emulator_tp_clear)},
+            {0, nullptr},
+        };
     }
 
     void register_windows_runtime_bindings(nb::module_& m)
@@ -146,7 +169,7 @@ namespace sogen::py
             .def_prop_ro("active_thread", &sogen_process_context::active_thread, nb::rv_policy::reference_internal)
             .def_prop_ro("callbacks", &sogen_process_context::callback_view, nb::rv_policy::reference_internal);
 
-        nb::class_<sogen_windows_emulator>(m, "Emulator")
+        nb::class_<sogen_windows_emulator>(m, "Emulator", nb::type_slots(emulator_slots))
             .def("start", &sogen_windows_emulator::start, nb::arg("count") = 0, nb::call_guard<nb::gil_scoped_release>())
             .def("stop", &sogen_windows_emulator::stop)
             .def("save_snapshot", &sogen_windows_emulator::save_snapshot)
