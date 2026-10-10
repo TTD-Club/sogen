@@ -75,29 +75,28 @@ namespace sogen
 
         static_assert(sizeof(console_screen_buffer_info_response) == 92);
 
+        struct console_io_buffer
+        {
+            uint32_t size;
+            uint32_t padding;
+            uint64_t address;
+        };
+
+        static_assert(sizeof(console_io_buffer) == 16);
+
+        // CD_USER_DEFINED_IO: the client handle and buffer counts, followed by the input buffers and then the output
+        // buffers. The first input holds the message header and API message; the first output is that API message, so
+        // that the driver returns it.
         struct console_ioctl_header
         {
             uint64_t target_handle;
             uint32_t input_count;
             uint32_t output_count;
-            uint32_t message_buffer_size;
-            uint32_t padding;
-            uint64_t message;
-            uint64_t data_size;
-            uint64_t data;
         };
 
-        static_assert(sizeof(console_ioctl_header) == 48);
+        static_assert(sizeof(console_ioctl_header) == 16);
 
-        struct console_ioctl_input_header
-        {
-            console_ioctl_header header;
-            uint32_t output_buffer_size;
-            uint32_t padding;
-            uint64_t output_buffer;
-        };
-
-        static_assert(sizeof(console_ioctl_input_header) == 64);
+        constexpr uint32_t max_console_io_buffers = 4;
 
         struct read_console_input_request
         {
@@ -111,7 +110,7 @@ namespace sogen
 
         struct write_console_request
         {
-            uint32_t characters_written;
+            uint32_t bytes_written;
             uint8_t unicode;
             std::array<uint8_t, 3> padding;
         };
@@ -293,18 +292,31 @@ namespace sogen
                 }
                 const auto endpoint = effective_console_endpoint(context, header.target_handle);
 
-                if (header.message_buffer_size != sizeof(console_message_header) + header.data_size ||
-                    header.data != header.message + sizeof(console_message_header) || !header.message || !header.data)
+                if (!header.input_count || !header.output_count || header.input_count > max_console_io_buffers ||
+                    header.output_count > max_console_io_buffers - header.input_count ||
+                    context.input_buffer_length < sizeof(header) + (header.input_count + header.output_count) * sizeof(console_io_buffer))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                std::array<console_io_buffer, max_console_io_buffers> buffers{};
+                win_emu.emu().read_memory(context.input_buffer + sizeof(header), buffers.data(),
+                                          (header.input_count + header.output_count) * sizeof(console_io_buffer));
+                const auto& message_buffer = buffers[0];
+                const auto& api_message = buffers[header.input_count];
+                if (!message_buffer.address || message_buffer.size != sizeof(console_message_header) + api_message.size ||
+                    api_message.address != message_buffer.address + sizeof(console_message_header))
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
 
                 console_message_header message{};
-                win_emu.emu().read_memory(header.message, &message, sizeof(message));
-                if (message.data_size != header.data_size)
+                win_emu.emu().read_memory(message_buffer.address, &message, sizeof(message));
+                if (message.data_size != api_message.size)
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
+                const auto data = api_message.address;
 
                 switch (static_cast<console_api>(message.api_number))
                 {
@@ -315,7 +327,7 @@ namespace sogen
                     }
 
                     const auto mode = is_input_endpoint(endpoint) ? input_mode_ : output_mode_;
-                    win_emu.emu().write_memory(header.data, &mode, sizeof(mode));
+                    win_emu.emu().write_memory(data, &mode, sizeof(mode));
                     return STATUS_SUCCESS;
                 }
 
@@ -326,7 +338,7 @@ namespace sogen
                     }
 
                     uint32_t mode{};
-                    win_emu.emu().read_memory(header.data, &mode, sizeof(mode));
+                    win_emu.emu().read_memory(data, &mode, sizeof(mode));
                     if (is_input_endpoint(endpoint))
                     {
                         input_mode_ = mode;
@@ -346,7 +358,7 @@ namespace sogen
                     }
 
                     constexpr uint64_t utf8_code_page = 65001;
-                    win_emu.emu().write_memory(header.data, &utf8_code_page, sizeof(utf8_code_page));
+                    win_emu.emu().write_memory(data, &utf8_code_page, sizeof(utf8_code_page));
                     return STATUS_SUCCESS;
                 }
                 case console_api::get_console_locale: {
@@ -356,7 +368,7 @@ namespace sogen
                     }
 
                     constexpr uint16_t english_united_states = 0x0409;
-                    win_emu.emu().write_memory(header.data, &english_united_states, sizeof(english_united_states));
+                    win_emu.emu().write_memory(data, &english_united_states, sizeof(english_united_states));
                     return STATUS_SUCCESS;
                 }
 
@@ -368,26 +380,25 @@ namespace sogen
                     }
 
                     const uint32_t event_count = win_emu.console().input_available() ? 1 : 0;
-                    win_emu.emu().write_memory(header.data, &event_count, sizeof(event_count));
+                    win_emu.emu().write_memory(data, &event_count, sizeof(event_count));
                     return STATUS_SUCCESS;
                 }
                 case console_api::read_console_input: {
                     constexpr uint16_t console_read_noremove = 0x0001;
                     constexpr uint16_t console_read_nowait = 0x0002;
-                    if (!is_input_endpoint(endpoint) || context.input_buffer_length < sizeof(console_ioctl_input_header) ||
-                        header.input_count != 1 || header.output_count != 2 || message.data_size != sizeof(read_console_input_request))
+                    if (!is_input_endpoint(endpoint) || header.input_count != 1 || header.output_count != 2 ||
+                        message.data_size != sizeof(read_console_input_request))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
 
-                    console_ioctl_input_header input_header{};
-                    win_emu.emu().read_memory(context.input_buffer, &input_header, sizeof(input_header));
-                    if (!input_header.output_buffer || input_header.output_buffer_size < sizeof(console_input_record))
+                    const auto& records = buffers[2];
+                    if (!records.address || records.size < sizeof(console_input_record))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
 
-                    auto request = win_emu.emu().read_memory<read_console_input_request>(header.data);
+                    auto request = win_emu.emu().read_memory<read_console_input_request>(data);
                     if ((request.flags & ~(console_read_noremove | console_read_nowait)) != 0)
                     {
                         return STATUS_INVALID_PARAMETER;
@@ -399,48 +410,46 @@ namespace sogen
                     if (!event)
                     {
                         request.events_read = 0;
-                        win_emu.emu().write_memory(header.data, &request, sizeof(request));
+                        win_emu.emu().write_memory(data, &request, sizeof(request));
                         return wait ? STATUS_END_OF_FILE : STATUS_SUCCESS;
                     }
 
                     const auto record = make_console_input_record(*event);
 
                     request.events_read = 1;
-                    win_emu.emu().write_memory(header.data, &request, sizeof(request));
-                    win_emu.emu().write_memory(input_header.output_buffer, &record, sizeof(record));
+                    win_emu.emu().write_memory(data, &request, sizeof(request));
+                    win_emu.emu().write_memory(records.address, &record, sizeof(record));
                     return STATUS_SUCCESS;
                 }
                 case console_api::write_console: {
-                    if (is_input_endpoint(endpoint) || context.input_buffer_length < sizeof(console_ioctl_input_header) ||
-                        header.input_count != 2 || header.output_count != 1 || message.data_size != sizeof(write_console_request))
+                    if (is_input_endpoint(endpoint) || header.input_count != 2 || header.output_count != 1 ||
+                        message.data_size != sizeof(write_console_request))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
 
-                    console_ioctl_input_header input_header{};
-                    win_emu.emu().read_memory(context.input_buffer, &input_header, sizeof(input_header));
-                    auto request = win_emu.emu().read_memory<write_console_request>(header.data);
-                    if (!input_header.output_buffer || (request.unicode && input_header.output_buffer_size % sizeof(char16_t) != 0))
+                    const auto& text = buffers[1];
+                    auto request = win_emu.emu().read_memory<write_console_request>(data);
+                    if (!text.address || (request.unicode && text.size % sizeof(char16_t) != 0))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
 
                     if (request.unicode)
                     {
-                        std::u16string output(input_header.output_buffer_size / sizeof(char16_t), u'\0');
-                        win_emu.emu().read_memory(input_header.output_buffer, output.data(), input_header.output_buffer_size);
+                        std::u16string output(text.size / sizeof(char16_t), u'\0');
+                        win_emu.emu().read_memory(text.address, output.data(), text.size);
                         win_emu.callbacks.on_stdout(u16_to_u8(output));
-                        request.characters_written = static_cast<uint32_t>(output.size());
                     }
                     else
                     {
-                        std::string output(input_header.output_buffer_size, '\0');
-                        win_emu.emu().read_memory(input_header.output_buffer, output.data(), output.size());
+                        std::string output(text.size, '\0');
+                        win_emu.emu().read_memory(text.address, output.data(), output.size());
                         win_emu.callbacks.on_stdout(output);
-                        request.characters_written = static_cast<uint32_t>(output.size());
                     }
 
-                    win_emu.emu().write_memory(header.data, &request, sizeof(request));
+                    request.bytes_written = text.size;
+                    win_emu.emu().write_memory(data, &request, sizeof(request));
                     return STATUS_SUCCESS;
                 }
 
@@ -451,14 +460,14 @@ namespace sogen
                     }
 
                     fill_console_output_request request{};
-                    win_emu.emu().read_memory(header.data, &request, sizeof(request));
+                    win_emu.emu().read_memory(data, &request, sizeof(request));
                     switch (request.type)
                     {
                     case fill_console_output_type::ansi_character:
                     case fill_console_output_type::unicode_character:
                     case fill_console_output_type::attribute:
                         // TODO
-                        win_emu.emu().write_memory(header.data, &request, sizeof(request));
+                        win_emu.emu().write_memory(data, &request, sizeof(request));
                         return STATUS_SUCCESS;
                     }
 
@@ -471,7 +480,7 @@ namespace sogen
                         return STATUS_INVALID_PARAMETER;
                     }
 
-                    win_emu.emu().read_memory(header.data, &cursor_position_, sizeof(cursor_position_));
+                    win_emu.emu().read_memory(data, &cursor_position_, sizeof(cursor_position_));
                     return STATUS_SUCCESS;
 
                 case console_api::set_console_text_attribute: {
@@ -480,7 +489,7 @@ namespace sogen
                         return STATUS_INVALID_PARAMETER;
                     }
 
-                    win_emu.emu().read_memory(header.data, &text_attributes_, sizeof(text_attributes_));
+                    win_emu.emu().read_memory(data, &text_attributes_, sizeof(text_attributes_));
                     return STATUS_SUCCESS;
                 }
 
@@ -503,7 +512,7 @@ namespace sogen
                     response.popup_attributes = 0xF5;
                     response.color_table = {0x00000000, 0x00800000, 0x00008000, 0x00808000, 0x00000080, 0x00800080, 0x00008080, 0x00C0C0C0,
                                             0x00808080, 0x00FF0000, 0x0000FF00, 0x00FFFF00, 0x000000FF, 0x00FF00FF, 0x0000FFFF, 0x00FFFFFF};
-                    win_emu.emu().write_memory(header.data, &response, sizeof(response));
+                    win_emu.emu().write_memory(data, &response, sizeof(response));
 
                     return STATUS_SUCCESS;
                 }

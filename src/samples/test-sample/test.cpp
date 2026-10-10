@@ -2178,6 +2178,28 @@ namespace
 
         return true;
     }
+
+    bool test_console_write()
+    {
+        const auto output = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode{};
+        if (!GetConsoleMode(output, &mode))
+        {
+            return true;
+        }
+
+        constexpr std::wstring_view wide_text = L"[console] ";
+        DWORD written{};
+        if (!WriteConsoleW(output, wide_text.data(), static_cast<DWORD>(wide_text.size()), &written, nullptr) ||
+            written != wide_text.size())
+        {
+            return false;
+        }
+
+        constexpr std::string_view text = "[console] ";
+        written = 0;
+        return WriteConsoleA(output, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) && written == text.size();
+    }
 }
 
 #define RUN_TEST(func, name)                 \
@@ -2212,6 +2234,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_file_locking, "File Locking")
     RUN_TEST(test_dir_io, "Dir I/O")
     RUN_TEST(test_apis, "APIs")
+    RUN_TEST(test_console_write, "Console Write")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif
