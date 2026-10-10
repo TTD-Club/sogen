@@ -2273,8 +2273,11 @@ namespace
     bool test_memory_priority()
     {
         MEMORY_PRIORITY_INFORMATION priority{.MemoryPriority = MEMORY_PRIORITY_NORMAL};
+        MEMORY_PRIORITY_INFORMATION queried{};
         return SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &priority, sizeof(priority)) &&
-               !SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &priority, sizeof(priority) + 1);
+               !SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &priority, sizeof(priority) + 1) &&
+               GetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &queried, sizeof(queried)) &&
+               queried.MemoryPriority == MEMORY_PRIORITY_NORMAL;
     }
 
     bool test_oem_conversion()

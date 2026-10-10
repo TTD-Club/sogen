@@ -510,6 +510,14 @@ namespace sogen
                                                                 c.PriorityClass = 32; // Normal
                                                             });
 
+            case ProcessPagePriority:
+                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
+                                           [](ULONG& priority) { priority = 5; }); // MEMORY_PRIORITY_NORMAL
+
+            case ProcessIoPriority:
+                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
+                                           [](ULONG& priority) { priority = 2; }); // IoPriorityNormal
+
             case ProcessWow64Information:
                 return handle_query<EmulatorTraits<Emu64>::ULONG_PTR>(
                     c.emu, process_information, process_information_length, return_length,
