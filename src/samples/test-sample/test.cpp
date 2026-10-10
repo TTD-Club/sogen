@@ -2201,6 +2201,24 @@ namespace
         return WriteConsoleA(output, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) && written == text.size();
     }
 
+    bool test_anonymous_pipe()
+    {
+        HANDLE read_end{};
+        HANDLE write_end{};
+        if (!CreatePipe(&read_end, &write_end, nullptr, 0))
+        {
+            return false;
+        }
+
+        HANDLE duplicate{};
+        const auto current_process = GetCurrentProcess();
+        const auto duplicated = DuplicateHandle(current_process, write_end, current_process, &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        const auto closed_write_end = CloseHandle(write_end);
+        const auto closed_duplicate = duplicated && CloseHandle(duplicate);
+        const auto closed_read_end = CloseHandle(read_end);
+        return duplicated && closed_write_end && closed_duplicate && closed_read_end;
+    }
+
     bool test_oem_conversion()
     {
         constexpr std::string_view text = "Sogen /? 123";
@@ -2244,6 +2262,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_apis, "APIs")
     RUN_TEST(test_console_write, "Console Write")
     RUN_TEST(test_oem_conversion, "OEM Conversion")
+    RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif
