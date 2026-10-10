@@ -2219,6 +2219,57 @@ namespace
         return duplicated && closed_write_end && closed_duplicate && closed_read_end;
     }
 
+    std::vector<uint8_t> query_token_information(const HANDLE token, const TOKEN_INFORMATION_CLASS information_class)
+    {
+        DWORD length = 0;
+        if (GetTokenInformation(token, information_class, nullptr, 0, &length) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        {
+            return {};
+        }
+
+        std::vector<uint8_t> buffer(length);
+        if (!GetTokenInformation(token, information_class, buffer.data(), length, &length))
+        {
+            return {};
+        }
+
+        return buffer;
+    }
+
+    bool test_token_information()
+    {
+        HANDLE token{};
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        {
+            return false;
+        }
+        const auto close_token = sogen::utils::finally([&] { CloseHandle(token); });
+
+        // SE_CHANGE_NOTIFY_PRIVILEGE from wdm.h; every user token holds it, enabled.
+        constexpr DWORD change_notify_privilege = 23;
+        const auto privileges_data = query_token_information(token, TokenPrivileges);
+        if (privileges_data.size() < sizeof(TOKEN_PRIVILEGES))
+        {
+            return false;
+        }
+
+        const auto* privileges = reinterpret_cast<const TOKEN_PRIVILEGES*>(privileges_data.data());
+        bool change_notify_enabled = false;
+        for (DWORD i = 0; i < privileges->PrivilegeCount; ++i)
+        {
+            const auto& privilege = privileges->Privileges[i];
+            if (privilege.Luid.LowPart == change_notify_privilege && privilege.Luid.HighPart == 0)
+            {
+                change_notify_enabled = (privilege.Attributes & SE_PRIVILEGE_ENABLED) != 0;
+            }
+        }
+
+        const auto claims_data = query_token_information(token, TokenUserClaimAttributes);
+        return change_notify_enabled && claims_data.size() >= sizeof(CLAIM_SECURITY_ATTRIBUTES_INFORMATION) &&
+               reinterpret_cast<const CLAIM_SECURITY_ATTRIBUTES_INFORMATION*>(claims_data.data())->Version ==
+                   CLAIM_SECURITY_ATTRIBUTES_INFORMATION_VERSION_V1;
+    }
+
     bool test_oem_conversion()
     {
         constexpr std::string_view text = "Sogen /? 123";
@@ -2263,6 +2314,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_console_write, "Console Write")
     RUN_TEST(test_oem_conversion, "OEM Conversion")
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
+    RUN_TEST(test_token_information, "Token Information")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif

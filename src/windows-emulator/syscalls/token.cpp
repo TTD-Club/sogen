@@ -19,6 +19,26 @@ namespace sogen
                 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x04, 0x00, 0x00, 0x00,
             };
 
+            struct token_privilege
+            {
+                LUID Luid;
+                DWORD Attributes;
+            };
+
+            static_assert(sizeof(token_privilege) == 12);
+
+            constexpr DWORD privilege_enabled_by_default = 0x1;
+            constexpr DWORD privilege_enabled = 0x2;
+
+            // A non-elevated user's privileges: shutdown, change notify, undock, increase working set, time zone.
+            constexpr std::array<token_privilege, 5> user_privileges = {{
+                {.Luid = {.LowPart = 19, .HighPart = 0}, .Attributes = 0},
+                {.Luid = {.LowPart = 23, .HighPart = 0}, .Attributes = privilege_enabled_by_default | privilege_enabled},
+                {.Luid = {.LowPart = 25, .HighPart = 0}, .Attributes = 0},
+                {.Luid = {.LowPart = 33, .HighPart = 0}, .Attributes = 0},
+                {.Luid = {.LowPart = 34, .HighPart = 0}, .Attributes = 0},
+            }};
+
             bool sid_matches(const memory_manager& memory, const uint64_t address, const std::span<const uint8_t> expected)
             {
                 std::array<uint8_t, 8> header{};
@@ -150,6 +170,21 @@ namespace sogen
                 c.emu.write_memory(token_information + sizeof(TOKEN_GROUPS64), interactive_group);
                 c.emu.write_memory(groups.Groups[0].Sid, sid.data(), sid.size());
                 c.emu.write_memory(interactive_group.Sid, interactive_sid);
+                return STATUS_SUCCESS;
+            }
+
+            if (token_information_class == TokenPrivileges)
+            {
+                constexpr auto required_size = sizeof(DWORD) + sizeof(user_privileges);
+                return_length.write(static_cast<ULONG>(required_size));
+
+                if (required_size > token_information_length)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                c.emu.write_memory(token_information, static_cast<DWORD>(user_privileges.size()));
+                c.emu.write_memory(token_information + sizeof(DWORD), user_privileges.data(), sizeof(user_privileges));
                 return STATUS_SUCCESS;
             }
 
@@ -378,7 +413,7 @@ namespace sogen
                 stats.TokenType = get_token_type(token_handle);
                 stats.ImpersonationLevel = stats.TokenType == TokenImpersonation ? SecurityImpersonation : SecurityAnonymous;
                 stats.GroupCount = 2;
-                stats.PrivilegeCount = 0;
+                stats.PrivilegeCount = static_cast<DWORD>(user_privileges.size());
                 stats.ModifiedId.LowPart = token_modified_id;
 
                 c.emu.write_memory(token_information, stats);
@@ -398,8 +433,9 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
+                constexpr USHORT token_security_attributes_information_version_v1 = 1;
                 c.emu.write_memory(token_information, TOKEN_SECURITY_ATTRIBUTES_INFORMATION{
-                                                          .Version = 0,
+                                                          .Version = token_security_attributes_information_version_v1,
                                                           .Reserved = {},
                                                           .AttributeCount = 0,
                                                           .Attribute = {},
