@@ -449,8 +449,6 @@ namespace sogen
                 teb_obj.ClientId.UniqueProcess = context.process_id;
                 teb_obj.ClientId.UniqueThread = static_cast<uint64_t>(this->id);
                 teb_obj.DeallocationStack = this->stack_base;
-                // TODO: Proper GuaranteedStack implementation.
-                teb_obj.GuaranteedStackBytes = static_cast<ULONG>(this->stack_size);
                 teb_obj.NtTib.StackLimit = this->stack_base;
                 teb_obj.NtTib.StackBase = this->stack_base + this->stack_size;
                 teb_obj.NtTib.Self = this->teb64->value();
@@ -526,8 +524,6 @@ namespace sogen
 
             // Native 64-bit stack
             teb_obj.DeallocationStack = this->stack_base;
-            // TODO: Proper GuaranteedStack implementation.
-            teb_obj.GuaranteedStackBytes = static_cast<ULONG>(this->stack_size);
             teb_obj.NtTib.StackLimit = this->stack_base;
             teb_obj.NtTib.StackBase = wow64_cpureserved_base;
             teb_obj.NtTib.Self = this->teb64->value();
@@ -584,8 +580,6 @@ namespace sogen
         this->teb32->access([&](TEB32& teb32_obj) {
             // Set NT_TIB32 fields
             teb32_obj.DeallocationStack = static_cast<uint32_t>(nttib32_stack_limit);
-            // TODO: Proper GuaranteedStack implementation.
-            teb32_obj.GuaranteedStackBytes = static_cast<ULONG>(this->wow64_stack_size.value());
             teb32_obj.NtTib.Self = static_cast<uint32_t>(teb32_addr);                // Self pointer to 32-bit TEB
             teb32_obj.NtTib.StackBase = static_cast<uint32_t>(nttib32_stack_base);   // Top of 32-bit stack (High address)
             teb32_obj.NtTib.StackLimit = static_cast<uint32_t>(nttib32_stack_limit); // Bottom of 32-bit stack (Low address)

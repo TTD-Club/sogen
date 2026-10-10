@@ -2289,6 +2289,19 @@ namespace
                    CLAIM_SECURITY_ATTRIBUTES_INFORMATION_VERSION_V1;
     }
 
+    bool test_stack_guarantee()
+    {
+        bool success = false;
+        std::thread([&] {
+            ULONG initial = 0;
+            ULONG requested = 0x10000;
+            ULONG current = 0;
+            success = SetThreadStackGuarantee(&initial) && initial == 0 && SetThreadStackGuarantee(&requested) &&
+                      SetThreadStackGuarantee(&current) && current == 0x10000;
+        }).join();
+        return success;
+    }
+
     bool test_system_random()
     {
         std::array<uint8_t, 32> first{};
@@ -2357,6 +2370,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_token_information, "Token Information")
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")
+    RUN_TEST(test_stack_guarantee, "Stack Guarantee")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif

@@ -1199,6 +1199,10 @@ namespace sogen
                 i.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 i.ChangeTime = i.LastWriteTime;
                 i.FileAttributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                i.NumberOfLinks = 1;
+                // Python's os.path.isfile counts only files on disk devices as regular files.
+                i.DeviceType = FILE_DEVICE_DISK;
+                i.DeviceCharacteristics = 0x20020;
 
                 const auto file_size = is_directory ? 0LL : file_stat.st_size;
                 i.EndOfFile.QuadPart = file_size;
