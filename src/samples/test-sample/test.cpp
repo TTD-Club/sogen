@@ -2200,6 +2200,14 @@ namespace
         written = 0;
         return WriteConsoleA(output, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) && written == text.size();
     }
+
+    bool test_oem_conversion()
+    {
+        constexpr std::string_view text = "Sogen /? 123";
+        std::array<char, 32> oem{};
+        std::array<char, 32> ansi{};
+        return CharToOemA(text.data(), oem.data()) && oem.data() == text && OemToCharA(oem.data(), ansi.data()) && ansi.data() == text;
+    }
 }
 
 #define RUN_TEST(func, name)                 \
@@ -2235,6 +2243,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_dir_io, "Dir I/O")
     RUN_TEST(test_apis, "APIs")
     RUN_TEST(test_console_write, "Console Write")
+    RUN_TEST(test_oem_conversion, "OEM Conversion")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif
