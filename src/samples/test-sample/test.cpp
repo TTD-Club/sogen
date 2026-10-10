@@ -2219,6 +2219,25 @@ namespace
         return duplicated && closed_write_end && closed_duplicate && closed_read_end;
     }
 
+    bool test_device_file_types()
+    {
+        HANDLE read_end{};
+        HANDLE write_end{};
+        if (!CreatePipe(&read_end, &write_end, nullptr, 0))
+        {
+            return false;
+        }
+
+        const auto null_device = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        const auto cleanup = sogen::utils::finally([&] {
+            CloseHandle(read_end);
+            CloseHandle(write_end);
+            CloseHandle(null_device);
+        });
+
+        return null_device != INVALID_HANDLE_VALUE && GetFileType(read_end) == FILE_TYPE_PIPE && GetFileType(null_device) == FILE_TYPE_CHAR;
+    }
+
     std::vector<uint8_t> query_token_information(const HANDLE token, const TOKEN_INFORMATION_CLASS information_class)
     {
         DWORD length = 0;
@@ -2334,6 +2353,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_console_write, "Console Write")
     RUN_TEST(test_oem_conversion, "OEM Conversion")
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
+    RUN_TEST(test_device_file_types, "Device File Types")
     RUN_TEST(test_token_information, "Token Information")
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")

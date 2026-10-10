@@ -325,10 +325,23 @@ namespace sogen
             case FileFsDeviceInformation:
                 return handle_query<FILE_FS_DEVICE_INFORMATION>(
                     c.emu, fs_information, length, io_status_block, [&](FILE_FS_DEVICE_INFORMATION& info) {
+                        const auto* device = c.proc.devices.get(file_handle);
+                        const auto device_name = device ? device->get_device_name() : std::u16string_view{};
                         if (file_handle == STDOUT_HANDLE || file_handle == STDIN_HANDLE || file_handle == CONSOLE_HANDLE)
                         {
                             info.DeviceType = FILE_DEVICE_CONSOLE;
                             info.Characteristics = 0x20000;
+                        }
+                        else if (file_handle == NUL_HANDLE)
+                        {
+                            info.DeviceType = FILE_DEVICE_NULL;
+                            info.Characteristics = 0;
+                        }
+                        // GetFileType reports these as FILE_TYPE_PIPE: AFD registers its sockets as named pipe devices.
+                        else if (device_name == u"NamedPipe" || device_name.starts_with(u"Afd"))
+                        {
+                            info.DeviceType = FILE_DEVICE_NAMED_PIPE;
+                            info.Characteristics = 0;
                         }
                         else
                         {
@@ -1142,6 +1155,18 @@ namespace sogen
                 block.Status = status;
                 return status;
             };
+
+            // Devices have no by-name information; callers such as Python's os.stat fall back to opening them.
+            std::u16string filename_upper = filename;
+            std::ranges::transform(filename_upper, filename_upper.begin(), ::towupper);
+            if (filename_upper == u"\\??\\NUL")
+            {
+                return ret(STATUS_INVALID_INFO_CLASS);
+            }
+            if (filename_upper == u"\\??\\CON" || filename_upper == u"\\??\\CONIN$" || filename_upper == u"\\??\\CONOUT$")
+            {
+                return ret(STATUS_INVALID_PARAMETER);
+            }
 
             if (info_class == FileStatBasicInformation)
             {

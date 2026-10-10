@@ -8,6 +8,8 @@
 #define DEVICE_TYPE              DWORD
 
 #define FILE_DEVICE_DISK         0x00000007
+#define FILE_DEVICE_NAMED_PIPE   0x00000011
+#define FILE_DEVICE_NULL         0x00000015
 #define FILE_DEVICE_CONSOLE      0x00000050
 
 #define FILE_SUPERSEDE           0x00000000
