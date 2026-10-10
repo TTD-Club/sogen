@@ -22,13 +22,13 @@ namespace sogen
         std::u16string name;
         std::deque<std::string> write_queue;
         ACCESS_MASK access = 0;
-        ULONG pipe_type;
-        ULONG read_mode;
-        ULONG completion_mode;
-        ULONG max_instances;
-        ULONG inbound_quota;
-        ULONG outbound_quota;
-        LARGE_INTEGER default_timeout;
+        ULONG pipe_type{};
+        ULONG read_mode{};
+        ULONG completion_mode{};
+        ULONG max_instances{};
+        ULONG inbound_quota{};
+        ULONG outbound_quota{};
+        LARGE_INTEGER default_timeout{};
 
         void create(windows_emulator&, const io_device_creation_data&) override
         {
@@ -49,12 +49,41 @@ namespace sogen
             return STATUS_NOT_SUPPORTED;
         }
 
-        void serialize_object(utils::buffer_serializer&) const override
+        void serialize_object(utils::buffer_serializer& buffer) const override
         {
+            buffer.write_string(this->name);
+            buffer.write(static_cast<uint64_t>(this->write_queue.size()));
+            for (const auto& chunk : this->write_queue)
+            {
+                buffer.write_string(chunk);
+            }
+            buffer.write(this->access);
+            buffer.write(this->pipe_type);
+            buffer.write(this->read_mode);
+            buffer.write(this->completion_mode);
+            buffer.write(this->max_instances);
+            buffer.write(this->inbound_quota);
+            buffer.write(this->outbound_quota);
+            buffer.write(this->default_timeout);
         }
 
-        void deserialize_object(utils::buffer_deserializer&) override
+        void deserialize_object(utils::buffer_deserializer& buffer) override
         {
+            buffer.read_string(this->name);
+            const auto chunks = buffer.read<uint64_t>();
+            this->write_queue.clear();
+            for (uint64_t i = 0; i < chunks; ++i)
+            {
+                buffer.read_string(this->write_queue.emplace_back());
+            }
+            buffer.read(this->access);
+            buffer.read(this->pipe_type);
+            buffer.read(this->read_mode);
+            buffer.read(this->completion_mode);
+            buffer.read(this->max_instances);
+            buffer.read(this->inbound_quota);
+            buffer.read(this->outbound_quota);
+            buffer.read(this->default_timeout);
         }
 
       private:
