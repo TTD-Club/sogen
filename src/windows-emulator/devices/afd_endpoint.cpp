@@ -359,9 +359,39 @@ namespace sogen
                 std::unique_ptr<network::i_socket> accepted_socket;
             };
 
+            // What a receive or send references, captured when it is issued: mswsock builds the AFD request on its
+            // stack, and WSARecv/WSASend let the caller reuse the WSABUF array once an overlapped call returns.
+            struct transfer_request
+            {
+                ULONG afd_flags{};
+                std::vector<EMU_WSABUF<Traits>> buffers{};
+                uint64_t address{};
+                uint64_t address_length{};
+                std::vector<std::byte> remote_address{};
+
+                void serialize(utils::buffer_serializer& buffer) const
+                {
+                    buffer.write(this->afd_flags);
+                    buffer.write_vector(this->buffers);
+                    buffer.write(this->address);
+                    buffer.write(this->address_length);
+                    buffer.write_vector(this->remote_address);
+                }
+
+                void deserialize(utils::buffer_deserializer& buffer)
+                {
+                    buffer.read(this->afd_flags);
+                    buffer.read_vector(this->buffers);
+                    buffer.read(this->address);
+                    buffer.read(this->address_length);
+                    buffer.read_vector(this->remote_address);
+                }
+            };
+
             std::unique_ptr<network::i_socket> s_{};
 
             bool executing_delayed_ioctl_{};
+            std::optional<transfer_request> delayed_request_{};
             bool connect_failed_{};
             std::optional<afd_creation_data> creation_data{};
             std::optional<bool> require_poll_{};
@@ -501,6 +531,7 @@ namespace sogen
                 this->timeout_ = {};
                 this->require_poll_ = {};
                 this->delayed_ioctl_ = {};
+                this->delayed_request_ = {};
             }
 
             void update_shared_info(windows_emulator& win_emu, const io_device_context& c)
@@ -558,15 +589,49 @@ namespace sogen
 
             // For a non-blocking socket an operation that would block must complete immediately with
             // STATUS_DEVICE_NOT_READY (mapped to WSAEWOULDBLOCK by mswsock); a blocking socket instead pends
-            // the request and the delayed-ioctl machinery resumes it once the host socket is ready.
-            NTSTATUS pend_or_would_block(windows_emulator& win_emu, const io_device_context& c, const bool require_poll)
+            // the request and the delayed-ioctl machinery resumes it once the host socket is ready. Overlapped
+            // requests (AFD_OVERLAPPED, set for WSARecv/WSASend with an OVERLAPPED) pend on non-blocking sockets too.
+            NTSTATUS pend_or_would_block(windows_emulator& win_emu, const io_device_context& c, const bool require_poll,
+                                         const transfer_request& request)
             {
-                if (this->non_blocking_)
+                constexpr ULONG afd_overlapped = 0x2;
+                if (this->non_blocking_ && !(request.afd_flags & afd_overlapped))
                 {
                     return STATUS_DEVICE_NOT_READY;
                 }
 
-                return this->delay_ioctrl(win_emu, c, require_poll);
+                const auto status = this->delay_ioctrl(win_emu, c, require_poll);
+                if (status == STATUS_PENDING && !this->executing_delayed_ioctl_)
+                {
+                    this->delayed_request_ = request;
+                }
+                return status;
+            }
+
+            template <typename Info>
+            NTSTATUS read_stream_request(windows_emulator& win_emu, const io_device_context& c, transfer_request& request) const
+            {
+                if (this->executing_delayed_ioctl_ && this->delayed_request_)
+                {
+                    request = *this->delayed_request_;
+                    return STATUS_SUCCESS;
+                }
+
+                if (c.input_buffer_length < sizeof(Info))
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                const auto info = win_emu.emu().read_memory<Info>(c.input_buffer);
+                if (!info.BufferArray || info.BufferCount == 0 || info.BufferCount > max_stream_buffer_count)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                request.afd_flags = info.AfdFlags;
+                request.buffers.resize(info.BufferCount);
+                win_emu.emu().read_memory(info.BufferArray, request.buffers.data(), request.buffers.size() * sizeof(EMU_WSABUF<Traits>));
+                return STATUS_SUCCESS;
             }
 
             void work(windows_emulator& win_emu) override
@@ -657,6 +722,7 @@ namespace sogen
 
                 buffer.read_optional(this->require_poll_);
                 buffer.read_optional(this->delayed_ioctl_);
+                buffer.read_optional(this->delayed_request_);
                 buffer.read(this->retained_completion_port_);
                 buffer.read_optional(this->timeout_);
                 buffer.read(this->non_blocking_);
@@ -669,6 +735,7 @@ namespace sogen
                 buffer.write_optional(this->creation_data);
                 buffer.write_optional(this->require_poll_);
                 buffer.write_optional(this->delayed_ioctl_);
+                buffer.write_optional(this->delayed_request_);
                 buffer.write(this->retained_completion_port_);
                 buffer.write_optional(this->timeout_);
                 buffer.write(this->non_blocking_);
@@ -957,36 +1024,20 @@ namespace sogen
 
                 auto& emu = win_emu.emu();
 
-                if (c.input_buffer_length < sizeof(AFD_RECV_INFO<Traits>))
+                transfer_request request{};
+                if (const auto status = this->read_stream_request<AFD_RECV_INFO<Traits>>(win_emu, c, request); status != STATUS_SUCCESS)
                 {
-                    return STATUS_BUFFER_TOO_SMALL;
+                    return status;
                 }
-
-                const auto receive_info = emu.read_memory<AFD_RECV_INFO<Traits>>(c.input_buffer);
-
-                if (!receive_info.BufferArray || receive_info.BufferCount == 0)
-                {
-                    return STATUS_INVALID_PARAMETER;
-                }
-
-                if (receive_info.BufferCount > max_stream_buffer_count)
-                {
-                    return STATUS_INVALID_PARAMETER;
-                }
-
-                std::vector<EMU_WSABUF<Traits>> buffers{};
-                buffers.reserve(receive_info.BufferCount);
 
                 size_t transfer_size = 0;
-                for (ULONG i = 0; i < receive_info.BufferCount; ++i)
+                for (const auto& wsabuf : request.buffers)
                 {
-                    const auto wsabuf = emu.read_memory<EMU_WSABUF<Traits>>(receive_info.BufferArray + (i * sizeof(EMU_WSABUF<Traits>)));
                     if (!wsabuf.buf && wsabuf.len != 0)
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
 
-                    buffers.push_back(wsabuf);
                     transfer_size += std::min<size_t>(wsabuf.len, max_stream_transfer_bytes - transfer_size);
                     if (transfer_size == max_stream_transfer_bytes)
                     {
@@ -1009,7 +1060,7 @@ namespace sogen
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(win_emu, c, true);
+                        return this->pend_or_would_block(win_emu, c, true, request);
                     }
 
                     if (error == SERR(ECONNRESET))
@@ -1021,7 +1072,7 @@ namespace sogen
                 }
 
                 size_t source_offset = 0;
-                for (const auto& wsabuf : buffers)
+                for (const auto& wsabuf : request.buffers)
                 {
                     const auto copy_size = std::min<size_t>(wsabuf.len, static_cast<size_t>(bytes_received) - source_offset);
                     if (copy_size == 0)
@@ -1052,29 +1103,18 @@ namespace sogen
 
                 auto& emu = win_emu.emu();
 
-                if (c.input_buffer_length < sizeof(AFD_SEND_INFO<Traits>))
+                transfer_request request{};
+                if (const auto status = this->read_stream_request<AFD_SEND_INFO<Traits>>(win_emu, c, request); status != STATUS_SUCCESS)
                 {
-                    return STATUS_BUFFER_TOO_SMALL;
-                }
-
-                const auto send_info = emu.read_memory<AFD_SEND_INFO<Traits>>(c.input_buffer);
-
-                if (!send_info.BufferArray || send_info.BufferCount == 0)
-                {
-                    return STATUS_INVALID_PARAMETER;
-                }
-
-                if (send_info.BufferCount > max_stream_buffer_count)
-                {
-                    return STATUS_INVALID_PARAMETER;
+                    return status;
                 }
 
                 std::vector<std::byte> host_buffer{};
                 host_buffer.reserve(0x1000);
 
-                for (ULONG i = 0; i < send_info.BufferCount && host_buffer.size() < max_stream_transfer_bytes; ++i)
+                for (size_t i = 0; i < request.buffers.size() && host_buffer.size() < max_stream_transfer_bytes; ++i)
                 {
-                    const auto wsabuf = emu.read_memory<EMU_WSABUF<Traits>>(send_info.BufferArray + (i * sizeof(EMU_WSABUF<Traits>)));
+                    const auto& wsabuf = request.buffers[i];
                     if (!wsabuf.buf && wsabuf.len != 0)
                     {
                         return STATUS_INVALID_PARAMETER;
@@ -1105,7 +1145,7 @@ namespace sogen
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(win_emu, c, false);
+                        return this->pend_or_would_block(win_emu, c, false, request);
                     }
 
                     if (error == SERR(ECONNRESET))
@@ -1289,14 +1329,26 @@ namespace sogen
 
                 auto& emu = win_emu.emu();
 
-                if (c.input_buffer_length < sizeof(AFD_RECV_DATAGRAM_INFO<Traits>))
+                transfer_request request{};
+                if (this->executing_delayed_ioctl_ && this->delayed_request_)
                 {
-                    return STATUS_BUFFER_TOO_SMALL;
+                    request = *this->delayed_request_;
+                }
+                else
+                {
+                    if (c.input_buffer_length < sizeof(AFD_RECV_DATAGRAM_INFO<Traits>))
+                    {
+                        return STATUS_BUFFER_TOO_SMALL;
+                    }
+
+                    const auto receive_info = emu.read_memory<AFD_RECV_DATAGRAM_INFO<Traits>>(c.input_buffer);
+                    request.afd_flags = receive_info.AfdFlags;
+                    request.buffers.push_back(emu.read_memory<EMU_WSABUF<Traits>>(receive_info.BufferArray));
+                    request.address = receive_info.Address;
+                    request.address_length = receive_info.AddressLength;
                 }
 
-                const auto receive_info = emu.read_memory<AFD_RECV_DATAGRAM_INFO<Traits>>(c.input_buffer);
-                const auto buffer = emu.read_memory<EMU_WSABUF<Traits>>(receive_info.BufferArray);
-
+                const auto& buffer = request.buffers.front();
                 if (!buffer.len || !buffer.buf)
                 {
                     return STATUS_INVALID_PARAMETER;
@@ -1316,7 +1368,7 @@ namespace sogen
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(win_emu, c, true);
+                        return this->pend_or_would_block(win_emu, c, true, request);
                     }
 
                     return STATUS_UNSUCCESSFUL;
@@ -1327,12 +1379,12 @@ namespace sogen
 
                 const auto win_from = convert_to_win_address(win_emu, from);
 
-                if (receive_info.Address && receive_info.AddressLength)
+                if (request.address && request.address_length)
                 {
-                    const emulator_object<ULONG> address_length{emu, receive_info.AddressLength};
+                    const emulator_object<ULONG> address_length{emu, request.address_length};
                     const auto address_size = std::min(win_from.size(), static_cast<size_t>(address_length.read()));
 
-                    emu.write_memory(receive_info.Address, win_from.data(), address_size);
+                    emu.write_memory(request.address, win_from.data(), address_size);
                     address_length.write(static_cast<ULONG>(address_size));
                 }
 
@@ -1355,26 +1407,36 @@ namespace sogen
 
                 const auto& emu = win_emu.emu();
 
-                if (c.input_buffer_length < sizeof(AFD_SEND_DATAGRAM_INFO<Traits>))
+                transfer_request request{};
+                if (this->executing_delayed_ioctl_ && this->delayed_request_)
                 {
-                    return STATUS_BUFFER_TOO_SMALL;
+                    request = *this->delayed_request_;
+                }
+                else
+                {
+                    if (c.input_buffer_length < sizeof(AFD_SEND_DATAGRAM_INFO<Traits>))
+                    {
+                        return STATUS_BUFFER_TOO_SMALL;
+                    }
+
+                    const auto send_info = emu.read_memory<AFD_SEND_DATAGRAM_INFO<Traits>>(c.input_buffer);
+
+                    // RemoteAddressLength is a signed LONG; a negative or oversized value would turn into a
+                    // huge read below. A sockaddr is at most sizeof(win_sockaddr_in6).
+                    if (send_info.TdiConnInfo.RemoteAddressLength < 0 ||
+                        static_cast<size_t>(send_info.TdiConnInfo.RemoteAddressLength) > sizeof(win_sockaddr_in6))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+
+                    request.afd_flags = send_info.AfdFlags;
+                    request.buffers.push_back(emu.read_memory<EMU_WSABUF<Traits>>(send_info.BufferArray));
+                    request.remote_address = emu.read_memory(send_info.TdiConnInfo.RemoteAddress,
+                                                             static_cast<size_t>(send_info.TdiConnInfo.RemoteAddressLength));
                 }
 
-                const auto send_info = emu.read_memory<AFD_SEND_DATAGRAM_INFO<Traits>>(c.input_buffer);
-                const auto buffer = emu.read_memory<EMU_WSABUF<Traits>>(send_info.BufferArray);
-
-                // RemoteAddressLength is a signed LONG; a negative or oversized value would turn into a
-                // huge read below. A sockaddr is at most sizeof(win_sockaddr_in6).
-                if (send_info.TdiConnInfo.RemoteAddressLength < 0 ||
-                    static_cast<size_t>(send_info.TdiConnInfo.RemoteAddressLength) > sizeof(win_sockaddr_in6))
-                {
-                    return STATUS_INVALID_PARAMETER;
-                }
-
-                auto address_buffer =
-                    emu.read_memory(send_info.TdiConnInfo.RemoteAddress, static_cast<size_t>(send_info.TdiConnInfo.RemoteAddressLength));
-
-                const auto target = convert_to_host_address(win_emu, address_buffer);
+                const auto& buffer = request.buffers.front();
+                const auto target = convert_to_host_address(win_emu, request.remote_address);
                 const auto data = emu.read_memory(buffer.buf, buffer.len);
 
                 const auto sent_data = this->s_->sendto(target, data);
@@ -1383,7 +1445,7 @@ namespace sogen
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(win_emu, c, false);
+                        return this->pend_or_would_block(win_emu, c, false, request);
                     }
 
                     return STATUS_UNSUCCESSFUL;
