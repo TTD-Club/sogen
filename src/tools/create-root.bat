@@ -77,6 +77,7 @@ CALL :collect diagnosticdatasettings.dll
 CALL :collect dinput8.dll
 CALL :collect dnsapi.dll
 CALL :collect dpapi.dll
+CALL :collect dsparse.dll
 CALL :collect dsound.dll
 CALL :collect dwmapi.dll
 CALL :collect dxcore.dll
