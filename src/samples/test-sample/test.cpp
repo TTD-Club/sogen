@@ -2270,6 +2270,13 @@ namespace
                    CLAIM_SECURITY_ATTRIBUTES_INFORMATION_VERSION_V1;
     }
 
+    bool test_memory_priority()
+    {
+        MEMORY_PRIORITY_INFORMATION priority{.MemoryPriority = MEMORY_PRIORITY_NORMAL};
+        return SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &priority, sizeof(priority)) &&
+               !SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &priority, sizeof(priority) + 1);
+    }
+
     bool test_oem_conversion()
     {
         constexpr std::string_view text = "Sogen /? 123";
@@ -2315,6 +2322,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_oem_conversion, "OEM Conversion")
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
     RUN_TEST(test_token_information, "Token Information")
+    RUN_TEST(test_memory_priority, "Memory Priority")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif

@@ -715,6 +715,11 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            if (info_class == ProcessPagePriority || info_class == ProcessIoPriority)
+            {
+                return process_information_length == sizeof(ULONG) ? STATUS_SUCCESS : STATUS_INFO_LENGTH_MISMATCH;
+            }
+
             if (info_class == ProcessExecuteFlags)
             {
                 return STATUS_NOT_SUPPORTED;
