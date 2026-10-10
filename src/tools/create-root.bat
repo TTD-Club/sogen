@@ -98,6 +98,8 @@ CALL :collect kdcom.dll
 CALL :collect kernel.appcore.dll
 CALL :collect kernel32.dll
 CALL :collect kernelbase.dll
+CALL :collect_file "%WINDIR%\System32\en-US", KernelBase.dll.mui, %EMU_SYSDIR%\en-us
+CALL :collect_file "%WINDIR%\SysWOW64\en-US", KernelBase.dll.mui, %EMU_SYSDIR_WOW64%\en-us
 CALL :collect ktmw32.dll
 CALL :collect mfperfhelper.dll
 CALL :collect mfplat.dll
