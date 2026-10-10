@@ -1484,12 +1484,19 @@ namespace sogen
             vcpu.cpu.start(count);
             lock.lock();
 
-            if (!vcpu.switch_thread && !vcpu.cpu.has_violation())
+            // A run that continues past the budget would switch threads before its next instruction, either because the
+            // last instruction requested it or because the next instruction's hook ends the time slice. The switch is
+            // done here too, and the budget checked at the top of the loop, so that a run stopping at a position leaves
+            // the same state as one passing through it.
+            if (use_count && this->executed_instructions_ >= target_instructions && this->uses_instruction_precision() &&
+                !vcpu.switch_thread && (vcpu.thread().executed_instructions + 1) % MAX_INSTRUCTIONS_PER_TIME_SLICE == 0)
             {
-                break;
+                ++vcpu.thread().executed_instructions;
+                vcpu.thread().apc_alertable = false;
+                vcpu.switch_thread = true;
             }
 
-            if (use_count && this->executed_instructions_ >= target_instructions)
+            if (!vcpu.switch_thread && !vcpu.cpu.has_violation())
             {
                 break;
             }
