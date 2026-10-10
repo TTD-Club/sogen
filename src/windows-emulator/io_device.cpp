@@ -56,11 +56,66 @@ namespace sogen
             }
         };
 
+        // bcryptprimitives seeds the process-wide generator behind BCryptGenRandom, RtlGenRandom, and rand_s from
+        // IOCTL_KSEC_RNG on \Device\CNG and fails them all when it returns fewer bytes than asked for. The bytes come
+        // from a generator seeded like NtAllocateUuids, from the emulated clock, so reproducible runs see the same ones.
+        struct cng_device : stateless_device
+        {
+            NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override
+            {
+                constexpr ULONG ioctl_ksec_rng = 0x390008;
+                if (context.io_control_code != ioctl_ksec_rng)
+                {
+                    return STATUS_SUCCESS;
+                }
+
+                std::vector<std::byte> bytes(context.output_buffer_length);
+                for (size_t offset = 0; offset < bytes.size(); offset += sizeof(uint64_t))
+                {
+                    const auto value = next_random(win_emu);
+                    std::memcpy(bytes.data() + offset, &value, std::min(sizeof(value), bytes.size() - offset));
+                }
+                win_emu.emu().write_memory(context.output_buffer, bytes.data(), bytes.size());
+
+                if (context.io_status_block)
+                {
+                    IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
+                    block.Information = bytes.size();
+                    context.io_status_block.write(block);
+                }
+
+                return STATUS_SUCCESS;
+            }
+
+          private:
+            static uint64_t next_random(windows_emulator& win_emu)
+            {
+                auto& state = win_emu.process.random_state;
+                if (!state)
+                {
+                    state = static_cast<uint64_t>(win_emu.clock().system_now().time_since_epoch().count()) ^
+                            win_emu.clock().timestamp_counter() ^ win_emu.process.ntdll_image_base;
+                }
+
+                // SplitMix64
+                state += 0x9E3779B97F4A7C15;
+                auto value = state;
+                value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9;
+                value = (value ^ (value >> 27)) * 0x94D049BB133111EB;
+                return value ^ (value >> 31);
+            }
+        };
+
         // Factories for the devices defined locally in this file, matching the shared create_*
         // (device_creation_context) signature so they slot straight into the registry.
         std::unique_ptr<io_device> create_dummy_device(const device_creation_context&)
         {
             return std::make_unique<dummy_device>();
+        }
+
+        std::unique_ptr<io_device> create_cng_device(const device_creation_context&)
+        {
+            return std::make_unique<cng_device>();
         }
 
         std::unique_ptr<io_device> create_transport_stub_device(const device_creation_context&)
@@ -85,8 +140,8 @@ namespace sogen
         using namespace std::string_view_literals;
 
         static const std::map<std::u16string_view, device_factory> registry = {
+            {u"CNG"sv, create_cng_device},
             // Dummy
-            {u"CNG"sv, create_dummy_device},
             {u"RasAcd"sv, create_dummy_device},
             {u"PcwDrv"sv, create_dummy_device},
             {u"DeviceApi\\CMApi"sv, create_dummy_device},

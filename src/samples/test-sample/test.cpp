@@ -2270,6 +2270,16 @@ namespace
                    CLAIM_SECURITY_ATTRIBUTES_INFORMATION_VERSION_V1;
     }
 
+    bool test_system_random()
+    {
+        std::array<uint8_t, 32> first{};
+        std::array<uint8_t, 32> second{};
+        return BCRYPT_SUCCESS(BCryptGenRandom(nullptr, first.data(), static_cast<ULONG>(first.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG)) &&
+               BCRYPT_SUCCESS(
+                   BCryptGenRandom(nullptr, second.data(), static_cast<ULONG>(second.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG)) &&
+               first != second;
+    }
+
     bool test_memory_priority()
     {
         MEMORY_PRIORITY_INFORMATION priority{.MemoryPriority = MEMORY_PRIORITY_NORMAL};
@@ -2326,6 +2336,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
     RUN_TEST(test_token_information, "Token Information")
     RUN_TEST(test_memory_priority, "Memory Priority")
+    RUN_TEST(test_system_random, "System Random")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif

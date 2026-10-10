@@ -589,6 +589,7 @@ namespace sogen
         std::array<uint8_t, 6> uuid_seed{};
         uint64_t next_uuid_time{};
         uint32_t uuid_sequence{};
+        uint64_t random_state{};
     };
 
 } // namespace sogen

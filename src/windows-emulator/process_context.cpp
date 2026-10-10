@@ -891,6 +891,7 @@ namespace sogen
         buffer.write(this->uuid_seed);
         buffer.write(this->next_uuid_time);
         buffer.write(this->uuid_sequence);
+        buffer.write(this->random_state);
 
         buffer.write_vector(this->default_register_set);
         buffer.write(this->process_id);
@@ -995,6 +996,7 @@ namespace sogen
         buffer.read(this->uuid_seed);
         buffer.read(this->next_uuid_time);
         buffer.read(this->uuid_sequence);
+        buffer.read(this->random_state);
 
         buffer.read_vector(this->default_register_set);
         buffer.read(this->process_id);
