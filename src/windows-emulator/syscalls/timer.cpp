@@ -127,10 +127,47 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtSetTimerEx(const syscall_context& /*c*/, handle /*timer_handle*/, uint32_t /*timer_set_info_class*/,
-                                     uint64_t /*timer_set_information*/, ULONG /*timer_set_information_length*/)
+        // SetWaitableTimerEx (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timers, e.g. Python's time.sleep) sets timers through
+        // TimerSetCoalescableTimer. Like NtSetTimer, the timer is not scheduled: waits treat timers as signaled.
+        NTSTATUS handle_NtSetTimerEx(const syscall_context& c, const handle timer_handle, const uint32_t timer_set_info_class,
+                                     const uint64_t timer_set_information, const ULONG timer_set_information_length)
         {
-            return STATUS_NOT_SUPPORTED;
+            struct timer_set_coalescable_timer_info
+            {
+                LARGE_INTEGER DueTime;
+                uint64_t TimerApcRoutine;
+                uint64_t TimerContext;
+                uint64_t WakeContext;
+                ULONG Period;
+                ULONG TolerableDelay;
+                uint64_t PreviousState;
+            };
+
+            static_assert(sizeof(timer_set_coalescable_timer_info) == 0x30);
+
+            constexpr uint32_t timer_set_coalescable_timer = 0;
+            if (timer_set_info_class != timer_set_coalescable_timer)
+            {
+                return STATUS_INVALID_INFO_CLASS;
+            }
+
+            if (timer_set_information_length != sizeof(timer_set_coalescable_timer_info))
+            {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+
+            if (!c.proc.timers.get(timer_handle))
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+
+            const auto info = c.emu.read_memory<timer_set_coalescable_timer_info>(timer_set_information);
+            if (info.PreviousState)
+            {
+                c.emu.write_memory<BOOLEAN>(info.PreviousState, FALSE);
+            }
+
+            return STATUS_SUCCESS;
         }
 
         NTSTATUS handle_NtCancelTimer()

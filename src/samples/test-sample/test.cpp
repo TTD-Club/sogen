@@ -2298,6 +2298,21 @@ namespace
                    CLAIM_SECURITY_ATTRIBUTES_INFORMATION_VERSION_V1;
     }
 
+    bool test_high_resolution_timer()
+    {
+        const auto timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!timer)
+        {
+            return false;
+        }
+
+        const auto close_timer = sogen::utils::finally([&] { CloseHandle(timer); });
+
+        LARGE_INTEGER due_time{};
+        due_time.QuadPart = -10000;
+        return SetWaitableTimerEx(timer, &due_time, 0, nullptr, nullptr, nullptr, 0) && WaitForSingleObject(timer, 5000) == WAIT_OBJECT_0;
+    }
+
     bool test_stack_guarantee()
     {
         bool success = false;
@@ -2381,6 +2396,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")
     RUN_TEST(test_stack_guarantee, "Stack Guarantee")
+    RUN_TEST(test_high_resolution_timer, "High Resolution Timer")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif
