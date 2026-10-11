@@ -170,6 +170,61 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            // FILE_LINK_INFORMATION has the layout of FILE_RENAME_INFORMATION.
+            const auto read_target_name = [&](const FILE_RENAME_INFORMATION& info) -> std::optional<std::u16string> {
+                auto name =
+                    read_string<char16_t>(c.emu, file_information + offsetof(FILE_RENAME_INFORMATION, FileName), info.FileNameLength / 2);
+                if (!info.RootDirectory)
+                {
+                    return name;
+                }
+
+                const auto* root = c.proc.files.get(info.RootDirectory);
+                if (!root)
+                {
+                    return std::nullopt;
+                }
+
+                const auto has_separator = root->name.ends_with(u"\\") || root->name.ends_with(u"/");
+                return root->name + (has_separator ? u"" : u"\\") + name;
+            };
+
+            if (info_class == FileLinkInformation)
+            {
+                if (length < sizeof(FILE_RENAME_INFORMATION))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                const auto info = c.emu.read_memory<FILE_RENAME_INFORMATION>(file_information);
+                const auto link_name = read_target_name(info);
+                if (!link_name)
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+
+                const auto source = c.win_emu.file_sys.translate(f->name);
+                const auto target = c.win_emu.file_sys.translate(*link_name);
+                std::error_code ec{};
+                if (std::filesystem::is_directory(source, ec))
+                {
+                    return STATUS_FILE_IS_A_DIRECTORY;
+                }
+
+                if (std::filesystem::exists(target, ec))
+                {
+                    if (!info.ReplaceIfExists)
+                    {
+                        return STATUS_OBJECT_NAME_COLLISION;
+                    }
+
+                    std::filesystem::remove(target, ec);
+                }
+
+                std::filesystem::create_hard_link(source, target, ec);
+                return ec ? STATUS_ACCESS_DENIED : STATUS_SUCCESS;
+            }
+
             if (info_class == FileRenameInformation)
             {
                 if (length < sizeof(FILE_RENAME_INFORMATION))
@@ -178,20 +233,12 @@ namespace sogen
                 }
 
                 const auto info = c.emu.read_memory<FILE_RENAME_INFORMATION>(file_information);
-                auto new_name =
-                    read_string<char16_t>(c.emu, file_information + offsetof(FILE_RENAME_INFORMATION, FileName), info.FileNameLength / 2);
-
-                if (info.RootDirectory)
+                const auto target_name = read_target_name(info);
+                if (!target_name)
                 {
-                    const auto* root = c.proc.files.get(info.RootDirectory);
-                    if (!root)
-                    {
-                        return STATUS_INVALID_HANDLE;
-                    }
-
-                    const auto has_separator = root->name.ends_with(u"\\") || root->name.ends_with(u"/");
-                    new_name = root->name + (has_separator ? u"" : u"\\") + new_name;
+                    return STATUS_INVALID_HANDLE;
                 }
+                const auto& new_name = *target_name;
 
                 c.win_emu.log.warn("--> File rename requested: %s --> %s\n", u16_to_u8(f->name).c_str(), u16_to_u8(new_name).c_str());
 
@@ -2008,7 +2055,7 @@ namespace sogen
 
                 if (file_exists)
                 {
-                    return STATUS_NOT_A_DIRECTORY;
+                    return create_disposition == FILE_CREATE ? STATUS_OBJECT_NAME_COLLISION : STATUS_NOT_A_DIRECTORY;
                 }
 
                 if (create_disposition != FILE_CREATE && create_disposition != FILE_OPEN_IF)

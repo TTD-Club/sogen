@@ -2219,6 +2219,15 @@ namespace
         return duplicated && closed_write_end && closed_duplicate && closed_read_end;
     }
 
+    bool test_directory_name_collision()
+    {
+        // Several identical instances of this sample may run in one directory at once, so the check uses this
+        // executable, which exists throughout and which no instance deletes.
+        std::array<wchar_t, MAX_PATH> executable{};
+        GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+        return !CreateDirectoryW(executable.data(), nullptr) && GetLastError() == ERROR_ALREADY_EXISTS;
+    }
+
     bool test_device_file_types()
     {
         HANDLE read_end{};
@@ -2367,6 +2376,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_oem_conversion, "OEM Conversion")
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
     RUN_TEST(test_device_file_types, "Device File Types")
+    RUN_TEST(test_directory_name_collision, "Directory Name Collision")
     RUN_TEST(test_token_information, "Token Information")
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")
