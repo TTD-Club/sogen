@@ -418,7 +418,14 @@ namespace sogen
 
             case FileFsVolumeInformation:
                 return handle_query<FILE_FS_VOLUME_INFORMATION>(c.emu, fs_information, length, io_status_block,
-                                                                [&](FILE_FS_VOLUME_INFORMATION&) {});
+                                                                [&](FILE_FS_VOLUME_INFORMATION& info) {
+                                                                    // The serial FileIdInformation and FileStatBasicInformation report, so
+                                                                    // st_dev matches.
+                                                                    if (const auto* f = c.proc.files.get(file_handle))
+                                                                    {
+                                                                        info.VolumeSerialNumber = f->drive_number;
+                                                                    }
+                                                                });
 
             case FileFsAttributeInformation:
                 return handle_query<_FILE_FS_ATTRIBUTE_INFORMATION>(
@@ -1247,6 +1254,12 @@ namespace sogen
                 i.ChangeTime = i.LastWriteTime;
                 i.FileAttributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
                 i.NumberOfLinks = 1;
+                i.FileId.QuadPart = static_cast<LONGLONG>(file_stat.st_ino);
+                memcpy(&i.FileId128.Identifier[0], &file_stat.st_ino, sizeof(file_stat.st_ino));
+                if (const auto drive = filepath.get_drive())
+                {
+                    i.VolumeSerialNumber.QuadPart = *drive - 'a' + 1;
+                }
                 // Python's os.path.isfile counts only files on disk devices as regular files.
                 i.DeviceType = FILE_DEVICE_DISK;
                 i.DeviceCharacteristics = 0x20020;

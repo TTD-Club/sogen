@@ -2228,6 +2228,49 @@ namespace
         return !CreateDirectoryW(executable.data(), nullptr) && GetLastError() == ERROR_ALREADY_EXISTS;
     }
 
+    bool test_file_ids_by_name()
+    {
+        // FILE_STAT_BASIC_INFORMATION; older SDKs lack it and GetFileInformationByName.
+        struct stat_basic_information
+        {
+            LARGE_INTEGER FileId;
+            LARGE_INTEGER CreationTime;
+            LARGE_INTEGER LastAccessTime;
+            LARGE_INTEGER LastWriteTime;
+            LARGE_INTEGER ChangeTime;
+            LARGE_INTEGER AllocationSize;
+            LARGE_INTEGER EndOfFile;
+            ULONG FileAttributes;
+            ULONG ReparseTag;
+            ULONG NumberOfLinks;
+            ULONG DeviceType;
+            ULONG DeviceCharacteristics;
+            ULONG Reserved;
+            LARGE_INTEGER VolumeSerialNumber;
+            std::array<uint8_t, 16> FileId128;
+        };
+
+        using get_file_information_by_name_t = BOOL(WINAPI*)(PCWSTR, int, PVOID, ULONG);
+        const auto get_file_information_by_name = reinterpret_cast<get_file_information_by_name_t>(
+            GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "GetFileInformationByName"));
+        if (!get_file_information_by_name)
+        {
+            return true;
+        }
+
+        constexpr int file_stat_basic_by_name_info = 3;
+        const auto query = [&](const HMODULE module, stat_basic_information& info) {
+            std::array<wchar_t, MAX_PATH> path{};
+            GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+            return get_file_information_by_name(path.data(), file_stat_basic_by_name_info, &info, sizeof(info));
+        };
+
+        stat_basic_information executable{};
+        stat_basic_information kernel32{};
+        return query(nullptr, executable) && query(GetModuleHandleW(L"kernel32.dll"), kernel32) && executable.FileId.QuadPart != 0 &&
+               executable.FileId.QuadPart != kernel32.FileId.QuadPart && executable.FileId128 != kernel32.FileId128;
+    }
+
     bool test_device_file_types()
     {
         HANDLE read_end{};
@@ -2391,6 +2434,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_oem_conversion, "OEM Conversion")
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
     RUN_TEST(test_device_file_types, "Device File Types")
+    RUN_TEST(test_file_ids_by_name, "File IDs by Name")
     RUN_TEST(test_directory_name_collision, "Directory Name Collision")
     RUN_TEST(test_token_information, "Token Information")
     RUN_TEST(test_memory_priority, "Memory Priority")
