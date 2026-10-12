@@ -893,6 +893,45 @@ namespace
         return true;
     }
 
+    // The drives are listed, a volume's name leads back to its drive, and a directory has a file index.
+    bool test_drives_and_volumes()
+    {
+        std::array<wchar_t, MAX_PATH> system{};
+        GetSystemDirectoryW(system.data(), static_cast<UINT>(system.size()));
+        const std::wstring root(system.data(), 3);
+
+        std::array<wchar_t, 512> drives{};
+        const auto drives_length = GetLogicalDriveStringsW(static_cast<DWORD>(drives.size()), drives.data());
+        auto drive_listed = false;
+        for (const auto* drive = drives.data(); drive < drives.data() + drives_length && *drive; drive += wcslen(drive) + 1)
+        {
+            drive_listed |= CompareStringOrdinal(drive, -1, root.c_str(), -1, TRUE) == CSTR_EQUAL;
+        }
+
+        std::array<wchar_t, MAX_PATH> volume{};
+        std::array<wchar_t, MAX_PATH> paths{};
+        DWORD paths_length{};
+        const auto volume_found =
+            GetVolumeNameForVolumeMountPointW(root.c_str(), volume.data(), static_cast<DWORD>(volume.size())) &&
+            GetVolumePathNamesForVolumeNameW(volume.data(), paths.data(), static_cast<DWORD>(paths.size()), &paths_length) &&
+            CompareStringOrdinal(paths.data(), -1, root.c_str(), -1, TRUE) == CSTR_EQUAL;
+
+        auto* const directory = CreateFileW(system.data(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        BY_HANDLE_FILE_INFORMATION information{};
+        const auto indexed = directory != INVALID_HANDLE_VALUE && GetFileInformationByHandle(directory, &information) &&
+                             (information.nFileIndexHigh != 0 || information.nFileIndexLow != 0);
+        CloseHandle(directory);
+
+        if (!drive_listed || !volume_found || !indexed)
+        {
+            printf("Drives listed %d, volume leads back %d, directory indexed %d\n", drive_listed, volume_found, indexed);
+            return false;
+        }
+
+        return true;
+    }
+
     // The volume of a path is its drive's root.
     bool test_volume_path()
     {
@@ -3489,6 +3528,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_registry_deletion, "Registry Deletion")
     RUN_TEST(test_case_mapping, "Case Mapping")
     RUN_TEST(test_volume_path, "Volume Path")
+    RUN_TEST(test_drives_and_volumes, "Drives and Volumes")
     RUN_TEST(test_file_mappings, "File Mappings")
     RUN_TEST(test_environment_and_names, "Environment and Names")
     RUN_TEST(test_reparse_points, "Reparse Points")

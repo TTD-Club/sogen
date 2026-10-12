@@ -492,11 +492,34 @@ namespace sogen
                                                                       ptr = 0; //
                                                                   });
 
-            case ProcessDeviceMap:
-                return handle_query<EmulatorTraits<Emu64>::PVOID>(c.emu, process_information, process_information_length, return_length,
-                                                                  [](EmulatorTraits<Emu64>::PVOID& ptr) {
-                                                                      ptr = 0; //
-                                                                  });
+            case ProcessDeviceMap: {
+                // PROCESS_DEVICEMAP_INFORMATION's query form: a bit per drive letter and each drive's type (all fixed
+                // disks here), then, in the Ex form, flags (none).
+                constexpr ULONG query_size = sizeof(ULONG) + 32;
+                constexpr ULONG query_ex_size = query_size + sizeof(ULONG);
+                constexpr uint8_t drive_fixed = 3;
+                if (process_information_length != query_size && process_information_length != query_ex_size)
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                std::array<uint8_t, query_ex_size> info{};
+                ULONG drive_map{};
+                for (const auto drive : c.win_emu.file_sys.list_drives())
+                {
+                    const auto index = static_cast<size_t>(drive - 'a');
+                    if (index < 26)
+                    {
+                        drive_map |= 1u << index;
+                        info[sizeof(ULONG) + index] = drive_fixed;
+                    }
+                }
+                memcpy(info.data(), &drive_map, sizeof(drive_map));
+
+                c.emu.write_memory(process_information, info.data(), process_information_length);
+                return_length.write_if_valid(process_information_length);
+                return STATUS_SUCCESS;
+            }
 
             case ProcessEnableAlignmentFaultFixup:
                 return handle_query<BOOLEAN>(c.emu, process_information, process_information_length, return_length, [](BOOLEAN& b) {

@@ -236,6 +236,19 @@ namespace sogen
                 return std::nullopt;
             }
 
+            // What the host knows of an open file or directory: a file through its stream, a directory by its path (left
+            // empty where that fails, as for a volume).
+            bool stat_open_file(const file& f, struct compat_stat& file_stat)
+            {
+                if (f.handle)
+                {
+                    return compat_fstat(f.handle.file_descriptor(), &file_stat);
+                }
+
+                (void)compat_stat(f.host_path, &file_stat);
+                return true;
+            }
+
             // The access an open holds for sharing purposes (IoCheckShareAccess): reading, writing, and deleting.
             struct shared_access
             {
@@ -836,7 +849,10 @@ namespace sogen
             std::error_code ec{};
             for (const auto& file : std::filesystem::directory_iterator(dir, ec))
             {
-                auto entry = make_file_entry(file.path().filename(), file.path(), file.is_directory());
+                // Some host entries cannot be inspected (app execution aliases in WindowsApps): list them as files.
+                std::error_code entry_ec{};
+                const auto is_directory = file.is_directory(entry_ec);
+                auto entry = make_file_entry(file.path().filename(), file.path(), is_directory && !entry_ec);
                 // A mask matches the name or the 8.3 name (GetLongPathName looks up PROGRA~1).
                 if (!file_mask.empty() && !utils::wildcard::match_filename(entry.file_path.u16string(), file_mask) &&
                     (entry.short_name.empty() || !utils::wildcard::match_filename(entry.short_name, file_mask)))
@@ -1169,11 +1185,6 @@ namespace sogen
 
             if (info_class == FileIdInformation)
             {
-                if (!f->handle)
-                {
-                    return ret(STATUS_NOT_SUPPORTED);
-                }
-
                 constexpr auto required_length = sizeof(FILE_ID_INFORMATION);
 
                 if (length < required_length)
@@ -1182,7 +1193,7 @@ namespace sogen
                 }
 
                 struct compat_stat file_stat{};
-                if (!compat_fstat(f->handle.file_descriptor(), &file_stat))
+                if (!stat_open_file(*f, file_stat))
                 {
                     return ret(STATUS_INVALID_HANDLE);
                 }
@@ -1212,7 +1223,7 @@ namespace sogen
                 }
 
                 struct compat_stat file_stat{};
-                if (f->handle && !compat_fstat(f->handle.file_descriptor(), &file_stat))
+                if (!stat_open_file(*f, file_stat))
                 {
                     return ret(STATUS_INVALID_HANDLE);
                 }
@@ -1277,7 +1288,7 @@ namespace sogen
                 }
 
                 struct compat_stat file_stat{};
-                if (f->handle && !compat_fstat(f->handle.file_descriptor(), &file_stat))
+                if (!stat_open_file(*f, file_stat))
                 {
                     return STATUS_INVALID_HANDLE;
                 }
@@ -1357,7 +1368,7 @@ namespace sogen
                 }
 
                 struct compat_stat file_stat{};
-                if (f->handle && !compat_fstat(f->handle.file_descriptor(), &file_stat))
+                if (!stat_open_file(*f, file_stat))
                 {
                     return STATUS_INVALID_HANDLE;
                 }

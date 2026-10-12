@@ -159,19 +159,33 @@ namespace sogen
                 const std::u16string_view file(reinterpret_cast<const char16_t*>(data.data() + name_offset),
                                                name_length / sizeof(char16_t));
 
+                // The volume as its device (\Device\HarddiskVolume<n>) or its name (\??\Volume{...}, as
+                // GetVolumePathNamesForVolumeName passes it, from the mount points).
+                int drive_index{};
                 constexpr std::u16string_view volume_prefix = u"\\Device\\HarddiskVolume";
-                if (!file.starts_with(volume_prefix))
+                if (file.starts_with(volume_prefix))
                 {
-                    return STATUS_NOT_SUPPORTED;
+                    const auto drive_number_u8 = u16_to_u8(file.substr(volume_prefix.size()));
+                    const auto* number_start = drive_number_u8.data();
+                    const auto* number_end = number_start + drive_number_u8.size();
+                    const auto [parse_end, parse_error] = std::from_chars(number_start, number_end, drive_index);
+                    if (parse_error != std::errc{} || parse_end != number_end)
+                    {
+                        return STATUS_NOT_SUPPORTED;
+                    }
+                }
+                else
+                {
+                    for (const auto drive : win_emu.file_sys.list_drives())
+                    {
+                        if (utils::string::equals_ignore_case(file, std::u16string_view{make_volume(drive, 0)}))
+                        {
+                            drive_index = drive - 'a' + 1;
+                        }
+                    }
                 }
 
-                const auto drive_number = file.substr(volume_prefix.size());
-                const auto drive_number_u8 = u16_to_u8(drive_number);
-                int drive_index{};
-                const auto* number_start = drive_number_u8.data();
-                const auto* number_end = number_start + drive_number_u8.size();
-                const auto [parse_end, parse_error] = std::from_chars(number_start, number_end, drive_index);
-                if (parse_error != std::errc{} || parse_end != number_end || drive_index < 1 || drive_index > 26)
+                if (drive_index < 1 || drive_index > 26)
                 {
                     return STATUS_NOT_SUPPORTED;
                 }
