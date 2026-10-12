@@ -2464,9 +2464,20 @@ namespace sogen
                     .length = ea_length,
                 };
 
-                io_device_container container{std::u16string(*io_device_name), c.win_emu, data};
+                // A device that cannot serve the request (a socket of an address family the host lacks, such as
+                // Bluetooth) fails the open, as on Windows, instead of the emulation.
+                std::optional<io_device_container> container{};
+                try
+                {
+                    container.emplace(std::u16string(*io_device_name), c.win_emu, data);
+                }
+                catch (const std::exception& e)
+                {
+                    c.win_emu.log.warn("Opening device %s failed: %s\n", u16_to_u8(*io_device_name).c_str(), e.what());
+                    return STATUS_NOT_SUPPORTED;
+                }
 
-                const auto handle = c.proc.devices.store(std::move(container));
+                const auto handle = c.proc.devices.store(std::move(*container));
                 file_handle.write(handle);
 
                 return STATUS_SUCCESS;
