@@ -1192,6 +1192,23 @@ namespace sogen
                     return ret(STATUS_SUCCESS, sizeof(FILE_POSITION_INFORMATION));
                 }
 
+                // The end of a pipe is the data waiting to be read, which SetFilePointerEx(FILE_END) seeks past (CPython
+                // opens a pipe with open(fd, 'a')).
+                if (pipe && info_class == FileStandardInformation)
+                {
+                    if (length < sizeof(FILE_STANDARD_INFORMATION))
+                    {
+                        return ret(STATUS_INFO_LENGTH_MISMATCH);
+                    }
+
+                    FILE_STANDARD_INFORMATION i{};
+                    i.AllocationSize.QuadPart = static_cast<LONGLONG>(pipe->inbound_quota) + pipe->outbound_quota;
+                    i.EndOfFile.QuadPart = static_cast<LONGLONG>(pipe->queued_bytes());
+                    i.NumberOfLinks = 1;
+                    c.emu.write_memory(file_information, i);
+                    return ret(STATUS_SUCCESS, sizeof(FILE_STANDARD_INFORMATION));
+                }
+
                 return ret(STATUS_INVALID_HANDLE);
             }
 
@@ -1976,6 +1993,7 @@ namespace sogen
                 }
             }
 
+            f->handle.prepare_read();
             const auto bytes_read = fread(temp_buffer.data(), 1, temp_buffer.size(), f->handle);
 
             if (bytes_read > 0)
@@ -2142,6 +2160,7 @@ namespace sogen
                 }
             }
 
+            f->handle.prepare_write();
             const auto bytes_written = fwrite(temp_buffer.data(), 1, temp_buffer.size(), f->handle);
 
             if (io_status_block)
@@ -2180,6 +2199,7 @@ namespace sogen
 
             std::string temp_buffer{};
             temp_buffer.resize(length);
+            source->handle.prepare_read();
             const auto bytes_read = fread(temp_buffer.data(), 1, temp_buffer.size(), source->handle);
 
             if (destination_offset)
@@ -2191,6 +2211,7 @@ namespace sogen
                 }
             }
 
+            destination->handle.prepare_write();
             const auto bytes_written = fwrite(temp_buffer.data(), 1, bytes_read, destination->handle);
             (void)fflush(destination->handle);
 

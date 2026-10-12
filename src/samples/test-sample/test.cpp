@@ -895,6 +895,46 @@ namespace
 
     // A read-only file says so and is not deleted until it is writable again; a handle names its file in the case the file
     // system keeps, whatever the case it was opened with.
+    // Reads right after a write, and writes right after a read, continue at the file position.
+    bool test_read_after_write()
+    {
+        const auto file = scratch_directory() + L"ReadAfterWrite" + std::to_wstring(GetCurrentProcessId()) + L".bin";
+        auto* const handle =
+            CreateFileW(file.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        const auto close_file = sogen::utils::finally([&] { CloseHandle(handle); });
+
+        const std::vector<char> data(10000, 'a');
+        DWORD count{};
+        WriteFile(handle, data.data(), static_cast<DWORD>(data.size()), &count, nullptr);
+        SetFilePointer(handle, 0, nullptr, FILE_BEGIN);
+        WriteFile(handle, data.data(), 8193, &count, nullptr);
+
+        std::vector<char> buffer(8192);
+        DWORD read{};
+        ReadFile(handle, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr);
+        const auto after_read = SetFilePointer(handle, 0, nullptr, FILE_CURRENT);
+
+        SetFilePointer(handle, 100, nullptr, FILE_BEGIN);
+        ReadFile(handle, buffer.data(), 10, &count, nullptr);
+        WriteFile(handle, "b", 1, &count, nullptr);
+        const auto after_write = SetFilePointer(handle, 0, nullptr, FILE_CURRENT);
+        SetFilePointer(handle, 110, nullptr, FILE_BEGIN);
+        char written{};
+        ReadFile(handle, &written, 1, &count, nullptr);
+
+        if (read != 1807 || after_read != 10000 || after_write != 111 || written != 'b')
+        {
+            printf("Read after write: read %lu, at %lu; write after read at %lu, wrote %c\n", read, after_read, after_write, written);
+            return false;
+        }
+
+        return true;
+    }
+
     bool test_read_only_and_final_names()
     {
         const auto base = scratch_directory() + L"ReadOnly" + std::to_wstring(GetCurrentProcessId());
@@ -2821,6 +2861,14 @@ namespace
             return false;
         }
 
+        // A pipe can seek to its end (CPython's open(fd, 'a')).
+        LARGE_INTEGER end{.QuadPart = -1};
+        if (!SetFilePointerEx(write_end, {}, &end, FILE_END) || end.QuadPart != 0)
+        {
+            printf("Pipe seek to end: %lld, error %lu\n", end.QuadPart, GetLastError());
+            return false;
+        }
+
         return true;
     }
 
@@ -3655,6 +3703,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_drives_and_volumes, "Drives and Volumes")
     RUN_TEST(test_replace_refusals, "Replace Refusals")
     RUN_TEST(test_read_only_and_final_names, "Read-Only and Final Names")
+    RUN_TEST(test_read_after_write, "Read After Write")
     RUN_TEST(test_file_mappings, "File Mappings")
     RUN_TEST(test_environment_and_names, "Environment and Names")
     RUN_TEST(test_reparse_points, "Reparse Points")

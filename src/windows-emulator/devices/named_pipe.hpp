@@ -95,6 +95,17 @@ namespace sogen
 
         bool cancel_io(windows_emulator& win_emu, uint64_t io_status_block) override;
 
+        // Bytes the other end wrote that wait to be read.
+        size_t queued_bytes() const
+        {
+            size_t queued = 0;
+            for (const auto& chunk : this->read_queue)
+            {
+                queued += chunk.size();
+            }
+            return queued;
+        }
+
         // Takes up to `length` bytes of what the other end wrote: in message mode the rest of the oldest message (sets
         // `more` when it does not fit), in byte mode as much as is queued.
         std::string take(size_t length, bool& more)
@@ -216,11 +227,7 @@ namespace sogen
                 return STATUS_INVALID_PARAMETER;
             }
 
-            size_t available = 0;
-            for (const auto& chunk : this->read_queue)
-            {
-                available += chunk.size();
-            }
+            const auto available = this->queued_bytes();
 
             // Peeking is non-destructive: copy as much queued data as the caller's buffer holds.
             const auto data_capacity = static_cast<size_t>(c.output_buffer_length - header_size);

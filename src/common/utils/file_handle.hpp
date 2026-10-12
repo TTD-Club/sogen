@@ -77,9 +77,11 @@ namespace sogen
                 {
                     this->release();
                     this->file_ = obj.file_;
+                    this->last_io_ = obj.last_io_;
                     this->deferred_rename_ = obj.deferred_rename_;
                     this->deferred_delete_ = obj.deferred_delete_;
                     obj.file_ = {};
+                    obj.last_io_ = {};
                     obj.deferred_rename_ = {};
                     obj.deferred_delete_ = {};
                 }
@@ -91,6 +93,7 @@ namespace sogen
             {
                 this->release();
                 this->file_ = file;
+                this->last_io_ = {};
 
                 return *this;
             }
@@ -123,7 +126,20 @@ namespace sogen
 
             bool seek_to(const int64_t position, const int origin = SEEK_SET) const
             {
+                this->last_io_ = io_direction::none;
                 return _fseeki64(this->file_, position, origin) == 0;
+            }
+
+            // A stream must not read right after writing, or write right after reading, without a seek in between (C11
+            // 7.21.5.3): the CRT would read from or write to a stale buffer position. Call before each fread/fwrite.
+            void prepare_read() const
+            {
+                this->switch_direction(io_direction::read);
+            }
+
+            void prepare_write() const
+            {
+                this->switch_direction(io_direction::write);
             }
 
             [[nodiscard]] int64_t tell() const
@@ -185,9 +201,27 @@ namespace sogen
             }
 
           private:
+            enum class io_direction : uint8_t
+            {
+                none,
+                read,
+                write,
+            };
+
             FILE* file_{};
+            mutable io_direction last_io_{io_direction::none};
             std::optional<rename_information> deferred_rename_;
             std::optional<delete_information> deferred_delete_;
+
+            void switch_direction(const io_direction direction) const
+            {
+                if (this->last_io_ != io_direction::none && this->last_io_ != direction)
+                {
+                    (void)this->seek_to(this->tell());
+                }
+
+                this->last_io_ = direction;
+            }
 
             void release()
             {

@@ -74,12 +74,7 @@ namespace sogen
             quota = default_quota;
         }
 
-        size_t queued = 0;
-        for (const auto& chunk : reader.read_queue)
-        {
-            queued += chunk.size();
-        }
-
+        const auto queued = reader.queued_bytes();
         return queued < quota ? quota - queued : 0;
     }
 
