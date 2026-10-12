@@ -105,22 +105,6 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            // A pipe's name without the \Device\NamedPipe\ or \??\pipe\ prefix, lower case; empty for the prefix itself.
-            std::u16string pipe_short_name(const std::u16string_view path)
-            {
-                for (const std::u16string_view prefix : {u"\\Device\\NamedPipe\\", u"\\??\\pipe\\"})
-                {
-                    if (utils::string::starts_with_ignore_case(path, prefix))
-                    {
-                        std::u16string name(path.substr(prefix.size()));
-                        std::ranges::transform(name, name.begin(), [](const char16_t c) { return utils::string::char_to_lower(c); });
-                        return name;
-                    }
-                }
-
-                return {};
-            }
-
             std::u16string resolve_system_root_path(const syscall_context& c, std::u16string filename)
             {
                 auto filename_upper = filename;
@@ -607,9 +591,17 @@ namespace sogen
             std::vector<file_entry> files{};
 
             const auto dir = file_sys.translate(win_path);
-            const auto make_file_entry = [deterministic_time](const std::filesystem::path& file_path,
-                                                              const std::filesystem::path& host_path, const bool is_directory) {
+            // An exact name (the usual lookup of one file, also by its short name) asks the host for that entry only.
+            const auto exact = !file_mask.empty() && file_mask.find_first_of(u"*?<>\"") == std::u16string_view::npos;
+            const auto short_names = compat_short_names(dir, exact ? std::u16string(file_mask) : u"*");
+            const auto make_file_entry = [deterministic_time, &short_names](const std::filesystem::path& file_path,
+                                                                            const std::filesystem::path& host_path,
+                                                                            const bool is_directory) {
                 file_entry entry{.file_path = file_path, .is_directory = is_directory};
+                if (const auto short_name = short_names.find(file_path.u16string()); short_name != short_names.end())
+                {
+                    entry.short_name = short_name->second;
+                }
 
                 struct compat_stat file_stat{};
                 if (compat_stat(host_path, &file_stat))
@@ -632,12 +624,15 @@ namespace sogen
             std::error_code ec{};
             for (const auto& file : std::filesystem::directory_iterator(dir, ec))
             {
-                if (!file_mask.empty() && !utils::wildcard::match_filename(file.path().filename().u16string(), file_mask))
+                auto entry = make_file_entry(file.path().filename(), file.path(), file.is_directory());
+                // A mask matches the name or the 8.3 name (GetLongPathName looks up PROGRA~1).
+                if (!file_mask.empty() && !utils::wildcard::match_filename(entry.file_path.u16string(), file_mask) &&
+                    (entry.short_name.empty() || !utils::wildcard::match_filename(entry.short_name, file_mask)))
                 {
                     continue;
                 }
 
-                files.emplace_back(make_file_entry(file.path().filename(), file.path(), file.is_directory()));
+                files.emplace_back(std::move(entry));
             }
 
             file_sys.access_mapped_entries(win_path, [&](const std::pair<windows_path, std::filesystem::path>& entry) {
@@ -734,6 +729,13 @@ namespace sogen
                 info.FileAttributes = current_file.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
                 info.FileNameLength = static_cast<ULONG>(file_name.size() * 2);
                 info.EndOfFile.QuadPart = current_file.file_size;
+
+                if constexpr (requires { info.ShortName; })
+                {
+                    const auto short_length = std::min(current_file.short_name.size(), std::size(info.ShortName));
+                    std::copy_n(current_file.short_name.begin(), short_length, std::begin(info.ShortName));
+                    info.ShortNameLength = static_cast<char>(short_length * sizeof(char16_t));
+                }
 
                 object.set_address(file_information + new_offset);
                 object.write(info);
@@ -866,6 +868,19 @@ namespace sogen
                     c.emu.write_memory(file_information,
                                        file_pipe_information{.read_mode = pipe->read_mode, .completion_mode = pipe->completion_mode});
                     return ret(STATUS_SUCCESS, sizeof(file_pipe_information));
+                }
+
+                // A pipe has no position: it reads as 0, and setting it is ignored (so SetFilePointerEx succeeds, and
+                // CPython opens a pipe with open(name, 'w+b')).
+                if (pipe && info_class == FilePositionInformation)
+                {
+                    if (length < sizeof(FILE_POSITION_INFORMATION))
+                    {
+                        return ret(STATUS_INFO_LENGTH_MISMATCH);
+                    }
+
+                    c.emu.write_memory(file_information, FILE_POSITION_INFORMATION{});
+                    return ret(STATUS_SUCCESS, sizeof(FILE_POSITION_INFORMATION));
                 }
 
                 return ret(STATUS_INVALID_HANDLE);
@@ -2118,6 +2133,13 @@ namespace sogen
 
             const auto attributes = object_attributes.read();
             auto filename = read_unicode_string(c.emu, attributes.ObjectName);
+
+            // \DosDevices\ is another name of \??\ (WaitNamedPipe opens \DosDevices\pipe\).
+            if (constexpr std::u16string_view dos_devices = u"\\DosDevices\\";
+                utils::string::starts_with_ignore_case(std::u16string_view{filename}, dos_devices))
+            {
+                filename = u"\\??\\" + filename.substr(dos_devices.size());
+            }
 
             // Check for console device paths
             // Convert to uppercase for case-insensitive comparison

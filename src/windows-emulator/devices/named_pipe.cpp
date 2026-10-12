@@ -4,6 +4,62 @@
 
 namespace sogen
 {
+    std::u16string pipe_short_name(const std::u16string_view path)
+    {
+        for (const std::u16string_view prefix : {u"\\Device\\NamedPipe\\", u"\\??\\pipe\\"})
+        {
+            if (utils::string::starts_with_ignore_case(path, prefix))
+            {
+                std::u16string name(path.substr(prefix.size()));
+                std::ranges::transform(name, name.begin(), [](const char16_t c) { return utils::string::char_to_lower(c); });
+                return name;
+            }
+        }
+
+        return {};
+    }
+
+    NTSTATUS named_pipe::wait(windows_emulator& win_emu, const io_device_context& c)
+    {
+        // FILE_PIPE_WAIT_FOR_BUFFER: Timeout, NameLength, TimeoutSpecified, then the name relative to \Device\NamedPipe\.
+        constexpr ULONG name_offset = 14;
+        if (c.input_buffer_length < name_offset)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        const auto name_length = win_emu.emu().read_memory<ULONG>(c.input_buffer + 8);
+        if (name_length % sizeof(char16_t) != 0 || name_offset + name_length > c.input_buffer_length)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        std::u16string wanted(name_length / sizeof(char16_t), u'\0');
+        win_emu.emu().read_memory(c.input_buffer + name_offset, wanted.data(), name_length);
+        wanted = pipe_short_name(u"\\Device\\NamedPipe\\" + wanted);
+
+        // An instance without a client is available now. Waiting for a busy one to be released is not supported: the
+        // wait times out at once.
+        auto exists = false;
+        for (auto& container : win_emu.process.devices | std::views::values)
+        {
+            const auto* end = container.get_internal_device<named_pipe>();
+            if (!end || !end->server || end->anonymous || pipe_short_name(end->name) != wanted)
+            {
+                continue;
+            }
+
+            exists = true;
+            if (!find_pipe_end(win_emu.process, end->instance, false))
+            {
+                return STATUS_SUCCESS;
+            }
+        }
+
+        constexpr auto status_io_timeout = static_cast<NTSTATUS>(0xC00000B5);
+        return exists ? status_io_timeout : STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     named_pipe* find_pipe_end(process_context& process, const uint64_t instance, const bool server)
     {
         if (!instance)

@@ -226,4 +226,34 @@ namespace sogen
     }
 
 #endif
+
+    std::map<std::u16string, std::u16string> compat_short_names(const std::filesystem::path& directory, const std::u16string& pattern)
+    {
+        std::map<std::u16string, std::u16string> names{};
+#if defined(_WIN32) && !defined(__MINGW64__)
+        WIN32_FIND_DATAW data{};
+        auto* const find = FindFirstFileExW((directory / std::filesystem::path(pattern)).c_str(), FindExInfoStandard, &data,
+                                            FindExSearchNameMatch, nullptr, 0);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            return names;
+        }
+
+        do
+        {
+            if (data.cAlternateFileName[0] != L'\0')
+            {
+                const std::filesystem::path name{data.cFileName};
+                const std::filesystem::path short_name{data.cAlternateFileName};
+                names.emplace(name.u16string(), short_name.u16string());
+            }
+        } while (FindNextFileW(find, &data));
+
+        FindClose(find);
+#else
+        (void)directory;
+        (void)pattern;
+#endif
+        return names;
+    }
 } // namespace sogen

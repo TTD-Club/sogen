@@ -6,6 +6,8 @@ namespace sogen
 {
     // FSCTL_PIPE_PEEK = CTL_CODE(FILE_DEVICE_NAMED_PIPE, 3, METHOD_BUFFERED, FILE_READ_DATA)
     constexpr ULONG FSCTL_PIPE_PEEK = 0x11400C;
+    // FSCTL_PIPE_WAIT = CTL_CODE(FILE_DEVICE_NAMED_PIPE, 6, METHOD_BUFFERED, FILE_ANY_ACCESS), on the \Device\NamedPipe\ root.
+    constexpr ULONG FSCTL_PIPE_WAIT = 0x110018;
     constexpr ULONG FILE_PIPE_CONNECTED_STATE = 3;
 
     // Header of FILE_PIPE_PEEK_BUFFER; the peeked data follows immediately after.
@@ -146,6 +148,11 @@ namespace sogen
                 return this->peek(win_emu, c);
             }
 
+            if (c.io_control_code == FSCTL_PIPE_WAIT)
+            {
+                return wait(win_emu, c);
+            }
+
             win_emu.log.warn("Unsupported named pipe FSCTL: 0x%X\n", static_cast<uint32_t>(c.io_control_code));
             return STATUS_NOT_SUPPORTED;
         }
@@ -198,6 +205,9 @@ namespace sogen
         }
 
       private:
+        // FSCTL_PIPE_WAIT (WaitNamedPipe): whether a server instance of the name has no client yet.
+        static NTSTATUS wait(windows_emulator& win_emu, const io_device_context& c);
+
         NTSTATUS peek(windows_emulator& win_emu, const io_device_context& c)
         {
             constexpr auto header_size = static_cast<ULONG>(sizeof(file_pipe_peek_buffer));
@@ -247,6 +257,9 @@ namespace sogen
             return available > data.size() ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
         }
     };
+
+    // A pipe's name without the \Device\NamedPipe\ or \??\pipe\ prefix, lower case; empty for the prefix itself.
+    std::u16string pipe_short_name(std::u16string_view path);
 
     // The end of pipe instance `instance` that is (or is not) the server, if it is open.
     named_pipe* find_pipe_end(process_context& process, uint64_t instance, bool server);

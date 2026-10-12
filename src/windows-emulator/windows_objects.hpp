@@ -718,6 +718,8 @@ namespace sogen
         LARGE_INTEGER creation_time{};
         LARGE_INTEGER last_access_time{};
         LARGE_INTEGER last_write_time{};
+        // The 8.3 name, for names that are not 8.3 themselves (empty where the host keeps none).
+        std::u16string short_name{};
 
         void serialize(utils::buffer_serializer& buffer) const
         {
@@ -727,6 +729,7 @@ namespace sogen
             buffer.write(this->creation_time);
             buffer.write(this->last_access_time);
             buffer.write(this->last_write_time);
+            buffer.write(this->short_name);
         }
 
         void deserialize(utils::buffer_deserializer& buffer)
@@ -737,6 +740,7 @@ namespace sogen
             buffer.read(this->creation_time);
             buffer.read(this->last_access_time);
             buffer.read(this->last_write_time);
+            buffer.read(this->short_name);
         }
     };
 

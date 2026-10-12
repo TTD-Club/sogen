@@ -328,7 +328,8 @@ namespace sogen
 
         utils::unordered_insensitive_u16string_map<std::u16string> get_environment_variables(registry_manager& registry,
                                                                                              const windows_version_manager& version,
-                                                                                             const application_settings& app_settings)
+                                                                                             const application_settings& app_settings,
+                                                                                             const bool is_wow64_process)
         {
             utils::unordered_insensitive_u16string_map<std::u16string> env_map;
             std::unordered_set<std::u16string_view> keys_to_expand;
@@ -385,6 +386,40 @@ namespace sogen
             env_map[u"TMP"] = user_profile + u"\\AppData\\Local\\Temp";
             env_map[u"TEMP"] = user_profile + u"\\AppData\\Local\\Temp";
             env_map[u"USERPROFILE"] = user_profile;
+
+            // What CreateEnvironmentBlock adds for a user, from where Windows keeps it. A 32-bit process sees the x86
+            // directories as ProgramFiles and CommonProgramFiles.
+            const auto read_current_version = [&](const std::string_view name, std::u16string fallback) {
+                auto value =
+                    registry_utils::read_registry_string(registry, R"(\Registry\Machine\Software\Microsoft\Windows\CurrentVersion)", name);
+                return value && !value->empty() ? std::move(*value) : std::move(fallback);
+            };
+            const auto program_files = read_current_version("ProgramFilesDir", system_drive + u"\\Program Files");
+            const auto program_files_x86 = read_current_version("ProgramFilesDir (x86)", system_drive + u"\\Program Files (x86)");
+            const auto common_files = read_current_version("CommonFilesDir", program_files + u"\\Common Files");
+            const auto common_files_x86 = read_current_version("CommonFilesDir (x86)", program_files_x86 + u"\\Common Files");
+            env_map[u"ProgramFiles"] = is_wow64_process ? program_files_x86 : program_files;
+            env_map[u"ProgramFiles(x86)"] = program_files_x86;
+            env_map[u"ProgramW6432"] = read_current_version("ProgramW6432Dir", program_files);
+            env_map[u"CommonProgramFiles"] = is_wow64_process ? common_files_x86 : common_files;
+            env_map[u"CommonProgramFiles(x86)"] = common_files_x86;
+            env_map[u"CommonProgramW6432"] = read_current_version("CommonW6432Dir", common_files);
+
+            const auto read_profile_list = [&](const std::string_view name, const std::u16string_view fallback) {
+                const auto value = registry_utils::read_registry_string(
+                    registry, R"(\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\ProfileList)", name);
+                return expand_environment_string(value && !value->empty() ? *value : std::u16string(fallback), env_map);
+            };
+            env_map[u"ProgramData"] = read_profile_list("ProgramData", system_drive + u"\\ProgramData");
+            env_map[u"ALLUSERSPROFILE"] = env_map[u"ProgramData"];
+            env_map[u"PUBLIC"] = read_profile_list("Public", system_drive + u"\\Users\\Public");
+
+            env_map[u"APPDATA"] = user_profile + u"\\AppData\\Roaming";
+            env_map[u"LOCALAPPDATA"] = user_profile + u"\\AppData\\Local";
+            env_map[u"HOMEDRIVE"] = user_profile.size() >= 2 && user_profile[1] == u':' ? user_profile.substr(0, 2) : system_drive;
+            env_map[u"HOMEPATH"] = user_profile.size() >= 2 && user_profile[1] == u':' ? user_profile.substr(2) : user_profile;
+            env_map[u"USERDOMAIN"] = env_map[u"COMPUTERNAME"];
+            env_map[u"LOGONSERVER"] = u"\\\\" + env_map[u"COMPUTERNAME"];
 
             for (const auto& [key, value] : app_settings.environment)
             {
@@ -467,7 +502,7 @@ namespace sogen
 
             proc_params.Environment = allocator.copy_string(u"=::=::\\");
 
-            const auto env_map = get_environment_variables(win_emu.registry, version, app_settings);
+            const auto env_map = get_environment_variables(win_emu.registry, version, app_settings, this->is_wow64_process);
             for (const auto& [name, value] : env_map)
             {
                 std::u16string entry;

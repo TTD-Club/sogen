@@ -742,6 +742,50 @@ namespace
         return true;
     }
 
+    // The environment names the program directories, WaitNamedPipe finds a free instance, and short and long path names
+    // round-trip (whether or not the volume keeps 8.3 names).
+    bool test_environment_and_names()
+    {
+        std::array<wchar_t, MAX_PATH> program_files{};
+        if (!GetEnvironmentVariableW(L"ProgramFiles", program_files.data(), static_cast<DWORD>(program_files.size())) ||
+            !GetEnvironmentVariableW(L"ProgramData", nullptr, 0) || !GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0))
+        {
+            puts("ProgramFiles, ProgramData or LOCALAPPDATA is not set");
+            return false;
+        }
+
+        const auto pipe_name = L"\\\\.\\pipe\\LOCAL\\SogenWait" + std::to_wstring(GetCurrentProcessId());
+        const auto missing_refused = !WaitNamedPipeW(pipe_name.c_str(), 0) && GetLastError() == ERROR_FILE_NOT_FOUND;
+        auto* const pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE, 2, 32, 32, 0, nullptr);
+        const auto free_found = pipe != INVALID_HANDLE_VALUE && WaitNamedPipeW(pipe_name.c_str(), 0);
+        CloseHandle(pipe);
+        if (!missing_refused || !free_found)
+        {
+            printf("WaitNamedPipe: missing refused %d, free instance found %d\n", missing_refused, free_found);
+            return false;
+        }
+
+        // Program Files where it exists (emulation roots may lack it), otherwise the system directory.
+        auto directory = program_files;
+        if (GetFileAttributesW(directory.data()) == INVALID_FILE_ATTRIBUTES)
+        {
+            GetSystemDirectoryW(directory.data(), static_cast<UINT>(directory.size()));
+        }
+
+        std::array<wchar_t, MAX_PATH> short_path{};
+        std::array<wchar_t, MAX_PATH> long_path{};
+        if (!GetShortPathNameW(directory.data(), short_path.data(), static_cast<DWORD>(short_path.size())) ||
+            !GetLongPathNameW(short_path.data(), long_path.data(), static_cast<DWORD>(long_path.size())) ||
+            CompareStringOrdinal(long_path.data(), -1, directory.data(), -1, TRUE) != CSTR_EQUAL)
+        {
+            printf("Short and long path names do not round-trip: %ls -> %ls -> %ls (%lu)\n", directory.data(), short_path.data(),
+                   long_path.data(), GetLastError());
+            return false;
+        }
+
+        return true;
+    }
+
     // The volume of a path is its drive's root.
     bool test_volume_path()
     {
@@ -3339,6 +3383,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_case_mapping, "Case Mapping")
     RUN_TEST(test_volume_path, "Volume Path")
     RUN_TEST(test_file_mappings, "File Mappings")
+    RUN_TEST(test_environment_and_names, "Environment and Names")
     RUN_TEST(test_system_info, "System Info")
     RUN_TEST(test_monitor_info, "Monitor Info")
     RUN_TEST(test_time_zone, "Time Zone")
