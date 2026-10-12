@@ -60,6 +60,29 @@ namespace sogen
         return exists ? status_io_timeout : STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
+    size_t pipe_room(process_context& process, const named_pipe& reader)
+    {
+        constexpr size_t default_quota = 4096;
+        const auto* server = reader.server ? &reader : find_pipe_end(process, reader.instance, true);
+        size_t quota = 0;
+        if (server)
+        {
+            quota = reader.server ? server->inbound_quota : server->outbound_quota;
+        }
+        if (quota == 0)
+        {
+            quota = default_quota;
+        }
+
+        size_t queued = 0;
+        for (const auto& chunk : reader.read_queue)
+        {
+            queued += chunk.size();
+        }
+
+        return queued < quota ? quota - queued : 0;
+    }
+
     named_pipe* find_pipe_end(process_context& process, const uint64_t instance, const bool server)
     {
         if (!instance)

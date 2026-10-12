@@ -2782,6 +2782,48 @@ namespace
         return true;
     }
 
+    // A non-blocking write takes only what the pipe's buffer has room for, nothing once it is full, and again after a
+    // read made room.
+    bool test_pipe_quota()
+    {
+        HANDLE read_end{};
+        HANDLE write_end{};
+        if (!CreatePipe(&read_end, &write_end, nullptr, 0))
+        {
+            return false;
+        }
+        const auto close_ends = sogen::utils::finally([&] {
+            CloseHandle(read_end);
+            CloseHandle(write_end);
+        });
+
+        DWORD mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        SetNamedPipeHandleState(write_end, &mode, nullptr, nullptr);
+
+        // The default buffer holds 4096 bytes; a write that does not fit writes nothing (also in byte mode).
+        const std::vector<char> data(64 * 1024, 'q');
+        DWORD too_big = 1;
+        DWORD fits = 0;
+        DWORD no_room = 1;
+        const auto wrote = WriteFile(write_end, data.data(), static_cast<DWORD>(data.size()), &too_big, nullptr) &&
+                           WriteFile(write_end, data.data(), 4000, &fits, nullptr) &&
+                           WriteFile(write_end, data.data(), 200, &no_room, nullptr);
+
+        std::vector<char> buffer(data.size());
+        DWORD read{};
+        ReadFile(read_end, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr);
+        DWORD after_read{};
+        const auto wrote_after_read = WriteFile(write_end, data.data(), 200, &after_read, nullptr);
+
+        if (!wrote || too_big != 0 || fits != 4000 || no_room != 0 || read != 4000 || !wrote_after_read || after_read != 200)
+        {
+            printf("Pipe quota: too big %lu, fits %lu, no room %lu, read %lu, after read %lu\n", too_big, fits, no_room, read, after_read);
+            return false;
+        }
+
+        return true;
+    }
+
     // A blocking read of an empty pipe waits for the other end to write, and then for it to close; an overlapped read
     // is pending until the data arrives.
     bool test_pipe_waits()
@@ -3586,6 +3628,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
     RUN_TEST(test_pipe_data, "Pipe Data")
     RUN_TEST(test_pipe_waits, "Pipe Waits")
+    RUN_TEST(test_pipe_quota, "Pipe Quota")
     RUN_TEST(test_device_file_types, "Device File Types")
     RUN_TEST(test_file_ids_by_name, "File IDs by Name")
     RUN_TEST(test_directory_name_collision, "Directory Name Collision")

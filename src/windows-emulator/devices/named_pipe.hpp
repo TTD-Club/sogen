@@ -269,6 +269,10 @@ namespace sogen
         return find_pipe_end(process, end.instance, !end.server);
     }
 
+    // How many more bytes `reader` takes before its buffer quota (the server's inbound quota for the server, its outbound
+    // quota for the client; 4096 where none was given, as CreatePipe's default) is full.
+    size_t pipe_room(process_context& process, const named_pipe& reader);
+
     // A read of up to `length` bytes into `buffer`, if it can complete now: STATUS_SUCCESS with what the other end
     // wrote (STATUS_BUFFER_OVERFLOW for part of a message), STATUS_PIPE_BROKEN when nothing is left and the other end
     // is closed. Writes the I/O status block when it completes. Nothing while the read has to wait.

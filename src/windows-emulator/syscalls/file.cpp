@@ -2076,6 +2076,14 @@ namespace sogen
                             return STATUS_PIPE_CLOSING;
                         }
 
+                        // A non-blocking (PIPE_NOWAIT) write that does not fit in the reader's buffer quota writes nothing
+                        // and succeeds, as on Windows (also in byte mode); CPython reports it as BlockingIOError. Blocking
+                        // writes are not held back.
+                        if (pipe->completion_mode == FILE_PIPE_COMPLETE_OPERATION_VALUE && temp_buffer.size() > pipe_room(c.proc, *peer))
+                        {
+                            temp_buffer.clear();
+                        }
+
                         if (!temp_buffer.empty())
                         {
                             peer->read_queue.emplace_back(temp_buffer.begin(), temp_buffer.end());
