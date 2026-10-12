@@ -1384,6 +1384,40 @@ namespace sogen::ttd
         return changes;
     }
 
+    std::vector<std::byte> encode_module_machines(const std::span<const module_entry> modules)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, modules.size());
+        for (const auto& mod : modules)
+        {
+            put_varint(raw, mod.machine);
+        }
+        return compress_table(raw, "module machines");
+    }
+
+    void decode_module_machines(const std::span<const std::byte> compressed, const std::span<module_entry> modules)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        if (reader.varint() != modules.size())
+        {
+            throw std::runtime_error("Invalid TTD module machines");
+        }
+        for (auto& mod : modules)
+        {
+            const auto machine = reader.varint();
+            if (machine > UINT16_MAX)
+            {
+                throw std::runtime_error("Invalid TTD module machines");
+            }
+            mod.machine = static_cast<uint16_t>(machine);
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD module machines");
+        }
+    }
+
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)
     {
         std::vector<std::byte> filtered(data.begin(), data.end());

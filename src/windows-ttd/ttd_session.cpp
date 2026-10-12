@@ -6,6 +6,8 @@
 #include <utils/finally.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -290,9 +292,11 @@ namespace sogen::ttd
     {
         // Runs the emulator to `position` with one start() per checkpoint interval, as the recording ran: window input
         // is pumped at each boundary. Also stops at `keyframe_stops` (sorted) and calls `at_keyframe` there. Returns
-        // whether it got there.
+        // whether it got there. With `control`, it also stops at every keyframe_interval to check it and report
+        // progress; the replay does not depend on where start() calls end (keyframe stops split them the same way).
         bool run_intervals(windows_emulator& win_emu, trace& recorded, const uint64_t position,
-                           const std::span<const uint64_t> keyframe_stops = {}, const std::function<void()>& at_keyframe = {})
+                           const std::span<const uint64_t> keyframe_stops = {}, const std::function<void()>& at_keyframe = {},
+                           const operation_control& control = {})
         {
             const auto run_to = [&](const uint64_t target) {
                 const auto before = win_emu.get_executed_instructions();
@@ -304,12 +308,22 @@ namespace sogen::ttd
             };
 
             const auto from = win_emu.get_executed_instructions();
+            const auto controlled = control.interrupted || control.progress;
+            const auto report = [&] { control.report(win_emu.get_executed_instructions() - from, position > from ? position - from : 0); };
             std::vector<uint64_t> stops{};
             for (const auto& checkpoint : recorded.checkpoints())
             {
                 stops.push_back(checkpoint.step);
             }
             stops.insert(stops.end(), keyframe_stops.begin(), keyframe_stops.end());
+            if (controlled)
+            {
+                for (auto stop = (from / keyframe_interval + 1) * keyframe_interval; stop < position; stop += keyframe_interval)
+                {
+                    stops.push_back(stop);
+                }
+                report();
+            }
             std::erase_if(stops, [&](const uint64_t stop) { return stop <= from || stop >= position; });
             std::ranges::sort(stops);
             stops.erase(std::ranges::unique(stops).begin(), stops.end());
@@ -323,6 +337,10 @@ namespace sogen::ttd
                 if (std::ranges::binary_search(keyframe_stops, stop))
                 {
                     at_keyframe();
+                }
+                if (controlled)
+                {
+                    report();
                 }
             }
             return run_to(position);
@@ -363,7 +381,7 @@ namespace sogen::ttd
         // `exact_start` tells that the state at `from` was reached without substituting inputs.
         seek_result replay_range(windows_emulator& win_emu, trace& recorded, const uint64_t from, const uint64_t position,
                                  const bool strict, const bool from_checkpoint, keyframe_store* keyframes = nullptr,
-                                 const bool exact_start = true, const bool every_interval = false)
+                                 const bool exact_start = true, const bool every_interval = false, const operation_control& control = {})
         {
             try
             {
@@ -428,7 +446,7 @@ namespace sogen::ttd
                 };
 
                 const auto stops = keyframes ? keyframe_stops(recorded, from, position, every_interval) : std::vector<uint64_t>{};
-                run_intervals(win_emu, recorded, position, stops, at_stop);
+                run_intervals(win_emu, recorded, position, stops, at_stop, control);
                 verifier.finish();
                 if (const auto reached = win_emu.get_executed_instructions(); reached != position)
                 {
@@ -451,7 +469,8 @@ namespace sogen::ttd
         }
     }
 
-    seek_result seek(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict)
+    seek_result seek(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict,
+                     const operation_control& control)
     {
         require_deterministic(win_emu);
         check_manifest(win_emu, recorded);
@@ -468,10 +487,10 @@ namespace sogen::ttd
         {
             snapshot::load_emulator_state(win_emu, *recorded.checkpoint_for_step(position).state);
         }
-        return replay_range(win_emu, recorded, from, position, strict, from == checkpoint_step, &keyframes, exact);
+        return replay_range(win_emu, recorded, from, position, strict, from == checkpoint_step, &keyframes, exact, false, control);
     }
 
-    void prepare_keyframes(trace& recorded, const std::span<windows_emulator* const> emulators)
+    void prepare_keyframes(trace& recorded, const std::span<windows_emulator* const> emulators, const operation_control& control)
     {
         for (auto* emulator : emulators)
         {
@@ -494,29 +513,64 @@ namespace sogen::ttd
         const auto workers = std::min(emulators.size(), starts.size());
         std::vector<std::exception_ptr> failures(workers);
         std::vector<std::thread> threads{};
+        // The workers stop at every keyframe anyway; there they add their progress and look for a cancellation, which
+        // only the calling thread decides (`control` is not called from the workers).
+        std::atomic<uint64_t> replayed{};
+        std::atomic<bool> cancelled{};
+        std::atomic<size_t> finished{};
         for (size_t worker = 0; worker < workers; ++worker)
         {
             const auto first = starts[worker * starts.size() / workers];
             const auto next = (worker + 1) * starts.size() / workers;
             const auto last = next < starts.size() ? starts[next] : end;
-            threads.emplace_back([&recorded, &failures, emulator = emulators[worker], worker, first, last] {
+            threads.emplace_back([&, emulator = emulators[worker], worker, first, last] {
+                uint64_t reported = 0;
+                const operation_control worker_control{
+                    .interrupted = [&] { return cancelled.load(); },
+                    .progress =
+                        [&](const uint64_t done, uint64_t) {
+                            replayed += done - reported;
+                            reported = done;
+                        },
+                };
                 try
                 {
                     trace reader(recorded.path());
                     reader.share_keyframes(recorded);
                     snapshot::load_emulator_state(*emulator, *reader.checkpoint_for_step(first).state);
                     reader.keyframes().capture(*emulator, true);
-                    replay_range(*emulator, reader, first, last, false, true, &reader.keyframes(), true, true);
+                    replay_range(*emulator, reader, first, last, false, true, &reader.keyframes(), true, true, worker_control);
                 }
                 catch (...)
                 {
                     failures[worker] = std::current_exception();
                 }
+                ++finished;
             });
+        }
+        const auto total = end - recorded.start_position();
+        while ((control.interrupted || control.progress) && finished < workers)
+        {
+            if (!cancelled)
+            {
+                try
+                {
+                    control.report(replayed, total);
+                }
+                catch (const operation_cancelled&)
+                {
+                    cancelled = true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         for (auto& thread : threads)
         {
             thread.join();
+        }
+        if (cancelled)
+        {
+            throw operation_cancelled();
         }
         for (const auto& failure : failures)
         {
@@ -525,9 +579,11 @@ namespace sogen::ttd
                 std::rethrow_exception(failure);
             }
         }
+        control.report(total, total);
     }
 
-    seek_result run_to(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict)
+    seek_result run_to(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict,
+                       const operation_control& control)
     {
         require_deterministic(win_emu);
         check_manifest(win_emu, recorded);
@@ -544,11 +600,11 @@ namespace sogen::ttd
         {
             throw std::out_of_range("TTD position is beyond end of trace");
         }
-        return replay_range(win_emu, recorded, from, position, strict, false);
+        return replay_range(win_emu, recorded, from, position, strict, false, nullptr, true, false, control);
     }
 
     seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach, const bool strict,
-                              const bool restore)
+                              const bool restore, const operation_control& control)
     {
         require_deterministic(win_emu);
         const auto start = recorded.start_position();
@@ -573,7 +629,7 @@ namespace sogen::ttd
         {
             replay_verifier verifier(win_emu, recorded, start, strict);
             const ui_replay ui(win_emu, recorded.ui_inputs(), 0, [&verifier] { return verifier.next_event_number(); });
-            const auto reached = run_intervals(win_emu, recorded, end);
+            const auto reached = run_intervals(win_emu, recorded, end, {}, {}, control);
             verifier.finish();
             if (!reached)
             {

@@ -98,6 +98,9 @@ namespace sogen::ttd
         // Every mapping and unmapping of guest memory (see mapping_change), encoded as described at
         // encode_mapping_changes; size = compressed bytes.
         mapping_changes = 14,
+        // The PE machine of each module in the modules section, encoded as described at encode_module_machines;
+        // size = compressed bytes.
+        module_machines = 15,
     };
 
     // Guest memory [address, address + size) was mapped or unmapped at position `step`, after `event_number` events,

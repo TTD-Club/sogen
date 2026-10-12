@@ -1,4 +1,11 @@
-file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS
+# Three targets, so a consumer that only reads traces does not link the emulator:
+#   windows-ttd-reader (reader/): trace files, queries, no emulator or CPU backend
+#   windows-ttd-view (view/): cpu_view, the registers at a position, on a standalone Unicorn CPU
+#   windows-ttd (this directory): recording, replay, keyframes, scans; needs windows-emulator
+add_subdirectory(reader)
+add_subdirectory(view)
+
+file(GLOB SRC_FILES CONFIGURE_DEPENDS
   *.cpp
   *.hpp
 )
@@ -10,6 +17,8 @@ add_library(windows-ttd STATIC ${SRC_FILES})
 sogen_assign_source_group(${SRC_FILES})
 
 target_link_libraries(windows-ttd PUBLIC
+  windows-ttd-reader
+  windows-ttd-view
   windows-emulator
 )
 

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <memory>
 
+#include <arch_emulator.hpp>
+
 #include "ttd_trace.hpp"
 
 namespace sogen::ttd

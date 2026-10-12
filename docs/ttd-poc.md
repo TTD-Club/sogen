@@ -52,6 +52,20 @@ with ttd.Trace("sample.sogttd") as trace:
     # A forwarded export names its target (export.forwarder, e.g. "ntdll.dll!RtlAllocateHeap" for kernel32's
     # HeapAlloc), and calls() of it are the target's calls while both modules are mapped.
 
+    # By address, with the instruction that led there (call site) and the matching return (cpu_at there shows the
+    # return value): the return is the first ret that reads the stack slot the call pushed. ~0.3 ms per call.
+    for call in trace.calls_to(module.base + export.rva):
+        print(call.position, hex(call.site), call.entry_position, call.return_position, call.is_call)
+    # Where indirect calls (and jumps) in address ranges went, from the execute events alone (~1 s for every module of
+    # test-sample, 175k executed branches); faulting branches are left out.
+    for branch in trace.indirect_branches([(module.base, module.size)], jumps=True):
+        print(hex(branch.site), "->", hex(branch.target), branch.hits)
+    # Exceptions the system dispatched to user mode (faults, breakpoints, single steps; not RaiseException, which
+    # ntdll dispatches in user mode), from the records the dispatch wrote to the stack.
+    for exception in trace.exceptions():
+        print(exception.position, exception.raise_position, hex(exception.code), hex(exception.address))
+    print(trace.id, trace.version, module.machine)     # recording id (survives copies), format version, PE machine
+
     # The CPU and memory at a position without an emulated process (~6 ms cold): registers from the nearest register
     # snapshot, then at most 25,000 instructions replayed on a standalone CPU fed the recorded reads and verified
     # against the recording. Like a debugger, the state is the one the next instruction starts from; it differs from
@@ -118,6 +132,25 @@ scans start from the trace's initial checkpoint, so they also work on a recorded
 `--ttd-buffers` and `--ttd-scan-selfmod` start from the application's setup and need a trace that starts at
 position 0. Every replay scan verifies all recorded events, takes recorded inputs unless strict, and delivers
 recorded window input.
+
+## Native library
+
+`src/windows-ttd` builds three static libraries, so a tool that only reads traces does not link the emulator:
+
+| Target | Headers | Needs | Provides |
+| --- | --- | --- | --- |
+| `windows-ttd-reader` | `ttd_trace.hpp`, `ttd_format.hpp`, `ttd_chunk.hpp` | `emulator-common` (zstd) | `ttd::trace` and every query that does not replay: accesses, `memory_at`, calls, `calls_to`, `indirect_branches`, `exceptions`, modules, threads, syscalls, ids |
+| `windows-ttd-view` | `ttd_view.hpp` | the reader, `emulator`, `unicorn-emulator` | `ttd::cpu_view` (`Trace.cpu_at`): registers at a position on a standalone Unicorn CPU |
+| `windows-ttd` | `ttd_record.hpp`, `ttd_session.hpp`, scans | both, `windows-emulator` | recording, replay (`seek`, `run_to`, `replay_to_end`), keyframes, replay scans |
+
+`trace::keyframes()` and `share_keyframes()` are declared with the reader but defined by `windows-ttd`.
+`src/windows-ttd/inspect` (`ttd-inspect TRACE [exceptions | calls-to ADDRESS | branches ADDRESS SIZE [jumps]]`)
+is a reader-only consumer. The long operations take a `ttd::operation_control`: `interrupted()` returning true
+makes them throw `ttd::operation_cancelled`, and `progress(done, total)` reports work done; both run on the
+calling thread (`prepare_keyframes` polls them while its workers run, so they need not be thread-safe). In Python,
+`Trace.prepare_seeks(emulators, interrupted=..., progress=...)` raises `ttd.OperationCancelled`.
+`test/ttd_reader_test.py ANALYZER SAMPLE` covers the reader queries against `cpu_at` and cancellation (SAMPLE
+should raise hardware exceptions, like `test-sample`).
 
 ## Recording and querying
 
@@ -496,9 +529,18 @@ found through the section table (24-byte entries `type, offset, size`):
   accesses stop showing a byte. A zstd frame of varints: count, then per
   change the position and event-number deltas, the address relative to the
   previous change's (zigzag), and the size. `test-sample`: 2.3 KB.
+- Module machines (type 15, size = compressed bytes; absent in older traces):
+  the PE machine of each module (`0x8664`, or `0x14c` for 32-bit code in a
+  WoW64 process). A zstd frame of varints: the module count (that of the
+  modules section), then each machine in module order.
 
 Unknown section types are ignored, so sections can be added without a new
-version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
+version. The library reads versions 1-4 and 7-8 (`ttd::is_supported_trace_version`;
+5 and 6 were development formats) and refuses others; `ttd::is_trace_file` and
+`ttd::trace_file_version` recognize any version from the first 8 bytes. A file of a
+supported version with sections this build does not know opens without them.
+Since the trace id, the manifest also holds `trace_id`, 32 random hex digits per
+recording (`Trace.id`; older traces get `h` and a hash of their header and tables). Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
 write. An event chunk is one zstd frame holding `event_count`, eight stream
 sizes, and the streams. Each stream predicts from earlier events of the same
 chunk only, so a chunk decodes on its own given the code table and the bulk

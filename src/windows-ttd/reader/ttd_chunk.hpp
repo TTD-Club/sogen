@@ -212,6 +212,9 @@ namespace sogen::ttd
         std::string path{};
         // Sorted by RVA, then name; null for traces without the exports section. Shared, so copies stay cheap.
         std::shared_ptr<const std::vector<module_export>> exports{};
+        // The PE header's machine (0x8664 for x64 code, 0x14c for 32-bit code in a WoW64 process); 0 for traces without
+        // the module machines section.
+        uint16_t machine{};
     };
 
     // From event `event_number` (at step `step`) on, thread `thread_id` runs: with execute events recorded, the event is
@@ -250,6 +253,11 @@ namespace sogen::ttd
     // forwarder as a length and UTF-8 bytes. decode_export_forwarders fills them into the decoded exports.
     std::vector<std::byte> encode_export_forwarders(std::span<const module_entry> modules);
     void decode_export_forwarders(std::span<const std::byte> compressed, std::span<module_entry> modules);
+
+    // The module machines section is a zstd frame of varints: the module count (that of the modules section), then
+    // each module's PE machine. decode_module_machines fills them into the decoded modules.
+    std::vector<std::byte> encode_module_machines(std::span<const module_entry> modules);
+    void decode_module_machines(std::span<const std::byte> compressed, std::span<module_entry> modules);
 
     // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
     // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.

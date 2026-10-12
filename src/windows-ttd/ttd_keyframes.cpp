@@ -1,4 +1,5 @@
 #include "ttd_keyframes.hpp"
+#include "ttd_trace.hpp"
 
 #include <utils/compression.hpp>
 
@@ -12,6 +13,29 @@
 
 namespace sogen::ttd
 {
+    // The reader holds its keyframe store by pointer only (it does not depend on the emulator); it is created here, on
+    // first use. Readers of one trace on several threads (prepare_keyframes) share one store, so creation is locked.
+    std::shared_ptr<keyframe_store>& trace::keyframes_slot() const
+    {
+        static std::mutex creation{};
+        const std::scoped_lock lock{creation};
+        if (!keyframes_)
+        {
+            keyframes_ = std::make_shared<keyframe_store>(default_keyframe_budget);
+        }
+        return keyframes_;
+    }
+
+    keyframe_store& trace::keyframes()
+    {
+        return *keyframes_slot();
+    }
+
+    void trace::share_keyframes(const trace& other)
+    {
+        keyframes_ = other.keyframes_slot();
+    }
+
     keyframe_store::keyframe_store(const size_t memory_budget)
         : memory_budget_(memory_budget)
     {

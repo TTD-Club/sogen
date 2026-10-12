@@ -1,6 +1,6 @@
 #include "ttd_view.hpp"
 
-#include <backend_selection.hpp>
+#include <unicorn_x86_64_emulator.hpp>
 
 #include <algorithm>
 #include <cstring>
@@ -25,7 +25,7 @@ namespace sogen::ttd
 
         std::unique_ptr<x86_64_emulator> cpu_with_registers(const std::vector<std::byte>& registers)
         {
-            auto cpu = create_x86_64_emulator(backend_type::unicorn);
+            auto cpu = unicorn::create_x86_64_emulator();
             cpu->restore_registers(registers);
             // Snapshots are taken while the recording CPU runs, where the backend keeps the arithmetic and direction flags
             // outside the flags register; starting the CPU would rebuild them from the flags register and lose them.
@@ -41,8 +41,7 @@ namespace sogen::ttd
     {
       public:
         view_engine()
-            : cpu_(create_x86_64_emulator(backend_type::unicorn)),
-              memory_(*cpu_)
+            : cpu_(unicorn::create_x86_64_emulator())
         {
             auto& cpu = *cpu_;
             cpu.hook_memory_execution_metadata([this](cpu_interface&, const uint64_t address, const size_t size) {
@@ -166,7 +165,6 @@ namespace sogen::ttd
 
       private:
         std::unique_ptr<x86_64_emulator> cpu_{};
-        memory_manager memory_;
         // Sorted page numbers mapped so far.
         std::vector<uint64_t> mapped_{};
 
@@ -335,10 +333,8 @@ namespace sogen::ttd
                 {
                     ++count;
                 }
-                if (!this->memory_.allocate_memory(missing[first] * page_size, count * page_size, memory_permission::all))
-                {
-                    throw std::runtime_error("Cannot map memory for a TTD CPU view");
-                }
+                // mapped_ tracks every mapping, so the CPU maps these directly.
+                this->cpu_->map_memory(missing[first] * page_size, count * page_size, memory_permission::all);
                 first += count;
             }
             if (!missing.empty())
