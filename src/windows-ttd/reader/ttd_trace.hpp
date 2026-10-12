@@ -408,12 +408,14 @@ namespace sogen::ttd
                                            uint64_t kind_mask = all_access_kinds, const operation_control& control = {});
         std::optional<access_event> next_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = all_access_kinds);
         std::optional<access_event> previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = all_access_kinds);
-        // The bytes of [address, address + size) at `position` (before instruction position + 1 runs, like cpu_view):
-        // each from the latest access at or before the position that shows it (a read, a write, a host write, or
-        // executed bytes), else from the first later access if that one reads or executes it; an access counts only
-        // when the memory was not mapped or unmapped between it and the position. Bytes no access shows come from the
-        // memory of the checkpoint the position replays from (has_checkpoint_memory), unless their memory was mapped or
-        // unmapped since; nothing for the rest (older traces, MMIO and host-aliased memory, remapped bytes).
+        // The bytes of [address, address + size) at `position` (before instruction position + 1 runs, like cpu_view).
+        // With has_checkpoint_memory: the memory of the checkpoint the position replays from, with the writes and host
+        // writes since applied, so the cost follows the writes to the memory, not its reads and executions. Bytes
+        // mapped or unmapped since the checkpoint and not written after, and MMIO (host-aliased memory included, whose
+        // contents checkpoints don't save), are read from accesses as below.
+        // Otherwise: each byte from the latest access at or before the position that shows it (a read, a write, a host
+        // write, or executed bytes), else from the first later access if that one reads or executes it; an access
+        // counts only when the memory was not mapped or unmapped between it and the position. Nothing for the rest.
         // Traces without mapping changes cannot tell remapped memory apart. Progress counts candidate chunks.
         std::vector<std::optional<uint8_t>> memory_at(uint64_t position, uint64_t address, uint64_t size,
                                                       const operation_control& control = {});
@@ -466,9 +468,19 @@ namespace sogen::ttd
         // Per checkpoint, where the memory manager's state begins in its decoded state; empty for traces without it.
         std::vector<uint64_t> checkpoint_memory_offsets_{};
 
-        // The committed memory of a checkpoint: by address, each range's length and its offset in the state.
+        // memory_at from the accesses to the memory, then the checkpoint for bytes they don't show.
+        std::vector<std::optional<uint8_t>> memory_from_accesses(uint64_t position, uint64_t address, uint64_t size,
+                                                                 const operation_control& control);
+        // memory_at from the checkpoint and the writes since (has_checkpoint_memory).
+        std::vector<std::optional<uint8_t>> memory_from_checkpoint(uint64_t position, uint64_t address, uint64_t size,
+                                                                   const operation_control& control);
+
+        // The committed memory of a checkpoint: by address, each range's length and its offset in the state
+        // (no_contents for MMIO, whose contents are not saved).
         struct checkpoint_memory
         {
+            static constexpr size_t no_contents = SIZE_MAX;
+
             std::shared_ptr<const std::vector<std::byte>> state{};
             std::map<uint64_t, std::pair<uint64_t, size_t>> ranges{};
         };

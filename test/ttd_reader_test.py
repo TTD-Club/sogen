@@ -105,6 +105,9 @@ def main() -> None:
             bottom = stacks[0].stack_limit
             assert not trace.accesses(bottom, 0x100), position
             assert bytes(trace.memory_at(position, bottom, 0x100)) == emulator.memory.read_memory(bottom, 0x100), position
+            # A code page executed throughout the trace reads from the checkpoint and the writes since, as replayed.
+            hot = next(m.base + e.rva for m, e in trace.find_exports("ntdll.dll!RtlAllocateHeap") if e.forwarder is None) & ~0xFFF
+            assert bytes(trace.memory_at(position, hot, 0x1000)) == emulator.memory.read_memory(hot, 0x1000), position
             committed = [region for region in regions if region.state == mem_commit and region.kind != 5]
             for region in random.sample(committed, min(25, len(committed))):
                 size = min(region.size, 0x2000)

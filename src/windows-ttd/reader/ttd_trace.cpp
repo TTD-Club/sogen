@@ -1618,11 +1618,137 @@ namespace sogen::ttd
         {
             throw std::out_of_range("TTD position is beyond end of trace");
         }
-        std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
         if (!size)
         {
-            return value;
+            return {};
         }
+        return checkpoint_memory_offsets_.empty() ? memory_from_accesses(position, address, size, control)
+                                                  : memory_from_checkpoint(position, address, size, control);
+    }
+
+    std::vector<std::optional<uint8_t>> trace::memory_from_checkpoint(const uint64_t position, const uint64_t address,
+                                                                      const uint64_t size, const operation_control& control)
+    {
+        std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
+        const auto last = last_byte(address, size);
+        const auto checkpoint_step = checkpoint_step_for(position);
+        const auto memory = checkpoint_memory_at(checkpoint_index(checkpoint_step));
+        // As in fill_from_checkpoint: the checkpoint's own events came before it, a mapping change numbered like an
+        // event came before that event, and one numbered like the first event after the position counts as before it.
+        const auto after = first_event_after(checkpoint_step);
+        const auto boundary = first_event_after(position);
+
+        // Per byte: needs the accesses (MMIO, or remapped since the checkpoint and not written after), and the last
+        // mapping change since the checkpoint that covers it.
+        std::vector<bool> from_accesses(value.size());
+        std::vector<std::optional<uint64_t>> remapped_at(value.size());
+
+        auto range = memory->ranges.upper_bound(address);
+        if (range != memory->ranges.begin())
+        {
+            --range;
+        }
+        for (; range != memory->ranges.end() && range->first <= last; ++range)
+        {
+            const auto& [length, offset] = range->second;
+            if (!length)
+            {
+                continue;
+            }
+            const auto range_last = range->first + (length - 1);
+            for (auto byte = std::max(range->first, address); byte <= std::min(range_last, last); ++byte)
+            {
+                const auto index = static_cast<size_t>(byte - address);
+                if (offset == checkpoint_memory::no_contents)
+                {
+                    from_accesses[index] = true;
+                }
+                else
+                {
+                    value[index] = static_cast<uint8_t>((*memory->state)[offset + static_cast<size_t>(byte - range->first)]);
+                }
+            }
+        }
+
+        for (auto change = std::ranges::lower_bound(mapping_changes_, after, {}, &mapping_change::event_number);
+             change != mapping_changes_.end() && change->event_number <= boundary; ++change)
+        {
+            if (!overlaps(change->address, change->size, address, size))
+            {
+                continue;
+            }
+            const auto change_last = change->address + (change->size - 1);
+            for (auto byte = std::max(change->address, address); byte <= std::min(change_last, last); ++byte)
+            {
+                const auto index = static_cast<size_t>(byte - address);
+                remapped_at[index] = change->event_number;
+                value[index].reset();
+            }
+        }
+
+        // The writes since the checkpoint, in order; one before a later mapping change of its byte is lost to it.
+        const auto ranges = candidates(address / page_size, last / page_size,
+                                       static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::host_write),
+                                       after, boundary);
+        uint64_t done = 0;
+        for (const auto& candidate : ranges)
+        {
+            control.report(done++, ranges.size());
+            for (auto number = candidate.begin; number < candidate.end; ++number)
+            {
+                const auto event = event_at(number);
+                if ((event.kind != access_kind::write && event.kind != access_kind::host_write) ||
+                    !overlaps(event.address, event.size, address, size))
+                {
+                    continue;
+                }
+                std::vector<std::byte> data{};
+                for (auto byte = std::max(event.address, address); byte < std::min(event.address + event.size, address + size); ++byte)
+                {
+                    const auto index = static_cast<size_t>(byte - address);
+                    if (remapped_at[index] && number < *remapped_at[index])
+                    {
+                        continue;
+                    }
+                    if (data.empty())
+                    {
+                        data = access_data(event);
+                    }
+                    value[index] = static_cast<uint8_t>(data.at(static_cast<size_t>(byte - event.address)));
+                }
+            }
+        }
+
+        // Bytes the checkpoint and the writes don't settle come from the accesses, over the span that holds them.
+        std::optional<size_t> first_unsettled{};
+        size_t last_unsettled{};
+        for (size_t index = 0; index < value.size(); ++index)
+        {
+            if (from_accesses[index] || (remapped_at[index] && !value[index]))
+            {
+                from_accesses[index] = true;
+                first_unsettled = first_unsettled.value_or(index);
+                last_unsettled = index;
+            }
+        }
+        if (first_unsettled)
+        {
+            const auto settled = memory_from_accesses(position, address + *first_unsettled, last_unsettled - *first_unsettled + 1, {});
+            for (auto index = *first_unsettled; index <= last_unsettled; ++index)
+            {
+                if (from_accesses[index])
+                {
+                    value[index] = settled[index - *first_unsettled];
+                }
+            }
+        }
+        return value;
+    }
+
+    std::vector<std::optional<uint8_t>> trace::memory_from_accesses(const uint64_t position, const uint64_t address,
+                                                                    const uint64_t size, const operation_control& control)
+    {
+        std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
         // Per byte: whether an access settled it, and whether the latest access up to the position was found (an older
         // one says less).
         std::vector<bool> settled(value.size());
@@ -1763,10 +1889,12 @@ namespace sogen::ttd
         // The committed memory in the memory manager's part of a checkpoint state (memory_manager::serialize_memory_state):
         // its layout version, default allocation address and DEP flag, the reservations (base, kind, mapped file name,
         // initial protection, length, and committed ranges with their protection), then the contents of the committed
-        // ranges of every reservation but MMIO, in that order. By address: each range's length and its offset in `data`.
+        // ranges of every reservation but MMIO, in that order. By address: each range's length and its offset in `data`,
+        // SIZE_MAX (trace::checkpoint_memory::no_contents) for MMIO.
         std::map<uint64_t, std::pair<uint64_t, size_t>> parse_checkpoint_memory(const std::span<const std::byte> data, const size_t offset)
         {
             constexpr uint8_t mmio_kind = 5;
+            constexpr size_t no_contents = SIZE_MAX;
             constexpr uint64_t nt_permission_size = 2;
             constexpr uint64_t name_char_size = 2;
 
@@ -1804,12 +1932,13 @@ namespace sogen::ttd
             std::map<uint64_t, std::pair<uint64_t, size_t>> ranges{};
             for (const auto& reserved : reservations)
             {
-                if (reserved.kind == mmio_kind)
-                {
-                    continue;
-                }
                 for (const auto& [address, length] : reserved.committed)
                 {
+                    if (reserved.kind == mmio_kind)
+                    {
+                        ranges.emplace(address, std::pair{length, no_contents});
+                        continue;
+                    }
                     const auto contents = fields.field(length);
                     ranges.emplace(address, std::pair{length, static_cast<size_t>(contents.data() - data.data())});
                 }
@@ -1857,7 +1986,8 @@ namespace sogen::ttd
             }
             const auto byte = address + index;
             auto range = memory->ranges.upper_bound(byte);
-            if (range == memory->ranges.begin() || byte - std::prev(range)->first >= std::prev(range)->second.first)
+            if (range == memory->ranges.begin() || byte - std::prev(range)->first >= std::prev(range)->second.first ||
+                std::prev(range)->second.second == checkpoint_memory::no_contents)
             {
                 continue;
             }
