@@ -758,6 +758,14 @@ namespace sogen
         });
     }
 
+    void expire_timers(windows_emulator& win_emu)
+    {
+        for (auto& t : win_emu.process.timers | std::views::values)
+        {
+            expire_timer(win_emu, t);
+        }
+    }
+
     void emulator_thread::mark_as_ready(const NTSTATUS status)
     {
         this->pending_status = status;
@@ -1133,12 +1141,6 @@ namespace sogen
 
         auto& process = win_emu.process;
         auto& clock = win_emu.clock();
-
-        // Expiries queue timer APCs and signal timers that wait-completion packets watch.
-        for (auto& t : process.timers | std::views::values)
-        {
-            expire_timer(win_emu, t);
-        }
 
         const auto complete_if_timed_out = [&](const NTSTATUS status) {
             if (!this->is_await_time_over(clock) || this->has_pending_alertable_apc())

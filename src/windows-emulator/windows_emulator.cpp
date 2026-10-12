@@ -893,8 +893,14 @@ namespace sogen
 
         const auto needed_switch = vcpu.switch_thread.exchange(false);
 
-        while (!switch_to_next_thread(*this, vcpu))
+        while (true)
         {
+            expire_timers(*this);
+            if (switch_to_next_thread(*this, vcpu))
+            {
+                break;
+            }
+
             if (this->vcpu_count_ > 1 && vcpu.active_thread)
             {
                 // Nothing runnable for this vCPU: detach the stale thread so another

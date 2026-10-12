@@ -342,6 +342,11 @@ namespace sogen
         }
     };
 
+    // Expires the timers that are due: signals them and queues their APCs. Only the scheduler calls this, where it picks
+    // the next thread, so that expiries do not depend on where a run was stopped and resumed (TTD replays stop
+    // anywhere).
+    void expire_timers(windows_emulator& win_emu);
+
     class emulator_thread : public ref_counted_object
     {
       public:
