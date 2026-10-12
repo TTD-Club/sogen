@@ -496,6 +496,14 @@ namespace sogen::ttd
                 memory_regions_ = decode_memory_regions(read_bytes(section.offset, section.size));
                 has_memory_regions_ = true;
             }
+            else if (section.type == section_type::checkpoint_memory)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                checkpoint_memory_offsets_ = decode_checkpoint_memory_offsets(read_bytes(section.offset, section.size));
+            }
             else if (section.type == section_type::modules || section.type == section_type::threads ||
                      section.type == section_type::exports || section.type == section_type::export_forwarders ||
                      section.type == section_type::module_machines)
@@ -538,6 +546,10 @@ namespace sogen::ttd
         if (machines)
         {
             decode_module_machines(*machines, modules_);
+        }
+        if (!checkpoint_memory_offsets_.empty() && checkpoint_memory_offsets_.size() != checkpoints_.size())
+        {
+            throw std::runtime_error("Invalid TTD checkpoint memory offsets");
         }
 
         uint64_t next_event = 0;
@@ -1706,7 +1718,157 @@ namespace sogen::ttd
                 }
             }
         }
+
+        // What no access shows is what the checkpoint the position replays from holds, unless remapped since.
+        if (!checkpoint_memory_offsets_.empty() && std::ranges::any_of(value, [](const auto& byte) { return !byte; }))
+        {
+            fill_from_checkpoint(position, address, boundary, value);
+        }
         return value;
+    }
+
+    namespace
+    {
+        // The fields of a serialized emulator state: each is a check byte (the low byte of its length), then its bytes.
+        struct state_fields
+        {
+            std::span<const std::byte> data{};
+            size_t offset{};
+
+            std::span<const std::byte> field(const uint64_t length)
+            {
+                if (offset >= data.size() || length > data.size() - offset - 1 ||
+                    static_cast<uint8_t>(data[offset]) != static_cast<uint8_t>(length))
+                {
+                    throw std::runtime_error("Invalid TTD checkpoint memory");
+                }
+                const auto bytes = data.subspan(offset + 1, static_cast<size_t>(length));
+                offset += 1 + static_cast<size_t>(length);
+                return bytes;
+            }
+
+            uint64_t u64()
+            {
+                uint64_t value{};
+                memcpy(&value, field(sizeof(value)).data(), sizeof(value));
+                return value;
+            }
+
+            uint8_t u8()
+            {
+                return static_cast<uint8_t>(field(1).front());
+            }
+        };
+
+        // The committed memory in the memory manager's part of a checkpoint state (memory_manager::serialize_memory_state):
+        // its layout version, default allocation address and DEP flag, the reservations (base, kind, mapped file name,
+        // initial protection, length, and committed ranges with their protection), then the contents of the committed
+        // ranges of every reservation but MMIO, in that order. By address: each range's length and its offset in `data`.
+        std::map<uint64_t, std::pair<uint64_t, size_t>> parse_checkpoint_memory(const std::span<const std::byte> data, const size_t offset)
+        {
+            constexpr uint8_t mmio_kind = 5;
+            constexpr uint64_t nt_permission_size = 2;
+            constexpr uint64_t name_char_size = 2;
+
+            state_fields fields{.data = data, .offset = offset};
+            (void)fields.u64();
+            (void)fields.u64();
+            (void)fields.u8();
+
+            struct reservation
+            {
+                uint8_t kind{};
+                std::vector<std::pair<uint64_t, uint64_t>> committed{};
+            };
+
+            std::vector<reservation> reservations(static_cast<size_t>(std::min<uint64_t>(fields.u64(), data.size())));
+            for (auto& reserved : reservations)
+            {
+                (void)fields.u64();
+                reserved.kind = fields.u8();
+                for (auto name_length = fields.u64(); name_length; --name_length)
+                {
+                    (void)fields.field(name_char_size);
+                }
+                (void)fields.u8();
+                (void)fields.u64();
+                for (auto count = fields.u64(); count; --count)
+                {
+                    const auto address = fields.u64();
+                    const auto length = fields.u64();
+                    (void)fields.field(nt_permission_size);
+                    reserved.committed.emplace_back(address, length);
+                }
+            }
+
+            std::map<uint64_t, std::pair<uint64_t, size_t>> ranges{};
+            for (const auto& reserved : reservations)
+            {
+                if (reserved.kind == mmio_kind)
+                {
+                    continue;
+                }
+                for (const auto& [address, length] : reserved.committed)
+                {
+                    const auto contents = fields.field(length);
+                    ranges.emplace(address, std::pair{length, static_cast<size_t>(contents.data() - data.data())});
+                }
+            }
+            return ranges;
+        }
+    }
+
+    std::shared_ptr<const trace::checkpoint_memory> trace::checkpoint_memory_at(const uint64_t index)
+    {
+        if (checkpoint_memory_cache_ && checkpoint_memory_cache_->first == index)
+        {
+            return checkpoint_memory_cache_->second;
+        }
+        auto memory = std::make_shared<checkpoint_memory>();
+        memory->state = checkpoint_state_at(index);
+        memory->ranges =
+            parse_checkpoint_memory(*memory->state, static_cast<size_t>(checkpoint_memory_offsets_.at(static_cast<size_t>(index))));
+        checkpoint_memory_cache_.emplace(index, memory);
+        return memory;
+    }
+
+    void trace::fill_from_checkpoint(const uint64_t position, const uint64_t address, const uint64_t boundary,
+                                     std::vector<std::optional<uint8_t>>& value)
+    {
+        const auto checkpoint_step = checkpoint_step_for(position);
+        const auto memory = checkpoint_memory_at(checkpoint_index(checkpoint_step));
+        // The events of the checkpoint's instructions came before it; a mapping change numbered like the first event
+        // after it may have come either side, so it counts as after.
+        const auto after = first_event_after(checkpoint_step);
+        std::vector<std::pair<uint64_t, uint64_t>> remapped_ranges{};
+        for (auto change = std::ranges::lower_bound(mapping_changes_, after, {}, &mapping_change::event_number);
+             change != mapping_changes_.end() && change->event_number <= boundary; ++change)
+        {
+            if (overlaps(change->address, change->size, address, value.size()))
+            {
+                remapped_ranges.emplace_back(change->address, change->size);
+            }
+        }
+        for (size_t index = 0; index < value.size(); ++index)
+        {
+            if (value[index])
+            {
+                continue;
+            }
+            const auto byte = address + index;
+            auto range = memory->ranges.upper_bound(byte);
+            if (range == memory->ranges.begin() || byte - std::prev(range)->first >= std::prev(range)->second.first)
+            {
+                continue;
+            }
+            --range;
+            const auto remapped_since = std::ranges::any_of(
+                remapped_ranges, [byte](const std::pair<uint64_t, uint64_t>& changed) { return byte - changed.first < changed.second; });
+            if (!remapped_since)
+            {
+                value[index] = static_cast<uint8_t>((*memory->state)[range->second.second + static_cast<size_t>(byte - range->first)]);
+            }
+        }
     }
 
     std::vector<memory_region> trace::memory_regions_at(const uint64_t position) const

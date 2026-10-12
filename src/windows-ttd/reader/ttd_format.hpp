@@ -109,6 +109,10 @@ namespace sogen::ttd
         // The memory map at the start and its changes (see memory_region), encoded as described at
         // encode_memory_regions; size = compressed bytes.
         memory_regions = 17,
+        // Per checkpoint, the offset in its decoded state at which the memory manager's state begins, so a reader can
+        // take memory contents from checkpoints without parsing the rest; encoded as described at
+        // encode_checkpoint_memory_offsets; size = compressed bytes.
+        checkpoint_memory = 18,
     };
 
     // What NtQueryVirtualMemory showed for [address, address + size) from position `step` on (after `event_number`

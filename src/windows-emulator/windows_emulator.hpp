@@ -435,6 +435,8 @@ namespace sogen
         void stop();
 
         void serialize(utils::buffer_serializer& buffer) const;
+        // Also tells where in the buffer the memory manager's state (serialize_memory_state) begins.
+        void serialize(utils::buffer_serializer& buffer, size_t& memory_offset) const;
         void deserialize(utils::buffer_deserializer& buffer);
 
         // The same state without the contents of committed guest memory, which a restore takes from `pages`.
@@ -539,7 +541,7 @@ namespace sogen
         void track_section_first_execution(uint64_t address);
 
         void register_factories(utils::buffer_deserializer& buffer);
-        void serialize_state(utils::buffer_serializer& buffer, bool memory_contents) const;
+        void serialize_state(utils::buffer_serializer& buffer, bool memory_contents, size_t* memory_offset = nullptr) const;
         void deserialize_state(utils::buffer_deserializer& buffer, const std::function<void()>& restore_memory);
     };
 

@@ -151,8 +151,9 @@ def main() -> None:
         for position in sorted(before_switch)[:5]:
             trace.cpu_at(position)
         assert len(trace.cpu_at(store.position).read_register_bytes(sogen.Register.xmm0)) == 16
-        # The global's old value comes from the image, and no access shows it before the store changes it.
-        assert trace.memory_at(store.position - 1, address, 8) == [None] * 8
+        # The global's old value comes from the image, and no access shows it before the store changes it: the checkpoint
+        # memory does.
+        assert trace.memory_at(store.position - 1, address, 8) == list(OLD_VALUE.to_bytes(8, "little"))
         assert trace.read_memory(store.position, address, 8) == NEW_VALUE.to_bytes(8, "little")
         assert trace.read_memory(load.position - 1, address, 8) == NEW_VALUE.to_bytes(8, "little")
         assert trace.memory_at(store.position, 0x10, 4) == [None] * 4

@@ -827,7 +827,10 @@ namespace sogen::ttd
         }
         // A released state returns its allocation to the pool, which keeps a couple.
         constexpr size_t kept_allocations = 2;
-        auto owned = std::make_unique<std::vector<std::byte>>(snapshot::create_emulator_state(emu_, expected_size, std::move(storage)));
+        size_t memory_offset{};
+        auto owned = std::make_unique<std::vector<std::byte>>(
+            snapshot::create_emulator_state(emu_, expected_size, std::move(storage), memory_offset));
+        checkpoint_memory_offsets_.push_back(memory_offset);
         const std::shared_ptr<const std::vector<std::byte>> state(owned.release(), [pool = state_pool_](std::vector<std::byte>* released) {
             const std::unique_ptr<std::vector<std::byte>> freed(released);
             const std::lock_guard lock{pool->mutex};
@@ -970,6 +973,7 @@ namespace sogen::ttd
         const auto machines = encode_module_machines(modules_);
         const auto stacks = encode_thread_stacks(thread_stacks_);
         const auto regions = encode_memory_regions(memory_regions_);
+        const auto memory_offsets = encode_checkpoint_memory_offsets(checkpoint_memory_offsets_);
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -989,6 +993,7 @@ namespace sogen::ttd
             section_entry{.type = section_type::module_machines, .offset = append_to_file(machines), .size = machines.size()},
             section_entry{.type = section_type::thread_stacks, .offset = append_to_file(stacks), .size = stacks.size()},
             section_entry{.type = section_type::memory_regions, .offset = append_to_file(regions), .size = regions.size()},
+            section_entry{.type = section_type::checkpoint_memory, .offset = append_to_file(memory_offsets), .size = memory_offsets.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));

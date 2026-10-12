@@ -12,6 +12,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -343,6 +344,13 @@ namespace sogen::ttd
             return has_memory_regions_;
         }
 
+        // Whether memory_at can take bytes no access shows from checkpoints (traces recorded with the checkpoint memory
+        // section).
+        bool has_checkpoint_memory() const
+        {
+            return !checkpoint_memory_offsets_.empty();
+        }
+
         // The memory map at `position` (after the changes made up to and at it), as NtQueryVirtualMemory would list it:
         // reserved and committed ranges in address order, free memory left out. Empty without has_memory_regions().
         std::vector<memory_region> memory_regions_at(uint64_t position) const;
@@ -403,7 +411,9 @@ namespace sogen::ttd
         // The bytes of [address, address + size) at `position` (before instruction position + 1 runs, like cpu_view):
         // each from the latest access at or before the position that shows it (a read, a write, a host write, or
         // executed bytes), else from the first later access if that one reads or executes it; an access counts only
-        // when the memory was not mapped or unmapped between it and the position. Nothing for bytes no access shows.
+        // when the memory was not mapped or unmapped between it and the position. Bytes no access shows come from the
+        // memory of the checkpoint the position replays from (has_checkpoint_memory), unless their memory was mapped or
+        // unmapped since; nothing for the rest (older traces, MMIO and host-aliased memory, remapped bytes).
         // Traces without mapping changes cannot tell remapped memory apart. Progress counts candidate chunks.
         std::vector<std::optional<uint8_t>> memory_at(uint64_t position, uint64_t address, uint64_t size,
                                                       const operation_control& control = {});
@@ -453,6 +463,21 @@ namespace sogen::ttd
         bool has_thread_stacks_{};
         memory_region_table memory_regions_{};
         bool has_memory_regions_{};
+        // Per checkpoint, where the memory manager's state begins in its decoded state; empty for traces without it.
+        std::vector<uint64_t> checkpoint_memory_offsets_{};
+
+        // The committed memory of a checkpoint: by address, each range's length and its offset in the state.
+        struct checkpoint_memory
+        {
+            std::shared_ptr<const std::vector<std::byte>> state{};
+            std::map<uint64_t, std::pair<uint64_t, size_t>> ranges{};
+        };
+
+        std::optional<std::pair<uint64_t, std::shared_ptr<const checkpoint_memory>>> checkpoint_memory_cache_{};
+        std::shared_ptr<const checkpoint_memory> checkpoint_memory_at(uint64_t index);
+        // Fills the bytes of `value` (at `address`, `position`) that no access showed from the memory of the checkpoint
+        // the position replays from, where nothing remapped them between it and `boundary`.
+        void fill_from_checkpoint(uint64_t position, uint64_t address, uint64_t boundary, std::vector<std::optional<uint8_t>>& value);
         // Whether a mapping change covering `address` came after event `after_number` and before event `through_number`.
         bool remapped(uint64_t address, uint64_t after_number, uint64_t through_number) const;
         std::shared_ptr<view_engine> view_engine_{};

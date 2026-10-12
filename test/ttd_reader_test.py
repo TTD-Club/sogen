@@ -99,6 +99,19 @@ def main() -> None:
             listed = run(analyzer.parent / "ttd-inspect.exe", path, "regions", str(position))
             assert len(listed.splitlines()) == len(regions) + 1, listed
 
+            # memory_at knows every byte of committed memory (from accesses, else from the checkpoint), as replayed. The
+            # bottom of the first thread's stack is never touched: only the checkpoint shows it.
+            assert trace.has_checkpoint_memory
+            bottom = stacks[0].stack_limit
+            assert not trace.accesses(bottom, 0x100), position
+            assert bytes(trace.memory_at(position, bottom, 0x100)) == emulator.memory.read_memory(bottom, 0x100), position
+            committed = [region for region in regions if region.state == mem_commit and region.kind != 5]
+            for region in random.sample(committed, min(25, len(committed))):
+                size = min(region.size, 0x2000)
+                shown = trace.memory_at(position, region.address, size)
+                assert None not in shown, (region, position, shown.count(None))
+                assert bytes(shown) == emulator.memory.read_memory(region.address, size), (region, position)
+
         listed = run(analyzer.parent / "ttd-inspect.exe", path, "stacks")
         assert len(listed.splitlines()) == len(stacks) + 1 and f"0x{stacks[0].teb:016x}" in listed, listed
 

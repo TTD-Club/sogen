@@ -272,6 +272,10 @@ namespace sogen::ttd
     std::vector<std::byte> encode_memory_regions(const memory_region_table& table);
     memory_region_table decode_memory_regions(std::span<const std::byte> compressed);
 
+    // The checkpoint memory section is a zstd frame of varints: the checkpoint count, then each checkpoint's offset.
+    std::vector<std::byte> encode_checkpoint_memory_offsets(std::span<const uint64_t> offsets);
+    std::vector<uint64_t> decode_checkpoint_memory_offsets(std::span<const std::byte> compressed);
+
     // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
     // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.
     // The register snapshots section is a zstd frame of varints: the entry count, then per entry the step and

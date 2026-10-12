@@ -203,6 +203,8 @@ namespace sogen::ttd
         std::optional<uint32_t> running_thread_{};
         // The stack of each thread that ran, taken from its TEB when it first ran.
         std::vector<thread_stack> thread_stacks_{};
+        // Per checkpoint, where the memory manager's state begins in it (the checkpoint memory section).
+        std::vector<uint64_t> checkpoint_memory_offsets_{};
         // The memory map at the start and its changes, and the index of each mapped file's name.
         memory_region_table memory_regions_{};
         std::unordered_map<std::string, uint32_t> memory_region_names_{};

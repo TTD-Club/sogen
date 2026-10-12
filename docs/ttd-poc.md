@@ -564,6 +564,18 @@ found through the section table (24-byte entries `type, offset, size`):
   index plus one. `trace::memory_regions_at(position)` replays the entries up
   to a position into the map at that position; `Trace.memory_regions_at`,
   `ttd-inspect TRACE regions POSITION`.
+- Checkpoint memory (type 18, size = compressed bytes; absent in older
+  traces): per checkpoint, the offset in its decoded state at which the
+  memory manager's state (`serialize_memory_state`) begins. A zstd frame of
+  varints: the checkpoint count, then the offsets. With it, `memory_at` takes
+  bytes no access shows from the memory of the checkpoint the position replays
+  from, unless a mapping change covered them since: the reader parses only
+  that part of the state (reservations, then committed contents; MMIO and
+  host-aliased memory are not in it). Filling a hole decodes that checkpoint's
+  state, which is cached. `Trace.has_checkpoint_memory`. The memory part's
+  layout is thereby read outside the emulator; `test/ttd_reader_test.py`
+  compares `memory_at` with a replayed emulator's memory, so a change to it
+  fails the test.
 
 Unknown section types are ignored, so sections can be added without a new
 version. The library reads versions 1-4 and 7-8 (`ttd::is_supported_trace_version`;

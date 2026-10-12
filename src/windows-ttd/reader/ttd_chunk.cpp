@@ -1572,6 +1572,38 @@ namespace sogen::ttd
         return table;
     }
 
+    std::vector<std::byte> encode_checkpoint_memory_offsets(const std::span<const uint64_t> offsets)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, offsets.size());
+        for (const auto offset : offsets)
+        {
+            put_varint(raw, offset);
+        }
+        return compress_table(raw, "checkpoint memory offsets");
+    }
+
+    std::vector<uint64_t> decode_checkpoint_memory_offsets(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        if (count > raw.size())
+        {
+            throw std::runtime_error("Invalid TTD checkpoint memory offsets");
+        }
+        std::vector<uint64_t> offsets(static_cast<size_t>(count));
+        for (auto& offset : offsets)
+        {
+            offset = reader.varint();
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD checkpoint memory offsets");
+        }
+        return offsets;
+    }
+
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)
     {
         std::vector<std::byte> filtered(data.begin(), data.end());

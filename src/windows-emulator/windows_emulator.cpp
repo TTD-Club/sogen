@@ -1900,6 +1900,11 @@ namespace sogen
         this->serialize_state(buffer, true);
     }
 
+    void windows_emulator::serialize(utils::buffer_serializer& buffer, size_t& memory_offset) const
+    {
+        this->serialize_state(buffer, true, &memory_offset);
+    }
+
     void windows_emulator::serialize_without_memory_contents(utils::buffer_serializer& buffer) const
     {
         this->serialize_state(buffer, false);
@@ -1915,7 +1920,7 @@ namespace sogen
         this->deserialize_state(buffer, [&] { this->memory.deserialize_memory_state(buffer, pages); });
     }
 
-    void windows_emulator::serialize_state(utils::buffer_serializer& buffer, const bool memory_contents) const
+    void windows_emulator::serialize_state(utils::buffer_serializer& buffer, const bool memory_contents, size_t* memory_offset) const
     {
         buffer.write(this->application_settings_);
         buffer.write(this->setup_completed_);
@@ -1929,6 +1934,10 @@ namespace sogen
 
         // Backend snapshot mode is not used here; Unicorn's in-place snapshot path is broken.
         this->emu().serialize_state(buffer, false);
+        if (memory_offset)
+        {
+            *memory_offset = buffer.get_buffer().size();
+        }
         this->memory.serialize_memory_state(buffer, !memory_contents);
         this->mod_manager.serialize(buffer);
         this->dispatcher.serialize(buffer);

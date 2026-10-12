@@ -797,6 +797,9 @@ namespace sogen::py
                 .def_prop_ro(
                     "memory_region_names", [](const ttd_trace& self) { return self.native().memory_regions().names; },
                     "The mapped files MemoryRegion.name_index refers to")
+                .def_prop_ro(
+                    "has_checkpoint_memory", [](const ttd_trace& self) { return self.native().has_checkpoint_memory(); },
+                    "Whether memory_at takes bytes no access shows from checkpoints")
                 .def(
                     "memory_regions_at",
                     [](const ttd_trace& self, const uint64_t position) { return self.native().memory_regions_at(position); },
