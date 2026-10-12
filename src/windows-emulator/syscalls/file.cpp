@@ -32,6 +32,79 @@ namespace sogen
                 return path.find_first_of(invalid_characters) == std::u16string_view::npos;
             }
 
+            // The access an open holds for sharing purposes (IoCheckShareAccess): reading, writing, and deleting.
+            struct shared_access
+            {
+                bool read{};
+                bool write{};
+                bool remove{};
+
+                bool any() const
+                {
+                    return this->read || this->write || this->remove;
+                }
+            };
+
+            shared_access get_shared_access(const ACCESS_MASK access)
+            {
+                if (access & GENERIC_ALL)
+                {
+                    return {.read = true, .write = true, .remove = true};
+                }
+
+                // The granted maximum is not computed; reading and writing cover what callers asking for it use.
+                const auto maximum = (access & MAXIMUM_ALLOWED) != 0;
+                return {
+                    .read = maximum || (access & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) != 0,
+                    .write = maximum || (access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE)) != 0,
+                    .remove = (access & DELETE) != 0,
+                };
+            }
+
+            std::u16string sharing_key(const std::filesystem::path& host_path)
+            {
+                auto key = host_path.lexically_normal().generic_u16string();
+#ifdef OS_WINDOWS
+                // Windows hosts ignore case, so differently spelled paths name one file.
+                std::ranges::transform(key, key.begin(), [](const char16_t c) { return utils::string::char_to_lower(c); });
+#endif
+                return key;
+            }
+
+            // Whether an open of `host_path` with `access` and `share_access` is compatible with the process's other
+            // opens of that file, the way IoCheckShareAccess decides it.
+            NTSTATUS check_share_access(const process_context& process, const std::filesystem::path& host_path, const ACCESS_MASK access,
+                                        const ULONG share_access)
+            {
+                const auto wanted = get_shared_access(access);
+                if (!wanted.any())
+                {
+                    return STATUS_SUCCESS;
+                }
+
+                const auto key = sharing_key(host_path);
+                for (const auto& open : process.files | std::views::values)
+                {
+                    const auto held = get_shared_access(open.access_mask);
+                    if (!held.any() || open.host_path.empty() || sharing_key(open.host_path) != key)
+                    {
+                        continue;
+                    }
+
+                    const auto refused =
+                        (wanted.read && !(open.share_access & FILE_SHARE_READ)) ||
+                        (wanted.write && !(open.share_access & FILE_SHARE_WRITE)) ||
+                        (wanted.remove && !(open.share_access & FILE_SHARE_DELETE)) || (held.read && !(share_access & FILE_SHARE_READ)) ||
+                        (held.write && !(share_access & FILE_SHARE_WRITE)) || (held.remove && !(share_access & FILE_SHARE_DELETE));
+                    if (refused)
+                    {
+                        return STATUS_SHARING_VIOLATION;
+                    }
+                }
+
+                return STATUS_SUCCESS;
+            }
+
             std::u16string resolve_system_root_path(const syscall_context& c, std::u16string filename)
             {
                 auto filename_upper = filename;
@@ -1886,7 +1959,7 @@ namespace sogen
                                      const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
                                      const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
                                      const emulator_object<LARGE_INTEGER> /*allocation_size*/, ULONG /*file_attributes*/,
-                                     ULONG /*share_access*/, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
+                                     ULONG share_access, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
                                      ULONG ea_length)
         {
             constexpr ULONG file_opened = 1;
@@ -2005,6 +2078,7 @@ namespace sogen
 
             file f{};
             f.access_mask = desired_access;
+            f.share_access = share_access;
             f.file_mode = create_options & FILE_MODE_MASK;
             f.name = std::move(filename);
 
@@ -2035,6 +2109,16 @@ namespace sogen
 
             const auto host_path = c.win_emu.file_sys.translate(path);
             const bool file_exists = std::filesystem::exists(host_path, ec);
+
+            // Opening an existing file or directory must agree with the share modes of its other opens (deleting a
+            // file another handle holds without FILE_SHARE_DELETE fails, as it does on Windows).
+            if (file_exists && create_disposition != FILE_CREATE)
+            {
+                if (const auto status = check_share_access(c.proc, host_path, desired_access, share_access); status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+            }
 
             if (file_exists && std::filesystem::is_directory(host_path, ec))
             {

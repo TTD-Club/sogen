@@ -766,6 +766,8 @@ namespace sogen
         std::filesystem::path host_path{};
         std::optional<file_enumeration_state> enumeration_state{};
         ACCESS_MASK access_mask{};
+        // FILE_SHARE_* the open allows others: checked against later opens of the same file.
+        ULONG share_access{FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE};
         uint32_t file_mode{}; // FileModeInformation
         uint8_t drive_number{'c' - 'a' + 1};
 
@@ -786,6 +788,7 @@ namespace sogen
             buffer.write(this->host_path.u16string());
             buffer.write_optional(this->enumeration_state);
             buffer.write(this->access_mask);
+            buffer.write(this->share_access);
             buffer.write(this->file_mode);
             buffer.write(this->drive_number);
 
@@ -805,6 +808,7 @@ namespace sogen
             this->host_path = buffer.read<std::u16string>();
             buffer.read_optional(this->enumeration_state);
             buffer.read(this->access_mask);
+            buffer.read(this->share_access);
             buffer.read(this->file_mode);
             buffer.read(this->drive_number);
 

@@ -51,6 +51,11 @@
 #define FILE_READ_ATTRIBUTES      0x0080 /* all */
 #define FILE_WRITE_ATTRIBUTES     0x0100 /* all */
 #define FILE_ALL_ACCESS           (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x1ff)
+#define MAXIMUM_ALLOWED           0x02000000
+
+#define FILE_SHARE_READ           0x00000001
+#define FILE_SHARE_WRITE          0x00000002
+#define FILE_SHARE_DELETE         0x00000004
 
 #endif
 

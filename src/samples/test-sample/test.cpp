@@ -2228,17 +2228,77 @@ namespace
         return !CreateDirectoryW(executable.data(), nullptr) && GetLastError() == ERROR_ALREADY_EXISTS;
     }
 
+    // Where a test creates files, followed by a separator. Several instances of this sample can run in one directory
+    // at once: natively their process ids differ (tests add them to names), and the emulator tests give each emulated
+    // instance (all with one process id) its own C:\sogen-test-scratch.
+    std::wstring scratch_directory()
+    {
+        const auto scratch = GetFileAttributesW(L"C:\\sogen-test-scratch");
+        return scratch != INVALID_FILE_ATTRIBUTES && (scratch & FILE_ATTRIBUTE_DIRECTORY) ? L"C:\\sogen-test-scratch\\" : L"";
+    }
+
+    // Opens refuse what other handles of the file do not share: deleting a file held without FILE_SHARE_DELETE,
+    // writing one held without FILE_SHARE_WRITE.
+    bool test_file_sharing()
+    {
+        const auto path = scratch_directory() + L"Shared" + std::to_wstring(GetCurrentProcessId()) + L".txt";
+        const auto held = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (held == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        auto close_held = sogen::utils::finally([&] { CloseHandle(held); });
+        const auto cleanup = sogen::utils::finally([&] { DeleteFileW(path.c_str()); });
+
+        if (DeleteFileW(path.c_str()) || GetLastError() != ERROR_SHARING_VIOLATION)
+        {
+            puts("Deleted a file another handle holds without FILE_SHARE_DELETE");
+            return false;
+        }
+
+        const auto writer =
+            CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (writer != INVALID_HANDLE_VALUE || GetLastError() != ERROR_SHARING_VIOLATION)
+        {
+            if (writer != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(writer);
+            }
+            puts("Opened for writing a file another handle holds without FILE_SHARE_WRITE");
+            return false;
+        }
+
+        // Reading is shared, and an open that neither reads, writes, nor deletes never conflicts.
+        const auto reader = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        const auto attributes = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        const auto opened = reader != INVALID_HANDLE_VALUE && attributes != INVALID_HANDLE_VALUE;
+        if (reader != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(reader);
+        }
+        if (attributes != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(attributes);
+        }
+        if (!opened)
+        {
+            puts("Refused a compatible open");
+            return false;
+        }
+
+        close_held.cancel();
+        CloseHandle(held);
+        return DeleteFileW(path.c_str()) != FALSE;
+    }
+
     // Created and renamed entries keep the case they were given. Sogen on a case-sensitive host (Linux, macOS)
     // stores names in lower case, which this accepts too; on Windows hosts and natively the case must match exactly.
     bool test_created_name_case()
     {
-        // Several instances of this sample can run in one directory at once. Natively their process ids differ; the
-        // emulator tests give each emulated instance (all with one process id) its own C:\sogen-test-scratch.
-        const auto scratch = GetFileAttributesW(L"C:\\sogen-test-scratch");
-        const std::wstring base =
-            scratch != INVALID_FILE_ATTRIBUTES && (scratch & FILE_ATTRIBUTE_DIRECTORY) ? L"C:\\sogen-test-scratch\\" : L"";
         const auto leaf = L"NameCase" + std::to_wstring(GetCurrentProcessId());
-        const auto directory = base + leaf;
+        const auto directory = scratch_directory() + leaf;
         const auto file = directory + L"\\Inner.Py";
         const auto renamed = directory + L"\\Renamed.TXT";
 
@@ -2639,6 +2699,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_file_ids_by_name, "File IDs by Name")
     RUN_TEST(test_directory_name_collision, "Directory Name Collision")
     RUN_TEST(test_created_name_case, "Created Name Case")
+    RUN_TEST(test_file_sharing, "File Sharing")
     RUN_TEST(test_token_information, "Token Information")
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")
