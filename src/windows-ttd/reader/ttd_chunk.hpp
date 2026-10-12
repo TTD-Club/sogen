@@ -265,6 +265,13 @@ namespace sogen::ttd
     std::vector<std::byte> encode_thread_stacks(std::span<const thread_stack> stacks);
     std::vector<thread_stack> decode_thread_stacks(std::span<const std::byte> compressed);
 
+    // The memory regions section is a zstd frame of varints: the name count and the names, then the region count and
+    // per region the step and event number deltas, the address relative to the previous region's (zigzag), the size,
+    // the distance from the allocation base plus one (0: no base), the allocation protection, state, type, protection,
+    // kind, and the name index plus one (0: none).
+    std::vector<std::byte> encode_memory_regions(const memory_region_table& table);
+    memory_region_table decode_memory_regions(std::span<const std::byte> compressed);
+
     // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
     // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.
     // The register snapshots section is a zstd frame of varints: the entry count, then per entry the step and

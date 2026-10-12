@@ -102,6 +102,18 @@ namespace sogen
             mapping_change_callback_ = std::move(callback);
         }
 
+        // Called with each range whose regions, as NtQueryVirtualMemory shows them (reservation, commit, protection,
+        // kind, mapped file), changed: get_region_info then describes it anew. Unlike the mapping change callback, it
+        // reports the guest's protections, not the backend's effective ones.
+        void set_region_change_callback(std::function<void(uint64_t, size_t)> callback)
+        {
+            if (callback && region_change_callback_)
+            {
+                throw std::logic_error("A memory region change callback is already installed");
+            }
+            region_change_callback_ = std::move(callback);
+        }
+
         using memory_interface::read_memory;
 
         void read_memory(uint64_t address, void* data, size_t size) const final;
@@ -221,6 +233,7 @@ namespace sogen
         bool dep_enabled_{true};
         std::vector<uint64_t> host_reserved_addresses_{};
         std::function<void(uint64_t, size_t)> mapping_change_callback_{};
+        std::function<void(uint64_t, size_t)> region_change_callback_{};
 
         // Returns the committed regions that stayed mapped; the others are mapped anew.
         std::set<uint64_t> restore_memory_layout(utils::buffer_deserializer& buffer);
@@ -232,7 +245,8 @@ namespace sogen
         void unmap_memory(uint64_t address, size_t size) final;
         void apply_memory_protection(uint64_t address, size_t size, memory_permission permissions) final;
 
-        void update_layout_version();
+        // After a change to the regions in [address, address + size).
+        void update_layout_version(uint64_t address, uint64_t size);
         bool commit_memory(uint64_t address, size_t size, nt_memory_permission permissions, bool allow_image_section);
         memory_permission get_effective_permissions(nt_memory_permission permissions) const;
 

@@ -487,6 +487,15 @@ namespace sogen::ttd
                 thread_stacks_ = decode_thread_stacks(read_bytes(section.offset, section.size));
                 has_thread_stacks_ = true;
             }
+            else if (section.type == section_type::memory_regions)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                memory_regions_ = decode_memory_regions(read_bytes(section.offset, section.size));
+                has_memory_regions_ = true;
+            }
             else if (section.type == section_type::modules || section.type == section_type::threads ||
                      section.type == section_type::exports || section.type == section_type::export_forwarders ||
                      section.type == section_type::module_machines)
@@ -1698,6 +1707,63 @@ namespace sogen::ttd
             }
         }
         return value;
+    }
+
+    std::vector<memory_region> trace::memory_regions_at(const uint64_t position) const
+    {
+        constexpr uint32_t mem_free = 0x10000;
+        // The ranges as each entry left them, by address; an entry replaces whatever it overlaps.
+        std::map<uint64_t, memory_region> current{};
+        for (const auto& region : memory_regions_.regions)
+        {
+            if (region.step > position)
+            {
+                break;
+            }
+            if (!region.size)
+            {
+                continue;
+            }
+
+            const auto end = region.address + region.size;
+            auto overlap = current.upper_bound(region.address);
+            if (overlap != current.begin() && std::prev(overlap)->first + std::prev(overlap)->second.size > region.address)
+            {
+                --overlap;
+            }
+            while (overlap != current.end() && overlap->first < end)
+            {
+                auto existing = overlap->second;
+                overlap = current.erase(overlap);
+                const auto existing_end = existing.address + existing.size;
+                if (existing.address < region.address)
+                {
+                    auto left = existing;
+                    left.size = region.address - existing.address;
+                    current.emplace(left.address, left);
+                }
+                if (existing_end > end)
+                {
+                    auto right = existing;
+                    right.address = end;
+                    right.size = existing_end - end;
+                    overlap = current.emplace(right.address, right).first;
+                    ++overlap;
+                }
+            }
+            if (region.state != mem_free)
+            {
+                current.emplace(region.address, region);
+            }
+        }
+
+        std::vector<memory_region> regions{};
+        regions.reserve(current.size());
+        for (auto& region : current | std::views::values)
+        {
+            regions.push_back(region);
+        }
+        return regions;
     }
 
     bool trace::remapped(const uint64_t address, const uint64_t after_number, const uint64_t through_number) const

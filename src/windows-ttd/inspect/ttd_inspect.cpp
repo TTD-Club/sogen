@@ -93,6 +93,18 @@ namespace
         }
     }
 
+    void regions(const trace& recorded, const uint64_t position)
+    {
+        std::printf("%-18s %-12s %-18s %-8s %-10s %-10s %s\n", "address", "size", "allocation", "state", "type", "protect", "file");
+        for (const auto& region : recorded.memory_regions_at(position))
+        {
+            const auto name = recorded.memory_region_name(region);
+            std::printf("0x%016llx 0x%-10llx 0x%016llx 0x%-6x 0x%-8x 0x%-8x %.*s\n", static_cast<unsigned long long>(region.address),
+                        static_cast<unsigned long long>(region.size), static_cast<unsigned long long>(region.allocation_base), region.state,
+                        region.type, region.protection, static_cast<int>(name.size()), name.data());
+        }
+    }
+
     void branches(trace& recorded, const uint64_t address, const uint64_t size, const bool jumps)
     {
         const std::vector<std::pair<uint64_t, uint64_t>> ranges{{address, size}};
@@ -113,7 +125,8 @@ int main(const int argc, char** argv)
         const std::vector<std::string> args(argv + 1, argv + argc);
         if (args.empty())
         {
-            std::fprintf(stderr, "Usage: ttd-inspect TRACE [exceptions | stacks | calls-to ADDRESS | branches ADDRESS SIZE [jumps]]\n");
+            std::fprintf(stderr, "Usage: ttd-inspect TRACE [exceptions | stacks | regions POSITION | calls-to ADDRESS | "
+                                 "branches ADDRESS SIZE [jumps]]\n");
             return 1;
         }
         if (!is_trace_file(args[0]))
@@ -133,6 +146,10 @@ int main(const int argc, char** argv)
         else if (args[1] == "stacks" && args.size() == 2)
         {
             stacks(recorded);
+        }
+        else if (args[1] == "regions" && args.size() == 3)
+        {
+            regions(recorded, parse_number(args[2]));
         }
         else if (args[1] == "calls-to" && args.size() == 3)
         {

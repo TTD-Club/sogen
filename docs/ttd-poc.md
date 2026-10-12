@@ -547,6 +547,23 @@ found through the section table (24-byte entries `type, offset, size`):
   the position and event-number deltas, TEB, stack base, stack limit, 32-bit
   TEB, 32-bit stack base, 32-bit stack limit. `trace::thread_stacks()`,
   `Trace.thread_stacks`, `ttd-inspect TRACE stacks`.
+- Memory regions (type 17, size = compressed bytes; absent in older traces):
+  the memory map as NtQueryVirtualMemory shows it (the memory manager's
+  regions, not the backend's mappings, so guard pages and protections are the
+  guest's even with DEP off). First the reserved and committed ranges when
+  recording began (at the start position, event number 0), then, whenever a
+  reservation, commit, decommit, release, protection or view changes, the
+  ranges it touched as they became, free memory included. Each entry: position,
+  event number, address, size, allocation base, AllocationProtect, `MEM_*`
+  state and type, `PAGE_*` protection (`PAGE_GUARD` included), Sogen's region
+  kind, and the mapped file of a file view (images are named by the modules
+  section). A zstd frame of varints: the file names, then count and per
+  entry the position and event-number deltas, the address relative to the
+  previous entry's (zigzag), size, distance from the allocation base plus one
+  (0: free), allocation protection, state, type, protection, kind, and name
+  index plus one. `trace::memory_regions_at(position)` replays the entries up
+  to a position into the map at that position; `Trace.memory_regions_at`,
+  `ttd-inspect TRACE regions POSITION`.
 
 Unknown section types are ignored, so sections can be added without a new
 version. The library reads versions 1-4 and 7-8 (`ttd::is_supported_trace_version`;

@@ -113,12 +113,14 @@ namespace sogen::py
         nb::class_<region_info>(m, "MemoryRegionInfo")
             .def_prop_ro("start", [](const region_info& self) { return self.start; })
             .def_prop_ro("length", [](const region_info& self) { return self.length; })
-            .def_prop_ro("permissions", [](const region_info& self) { return self.permissions; })
+            // The NT permission has no Python type of its own: its read/write/execute part, and whether it is a guard page.
+            .def_prop_ro("permissions", [](const region_info& self) { return self.permissions.common; })
+            .def_prop_ro("is_guarded", [](const region_info& self) { return self.permissions.is_guarded(); })
             .def_prop_ro("allocation_base", [](const region_info& self) { return self.allocation_base; })
             .def_prop_ro("allocation_length", [](const region_info& self) { return self.allocation_length; })
             .def_prop_ro("is_reserved", [](const region_info& self) { return self.is_reserved; })
             .def_prop_ro("is_committed", [](const region_info& self) { return self.is_committed; })
-            .def_prop_ro("initial_permissions", [](const region_info& self) { return self.initial_permissions; })
+            .def_prop_ro("initial_permissions", [](const region_info& self) { return self.initial_permissions.common; })
             .def_prop_ro("kind", [](const region_info& self) { return self.kind; });
 
         nb::enum_<instruction_hook_continuation>(m, "HookContinuation")

@@ -203,6 +203,11 @@ namespace sogen::ttd
         std::optional<uint32_t> running_thread_{};
         // The stack of each thread that ran, taken from its TEB when it first ran.
         std::vector<thread_stack> thread_stacks_{};
+        // The memory map at the start and its changes, and the index of each mapped file's name.
+        memory_region_table memory_regions_{};
+        std::unordered_map<std::string, uint32_t> memory_region_names_{};
+        // Lists the regions in [address, address + size) as they are now; at the start (`initial`), only reserved ones.
+        void note_memory_regions(uint64_t address, uint64_t size, bool initial);
         void note_thread(const access_event& event);
         void note_thread_stack(const emulator_thread& thread, const access_event& event);
 

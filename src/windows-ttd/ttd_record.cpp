@@ -2,6 +2,7 @@
 #include "snapshot.hpp"
 
 #include <disassembler.hpp>
+#include <memory_utils.hpp>
 
 #include <utils/compression.hpp>
 #include <utils/finally.hpp>
@@ -307,12 +308,16 @@ namespace sogen::ttd
             // outside the registers it saves, so snapshots are only taken where a block starts.
             block_hook_ = scoped_hook(cpu, cpu.hook_basic_block([this](cpu_interface&, const basic_block&) { at_block_start_ = true; }));
         }
+        // The memory map at the start; its changes follow from the callback below.
+        note_memory_regions(0, MAX_ALLOCATION_END_EXCL, true);
         // Last, so a constructor that throws never leaves a callback behind.
         emu_.memory.set_mapping_change_callback([this](const uint64_t address, const size_t size) {
             mapping_changes_.push_back(
                 {.step = emu_.get_executed_instructions(), .event_number = header_.event_count, .address = address, .size = size});
             forget_instructions(address, size);
         });
+        emu_.memory.set_region_change_callback(
+            [this](const uint64_t address, const size_t size) { note_memory_regions(address, size, false); });
         ui_ = dynamic_cast<recordable_ui_backend*>(&emu_.ui());
         if (ui_)
         {
@@ -389,6 +394,62 @@ namespace sogen::ttd
         if (std::ranges::find(thread_stacks_, thread->id, &thread_stack::thread_id) == thread_stacks_.end())
         {
             note_thread_stack(*thread, event);
+        }
+    }
+
+    void recorder::note_memory_regions(const uint64_t address, const uint64_t size, const bool initial)
+    {
+        constexpr uint32_t mem_commit = 0x1000;
+        constexpr uint32_t mem_reserve = 0x2000;
+        constexpr uint32_t mem_free = 0x10000;
+        constexpr uint32_t page_guard = 0x100;
+        const auto protection_of = [](const nt_memory_permission permission) {
+            return map_emulator_to_nt_protection(permission.common) | (permission.is_guarded() ? page_guard : 0);
+        };
+
+        const auto step = emu_.get_executed_instructions();
+        auto cursor = address & ~(page_size - 1);
+        const auto end = address + size;
+        while (cursor < end)
+        {
+            const auto info = emu_.memory.get_region_info(cursor);
+            const auto region_end = std::min<uint64_t>(info.start + info.length, end);
+            if (region_end <= cursor)
+            {
+                break;
+            }
+
+            memory_region region{.step = step, .event_number = header_.event_count, .address = cursor, .size = region_end - cursor};
+            if (info.is_reserved)
+            {
+                region.allocation_base = info.allocation_base;
+                region.allocation_protection = protection_of(info.initial_permissions);
+                region.state = info.is_committed ? mem_commit : mem_reserve;
+                region.type = memory_region_policy::to_memory_basic_information_type(info.kind);
+                region.protection = info.is_committed ? protection_of(info.permissions) : 0;
+                region.kind = static_cast<uint32_t>(info.kind);
+                if (const auto file = emu_.memory.get_region_mapped_filename(cursor))
+                {
+                    const auto name = u16_to_u8(*file);
+                    const auto known = memory_region_names_.try_emplace(name, static_cast<uint32_t>(memory_regions_.names.size()));
+                    if (known.second)
+                    {
+                        memory_regions_.names.push_back(name);
+                    }
+                    region.name = known.first->second;
+                }
+            }
+            else
+            {
+                region.state = mem_free;
+            }
+
+            // At the start, free memory is what is not listed.
+            if (!initial || info.is_reserved)
+            {
+                memory_regions_.regions.push_back(region);
+            }
+            cursor = region_end;
         }
     }
 
@@ -862,6 +923,7 @@ namespace sogen::ttd
         host_write_hook_.remove();
         block_hook_.remove();
         emu_.memory.set_mapping_change_callback({});
+        emu_.memory.set_region_change_callback({});
         if (ui_)
         {
             ui_->stop();
@@ -907,6 +969,7 @@ namespace sogen::ttd
         const auto mappings = encode_mapping_changes(mapping_changes_);
         const auto machines = encode_module_machines(modules_);
         const auto stacks = encode_thread_stacks(thread_stacks_);
+        const auto regions = encode_memory_regions(memory_regions_);
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -925,6 +988,7 @@ namespace sogen::ttd
             section_entry{.type = section_type::mapping_changes, .offset = append_to_file(mappings), .size = mappings.size()},
             section_entry{.type = section_type::module_machines, .offset = append_to_file(machines), .size = machines.size()},
             section_entry{.type = section_type::thread_stacks, .offset = append_to_file(stacks), .size = stacks.size()},
+            section_entry{.type = section_type::memory_regions, .offset = append_to_file(regions), .size = regions.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));

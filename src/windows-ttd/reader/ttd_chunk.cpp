@@ -1478,6 +1478,100 @@ namespace sogen::ttd
         return stacks;
     }
 
+    std::vector<std::byte> encode_memory_regions(const memory_region_table& table)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, table.names.size());
+        for (const auto& name : table.names)
+        {
+            put_text(raw, name);
+        }
+        put_varint(raw, table.regions.size());
+        memory_region previous{};
+        for (const auto& region : table.regions)
+        {
+            if (region.step < previous.step || region.event_number < previous.event_number ||
+                (region.name != UINT32_MAX && region.name >= table.names.size()))
+            {
+                throw std::runtime_error("Invalid TTD memory region");
+            }
+            put_varint(raw, region.step - previous.step);
+            put_varint(raw, region.event_number - previous.event_number);
+            put_varint(raw, zigzag(region.address - previous.address));
+            put_varint(raw, region.size);
+            // The base relative to the address: 0 for free memory, small for the parts of one reservation.
+            put_varint(raw, region.allocation_base ? region.address - region.allocation_base + 1 : 0);
+            for (const auto value : {region.allocation_protection, region.state, region.type, region.protection, region.kind})
+            {
+                put_varint(raw, value);
+            }
+            put_varint(raw, region.name == UINT32_MAX ? 0 : uint64_t{region.name} + 1);
+            previous = region;
+        }
+        return compress_table(raw, "memory regions");
+    }
+
+    memory_region_table decode_memory_regions(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        memory_region_table table{};
+        const auto name_count = reader.varint();
+        if (name_count > raw.size())
+        {
+            throw std::runtime_error("Invalid TTD memory regions");
+        }
+        table.names.resize(static_cast<size_t>(name_count));
+        for (auto& name : table.names)
+        {
+            name = read_text(reader);
+        }
+        const auto count = reader.varint();
+        // Every region takes at least eleven bytes.
+        if (count > raw.size() / 11)
+        {
+            throw std::runtime_error("Invalid TTD memory regions");
+        }
+        table.regions.resize(static_cast<size_t>(count));
+        memory_region previous{};
+        for (auto& region : table.regions)
+        {
+            const auto step_delta = reader.varint();
+            const auto event_delta = reader.varint();
+            if (step_delta > UINT64_MAX - previous.step || event_delta > UINT64_MAX - previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD memory region");
+            }
+            region.step = previous.step + step_delta;
+            region.event_number = previous.event_number + event_delta;
+            region.address = previous.address + unzigzag(reader.varint());
+            region.size = reader.varint();
+            const auto base_distance = reader.varint();
+            region.allocation_base = base_distance ? region.address - (base_distance - 1) : 0;
+            for (auto* value : {&region.allocation_protection, &region.state, &region.type, &region.protection, &region.kind})
+            {
+                const auto read = reader.varint();
+                if (read > UINT32_MAX)
+                {
+                    throw std::runtime_error("Invalid TTD memory region");
+                }
+                *value = static_cast<uint32_t>(read);
+            }
+            const auto name = reader.varint();
+            if (name > table.names.size())
+            {
+                throw std::runtime_error("Invalid TTD memory region");
+            }
+            region.name = name ? static_cast<uint32_t>(name - 1) : UINT32_MAX;
+            previous = region;
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD memory regions");
+        }
+        return table;
+    }
+
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)
     {
         std::vector<std::byte> filtered(data.begin(), data.end());

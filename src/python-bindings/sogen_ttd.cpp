@@ -479,6 +479,31 @@ namespace sogen::py
                     return text.str();
                 });
 
+            nb::class_<ttd::memory_region>(m, "MemoryRegion",
+                                           "What NtQueryVirtualMemory showed for a range from a position on (Windows MEM_* and "
+                                           "PAGE_* values)")
+                .def_ro("position", &ttd::memory_region::step)
+                .def_ro("event_number", &ttd::memory_region::event_number)
+                .def_ro("address", &ttd::memory_region::address)
+                .def_ro("size", &ttd::memory_region::size)
+                .def_ro("allocation_base", &ttd::memory_region::allocation_base, "0 for free memory")
+                .def_ro("allocation_protection", &ttd::memory_region::allocation_protection)
+                .def_ro("state", &ttd::memory_region::state, "MEM_COMMIT, MEM_RESERVE or MEM_FREE")
+                .def_ro("type", &ttd::memory_region::type, "MEM_PRIVATE, MEM_MAPPED or MEM_IMAGE; 0 for free memory")
+                .def_ro("protection", &ttd::memory_region::protection, "PAGE_* of committed memory (PAGE_GUARD included), else 0")
+                .def_ro("kind", &ttd::memory_region::kind,
+                        "0 free, 1 private, 2 file view, 3 pagefile-backed view, 4 image, 5 MMIO or host memory, 6 host-reserved")
+                .def_ro("name_index", &ttd::memory_region::name,
+                        "The mapped file of a file view, as an index into Trace.memory_region_names; 0xFFFFFFFF for none "
+                        "(images have none: see Trace.modules)")
+                .def("__repr__", [](const ttd::memory_region& self) {
+                    std::ostringstream text;
+                    text << "MemoryRegion(position=0x" << std::hex << self.step << ", address=0x" << self.address << ", size=0x"
+                         << self.size << ", state=0x" << self.state << ", type=0x" << self.type << ", protection=0x" << self.protection
+                         << ", allocation_base=0x" << self.allocation_base << ")";
+                    return text.str();
+                });
+
             nb::class_<ttd::recovered_string>(m, "RecoveredString")
                 .def_ro("address", &ttd::recovered_string::address)
                 .def_ro("position", &ttd::recovered_string::step, "Position at which the string was last seen extended")
@@ -766,6 +791,18 @@ namespace sogen::py
                 .def_prop_ro(
                     "thread_names", [](const ttd_trace& self) { return self.native().threads().names; },
                     "Name of each thread that ran, by id; empty for unnamed threads")
+                .def_prop_ro(
+                    "memory_regions", [](const ttd_trace& self) { return self.native().memory_regions().regions; },
+                    "The memory map at the start and every change to it, in order; empty for traces recorded before it was")
+                .def_prop_ro(
+                    "memory_region_names", [](const ttd_trace& self) { return self.native().memory_regions().names; },
+                    "The mapped files MemoryRegion.name_index refers to")
+                .def(
+                    "memory_regions_at",
+                    [](const ttd_trace& self, const uint64_t position) { return self.native().memory_regions_at(position); },
+                    nb::arg("position"),
+                    "The memory map at position, as NtQueryVirtualMemory would list it: reserved and committed ranges in "
+                    "address order, free memory left out")
                 .def_prop_ro(
                     "thread_stacks",
                     [](const ttd_trace& self) {

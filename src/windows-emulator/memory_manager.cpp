@@ -103,11 +103,15 @@ namespace sogen
         }
     }
 
-    void memory_manager::update_layout_version()
+    void memory_manager::update_layout_version(const uint64_t address, const uint64_t size)
     {
 #if SOGEN_REFLECTION_LEVEL > 0
         this->layout_version_.fetch_add(1, std::memory_order_relaxed);
 #endif
+        if (this->region_change_callback_ && size)
+        {
+            this->region_change_callback_(address, static_cast<size_t>(size));
+        }
     }
 
     memory_stats memory_manager::compute_memory_stats() const
@@ -421,7 +425,7 @@ namespace sogen
 
         merge_regions(committed_regions);
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -449,7 +453,7 @@ namespace sogen
             .permissions = memory_permission::read_write,
         };
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -477,7 +481,7 @@ namespace sogen
             .permissions = permissions,
         };
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -582,6 +586,7 @@ namespace sogen
         // break the pairwise-non-overlap invariant overlaps_reserved_region's fast path depends on,
         // so the surrounding host_reserved coverage is split around the hole instead.
         const uint64_t end = address + size;
+        std::vector<std::pair<uint64_t, uint64_t>> split{};
 
         auto it = this->reserved_regions_.upper_bound(address);
         if (it != this->reserved_regions_.begin())
@@ -603,6 +608,8 @@ namespace sogen
             assert(it->second.committed_regions.empty());
             const bool was_tracked = std::erase(this->host_reserved_addresses_, region_start) != 0;
             it = this->reserved_regions_.erase(it);
+            // The parts around the hole become reservations of their own.
+            split.emplace_back(region_start, region_end - region_start);
 
             if (region_start < address)
             {
@@ -631,6 +638,11 @@ namespace sogen
                 }
                 ++it;
             }
+        }
+
+        for (const auto& [start, length] : split)
+        {
+            this->update_layout_version(start, length);
         }
     }
 
@@ -706,7 +718,7 @@ namespace sogen
             };
         }
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -809,7 +821,7 @@ namespace sogen
 
         merge_regions(committed_regions);
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -857,7 +869,7 @@ namespace sogen
             ++i;
         }
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -912,7 +924,7 @@ namespace sogen
 
             this->reserved_regions_.erase(entry);
             this->release_host_claims(address + entry_length);
-            this->update_layout_version();
+            this->update_layout_version(address, entry_length);
             return true;
         }
 
@@ -997,7 +1009,8 @@ namespace sogen
         }
 
         this->release_host_claims(aligned_end);
-        this->update_layout_version();
+        // The part after the released range becomes its own reservation, with a new allocation base.
+        this->update_layout_version(reserved_start, reserved_end - reserved_start);
         return true;
     }
 
@@ -1314,6 +1327,7 @@ namespace sogen
         }
 
         entry->second.mapped_filename = std::move(filename);
+        this->update_layout_version(entry->first, entry->second.length);
     }
 
     memory_manager::reserved_region_map::iterator memory_manager::find_reserved_region(const uint64_t address)

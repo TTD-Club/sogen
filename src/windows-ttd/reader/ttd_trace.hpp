@@ -331,6 +331,28 @@ namespace sogen::ttd
             return has_thread_stacks_;
         }
 
+        // The memory map at the start and every change to it, in order (see memory_region); empty for traces recorded
+        // before it was (has_memory_regions).
+        const memory_region_table& memory_regions() const
+        {
+            return memory_regions_;
+        }
+
+        bool has_memory_regions() const
+        {
+            return has_memory_regions_;
+        }
+
+        // The memory map at `position` (after the changes made up to and at it), as NtQueryVirtualMemory would list it:
+        // reserved and committed ranges in address order, free memory left out. Empty without has_memory_regions().
+        std::vector<memory_region> memory_regions_at(uint64_t position) const;
+
+        // The mapped file of a region, empty for none.
+        std::string_view memory_region_name(const memory_region& region) const
+        {
+            return region.name < memory_regions_.names.size() ? std::string_view(memory_regions_.names[region.name]) : std::string_view{};
+        }
+
         // The stack of thread `thread_id`, or null when the trace does not record it.
         const thread_stack* thread_stack_of(uint32_t thread_id) const
         {
@@ -429,6 +451,8 @@ namespace sogen::ttd
         bool has_mapping_changes_{};
         std::vector<thread_stack> thread_stacks_{};
         bool has_thread_stacks_{};
+        memory_region_table memory_regions_{};
+        bool has_memory_regions_{};
         // Whether a mapping change covering `address` came after event `after_number` and before event `through_number`.
         bool remapped(uint64_t address, uint64_t after_number, uint64_t through_number) const;
         std::shared_ptr<view_engine> view_engine_{};

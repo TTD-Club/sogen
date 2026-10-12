@@ -66,6 +66,39 @@ def main() -> None:
             assert stack.teb32 == stack.stack32_base == stack.stack32_limit == 0, stack
             rsp = trace.cpu_at(stack.position).read_register(registers.rsp)
             assert stack.stack_limit <= rsp <= stack.stack_base, (stack, hex(rsp))
+        # Memory regions: the map at a position is the replayed emulator's own (what NtQueryVirtualMemory shows).
+        mem_commit, mem_image, top = 0x1000, 0x1000000, 0x7FFFFFFF0000
+        permission = sogen.MemoryPermission
+        page_protections = {permission.none: 0x01, permission.read: 0x02, permission.read_write: 0x04, permission.exec: 0x01,
+                            permission.read_exec: 0x20, permission.write: 0x01, permission.write_exec: 0x01,
+                            permission.all: 0x40}
+        assert trace.memory_regions and any(region.position > trace.start_position for region in trace.memory_regions)
+        image = next(region for region in trace.memory_regions_at(trace.start_position) if region.allocation_base == ntdll.base)
+        assert image.type == mem_image and image.name_index == 0xFFFFFFFF, image
+        for position in (trace.start_position, trace.instruction_count // 2, trace.instruction_count - 1):
+            emulator = ttd.create_emulator(sample, **settings)
+            ttd.Replay(trace, emulator).seek(position)
+            regions = trace.memory_regions_at(position)
+            for region in regions:
+                info = emulator.memory.get_region_info(region.address)
+                assert info.start <= region.address and region.address + region.size <= info.start + info.length, (region, position)
+                assert info.allocation_base == region.allocation_base and info.is_committed == (region.state == mem_commit), (
+                    region, position)
+                assert info.kind.value == region.kind, (region, position)
+                if region.state == mem_commit:
+                    expected = page_protections[info.permissions] | (0x100 if info.is_guarded else 0)
+                    assert region.protection == expected, (region, info.permissions, position)
+            address, covered = 0x10000, 0
+            while address < top:
+                info = emulator.memory.get_region_info(address)
+                if info.is_reserved:
+                    assert any(r.address <= address < r.address + r.size for r in regions), (hex(address), position)
+                    covered += 1
+                address = info.start + info.length
+            assert covered and covered <= len(regions), (covered, len(regions))
+            listed = run(analyzer.parent / "ttd-inspect.exe", path, "regions", str(position))
+            assert len(listed.splitlines()) == len(regions) + 1, listed
+
         listed = run(analyzer.parent / "ttd-inspect.exe", path, "stacks")
         assert len(listed.splitlines()) == len(stacks) + 1 and f"0x{stacks[0].teb:016x}" in listed, listed
 

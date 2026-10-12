@@ -3,6 +3,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace sogen::ttd
 {
@@ -104,6 +106,43 @@ namespace sogen::ttd
         // The stack of each thread that ran (see thread_stack), encoded as described at encode_thread_stacks;
         // size = compressed bytes.
         thread_stacks = 16,
+        // The memory map at the start and its changes (see memory_region), encoded as described at
+        // encode_memory_regions; size = compressed bytes.
+        memory_regions = 17,
+    };
+
+    // What NtQueryVirtualMemory showed for [address, address + size) from position `step` on (after `event_number`
+    // events), until a later entry covers the range again. The entries at the trace's start position with event number
+    // 0 are the memory that existed when recording began (free memory then is not listed); later ones describe a range
+    // whose reservation, commit, protection or mapping changed, free memory included. The values are Windows' own:
+    // MEM_* states and types, PAGE_* protections (PAGE_GUARD included).
+    struct memory_region
+    {
+        uint64_t step{};
+        uint64_t event_number{};
+        uint64_t address{};
+        uint64_t size{};
+        // The reservation's base and its protection when reserved (AllocationProtect); 0 for free memory.
+        uint64_t allocation_base{};
+        uint32_t allocation_protection{};
+        // MEM_COMMIT, MEM_RESERVE or MEM_FREE.
+        uint32_t state{};
+        // MEM_PRIVATE, MEM_MAPPED or MEM_IMAGE; 0 for free memory.
+        uint32_t type{};
+        // The protection of committed memory; 0 otherwise.
+        uint32_t protection{};
+        // Sogen's finer kind: 0 free, 1 private, 2 file view, 3 pagefile-backed view, 4 image, 5 MMIO or host-aliased
+        // memory, 6 reserved for the host.
+        uint32_t kind{};
+        // The mapped file of a file view, as an index into memory_region_table::names; UINT32_MAX for none. Images have
+        // none: the modules section names them (trace::module_at).
+        uint32_t name{UINT32_MAX};
+    };
+
+    struct memory_region_table
+    {
+        std::vector<memory_region> regions{};
+        std::vector<std::string> names{};
     };
 
     // A thread's stack as its TEB (NT_TIB StackBase and StackLimit) described it when the thread first ran in the trace:
