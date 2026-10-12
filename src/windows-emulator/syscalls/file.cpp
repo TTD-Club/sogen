@@ -32,6 +32,210 @@ namespace sogen
                 return path.find_first_of(invalid_characters) == std::u16string_view::npos;
             }
 
+            constexpr ULONG io_reparse_tag_mount_point = 0xA0000003;
+            constexpr ULONG io_reparse_tag_symlink = 0xA000000C;
+            constexpr ULONG symlink_flag_relative = 1;
+            constexpr ULONG file_open_reparse_point = 0x00200000;
+            constexpr auto status_reparse_point_not_resolved = static_cast<NTSTATUS>(0xC0000280);
+            // A reparse point's chain may not be longer (as on Windows).
+            constexpr int max_reparses = 63;
+
+            std::u16string reparse_key(const std::u16string_view path)
+            {
+                return windows_path(path).u16string();
+            }
+
+            ULONG reparse_tag(const std::vector<uint8_t>& data)
+            {
+                ULONG tag{};
+                if (data.size() >= sizeof(tag))
+                {
+                    memcpy(&tag, data.data(), sizeof(tag));
+                }
+                return tag;
+            }
+
+            // A file's attributes with FILE_ATTRIBUTE_REPARSE_POINT if it is one (FILE_ATTRIBUTE_NORMAL stands alone).
+            ULONG with_reparse_attribute(const ULONG attributes, const ULONG tag)
+            {
+                constexpr ULONG file_attribute_reparse_point = 0x400;
+                return tag ? ((attributes & ~static_cast<ULONG>(FILE_ATTRIBUTE_NORMAL)) | file_attribute_reparse_point) : attributes;
+            }
+
+            // The tag of the reparse point at `path`, 0 for none.
+            ULONG reparse_tag_at(const process_context& process, const std::u16string_view path)
+            {
+                if (process.reparse_points.empty())
+                {
+                    return 0;
+                }
+
+                const auto entry = process.reparse_points.find(reparse_key(path));
+                return entry == process.reparse_points.end() ? 0 : reparse_tag(entry->second);
+            }
+
+            // Appends the components of `path` (separated by \ or /) to `parts`, resolving "." and ".." (which stops at the
+            // drive, parts[0]).
+            void append_components(std::vector<std::u16string>& parts, const std::u16string_view path)
+            {
+                size_t start = 0;
+                while (start <= path.size())
+                {
+                    const auto end = path.find_first_of(u"\\/", start);
+                    const auto component = path.substr(start, end == std::u16string_view::npos ? std::u16string_view::npos : end - start);
+                    if (component == u"..")
+                    {
+                        if (parts.size() > 1)
+                        {
+                            parts.pop_back();
+                        }
+                    }
+                    else if (!component.empty() && component != u".")
+                    {
+                        parts.emplace_back(component);
+                    }
+
+                    if (end == std::u16string_view::npos)
+                    {
+                        break;
+                    }
+                    start = end + 1;
+                }
+            }
+
+            // An absolute guest path as its drive ("C:") and its components, keeping their case; nothing for other paths.
+            std::optional<std::vector<std::u16string>> split_path(std::u16string_view path)
+            {
+                for (const std::u16string_view prefix : {u"\\??\\", u"\\\\?\\"})
+                {
+                    if (path.starts_with(prefix))
+                    {
+                        path.remove_prefix(prefix.size());
+                        break;
+                    }
+                }
+
+                const auto is_drive_letter = [](const char16_t c) { return (c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z'); };
+                if (path.size() < 2 || path[1] != u':' || !is_drive_letter(path[0]))
+                {
+                    return std::nullopt;
+                }
+
+                std::vector<std::u16string> parts{std::u16string(path.substr(0, 2))};
+                append_components(parts, path.substr(2));
+                return parts;
+            }
+
+            std::u16string join_path(const std::vector<std::u16string>& parts)
+            {
+                std::u16string path = u"\\??\\" + parts.front() + u"\\";
+                for (size_t i = 1; i < parts.size(); ++i)
+                {
+                    path += (i > 1 ? u"\\" : u"") + parts[i];
+                }
+                return path;
+            }
+
+            // Where a junction or symbolic link leads, as components (a relative link resolves against `link_directory`);
+            // nothing for tags opens do not follow.
+            std::optional<std::vector<std::u16string>> reparse_target(const std::vector<uint8_t>& data,
+                                                                      const std::vector<std::u16string>& link_directory)
+            {
+                // REPARSE_DATA_BUFFER: tag, data length, reserved, then the substitute and print name offsets and lengths
+                // (and, for a symbolic link, its flags) before the path buffer.
+                const auto tag = reparse_tag(data);
+                const auto buffer_offset = tag == io_reparse_tag_symlink ? size_t{20} : size_t{16};
+                if ((tag != io_reparse_tag_mount_point && tag != io_reparse_tag_symlink) || data.size() < buffer_offset)
+                {
+                    return std::nullopt;
+                }
+
+                uint16_t substitute_offset{};
+                uint16_t substitute_length{};
+                memcpy(&substitute_offset, data.data() + 8, sizeof(substitute_offset));
+                memcpy(&substitute_length, data.data() + 10, sizeof(substitute_length));
+                ULONG flags{};
+                if (tag == io_reparse_tag_symlink)
+                {
+                    memcpy(&flags, data.data() + 16, sizeof(flags));
+                }
+
+                if (buffer_offset + substitute_offset + substitute_length > data.size() || substitute_length % sizeof(char16_t) != 0)
+                {
+                    return std::nullopt;
+                }
+
+                std::u16string substitute(substitute_length / sizeof(char16_t), u'\0');
+                memcpy(substitute.data(), data.data() + buffer_offset + substitute_offset, substitute_length);
+
+                if (tag == io_reparse_tag_symlink && (flags & symlink_flag_relative))
+                {
+                    auto parts = link_directory;
+                    append_components(parts, substitute);
+                    return parts;
+                }
+
+                return split_path(substitute);
+            }
+
+            // `name` after following the reparse points among its components, all of them or all but the last (an open
+            // with FILE_OPEN_REPARSE_POINT, or a by-name query). Unchanged without reparse points on the way; nothing for
+            // a chain longer than Windows follows.
+            std::optional<std::u16string> resolve_reparse_points(const process_context& process, const std::u16string& name,
+                                                                 const bool follow_last)
+            {
+                if (process.reparse_points.empty())
+                {
+                    return name;
+                }
+
+                auto parts = split_path(name);
+                if (!parts)
+                {
+                    return name;
+                }
+
+                for (int reparses = 0; reparses <= max_reparses; ++reparses)
+                {
+                    auto replaced = false;
+                    std::vector<std::u16string> prefix{parts->front()};
+                    for (size_t i = 1; i < parts->size(); ++i)
+                    {
+                        prefix.push_back((*parts)[i]);
+                        if (i + 1 == parts->size() && !follow_last)
+                        {
+                            break;
+                        }
+
+                        const auto entry = process.reparse_points.find(reparse_key(join_path(prefix)));
+                        if (entry == process.reparse_points.end())
+                        {
+                            continue;
+                        }
+
+                        prefix.pop_back();
+                        auto target = reparse_target(entry->second, prefix);
+                        if (!target)
+                        {
+                            prefix.push_back((*parts)[i]);
+                            continue;
+                        }
+
+                        target->insert(target->end(), parts->begin() + static_cast<ptrdiff_t>(i) + 1, parts->end());
+                        parts = std::move(target);
+                        replaced = true;
+                        break;
+                    }
+
+                    if (!replaced)
+                    {
+                        return reparses == 0 ? name : join_path(*parts);
+                    }
+                }
+
+                return std::nullopt;
+            }
+
             // The access an open holds for sharing purposes (IoCheckShareAccess): reading, writing, and deleting.
             struct shared_access
             {
@@ -342,7 +546,14 @@ namespace sogen
                 {
                     return STATUS_INVALID_HANDLE;
                 }
-                const auto& new_name = *target_name;
+
+                // The target's directory may lie behind a junction or link.
+                const auto resolved_name = resolve_reparse_points(c.proc, *target_name, false);
+                if (!resolved_name)
+                {
+                    return status_reparse_point_not_resolved;
+                }
+                const auto& new_name = *resolved_name;
 
                 c.win_emu.log.warn("--> File rename requested: %s --> %s\n", u16_to_u8(f->name).c_str(), u16_to_u8(new_name).c_str());
 
@@ -370,6 +581,7 @@ namespace sogen
 
                 f->handle.defer_rename(c.win_emu.file_sys.translate(f->name),
                                        c.win_emu.file_sys.translate_for_creation(new_name, new_name));
+                f->renamed_to = new_name;
 
                 return STATUS_SUCCESS;
             }
@@ -668,6 +880,13 @@ namespace sogen
 
                 f->enumeration_state.emplace(file_enumeration_state{});
                 f->enumeration_state->files = scan_directory(c.win_emu.file_sys, f->name, mask, c.win_emu.uses_relative_time());
+                if (!c.proc.reparse_points.empty())
+                {
+                    for (auto& entry : f->enumeration_state->files)
+                    {
+                        entry.reparse_tag = reparse_tag_at(c.proc, f->name + u"\\" + entry.file_path.u16string());
+                    }
+                }
             }
 
             auto& enum_state = *f->enumeration_state;
@@ -726,9 +945,16 @@ namespace sogen
                 info.LastWriteTime = current_file.last_write_time;
                 info.ChangeTime = info.LastWriteTime;
 
-                info.FileAttributes = current_file.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                info.FileAttributes = with_reparse_attribute(current_file.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
+                                                             current_file.reparse_tag);
                 info.FileNameLength = static_cast<ULONG>(file_name.size() * 2);
                 info.EndOfFile.QuadPart = current_file.file_size;
+
+                // For a reparse point, the EA size field holds its tag.
+                if constexpr (requires { info.EaSize; })
+                {
+                    info.EaSize = current_file.reparse_tag;
+                }
 
                 if constexpr (requires { info.ShortName; })
                 {
@@ -903,7 +1129,9 @@ namespace sogen
                 const emulator_object<FILE_ATTRIBUTE_TAG_INFORMATION> info{c.emu, file_information};
                 FILE_ATTRIBUTE_TAG_INFORMATION i{};
 
-                i.FileAttributes = f->is_directory() ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                i.ReparseTag = reparse_tag_at(c.proc, f->name);
+                i.FileAttributes =
+                    with_reparse_attribute(f->is_directory() ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL, i.ReparseTag);
 
                 info.write(i);
 
@@ -1068,7 +1296,8 @@ namespace sogen
                 i.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 i.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 i.ChangeTime = i.LastWriteTime;
-                i.FileAttributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                i.FileAttributes = with_reparse_attribute(is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
+                                                          reparse_tag_at(c.proc, f->name));
 
                 info.write(i);
 
@@ -1403,7 +1632,14 @@ namespace sogen
                     return ret(STATUS_BUFFER_OVERFLOW);
                 }
 
-                const auto filepath = windows_path(filename);
+                // The name itself, not where a link at its end leads (as an open with FILE_OPEN_REPARSE_POINT).
+                const auto resolved = resolve_reparse_points(c.proc, filename, false);
+                if (!resolved)
+                {
+                    return ret(status_reparse_point_not_resolved);
+                }
+
+                const auto filepath = windows_path(*resolved);
                 if (filepath.is_relative())
                 {
                     return ret(STATUS_OBJECT_NAME_NOT_FOUND);
@@ -1424,7 +1660,8 @@ namespace sogen
                 i.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 i.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 i.ChangeTime = i.LastWriteTime;
-                i.FileAttributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                i.ReparseTag = reparse_tag_at(c.proc, *resolved);
+                i.FileAttributes = with_reparse_attribute(is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL, i.ReparseTag);
                 i.NumberOfLinks = 1;
                 i.FileId.QuadPart = static_cast<LONGLONG>(file_stat.st_ino);
                 memcpy(&i.FileId128.Identifier[0], &file_stat.st_ino, sizeof(file_stat.st_ino));
@@ -2271,6 +2508,17 @@ namespace sogen
 
             std::error_code ec{};
 
+            // Junctions and symbolic links on the way lead elsewhere; the last component itself is opened, not followed,
+            // with FILE_OPEN_REPARSE_POINT. The handle names where it led (GetFinalPathNameByHandle).
+            if (auto resolved = resolve_reparse_points(c.proc, f.name, !(create_options & file_open_reparse_point)))
+            {
+                f.name = std::move(*resolved);
+            }
+            else
+            {
+                return status_reparse_point_not_resolved;
+            }
+
             const windows_path path = f.name;
 
             if (!path.is_absolute())
@@ -2477,6 +2725,16 @@ namespace sogen
 
             c.win_emu.callbacks.on_generic_access("Querying file attributes", filename);
 
+            // A link at the end of the name is described itself, not followed.
+            if (auto resolved = resolve_reparse_points(c.proc, filename, false))
+            {
+                filename = std::move(*resolved);
+            }
+            else
+            {
+                return status_reparse_point_not_resolved;
+            }
+
             const windows_path filepath(filename);
             if (!has_valid_filename_characters(filepath.u16string()))
             {
@@ -2503,7 +2761,9 @@ namespace sogen
                 info.AllocationSize.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
                 info.EndOfFile.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
                 info.ChangeTime = info.LastWriteTime;
-                info.FileAttributes = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                info.FileAttributes =
+                    with_reparse_attribute((file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
+                                           reparse_tag_at(c.proc, filename));
             });
 
             return STATUS_SUCCESS;
@@ -2543,6 +2803,16 @@ namespace sogen
 
             c.win_emu.callbacks.on_generic_access("Querying file attributes", filename);
 
+            // A link at the end of the name is described itself, not followed.
+            if (auto resolved = resolve_reparse_points(c.proc, filename, false))
+            {
+                filename = std::move(*resolved);
+            }
+            else
+            {
+                return status_reparse_point_not_resolved;
+            }
+
             const windows_path filepath(filename);
             if (!has_valid_filename_characters(filepath.u16string()))
             {
@@ -2567,7 +2837,9 @@ namespace sogen
                 info.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 info.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 info.ChangeTime = info.LastWriteTime;
-                info.FileAttributes = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                info.FileAttributes =
+                    with_reparse_attribute((file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
+                                           reparse_tag_at(c.proc, filename));
             });
 
             return STATUS_SUCCESS;
@@ -2755,6 +3027,92 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        // FSCTL_SET/GET/DELETE_REPARSE_POINT on a file or directory handle (opened with FILE_OPEN_REPARSE_POINT for a link
+        // itself); nothing for other controls.
+        static std::optional<NTSTATUS> reparse_point_control(const syscall_context& c, const file& f,
+                                                             const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                                             const ULONG fs_control_code, const emulator_pointer input_buffer,
+                                                             const ULONG input_buffer_length, const emulator_pointer output_buffer,
+                                                             const ULONG output_buffer_length)
+        {
+            constexpr ULONG fsctl_set_reparse_point = 0x900A4;
+            constexpr ULONG fsctl_get_reparse_point = 0x900A8;
+            constexpr ULONG fsctl_delete_reparse_point = 0x900AC;
+            constexpr auto status_io_reparse_data_invalid = static_cast<NTSTATUS>(0xC0000278);
+            constexpr auto status_directory_not_empty = static_cast<NTSTATUS>(0xC0000101);
+            constexpr auto status_not_a_directory = static_cast<NTSTATUS>(0xC0000103);
+            // Tag, data length, reserved.
+            constexpr ULONG header_size = 8;
+
+            const auto complete = [&](const NTSTATUS status, const uint64_t information) {
+                if (io_status_block)
+                {
+                    io_status_block.write({.Status = status, .Information = information});
+                }
+                return status;
+            };
+
+            const auto key = reparse_key(f.name);
+            switch (fs_control_code)
+            {
+            case fsctl_set_reparse_point: {
+                if (input_buffer_length < header_size)
+                {
+                    return complete(status_io_reparse_data_invalid, 0);
+                }
+
+                std::vector<uint8_t> data(input_buffer_length);
+                c.emu.read_memory(input_buffer, data.data(), data.size());
+                uint16_t data_length{};
+                memcpy(&data_length, data.data() + 4, sizeof(data_length));
+                if (header_size + data_length > data.size())
+                {
+                    return complete(status_io_reparse_data_invalid, 0);
+                }
+                data.resize(header_size + data_length);
+
+                // A junction replaces an empty directory.
+                if (reparse_tag(data) == io_reparse_tag_mount_point && !c.proc.reparse_points.contains(key))
+                {
+                    if (!f.is_directory())
+                    {
+                        return complete(status_not_a_directory, 0);
+                    }
+
+                    std::error_code ec{};
+                    if (!std::filesystem::is_empty(f.host_path, ec))
+                    {
+                        return complete(status_directory_not_empty, 0);
+                    }
+                }
+
+                c.proc.reparse_points[key] = std::move(data);
+                return complete(STATUS_SUCCESS, 0);
+            }
+            case fsctl_get_reparse_point: {
+                const auto entry = c.proc.reparse_points.find(key);
+                if (entry == c.proc.reparse_points.end())
+                {
+                    return complete(STATUS_NOT_A_REPARSE_POINT, 0);
+                }
+
+                const auto& data = entry->second;
+                if (output_buffer_length < header_size)
+                {
+                    return complete(STATUS_BUFFER_TOO_SMALL, 0);
+                }
+
+                const auto size = std::min<size_t>(data.size(), output_buffer_length);
+                c.emu.write_memory(output_buffer, data.data(), size);
+                return complete(size < data.size() ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS, size);
+            }
+            case fsctl_delete_reparse_point:
+                return complete(c.proc.reparse_points.erase(key) ? STATUS_SUCCESS : STATUS_NOT_A_REPARSE_POINT, 0);
+            default:
+                return std::nullopt;
+            }
+        }
+
         NTSTATUS handle_NtFsControlFile(const syscall_context& c, const handle file_handle, const handle event,
                                         const emulator_pointer apc_routine, const emulator_pointer apc_context,
                                         const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
@@ -2764,13 +3122,17 @@ namespace sogen
             auto* device = c.proc.devices.get(file_handle);
             if (!device)
             {
-                constexpr ULONG FSCTL_GET_REPARSE_POINT = 0x900A8;
-                if (fs_control_code == FSCTL_GET_REPARSE_POINT && c.proc.files.get(file_handle))
+                if (const auto* f = c.proc.files.get(file_handle))
                 {
-                    // The target is a regular file or directory, not a reparse point. Returning
-                    // STATUS_INVALID_HANDLE here makes callers (e.g. path canonicalization) treat
-                    // the buffer as populated; Windows reports STATUS_NOT_A_REPARSE_POINT instead.
-                    return STATUS_NOT_A_REPARSE_POINT;
+                    if (const auto status = reparse_point_control(c, *f, io_status_block, fs_control_code, input_buffer,
+                                                                  input_buffer_length, output_buffer, output_buffer_length))
+                    {
+                        if (auto* e = c.proc.events.get(event); e && NT_SUCCESS(*status))
+                        {
+                            e->signaled = true;
+                        }
+                        return *status;
+                    }
                 }
 
                 c.win_emu.log.warn("NtFsControlFile on non-device handle (control code 0x%X)\n", static_cast<uint32_t>(fs_control_code));

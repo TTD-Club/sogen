@@ -720,6 +720,8 @@ namespace sogen
         LARGE_INTEGER last_write_time{};
         // The 8.3 name, for names that are not 8.3 themselves (empty where the host keeps none).
         std::u16string short_name{};
+        // The tag of a junction or symbolic link, 0 for other entries.
+        uint32_t reparse_tag{};
 
         void serialize(utils::buffer_serializer& buffer) const
         {
@@ -730,6 +732,7 @@ namespace sogen
             buffer.write(this->last_access_time);
             buffer.write(this->last_write_time);
             buffer.write(this->short_name);
+            buffer.write(this->reparse_tag);
         }
 
         void deserialize(utils::buffer_deserializer& buffer)
@@ -741,6 +744,7 @@ namespace sogen
             buffer.read(this->last_access_time);
             buffer.read(this->last_write_time);
             buffer.read(this->short_name);
+            buffer.read(this->reparse_tag);
         }
     };
 
@@ -774,6 +778,8 @@ namespace sogen
         ULONG share_access{FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE};
         uint32_t file_mode{}; // FileModeInformation
         uint8_t drive_number{'c' - 'a' + 1};
+        // The guest name a pending rename (done at close) moves it to, empty for none.
+        std::u16string renamed_to{};
 
         bool is_file() const
         {
@@ -795,6 +801,7 @@ namespace sogen
             buffer.write(this->share_access);
             buffer.write(this->file_mode);
             buffer.write(this->drive_number);
+            buffer.write(this->renamed_to);
 
             const auto has_handle = static_cast<bool>(this->handle);
             buffer.write(has_handle);
@@ -815,6 +822,7 @@ namespace sogen
             buffer.read(this->share_access);
             buffer.read(this->file_mode);
             buffer.read(this->drive_number);
+            buffer.read(this->renamed_to);
 
             const auto has_handle = buffer.read<bool>();
 

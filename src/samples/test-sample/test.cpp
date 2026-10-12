@@ -29,6 +29,7 @@
 #include <knownfolders.h>
 #include <sddl.h>
 #include <ntsecapi.h>
+#include <winioctl.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
 
@@ -780,6 +781,112 @@ namespace
         {
             printf("Short and long path names do not round-trip: %ls -> %ls -> %ls (%lu)\n", directory.data(), short_path.data(),
                    long_path.data(), GetLastError());
+            return false;
+        }
+
+        return true;
+    }
+
+    // A junction and a symbolic link lead to their targets, show as reparse points, and removing the junction leaves its
+    // target.
+    bool test_reparse_points()
+    {
+        std::array<wchar_t, MAX_PATH> full{};
+        const auto relative = scratch_directory() + L"Reparse" + std::to_wstring(GetCurrentProcessId());
+        GetFullPathNameW(relative.c_str(), static_cast<DWORD>(full.size()), full.data(), nullptr);
+        const std::wstring base = full.data();
+        const auto target = base + L"\\target";
+        const auto junction = base + L"\\junction";
+        const auto inner = target + L"\\inner.txt";
+        const auto link = base + L"\\link.txt";
+
+        const auto cleanup = sogen::utils::finally([&] {
+            DeleteFileW(link.c_str());
+            RemoveDirectoryW(junction.c_str());
+            DeleteFileW(inner.c_str());
+            RemoveDirectoryW(target.c_str());
+            RemoveDirectoryW(base.c_str());
+        });
+
+        if (!CreateDirectoryW(base.c_str(), nullptr) || !CreateDirectoryW(target.c_str(), nullptr) ||
+            !CreateDirectoryW(junction.c_str(), nullptr))
+        {
+            return false;
+        }
+
+        auto* const file = CreateFileW(inner.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        DWORD transferred{};
+        WriteFile(file, "data", 4, &transferred, nullptr);
+        CloseHandle(file);
+
+        // REPARSE_DATA_BUFFER for a mount point: tag, data length, reserved, substitute name offset/length, print name
+        // offset/length, then "\??\<target>" and "<target>", each followed by a NUL.
+        const auto substitute = L"\\??\\" + target;
+        std::vector<uint8_t> buffer(16 + (substitute.size() + 1 + target.size() + 1) * sizeof(wchar_t));
+        const auto put16 = [&](const size_t offset, const size_t value) {
+            const auto v = static_cast<uint16_t>(value);
+            memcpy(buffer.data() + offset, &v, sizeof(v));
+        };
+        constexpr DWORD mount_point_tag = IO_REPARSE_TAG_MOUNT_POINT;
+        memcpy(buffer.data(), &mount_point_tag, sizeof(mount_point_tag));
+        put16(4, buffer.size() - 8);
+        put16(8, 0);
+        put16(10, substitute.size() * sizeof(wchar_t));
+        put16(12, (substitute.size() + 1) * sizeof(wchar_t));
+        put16(14, target.size() * sizeof(wchar_t));
+        memcpy(buffer.data() + 16, substitute.c_str(), (substitute.size() + 1) * sizeof(wchar_t));
+        memcpy(buffer.data() + 16 + (substitute.size() + 1) * sizeof(wchar_t), target.c_str(), (target.size() + 1) * sizeof(wchar_t));
+
+        auto* const junction_handle = CreateFileW(junction.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                                  FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        const auto set = DeviceIoControl(junction_handle, FSCTL_SET_REPARSE_POINT, buffer.data(), static_cast<DWORD>(buffer.size()),
+                                         nullptr, 0, &transferred, nullptr);
+        std::array<uint8_t, 1024> read_back{};
+        DWORD tag{};
+        const auto got = DeviceIoControl(junction_handle, FSCTL_GET_REPARSE_POINT, nullptr, 0, read_back.data(),
+                                         static_cast<DWORD>(read_back.size()), &transferred, nullptr);
+        memcpy(&tag, read_back.data(), sizeof(tag));
+        CloseHandle(junction_handle);
+        if (!set || !got || tag != IO_REPARSE_TAG_MOUNT_POINT)
+        {
+            printf("Setting a junction failed: set %d, get %d, tag %lX (%lu)\n", set, got, tag, GetLastError());
+            return false;
+        }
+
+        const auto read_through = [&](const std::wstring& path) {
+            std::array<char, 8> contents{};
+            auto* const handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            DWORD read{};
+            const auto ok = handle != INVALID_HANDLE_VALUE &&
+                            ReadFile(handle, contents.data(), static_cast<DWORD>(contents.size()), &read, nullptr) &&
+                            std::string_view(contents.data(), read) == "data";
+            CloseHandle(handle);
+            return ok;
+        };
+
+        WIN32_FIND_DATAW entry{};
+        auto* const find = FindFirstFileW((base + L"\\junc*").c_str(), &entry);
+        const auto listed = find != INVALID_HANDLE_VALUE && (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                            entry.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT;
+        FindClose(find);
+        const auto attributes = GetFileAttributesW(junction.c_str());
+        if (!read_through(junction + L"\\inner.txt") || !listed || attributes == INVALID_FILE_ATTRIBUTES ||
+            !(attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        {
+            printf("Junction: read through %d, listed %d, attributes %lX\n", read_through(junction + L"\\inner.txt"), listed, attributes);
+            return false;
+        }
+
+        // A relative file link, where the host lets this process create one.
+        if (CreateSymbolicLinkW(link.c_str(), L"target\\inner.txt", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) && !read_through(link))
+        {
+            puts("Reading through a relative symbolic link failed");
+            return false;
+        }
+
+        if (!RemoveDirectoryW(junction.c_str()) || GetFileAttributesW(junction.c_str()) != INVALID_FILE_ATTRIBUTES || !read_through(inner))
+        {
+            puts("Removing a junction did not leave its target alone");
             return false;
         }
 
@@ -3384,6 +3491,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_volume_path, "Volume Path")
     RUN_TEST(test_file_mappings, "File Mappings")
     RUN_TEST(test_environment_and_names, "Environment and Names")
+    RUN_TEST(test_reparse_points, "Reparse Points")
     RUN_TEST(test_system_info, "System Info")
     RUN_TEST(test_monitor_info, "Monitor Info")
     RUN_TEST(test_time_zone, "Time Zone")

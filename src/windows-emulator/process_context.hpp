@@ -567,6 +567,11 @@ namespace sogen
 
         std::map<uint64_t, file_section_view> file_section_views{};
 
+        // Reparse points (junctions, symbolic links) by guest path (windows_path::u16string, lower case): the
+        // REPARSE_DATA_BUFFER FSCTL_SET_REPARSE_POINT stored. The host keeps a plain directory or file in their place;
+        // opens follow them here.
+        std::map<std::u16string, std::vector<uint8_t>> reparse_points{};
+
         // Views mapped of each pagefile section's backing (by its address), and the backings whose section is closed:
         // such a backing stays until its last view is unmapped, as a view keeps its section's pages.
         std::map<uint64_t, uint32_t> pagefile_view_counts{};

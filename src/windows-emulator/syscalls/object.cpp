@@ -13,6 +13,51 @@ namespace sogen
         NTSTATUS handle_NtReleaseSemaphore(const syscall_context& c, handle semaphore_handle, ULONG release_count,
                                            emulator_object<LONG> previous_count);
 
+        namespace
+        {
+            struct closing_file
+            {
+                std::u16string name{};
+                std::filesystem::path host_path{};
+                std::u16string renamed_to{};
+            };
+
+            // A file or directory that is gone after its last handle closed was deleted or renamed: its reparse point, and
+            // any below it, go too, or move to the new name.
+            void update_reparse_points_after_close(process_context& process, const closing_file& closing)
+            {
+                std::error_code ec{};
+                if (std::filesystem::exists(std::filesystem::symlink_status(closing.host_path, ec)))
+                {
+                    return;
+                }
+
+                const auto old_key = windows_path(closing.name).u16string();
+                const auto new_key = closing.renamed_to.empty() ? std::u16string{} : windows_path(closing.renamed_to).u16string();
+                std::vector<std::pair<std::u16string, std::vector<uint8_t>>> moved{};
+                for (auto entry = process.reparse_points.begin(); entry != process.reparse_points.end();)
+                {
+                    const auto& key = entry->first;
+                    if (key != old_key && !key.starts_with(old_key + u"\\"))
+                    {
+                        ++entry;
+                        continue;
+                    }
+
+                    if (!new_key.empty())
+                    {
+                        moved.emplace_back(new_key + key.substr(old_key.size()), std::move(entry->second));
+                    }
+                    entry = process.reparse_points.erase(entry);
+                }
+
+                for (auto& [key, data] : moved)
+                {
+                    process.reparse_points[std::move(key)] = std::move(data);
+                }
+            }
+        }
+
         NTSTATUS handle_NtClose(const syscall_context& c, const handle h)
         {
             const auto value = h.value;
@@ -112,9 +157,25 @@ namespace sogen
                 }
             }
 
+            // The last handle of a file runs its pending delete or rename; reparse points there go or move along.
+            std::optional<closing_file> closing{};
+            if (value.type == handle_types::file && !c.proc.reparse_points.empty())
+            {
+                const auto* f = c.proc.files.get(h);
+                if (f && f->ref_count == 1)
+                {
+                    closing = closing_file{.name = f->name, .host_path = f->host_path, .renamed_to = f->renamed_to};
+                }
+            }
+
             auto* handle_store = c.proc.get_handle_store(h);
             if (handle_store && handle_store->erase(h))
             {
+                if (closing)
+                {
+                    update_reparse_points_after_close(c.proc, *closing);
+                }
+
                 // Mapped views keep the section's pages: the backing goes with the last of them.
                 if (section_backing_address != 0 && c.proc.pagefile_view_counts.contains(section_backing_address))
                 {

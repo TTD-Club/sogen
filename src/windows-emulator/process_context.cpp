@@ -893,6 +893,7 @@ namespace sogen
         buffer.write_map(this->file_section_views);
         buffer.write_map(this->pagefile_view_counts);
         buffer.write_map(this->closed_pagefile_backings);
+        buffer.write_map(this->reparse_points);
         buffer.write_atomic(this->audio_render_event);
 
         buffer.write(this->user_handles);
@@ -1004,6 +1005,7 @@ namespace sogen
         buffer.read_map(this->file_section_views);
         buffer.read_map(this->pagefile_view_counts);
         buffer.read_map(this->closed_pagefile_backings);
+        buffer.read_map(this->reparse_points);
         buffer.read_atomic(this->audio_render_event);
 
         buffer.read(this->user_handles);
