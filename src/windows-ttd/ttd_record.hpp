@@ -201,7 +201,10 @@ namespace sogen::ttd
 
         thread_table threads_{};
         std::optional<uint32_t> running_thread_{};
+        // The stack of each thread that ran, taken from its TEB when it first ran.
+        std::vector<thread_stack> thread_stacks_{};
         void note_thread(const access_event& event);
+        void note_thread_stack(const emulator_thread& thread, const access_event& event);
 
         bool caches_instructions_{};
         // Index in cached_instructions_ by address; a forgotten instruction keeps its entry with size 0.

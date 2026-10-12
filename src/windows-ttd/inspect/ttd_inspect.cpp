@@ -82,6 +82,17 @@ namespace
         }
     }
 
+    void stacks(const trace& recorded)
+    {
+        std::printf("%-8s %-12s %-18s %-18s %s\n", "thread", "position", "teb", "stack limit", "stack base");
+        for (const auto& stack : recorded.thread_stacks())
+        {
+            std::printf("%-8u %-12llu 0x%016llx 0x%016llx 0x%016llx\n", stack.thread_id, static_cast<unsigned long long>(stack.step),
+                        static_cast<unsigned long long>(stack.teb), static_cast<unsigned long long>(stack.stack_limit),
+                        static_cast<unsigned long long>(stack.stack_base));
+        }
+    }
+
     void branches(trace& recorded, const uint64_t address, const uint64_t size, const bool jumps)
     {
         const std::vector<std::pair<uint64_t, uint64_t>> ranges{{address, size}};
@@ -102,7 +113,7 @@ int main(const int argc, char** argv)
         const std::vector<std::string> args(argv + 1, argv + argc);
         if (args.empty())
         {
-            std::fprintf(stderr, "Usage: ttd-inspect TRACE [exceptions | calls-to ADDRESS | branches ADDRESS SIZE [jumps]]\n");
+            std::fprintf(stderr, "Usage: ttd-inspect TRACE [exceptions | stacks | calls-to ADDRESS | branches ADDRESS SIZE [jumps]]\n");
             return 1;
         }
         if (!is_trace_file(args[0]))
@@ -118,6 +129,10 @@ int main(const int argc, char** argv)
         else if (args[1] == "exceptions" && args.size() == 2)
         {
             exceptions(recorded);
+        }
+        else if (args[1] == "stacks" && args.size() == 2)
+        {
+            stacks(recorded);
         }
         else if (args[1] == "calls-to" && args.size() == 3)
         {

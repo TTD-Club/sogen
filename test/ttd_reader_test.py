@@ -57,6 +57,18 @@ def main() -> None:
         ntdll = next(module for module in trace.modules if module.name.lower() == "ntdll.dll")
         assert ntdll.machine == 0x8664, hex(ntdll.machine)
 
+        # Thread stacks: one per thread that ran, from its TEB, and its first instruction runs on that stack.
+        stacks = trace.thread_stacks
+        assert stacks and [stack.thread_id for stack in stacks] == list(dict.fromkeys(
+            switch.thread_id for switch in trace.thread_switches)), (stacks, trace.thread_switches)
+        for stack in stacks:
+            assert stack.teb and stack.teb % 0x1000 == 0 and 0 < stack.stack_limit < stack.stack_base, stack
+            assert stack.teb32 == stack.stack32_base == stack.stack32_limit == 0, stack
+            rsp = trace.cpu_at(stack.position).read_register(registers.rsp)
+            assert stack.stack_limit <= rsp <= stack.stack_base, (stack, hex(rsp))
+        listed = run(analyzer.parent / "ttd-inspect.exe", path, "stacks")
+        assert len(listed.splitlines()) == len(stacks) + 1 and f"0x{stacks[0].teb:016x}" in listed, listed
+
         # calls_to: every entry calls() finds, the call before it, and the matching return; checked against cpu_at.
         name = "ntdll.dll!RtlAllocateHeap"
         target = next(m.base + e.rva for m, e in trace.find_exports(name) if e.forwarder is None)

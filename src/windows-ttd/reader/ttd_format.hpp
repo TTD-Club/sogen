@@ -101,6 +101,29 @@ namespace sogen::ttd
         // The PE machine of each module in the modules section, encoded as described at encode_module_machines;
         // size = compressed bytes.
         module_machines = 15,
+        // The stack of each thread that ran (see thread_stack), encoded as described at encode_thread_stacks;
+        // size = compressed bytes.
+        thread_stacks = 16,
+    };
+
+    // A thread's stack as its TEB (NT_TIB StackBase and StackLimit) described it when the thread first ran in the trace:
+    // at its creation, or at the trace's start for a thread that already existed. Sogen commits a thread's whole stack
+    // when it creates it, so these hold for the thread's life unless the guest rewrites its TEB itself (fibers, which
+    // memory_at at the TEB shows).
+    struct thread_stack
+    {
+        uint32_t thread_id{};
+        // The thread's first instruction in the trace, and the number of events recorded before it.
+        uint64_t step{};
+        uint64_t event_number{};
+        uint64_t teb{};
+        // The stack's high end (StackBase) and low end (StackLimit): it holds [stack_limit, stack_base).
+        uint64_t stack_base{};
+        uint64_t stack_limit{};
+        // For a WoW64 thread, its 32-bit TEB and the 32-bit stack; 0 otherwise.
+        uint64_t teb32{};
+        uint64_t stack32_base{};
+        uint64_t stack32_limit{};
     };
 
     // Guest memory [address, address + size) was mapped or unmapped at position `step`, after `event_number` events,

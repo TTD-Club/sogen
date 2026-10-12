@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -318,6 +319,25 @@ namespace sogen::ttd
             return has_mapping_changes_;
         }
 
+        // The stack of each thread that ran, in the order threads first ran (see thread_stack); empty for traces recorded
+        // before stacks were (has_thread_stacks).
+        std::span<const thread_stack> thread_stacks() const
+        {
+            return thread_stacks_;
+        }
+
+        bool has_thread_stacks() const
+        {
+            return has_thread_stacks_;
+        }
+
+        // The stack of thread `thread_id`, or null when the trace does not record it.
+        const thread_stack* thread_stack_of(uint32_t thread_id) const
+        {
+            const auto found = std::ranges::find(thread_stacks_, thread_id, &thread_stack::thread_id);
+            return found == thread_stacks_.end() ? nullptr : &*found;
+        }
+
         // The standalone CPU cpu_view replays on (see ttd_view.cpp), created on first use and kept with the reader.
         std::shared_ptr<view_engine>& view_engine_slot()
         {
@@ -407,6 +427,8 @@ namespace sogen::ttd
         // Empty for traces recorded before mapping changes were, whose memory_at cannot notice remapped memory.
         std::vector<mapping_change> mapping_changes_{};
         bool has_mapping_changes_{};
+        std::vector<thread_stack> thread_stacks_{};
+        bool has_thread_stacks_{};
         // Whether a mapping change covering `address` came after event `after_number` and before event `through_number`.
         bool remapped(uint64_t address, uint64_t after_number, uint64_t through_number) const;
         std::shared_ptr<view_engine> view_engine_{};

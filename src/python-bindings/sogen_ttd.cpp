@@ -461,6 +461,24 @@ namespace sogen::py
                     return text.str();
                 });
 
+            nb::class_<ttd::thread_stack>(m, "ThreadStack",
+                                          "A thread's stack as its TEB described it when the thread first ran in the trace")
+                .def_ro("thread_id", &ttd::thread_stack::thread_id)
+                .def_ro("position", &ttd::thread_stack::step, "Position of the thread's first instruction in the trace")
+                .def_ro("event_number", &ttd::thread_stack::event_number)
+                .def_ro("teb", &ttd::thread_stack::teb)
+                .def_ro("stack_base", &ttd::thread_stack::stack_base, "High end of the stack (NT_TIB StackBase)")
+                .def_ro("stack_limit", &ttd::thread_stack::stack_limit, "Low end of the stack (NT_TIB StackLimit)")
+                .def_ro("teb32", &ttd::thread_stack::teb32, "The 32-bit TEB of a WoW64 thread, 0 otherwise")
+                .def_ro("stack32_base", &ttd::thread_stack::stack32_base)
+                .def_ro("stack32_limit", &ttd::thread_stack::stack32_limit)
+                .def("__repr__", [](const ttd::thread_stack& self) {
+                    std::ostringstream text;
+                    text << "ThreadStack(thread_id=" << self.thread_id << ", position=0x" << std::hex << self.step << ", teb=0x" << self.teb
+                         << ", stack=[0x" << self.stack_limit << ", 0x" << self.stack_base << "))";
+                    return text.str();
+                });
+
             nb::class_<ttd::recovered_string>(m, "RecoveredString")
                 .def_ro("address", &ttd::recovered_string::address)
                 .def_ro("position", &ttd::recovered_string::step, "Position at which the string was last seen extended")
@@ -748,6 +766,14 @@ namespace sogen::py
                 .def_prop_ro(
                     "thread_names", [](const ttd_trace& self) { return self.native().threads().names; },
                     "Name of each thread that ran, by id; empty for unnamed threads")
+                .def_prop_ro(
+                    "thread_stacks",
+                    [](const ttd_trace& self) {
+                        const auto stacks = self.native().thread_stacks();
+                        return std::vector<ttd::thread_stack>(stacks.begin(), stacks.end());
+                    },
+                    "The stack of each thread that ran, in the order threads first ran; empty for traces recorded before "
+                    "stacks were")
                 .def(
                     "thread_at", [](const ttd_trace& self, const uint64_t position) { return self.native().thread_at(position); },
                     nb::arg("position"), "Id of the thread executing the instruction at position, or None before the first switch")

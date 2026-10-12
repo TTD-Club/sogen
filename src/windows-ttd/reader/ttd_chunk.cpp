@@ -1418,6 +1418,66 @@ namespace sogen::ttd
         }
     }
 
+    std::vector<std::byte> encode_thread_stacks(const std::span<const thread_stack> stacks)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, stacks.size());
+        thread_stack previous{};
+        for (const auto& stack : stacks)
+        {
+            if (stack.step < previous.step || stack.event_number < previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD thread stack");
+            }
+            put_varint(raw, stack.thread_id);
+            put_varint(raw, stack.step - previous.step);
+            put_varint(raw, stack.event_number - previous.event_number);
+            for (const auto value : {stack.teb, stack.stack_base, stack.stack_limit, stack.teb32, stack.stack32_base, stack.stack32_limit})
+            {
+                put_varint(raw, value);
+            }
+            previous = stack;
+        }
+        return compress_table(raw, "thread stacks");
+    }
+
+    std::vector<thread_stack> decode_thread_stacks(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        // Every entry takes at least nine bytes.
+        if (count > raw.size() / 9)
+        {
+            throw std::runtime_error("Invalid TTD thread stacks");
+        }
+        std::vector<thread_stack> stacks(static_cast<size_t>(count));
+        thread_stack previous{};
+        for (auto& stack : stacks)
+        {
+            const auto id = reader.varint();
+            const auto step_delta = reader.varint();
+            const auto event_delta = reader.varint();
+            if (id > UINT32_MAX || step_delta > UINT64_MAX - previous.step || event_delta > UINT64_MAX - previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD thread stack");
+            }
+            stack.thread_id = static_cast<uint32_t>(id);
+            stack.step = previous.step + step_delta;
+            stack.event_number = previous.event_number + event_delta;
+            for (auto* value : {&stack.teb, &stack.stack_base, &stack.stack_limit, &stack.teb32, &stack.stack32_base, &stack.stack32_limit})
+            {
+                *value = reader.varint();
+            }
+            previous = stack;
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD thread stacks");
+        }
+        return stacks;
+    }
+
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)
     {
         std::vector<std::byte> filtered(data.begin(), data.end());

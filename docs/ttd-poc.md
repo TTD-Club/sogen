@@ -536,6 +536,17 @@ found through the section table (24-byte entries `type, offset, size`):
   the PE machine of each module (`0x8664`, or `0x14c` for 32-bit code in a
   WoW64 process). A zstd frame of varints: the module count (that of the
   modules section), then each machine in module order.
+- Thread stacks (type 16, size = compressed bytes; absent in older traces):
+  per thread that ran, in the order threads first ran, its TEB and its
+  `NT_TIB` StackBase and StackLimit as the TEB held them at the thread's first
+  instruction in the trace (its creation, or the trace's start), plus the
+  32-bit TEB and stack of a WoW64 thread (0 otherwise). Sogen commits a
+  thread's whole stack when it creates it, so the bounds hold for the
+  thread's life unless the guest rewrites them (fibers; `memory_at` at the
+  TEB shows that). A zstd frame of varints: count, then per thread its id,
+  the position and event-number deltas, TEB, stack base, stack limit, 32-bit
+  TEB, 32-bit stack base, 32-bit stack limit. `trace::thread_stacks()`,
+  `Trace.thread_stacks`, `ttd-inspect TRACE stacks`.
 
 Unknown section types are ignored, so sections can be added without a new
 version. The library reads versions 1-4 and 7-8 (`ttd::is_supported_trace_version`;

@@ -386,6 +386,31 @@ namespace sogen::ttd
         // The event is already counted.
         threads_.switches.push_back({.step = event.step, .event_number = header_.event_count - 1, .thread_id = thread->id});
         threads_.names[thread->id] = u16_to_u8(thread->name);
+        if (std::ranges::find(thread_stacks_, thread->id, &thread_stack::thread_id) == thread_stacks_.end())
+        {
+            note_thread_stack(*thread, event);
+        }
+    }
+
+    void recorder::note_thread_stack(const emulator_thread& thread, const access_event& event)
+    {
+        thread_stack stack{.thread_id = thread.id, .step = event.step, .event_number = header_.event_count - 1};
+        // Read as the guest sees them (the TEB, not the emulator's bookkeeping), without recording the reads.
+        if (thread.teb64)
+        {
+            const auto teb = thread.teb64->read();
+            stack.teb = thread.teb64->value();
+            stack.stack_base = teb.NtTib.StackBase;
+            stack.stack_limit = teb.NtTib.StackLimit;
+        }
+        if (thread.teb32)
+        {
+            const auto teb = thread.teb32->read();
+            stack.teb32 = thread.teb32->value();
+            stack.stack32_base = teb.NtTib.StackBase;
+            stack.stack32_limit = teb.NtTib.StackLimit;
+        }
+        thread_stacks_.push_back(stack);
     }
 
     void recorder::close_syscall(const uint32_t id)
@@ -881,6 +906,7 @@ namespace sogen::ttd
         const auto snapshots = encode_register_snapshots(register_snapshots_);
         const auto mappings = encode_mapping_changes(mapping_changes_);
         const auto machines = encode_module_machines(modules_);
+        const auto stacks = encode_thread_stacks(thread_stacks_);
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -898,6 +924,7 @@ namespace sogen::ttd
             section_entry{.type = section_type::register_snapshots, .offset = append_to_file(snapshots), .size = snapshots.size()},
             section_entry{.type = section_type::mapping_changes, .offset = append_to_file(mappings), .size = mappings.size()},
             section_entry{.type = section_type::module_machines, .offset = append_to_file(machines), .size = machines.size()},
+            section_entry{.type = section_type::thread_stacks, .offset = append_to_file(stacks), .size = stacks.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));

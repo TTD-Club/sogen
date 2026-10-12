@@ -478,6 +478,15 @@ namespace sogen::ttd
                 mapping_changes_ = decode_mapping_changes(read_bytes(section.offset, section.size));
                 has_mapping_changes_ = true;
             }
+            else if (section.type == section_type::thread_stacks)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                thread_stacks_ = decode_thread_stacks(read_bytes(section.offset, section.size));
+                has_thread_stacks_ = true;
+            }
             else if (section.type == section_type::modules || section.type == section_type::threads ||
                      section.type == section_type::exports || section.type == section_type::export_forwarders ||
                      section.type == section_type::module_machines)
