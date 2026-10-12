@@ -167,6 +167,43 @@ namespace sogen
             return domain_sid;
         }
 
+        constexpr uint32_t k_sid_type_alias = 4;
+        constexpr uint32_t k_sid_type_well_known_group = 5;
+
+        // A well-known SID of the NT authority (S-1-5-...) with the name LSA gives it.
+        struct well_known_sid
+        {
+            std::vector<uint32_t> sub_authorities{};
+            std::vector<uint32_t> domain_sub_authorities{};
+            std::u16string_view domain{};
+            std::u16string_view name{};
+            uint32_t type{};
+        };
+
+        const std::array<well_known_sid, 9> k_well_known_sids = {{
+            {{2}, {}, u"NT AUTHORITY", u"NETWORK", k_sid_type_well_known_group},
+            {{4}, {}, u"NT AUTHORITY", u"INTERACTIVE", k_sid_type_well_known_group},
+            {{11}, {}, u"NT AUTHORITY", u"Authenticated Users", k_sid_type_well_known_group},
+            {{15}, {}, u"NT AUTHORITY", u"This Organization", k_sid_type_well_known_group},
+            {{18}, {}, u"NT AUTHORITY", u"SYSTEM", k_sid_type_well_known_group},
+            {{19}, {}, u"NT AUTHORITY", u"LOCAL SERVICE", k_sid_type_well_known_group},
+            {{20}, {}, u"NT AUTHORITY", u"NETWORK SERVICE", k_sid_type_well_known_group},
+            {{32, 544}, {32}, u"BUILTIN", u"Administrators", k_sid_type_alias},
+            {{32, 545}, {32}, u"BUILTIN", u"Users", k_sid_type_alias},
+        }};
+
+        // The binary SID S-1-5-<sub authorities>.
+        std::vector<uint8_t> make_sid(const std::span<const uint32_t> sub_authorities)
+        {
+            std::vector<uint8_t> sid{1, static_cast<uint8_t>(sub_authorities.size()), 0, 0, 0, 0, 0, 5};
+            for (const auto sub_authority : sub_authorities)
+            {
+                const auto* bytes = reinterpret_cast<const uint8_t*>(&sub_authority);
+                sid.insert(sid.end(), bytes, bytes + sizeof(sub_authority));
+            }
+            return sid;
+        }
+
         void write_lsa_unicode_string_header(utils::aligned_binary_writer& writer, const std::u16string_view value)
         {
             writer.write(static_cast<uint16_t>(value.size() * sizeof(char16_t)));
@@ -174,9 +211,9 @@ namespace sogen
             writer.write_ndr_pointer(true);
         }
 
-        void write_lsa_translated_name(utils::aligned_binary_writer& writer, const std::u16string_view value)
+        void write_lsa_translated_name(utils::aligned_binary_writer& writer, const std::u16string_view value, const uint32_t sid_type)
         {
-            writer.write(k_sid_type_user);
+            writer.write(sid_type);
             writer.align_to(writer.pointer_size());
             write_lsa_unicode_string_header(writer, value);
             writer.write<int32_t>(0);
@@ -186,7 +223,8 @@ namespace sogen
         }
 
         void write_lookup_sids_success_reply(utils::aligned_binary_writer& writer, const std::u16string_view domain,
-                                             const std::span<const uint8_t> domain_sid, const std::u16string_view user)
+                                             const std::span<const uint8_t> domain_sid, const std::u16string_view user,
+                                             const uint32_t sid_type = k_sid_type_user)
         {
             writer.write_ndr_pointer(true);
 
@@ -208,7 +246,7 @@ namespace sogen
             writer.write<uint32_t>(1);
             writer.write_ndr_pointer(true);
             writer.write_pointer_sized(1);
-            write_lsa_translated_name(writer, user);
+            write_lsa_translated_name(writer, user, sid_type);
 
             writer.write<uint32_t>(1);
             writer.write(STATUS_SUCCESS);
@@ -457,6 +495,17 @@ namespace sogen
                     write_lookup_sids_success_reply(writer, domain, domain_sid, user);
 
                     return STATUS_SUCCESS;
+                }
+
+                for (const auto& known : k_well_known_sids)
+                {
+                    const auto sid = make_sid(known.sub_authorities);
+                    if (request_contains_sid(win_emu, c, sid))
+                    {
+                        const auto domain_sid = make_sid(known.domain_sub_authorities);
+                        write_lookup_sids_success_reply(writer, known.domain, domain_sid, known.name, known.type);
+                        return STATUS_SUCCESS;
+                    }
                 }
 
                 return write_lookup_not_mapped_reply(writer);

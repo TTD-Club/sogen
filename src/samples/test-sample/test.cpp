@@ -245,7 +245,31 @@ namespace
         name.resize(name_size);
         domain.resize(domain_size);
 
-        return !name.empty() && !domain.empty() && use == SidTypeUser;
+        if (name.empty() || domain.empty() || use != SidTypeUser)
+        {
+            return false;
+        }
+
+        // A well-known group: NT AUTHORITY\INTERACTIVE (S-1-5-4).
+        SID_IDENTIFIER_AUTHORITY nt_authority = SECURITY_NT_AUTHORITY;
+        PSID interactive{};
+        if (!AllocateAndInitializeSid(&nt_authority, 1, SECURITY_INTERACTIVE_RID, 0, 0, 0, 0, 0, 0, 0, &interactive))
+        {
+            return false;
+        }
+        const auto free_sid = sogen::utils::finally([&] { FreeSid(interactive); });
+
+        std::array<wchar_t, 64> group_name{};
+        std::array<wchar_t, 64> group_domain{};
+        auto group_name_size = static_cast<DWORD>(group_name.size());
+        auto group_domain_size = static_cast<DWORD>(group_domain.size());
+        if (!LookupAccountSidW(nullptr, interactive, group_name.data(), &group_name_size, group_domain.data(), &group_domain_size, &use))
+        {
+            puts("Looking up a well-known SID failed");
+            return false;
+        }
+
+        return std::wstring_view(group_name.data()) == L"INTERACTIVE" && use == SidTypeWellKnownGroup;
     }
 
     bool test_file_path_io(const std::filesystem::path& filename)
