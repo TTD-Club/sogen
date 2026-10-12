@@ -668,6 +668,28 @@ namespace
         return true;
     }
 
+    // The volume of a path is its drive's root.
+    bool test_volume_path()
+    {
+        std::array<wchar_t, MAX_PATH> executable{};
+        GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+        std::array<wchar_t, MAX_PATH> system{};
+        GetSystemDirectoryW(system.data(), static_cast<DWORD>(system.size()));
+
+        for (const auto* path : {executable.data(), system.data()})
+        {
+            std::array<wchar_t, MAX_PATH> volume{};
+            if (!GetVolumePathNameW(path, volume.data(), static_cast<DWORD>(volume.size())) ||
+                std::wstring_view(volume.data()) != std::wstring_view(path, 3))
+            {
+                printf("GetVolumePathNameW did not return the drive's root (%lu)\n", GetLastError());
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // Case mapping covers more than ASCII.
     bool test_case_mapping()
     {
@@ -3241,6 +3263,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_registry, "Registry")
     RUN_TEST(test_registry_deletion, "Registry Deletion")
     RUN_TEST(test_case_mapping, "Case Mapping")
+    RUN_TEST(test_volume_path, "Volume Path")
     RUN_TEST(test_system_info, "System Info")
     RUN_TEST(test_monitor_info, "Monitor Info")
     RUN_TEST(test_time_zone, "Time Zone")

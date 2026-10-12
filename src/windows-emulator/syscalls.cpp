@@ -1003,6 +1003,53 @@ namespace sogen
             return STATUS_NOT_SUPPORTED;
         }
 
+        // Device I/O controls on file and directory handles, which go to the file system: a volume handle (\??\C:)
+        // names its device (IOCTL_MOUNTDEV_QUERY_DEVICE_NAME, which GetVolumePathName uses); other requests are not
+        // supported.
+        NTSTATUS file_io_control(const syscall_context& c, const file& f, const handle event,
+                                 const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const ULONG io_control_code,
+                                 const emulator_pointer output_buffer, const ULONG output_buffer_length)
+        {
+            constexpr ULONG ioctl_mountdev_query_device_name = 0x4D0008;
+            constexpr auto status_invalid_device_request = static_cast<NTSTATUS>(0xC0000010);
+            const windows_path path{f.name};
+            const auto is_volume = path.is_absolute() && path.depth() == 0 && !f.name.ends_with(u'\\');
+
+            const auto complete = [&](const NTSTATUS status, const uint64_t information) {
+                if (io_status_block)
+                {
+                    io_status_block.write({.Status = status, .Information = information});
+                }
+                if (auto* e = c.proc.events.get(event); e && NT_SUCCESS(status))
+                {
+                    e->signaled = true;
+                }
+                return status;
+            };
+
+            if (io_control_code != ioctl_mountdev_query_device_name || !is_volume)
+            {
+                return complete(status_invalid_device_request, 0);
+            }
+
+            // MOUNTDEV_NAME: the name's length in bytes, then the name.
+            const auto name = u"\\Device\\HarddiskVolume" + u8_to_u16(std::to_string(f.drive_number));
+            const auto name_length = static_cast<USHORT>(name.size() * sizeof(char16_t));
+            if (output_buffer_length < sizeof(USHORT))
+            {
+                return complete(STATUS_INVALID_PARAMETER, 0);
+            }
+
+            c.emu.write_memory(output_buffer, name_length);
+            if (output_buffer_length < sizeof(USHORT) + name_length)
+            {
+                return complete(STATUS_BUFFER_OVERFLOW, sizeof(USHORT));
+            }
+
+            c.emu.write_memory(output_buffer + sizeof(USHORT), name.data(), name_length);
+            return complete(STATUS_SUCCESS, sizeof(USHORT) + name_length);
+        }
+
         NTSTATUS handle_NtDeviceIoControlFile(const syscall_context& c, const handle file_handle, const handle event,
                                               const emulator_pointer /*PIO_APC_ROUTINE*/ apc_routine, const emulator_pointer apc_context,
                                               const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
@@ -1019,6 +1066,11 @@ namespace sogen
             auto* device = c.proc.devices.get(resolved_file_handle);
             if (!device)
             {
+                if (const auto* f = c.proc.files.get(resolved_file_handle))
+                {
+                    return file_io_control(c, *f, event, io_status_block, io_control_code, output_buffer, output_buffer_length);
+                }
+
                 return STATUS_INVALID_HANDLE;
             }
 
