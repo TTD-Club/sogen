@@ -35,6 +35,7 @@ namespace sogen
             std::vector<token_privilege> held_privileges(const process_context& process)
             {
                 std::vector<token_privilege> privileges{};
+                privileges.reserve(process.token_privileges.size());
                 for (const auto& [luid, attributes] : process.token_privileges)
                 {
                     privileges.push_back({.Luid = {.LowPart = luid, .HighPart = 0}, .Attributes = attributes});
@@ -667,8 +668,8 @@ namespace sogen
         // Enables, disables, or removes the token's privileges. Changes to privileges the token does not hold are
         // skipped with STATUS_NOT_ALL_ASSIGNED; PreviousState receives the old attributes of what changed.
         NTSTATUS handle_NtAdjustPrivilegesToken(const syscall_context& c, const handle /*token_handle*/, const BOOLEAN disable_all,
-                                                const uint64_t new_state, const ULONG /*buffer_length*/, const uint64_t previous_state,
-                                                const ULONG previous_state_length, const emulator_object<ULONG> return_length)
+                                                const uint64_t new_state, const ULONG previous_state_length, const uint64_t previous_state,
+                                                const emulator_object<ULONG> return_length)
         {
             if (!disable_all && !new_state)
             {

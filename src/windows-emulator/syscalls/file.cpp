@@ -2199,6 +2199,12 @@ namespace sogen
                                  create_disposition == FILE_SUPERSEDE || create_disposition == FILE_OVERWRITE_IF;
             if (creates && !file_exists)
             {
+                // A missing parent, or one that is a file, is a path that does not exist.
+                if (!std::filesystem::is_directory(host_path.parent_path(), ec))
+                {
+                    return STATUS_OBJECT_PATH_NOT_FOUND;
+                }
+
                 std::ofstream touch(c.win_emu.file_sys.translate_for_creation(path, f.name), std::ios::binary | std::ios::app);
                 if (!touch)
                 {

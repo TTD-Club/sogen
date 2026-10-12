@@ -15,7 +15,8 @@
 
 namespace
 {
-    using namespace sogen::ttd;
+    using sogen::ttd::is_trace_file;
+    using sogen::ttd::trace;
 
     uint64_t parse_number(const std::string& text)
     {

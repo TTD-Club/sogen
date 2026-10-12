@@ -2205,7 +2205,7 @@ namespace
 
     bool test_console_write()
     {
-        const auto output = GetStdHandle(STD_OUTPUT_HANDLE);
+        auto* const output = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD mode{};
         if (!GetConsoleMode(output, &mode))
         {
@@ -2235,7 +2235,7 @@ namespace
         }
 
         HANDLE duplicate{};
-        const auto current_process = GetCurrentProcess();
+        auto* const current_process = GetCurrentProcess();
         const auto duplicated = DuplicateHandle(current_process, write_end, current_process, &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS);
         const auto closed_write_end = CloseHandle(write_end);
         const auto closed_duplicate = duplicated && CloseHandle(duplicate);
@@ -2266,8 +2266,8 @@ namespace
     bool test_file_sharing()
     {
         const auto path = scratch_directory() + L"Shared" + std::to_wstring(GetCurrentProcessId()) + L".txt";
-        const auto held = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
-                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+        auto* const held = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                                       FILE_ATTRIBUTE_NORMAL, nullptr);
         if (held == INVALID_HANDLE_VALUE)
         {
             return false;
@@ -2282,7 +2282,7 @@ namespace
             return false;
         }
 
-        const auto writer =
+        auto* const writer =
             CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
         if (writer != INVALID_HANDLE_VALUE || GetLastError() != ERROR_SHARING_VIOLATION)
         {
@@ -2295,8 +2295,9 @@ namespace
         }
 
         // Reading is shared, and an open that neither reads, writes, nor deletes never conflicts.
-        const auto reader = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-        const auto attributes = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        auto* const reader =
+            CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        auto* const attributes = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
         const auto opened = reader != INVALID_HANDLE_VALUE && attributes != INVALID_HANDLE_VALUE;
         if (reader != INVALID_HANDLE_VALUE)
         {
@@ -2336,7 +2337,7 @@ namespace
         const auto list = [](const std::wstring& pattern) {
             std::vector<std::wstring> names{};
             WIN32_FIND_DATAW data{};
-            const auto search = FindFirstFileW(pattern.c_str(), &data);
+            auto* const search = FindFirstFileW(pattern.c_str(), &data);
             if (search == INVALID_HANDLE_VALUE)
             {
                 return names;
@@ -2363,12 +2364,27 @@ namespace
             RemoveDirectoryW(directory.c_str());
         });
 
-        const auto handle = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        auto* const handle = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (handle == INVALID_HANDLE_VALUE)
         {
             return false;
         }
         CloseHandle(handle);
+
+        // Creating below a missing directory, or below a file, fails with a missing path.
+        for (const auto& below : {directory + L"\\Missing\\New.txt", file + L"\\New.txt"})
+        {
+            auto* const created = CreateFileW(below.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (created != INVALID_HANDLE_VALUE || GetLastError() != ERROR_PATH_NOT_FOUND)
+            {
+                if (created != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(created);
+                }
+                puts("Created a file below a missing directory or a file");
+                return false;
+            }
+        }
 
         const auto directories = list(directory);
         auto files = list(directory + L"\\*");
@@ -2445,7 +2461,7 @@ namespace
             return false;
         }
 
-        const auto null_device = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        auto* const null_device = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
         const auto cleanup = sogen::utils::finally([&] {
             CloseHandle(read_end);
             CloseHandle(write_end);
@@ -2584,7 +2600,7 @@ namespace
 
     bool test_high_resolution_timer()
     {
-        const auto timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        auto* const timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (!timer)
         {
             return false;
@@ -2600,7 +2616,7 @@ namespace
     bool test_waitable_timer_semantics(const DWORD flags)
     {
         const auto manual_reset = (flags & CREATE_WAITABLE_TIMER_MANUAL_RESET) != 0;
-        const auto timer = CreateWaitableTimerExW(nullptr, nullptr, flags, TIMER_ALL_ACCESS);
+        auto* const timer = CreateWaitableTimerExW(nullptr, nullptr, flags, TIMER_ALL_ACCESS);
         if (!timer)
         {
             return false;
@@ -2653,7 +2669,7 @@ namespace
         }
 
         // A periodic timer re-arms and queues its completion routine to the setting thread.
-        const auto timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+        auto* const timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
         if (!timer)
         {
             return false;
@@ -2686,7 +2702,7 @@ namespace
         }
 
         // Thread pool timers wait on a timer through a wait completion packet.
-        const auto fired = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        auto* const fired = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!fired)
         {
             return false;
@@ -2753,10 +2769,11 @@ namespace
 
     bool test_oem_conversion()
     {
-        constexpr std::string_view text = "Sogen /? 123";
+        const char* const text = "Sogen /? 123";
         std::array<char, 32> oem{};
         std::array<char, 32> ansi{};
-        return CharToOemA(text.data(), oem.data()) && oem.data() == text && OemToCharA(oem.data(), ansi.data()) && ansi.data() == text;
+        return CharToOemA(text, oem.data()) && std::string_view(oem.data()) == text && OemToCharA(oem.data(), ansi.data()) &&
+               std::string_view(ansi.data()) == text;
     }
 }
 

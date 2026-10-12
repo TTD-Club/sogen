@@ -2184,8 +2184,10 @@ namespace sogen::ttd
                 const auto thread_id = thread_at(entry.step).value_or(0);
                 exception_event exception{.step = entry.step, .thread_id = thread_id};
                 const auto entry_number = first_event_at_or_after(entry.step);
-                for (auto number = entry_number; number-- > 0 && entry_number - number <= record_lookback;)
+                const auto first_number = entry_number > record_lookback ? entry_number - record_lookback : 0;
+                for (auto number = entry_number; number > first_number;)
                 {
+                    --number;
                     const auto event = event_at(number);
                     if (event.kind != access_kind::host_write || event.size != record_size)
                     {

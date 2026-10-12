@@ -55,11 +55,11 @@ namespace sogen::py
             return 0;
         }
 
-        PyType_Slot emulator_slots[] = {
-            {Py_tp_traverse, reinterpret_cast<void*>(emulator_tp_traverse)},
-            {Py_tp_clear, reinterpret_cast<void*>(emulator_tp_clear)},
-            {0, nullptr},
-        };
+        std::array<PyType_Slot, 3> emulator_slots = {{
+            {.slot = Py_tp_traverse, .pfunc = reinterpret_cast<void*>(emulator_tp_traverse)},
+            {.slot = Py_tp_clear, .pfunc = reinterpret_cast<void*>(emulator_tp_clear)},
+            {.slot = 0, .pfunc = nullptr},
+        }};
     }
 
     void register_windows_runtime_bindings(nb::module_& m)
@@ -169,7 +169,7 @@ namespace sogen::py
             .def_prop_ro("active_thread", &sogen_process_context::active_thread, nb::rv_policy::reference_internal)
             .def_prop_ro("callbacks", &sogen_process_context::callback_view, nb::rv_policy::reference_internal);
 
-        nb::class_<sogen_windows_emulator>(m, "Emulator", nb::type_slots(emulator_slots))
+        nb::class_<sogen_windows_emulator>(m, "Emulator", nb::type_slots(emulator_slots.data()))
             .def("start", &sogen_windows_emulator::start, nb::arg("count") = 0, nb::call_guard<nb::gil_scoped_release>())
             .def("stop", &sogen_windows_emulator::stop)
             .def("save_snapshot", &sogen_windows_emulator::save_snapshot)

@@ -514,6 +514,24 @@ namespace sogen
             case SystemModuleInformationEx:
                 return handle_system_module_information_ex(c, system_information, system_information_length, return_length);
 
+            case SystemRegistryQuotaInformation: {
+                // SYSTEM_REGISTRY_QUOTA_INFORMATION (PDH's "Registry Quota" counters, e.g. CPython's test runner). The
+                // registry quota has been unlimited since Windows Vista: the allowed size reports as 4 GiB - 1.
+                struct registry_quota_information
+                {
+                    ULONG RegistryQuotaAllowed;
+                    ULONG RegistryQuotaUsed;
+                    uint64_t PagedPoolSize;
+                };
+
+                return handle_query<registry_quota_information>(c.emu, system_information, system_information_length, return_length,
+                                                                [&](registry_quota_information& info) {
+                                                                    info.RegistryQuotaAllowed = 0xFFFFFFFF;
+                                                                    info.RegistryQuotaUsed = 0x00800000;
+                                                                    info.PagedPoolSize = 0x10000000;
+                                                                });
+            }
+
             case SystemTimeOfDayInformation:
                 return handle_query<SYSTEM_TIMEOFDAY_INFORMATION64>(c.emu, system_information, system_information_length, return_length,
                                                                     [&](SYSTEM_TIMEOFDAY_INFORMATION64& info) {

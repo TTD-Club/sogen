@@ -55,6 +55,7 @@ namespace sogen
         };
 
         // The privileges every Windows system defines, with their fixed LUIDs (SE_*_PRIVILEGE) and English display names.
+        // NOLINTBEGIN(modernize-use-designated-initializers): a table of (LUID, name, display name) rows
         constexpr std::array<privilege_entry, 35> k_privileges = {{
             {2, u"SeCreateTokenPrivilege", u"Create a token object"},
             {3, u"SeAssignPrimaryTokenPrivilege", u"Replace a process level token"},
@@ -92,6 +93,8 @@ namespace sogen
             {35, u"SeCreateSymbolicLinkPrivilege", u"Create symbolic links"},
             {36, u"SeDelegateSessionUserImpersonatePrivilege", u"Obtain an impersonation token for another user in the same session"},
         }};
+
+        // NOLINTEND(modernize-use-designated-initializers)
 
         // Privilege names compare without regard to case, as LSA compares them.
         const privilege_entry* find_privilege(const std::u16string_view name)
@@ -180,17 +183,32 @@ namespace sogen
             uint32_t type{};
         };
 
-        const std::array<well_known_sid, 9> k_well_known_sids = {{
-            {{2}, {}, u"NT AUTHORITY", u"NETWORK", k_sid_type_well_known_group},
-            {{4}, {}, u"NT AUTHORITY", u"INTERACTIVE", k_sid_type_well_known_group},
-            {{11}, {}, u"NT AUTHORITY", u"Authenticated Users", k_sid_type_well_known_group},
-            {{15}, {}, u"NT AUTHORITY", u"This Organization", k_sid_type_well_known_group},
-            {{18}, {}, u"NT AUTHORITY", u"SYSTEM", k_sid_type_well_known_group},
-            {{19}, {}, u"NT AUTHORITY", u"LOCAL SERVICE", k_sid_type_well_known_group},
-            {{20}, {}, u"NT AUTHORITY", u"NETWORK SERVICE", k_sid_type_well_known_group},
-            {{32, 544}, {32}, u"BUILTIN", u"Administrators", k_sid_type_alias},
-            {{32, 545}, {32}, u"BUILTIN", u"Users", k_sid_type_alias},
-        }};
+        well_known_sid nt_authority_group(const uint32_t rid, const std::u16string_view name)
+        {
+            return {.sub_authorities = {rid}, .domain = u"NT AUTHORITY", .name = name, .type = k_sid_type_well_known_group};
+        }
+
+        well_known_sid builtin_alias(const uint32_t rid, const std::u16string_view name)
+        {
+            constexpr uint32_t builtin_domain_rid = 32;
+            return {.sub_authorities = {builtin_domain_rid, rid},
+                    .domain_sub_authorities = {builtin_domain_rid},
+                    .domain = u"BUILTIN",
+                    .name = name,
+                    .type = k_sid_type_alias};
+        }
+
+        const std::array<well_known_sid, 9> k_well_known_sids = {
+            nt_authority_group(2, u"NETWORK"),
+            nt_authority_group(4, u"INTERACTIVE"),
+            nt_authority_group(11, u"Authenticated Users"),
+            nt_authority_group(15, u"This Organization"),
+            nt_authority_group(18, u"SYSTEM"),
+            nt_authority_group(19, u"LOCAL SERVICE"),
+            nt_authority_group(20, u"NETWORK SERVICE"),
+            builtin_alias(544, u"Administrators"),
+            builtin_alias(545, u"Users"),
+        };
 
         // The binary SID S-1-5-<sub authorities>.
         std::vector<uint8_t> make_sid(const std::span<const uint32_t> sub_authorities)

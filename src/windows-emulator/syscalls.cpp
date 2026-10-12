@@ -477,8 +477,7 @@ namespace sogen
                                       uint64_t privilege_set, emulator_object<ULONG> privilege_set_length,
                                       emulator_object<ACCESS_MASK> granted_access, emulator_object<NTSTATUS> access_status);
         NTSTATUS handle_NtAdjustPrivilegesToken(const syscall_context& c, handle token_handle, BOOLEAN disable_all, uint64_t new_state,
-                                                ULONG buffer_length, uint64_t previous_state, ULONG previous_state_length,
-                                                emulator_object<ULONG> return_length);
+                                                ULONG previous_state_length, uint64_t previous_state, emulator_object<ULONG> return_length);
         NTSTATUS handle_NtQuerySecurityPolicy();
         NTSTATUS handle_NtFlushInstructionCache(const syscall_context& c, handle process_handle, emulator_object<uint64_t> base_address,
                                                 uint64_t region_size);
