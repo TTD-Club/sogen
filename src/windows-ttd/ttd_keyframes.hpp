@@ -119,4 +119,13 @@ namespace sogen::ttd
         void release(const keyframe& frame);
         void enforce_budget(uint64_t keep);
     };
+
+    class trace;
+
+    // The states that replays of `recorded` reached, for later seeks to restore; created on first use. Part of
+    // windows-ttd, not of the reader: a reader-only build that calls it does not compile.
+    keyframe_store& keyframes(const trace& recorded);
+
+    // Makes `reader` use (and add to) the keyframes of `other`, another reader of the same file.
+    void share_keyframes(trace& reader, const trace& other);
 }

@@ -585,11 +585,11 @@ namespace sogen::py
                     "interrupted() returning True stops it with OperationCancelled (keyframes kept so far stay); "
                     "progress(done, total) reports instructions replayed")
                 .def_prop_rw(
-                    "keyframe_budget", [](const ttd_trace& self) { return self.native().keyframes().memory_budget(); },
-                    [](const ttd_trace& self, const size_t budget) { self.native().keyframes().set_memory_budget(budget); },
+                    "keyframe_budget", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).memory_budget(); },
+                    [](const ttd_trace& self, const size_t budget) { sogen::ttd::keyframes(self.native()).set_memory_budget(budget); },
                     "Bytes of memory the keyframes of seeks may use; the least recently used are dropped beyond it")
-                .def_prop_ro("keyframe_count", [](const ttd_trace& self) { return self.native().keyframes().size(); })
-                .def_prop_ro("keyframe_memory", [](const ttd_trace& self) { return self.native().keyframes().memory_usage(); })
+                .def_prop_ro("keyframe_count", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).size(); })
+                .def_prop_ro("keyframe_memory", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).memory_usage(); })
                 .def_prop_ro("instruction_count", [](const ttd_trace& self) { return self.native().metadata().instruction_count; })
                 .def_prop_ro("event_count", [](const ttd_trace& self) { return self.native().metadata().event_count; })
                 .def_prop_ro("access_mask", [](const ttd_trace& self) { return static_cast<access_kind>(self.native().access_mask()); })

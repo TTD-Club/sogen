@@ -205,9 +205,10 @@ namespace sogen::ttd
 
         std::optional<std::string_view> manifest_value(std::string_view key) const;
 
-        // Identifies this recording: 32 hex digits that differ between any two recordings (also of the same program)
-        // and stay with the file when it is moved or copied. Recordings store a random id (manifest key "trace_id");
-        // for older ones it is a hash of the file's header and tables, prefixed "h".
+        // Identifies this recording: ASCII that differs between any two recordings (also of the same program) and stays
+        // with the file when it is moved or copied, at most 33 characters. Recordings store a random id of 32 hex digits
+        // (manifest key "trace_id"); for older ones it is "h" and 32 hex digits of a hash of the file's header and
+        // tables, 33 characters.
         const std::string& id() const
         {
             return id_;
@@ -340,12 +341,12 @@ namespace sogen::ttd
         uint64_t checkpoint_step_for(uint64_t step) const;
         checkpoint_state checkpoint_for_step(uint64_t step);
 
-        // States that replays of this trace reached, for later seeks to restore. Defined by windows-ttd (with the
-        // emulator), not by the reader.
-        keyframe_store& keyframes();
-
-        // Makes this reader use (and add to) the keyframes of another reader of the same file. Defined by windows-ttd.
-        void share_keyframes(const trace& other);
+        // Where windows-ttd keeps the states replays of this trace reached (null until first used): see keyframes() and
+        // share_keyframes() in ttd_keyframes.hpp, which need the emulator. The reader only holds the pointer.
+        std::shared_ptr<keyframe_store>& keyframes_slot() const
+        {
+            return keyframes_;
+        }
 
         const std::filesystem::path& path() const
         {
@@ -423,7 +424,6 @@ namespace sogen::ttd
         std::string id_{};
         // Created on first use by keyframes() (windows-ttd), so the reader does not need keyframe_store.
         mutable std::shared_ptr<keyframe_store> keyframes_{};
-        std::shared_ptr<keyframe_store>& keyframes_slot() const;
 
         uint64_t legacy_event_offset_{};
         uint64_t legacy_event_size_{};

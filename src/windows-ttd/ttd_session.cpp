@@ -474,12 +474,12 @@ namespace sogen::ttd
     {
         require_deterministic(win_emu);
         check_manifest(win_emu, recorded);
-        auto& keyframes = recorded.keyframes();
+        auto& store = keyframes(recorded);
         const auto checkpoint_step = recorded.checkpoint_step_for(position);
         auto from = checkpoint_step;
         auto exact = true;
         // A strict seek must check every input from the checkpoint on, so it starts only from exact keyframes.
-        if (const auto keyframe = keyframes.restore_latest(win_emu, checkpoint_step, position, strict))
+        if (const auto keyframe = store.restore_latest(win_emu, checkpoint_step, position, strict))
         {
             std::tie(from, exact) = *keyframe;
         }
@@ -487,7 +487,7 @@ namespace sogen::ttd
         {
             snapshot::load_emulator_state(win_emu, *recorded.checkpoint_for_step(position).state);
         }
-        return replay_range(win_emu, recorded, from, position, strict, from == checkpoint_step, &keyframes, exact, false, control);
+        return replay_range(win_emu, recorded, from, position, strict, from == checkpoint_step, &store, exact, false, control);
     }
 
     void prepare_keyframes(trace& recorded, const std::span<windows_emulator* const> emulators, const operation_control& control)
@@ -536,10 +536,11 @@ namespace sogen::ttd
                 try
                 {
                     trace reader(recorded.path());
-                    reader.share_keyframes(recorded);
+                    share_keyframes(reader, recorded);
                     snapshot::load_emulator_state(*emulator, *reader.checkpoint_for_step(first).state);
-                    reader.keyframes().capture(*emulator, true);
-                    replay_range(*emulator, reader, first, last, false, true, &reader.keyframes(), true, true, worker_control);
+                    auto& store = keyframes(reader);
+                    store.capture(*emulator, true);
+                    replay_range(*emulator, reader, first, last, false, true, &store, true, true, worker_control);
                 }
                 catch (...)
                 {

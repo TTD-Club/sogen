@@ -15,25 +15,29 @@ namespace sogen::ttd
 {
     // The reader holds its keyframe store by pointer only (it does not depend on the emulator); it is created here, on
     // first use. Readers of one trace on several threads (prepare_keyframes) share one store, so creation is locked.
-    std::shared_ptr<keyframe_store>& trace::keyframes_slot() const
+    namespace
     {
-        static std::mutex creation{};
-        const std::scoped_lock lock{creation};
-        if (!keyframes_)
+        std::shared_ptr<keyframe_store>& created_keyframes(const trace& recorded)
         {
-            keyframes_ = std::make_shared<keyframe_store>(default_keyframe_budget);
+            static std::mutex creation{};
+            const std::scoped_lock lock{creation};
+            auto& slot = recorded.keyframes_slot();
+            if (!slot)
+            {
+                slot = std::make_shared<keyframe_store>(default_keyframe_budget);
+            }
+            return slot;
         }
-        return keyframes_;
     }
 
-    keyframe_store& trace::keyframes()
+    keyframe_store& keyframes(const trace& recorded)
     {
-        return *keyframes_slot();
+        return *created_keyframes(recorded);
     }
 
-    void trace::share_keyframes(const trace& other)
+    void share_keyframes(trace& reader, const trace& other)
     {
-        keyframes_ = other.keyframes_slot();
+        reader.keyframes_slot() = created_keyframes(other);
     }
 
     keyframe_store::keyframe_store(const size_t memory_budget)

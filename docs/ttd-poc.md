@@ -143,7 +143,10 @@ recorded window input.
 | `windows-ttd-view` | `ttd_view.hpp` | the reader, `emulator`, `unicorn-emulator` | `ttd::cpu_view` (`Trace.cpu_at`): registers at a position on a standalone Unicorn CPU |
 | `windows-ttd` | `ttd_record.hpp`, `ttd_session.hpp`, scans | both, `windows-emulator` | recording, replay (`seek`, `run_to`, `replay_to_end`), keyframes, replay scans |
 
-`trace::keyframes()` and `share_keyframes()` are declared with the reader but defined by `windows-ttd`.
+`ttd::keyframes(trace)` and `ttd::share_keyframes(reader, other)` are free functions of `windows-ttd`
+(`ttd_keyframes.hpp`, included by `ttd_session.hpp`), so a reader-only build that calls them fails to compile; the
+reader only holds the store's pointer (`trace::keyframes_slot`). A `trace` is not thread-safe (one file stream,
+caches, the view's CPU): open one per thread or cursor, which reads only the tables (about 25 ms for a 189 MB trace).
 `src/windows-ttd/inspect` (`ttd-inspect TRACE [exceptions | calls-to ADDRESS | branches ADDRESS SIZE [jumps]]`)
 is a reader-only consumer. The long operations take a `ttd::operation_control`: `interrupted()` returning true
 makes them throw `ttd::operation_cancelled`, and `progress(done, total)` reports work done; both run on the
@@ -540,7 +543,8 @@ version. The library reads versions 1-4 and 7-8 (`ttd::is_supported_trace_versio
 `ttd::trace_file_version` recognize any version from the first 8 bytes. A file of a
 supported version with sections this build does not know opens without them.
 Since the trace id, the manifest also holds `trace_id`, 32 random hex digits per
-recording (`Trace.id`; older traces get `h` and a hash of their header and tables). Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
+recording (`Trace.id`; older traces get `h` and 32 hex digits of a hash of their header and tables, 33
+characters). Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
 write. An event chunk is one zstd frame holding `event_count`, eight stream
 sizes, and the streams. Each stream predicts from earlier events of the same
 chunk only, so a chunk decodes on its own given the code table and the bulk
