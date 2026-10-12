@@ -967,6 +967,12 @@ namespace sogen
             return success;
         }
 
+// GCC 13 reports the value-initialized analysis_options' std::set members as maybe used uninitialized once CLI11's
+// option setup is inlined into run_main.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
         int run_main(int argc, char** argv)
         {
 #ifndef _WIN32
@@ -1176,6 +1182,9 @@ namespace sogen
 
             return 1;
         }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     }
 
     int windows_main(const int argc, char** argv)

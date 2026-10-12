@@ -114,29 +114,6 @@ namespace sogen::ttd
             return classify_branch(std::span(execute.payload).first(size));
         }
 
-        // A checkpoint delta's zstd reference is its base state followed by the bulk blocks recorded in between. This
-        // returns that concatenation, or nothing when those blocks are empty and the base state alone is the reference.
-        std::vector<std::byte> extended_reference(const std::span<const std::byte> base, const std::span<const bulk_block> between)
-        {
-            size_t bulk_size = 0;
-            for (const auto& block : between)
-            {
-                bulk_size += block->size();
-            }
-            if (!bulk_size)
-            {
-                return {};
-            }
-            std::vector<std::byte> reference{};
-            reference.reserve(base.size() + bulk_size);
-            reference.insert(reference.end(), base.begin(), base.end());
-            for (const auto& block : between)
-            {
-                reference.insert(reference.end(), block->begin(), block->end());
-            }
-            return reference;
-        }
-
         // Versions 1-4 stored every event as a fixed-size record, followed by full checkpoint snapshots and a
         // per-event page index. They remain readable.
         struct v1_header

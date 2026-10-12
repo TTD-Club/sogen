@@ -25,8 +25,14 @@ namespace sogen::gpu_bridge::marshal
 
         void bytes(const void* data, size_t size)
         {
-            const auto* begin = static_cast<const std::byte*>(data);
-            this->out_.insert(this->out_.end(), begin, begin + size);
+            if (!size)
+            {
+                return;
+            }
+            // Not a range insert: GCC 13 reports bounds it cannot prove for one inlined from a string literal.
+            const auto offset = this->out_.size();
+            this->out_.resize(offset + size);
+            std::memcpy(this->out_.data() + offset, data, size);
         }
 
         template <typename T>
