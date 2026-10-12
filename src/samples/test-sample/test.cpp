@@ -622,6 +622,70 @@ namespace
         return values;
     }
 
+    // Registry values and keys can be deleted (a key only without sub keys), and a hive's root key opens.
+    bool test_registry_deletion()
+    {
+        HKEY root{};
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE", 0, KEY_READ, &root) != ERROR_SUCCESS)
+        {
+            puts("Opening HKLM\\SOFTWARE failed");
+            return false;
+        }
+        RegCloseKey(root);
+
+        const auto parent_name = L"Software\\SogenDeletion" + std::to_wstring(GetCurrentProcessId());
+        const auto child_name = parent_name + L"\\Child";
+        HKEY child{};
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, child_name.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &child, nullptr) !=
+            ERROR_SUCCESS)
+        {
+            return false;
+        }
+
+        constexpr DWORD value = 42;
+        DWORD size = sizeof(value);
+        const auto value_deleted =
+            RegSetValueExW(child, L"Value", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), size) == ERROR_SUCCESS &&
+            RegDeleteValueW(child, L"Value") == ERROR_SUCCESS &&
+            RegQueryValueExW(child, L"Value", nullptr, nullptr, nullptr, &size) == ERROR_FILE_NOT_FOUND &&
+            RegDeleteValueW(child, L"Value") == ERROR_FILE_NOT_FOUND;
+        RegCloseKey(child);
+
+        // The parent still has its child; deleting the child first works, and the parent goes after.
+        const auto parent_refused = RegDeleteKeyW(HKEY_CURRENT_USER, parent_name.c_str()) != ERROR_SUCCESS;
+        const auto child_deleted = RegDeleteKeyW(HKEY_CURRENT_USER, child_name.c_str()) == ERROR_SUCCESS;
+        const auto parent_deleted = RegDeleteKeyW(HKEY_CURRENT_USER, parent_name.c_str()) == ERROR_SUCCESS;
+        HKEY gone{};
+        const auto parent_gone = RegOpenKeyExW(HKEY_CURRENT_USER, parent_name.c_str(), 0, KEY_READ, &gone) == ERROR_FILE_NOT_FOUND;
+
+        if (!value_deleted || !parent_refused || !child_deleted || !parent_deleted || !parent_gone)
+        {
+            printf("Registry deletion: value %d, parent refused %d, child %d, parent %d, gone %d\n", value_deleted, parent_refused,
+                   child_deleted, parent_deleted, parent_gone);
+            return false;
+        }
+
+        return true;
+    }
+
+    // Case mapping covers more than ASCII.
+    bool test_case_mapping()
+    {
+        // A-diaeresis, L-stroke and Psi, as code units (the source is not read as UTF-8).
+        constexpr std::array<wchar_t, 3> upper{0x00C4, 0x0141, 0x03A8};
+        constexpr std::array<wchar_t, 3> expected{0x00E4, 0x0142, 0x03C8};
+        std::array<wchar_t, 8> lower{};
+        const auto length = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, upper.data(), static_cast<int>(upper.size()),
+                                          lower.data(), static_cast<int>(lower.size()), nullptr, nullptr, 0);
+        if (length != 3 || !std::equal(expected.begin(), expected.end(), lower.begin()))
+        {
+            printf("Lowercasing beyond ASCII failed: %d %04X %04X %04X (%lu)\n", length, lower[0], lower[1], lower[2], GetLastError());
+            return false;
+        }
+
+        return true;
+    }
+
     bool test_registry()
     {
 #ifdef _WIN64
@@ -3175,6 +3239,8 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_working_directory, "Working Directory")
 #endif
     RUN_TEST(test_registry, "Registry")
+    RUN_TEST(test_registry_deletion, "Registry Deletion")
+    RUN_TEST(test_case_mapping, "Case Mapping")
     RUN_TEST(test_system_info, "System Info")
     RUN_TEST(test_monitor_info, "Monitor Info")
     RUN_TEST(test_time_zone, "Time Zone")

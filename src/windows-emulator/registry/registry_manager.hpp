@@ -130,6 +130,10 @@ namespace sogen
         std::optional<registry_value> get_value(const registry_key& key, size_t index);
         size_t get_value_count(const registry_key& key);
         void set_value(const registry_key& key, std::string name, uint32_t type, std::span<const std::byte> data);
+        // Deletes a value; false if the key has no value of that name.
+        bool delete_value(const registry_key& key, std::string_view name);
+        // Deletes a key, which must have no sub keys (the caller checks).
+        void delete_key(const registry_key& key);
 
         std::optional<std::string_view> get_sub_key_name(const registry_key& key, size_t index);
         size_t get_sub_key_count(const registry_key& key);
@@ -145,37 +149,62 @@ namespace sogen
         {
             uint32_t type{};
             std::vector<std::byte> data{};
+            // A deleted value, hiding the hive's value of that name.
+            bool deleted{};
 
             void serialize(utils::buffer_serializer& buffer) const
             {
                 buffer.write(this->type);
                 buffer.write_vector(this->data);
+                buffer.write(this->deleted);
             }
 
             void deserialize(utils::buffer_deserializer& buffer)
             {
                 buffer.read(this->type);
                 buffer.read_vector(this->data);
+                buffer.read(this->deleted);
             }
         };
 
+        // Changes to a key over its hive: sub keys created (true) or deleted (false), values set or deleted.
         struct overlay_bucket
         {
             utils::insensitive_string_map<bool> sub_keys{};
             utils::insensitive_string_map<overlay_value> values{};
+            // The key was deleted.
+            bool deleted{};
+            // The key was deleted (and maybe created again): the hive's values and sub keys are gone.
+            bool hide_hive{};
+
+            // Whether enumerations must merge this bucket with the hive name by name.
+            bool has_tombstones() const
+            {
+                return this->hide_hive || std::ranges::any_of(this->sub_keys, [](const auto& entry) { return !entry.second; }) ||
+                       std::ranges::any_of(this->values, [](const auto& entry) { return entry.second.deleted; });
+            }
 
             void serialize(utils::buffer_serializer& buffer) const
             {
                 buffer.write_map(this->sub_keys);
                 buffer.write_map(this->values);
+                buffer.write(this->deleted);
+                buffer.write(this->hide_hive);
             }
 
             void deserialize(utils::buffer_deserializer& buffer)
             {
                 buffer.read_map(this->sub_keys);
                 buffer.read_map(this->values);
+                buffer.read(this->deleted);
+                buffer.read(this->hide_hive);
             }
         };
+
+        // Names of a key's values or sub keys, the hive's merged with the overlay's, for keys with tombstones.
+        // The views point into the hive and the bucket.
+        std::vector<std::string_view> merged_value_names(const registry_key& key, const overlay_bucket& bucket);
+        std::vector<std::string_view> merged_sub_key_names(const registry_key& key, const overlay_bucket& bucket);
 
         std::filesystem::path hive_path_{};
         hive_map hives_{};

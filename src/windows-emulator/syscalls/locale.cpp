@@ -167,9 +167,14 @@ namespace sogen
                                            emulator_pointer /*context_data*/, const emulator_object<uint64_t> section_pointer,
                                            const emulator_object<ULONG> section_size)
         {
-            if (section_type == 11)
+            // 11: code page section_data (C_<n>.NLS), 14: the Unicode casing table (l_intl.nls) kernelbase uses when the
+            // PEB's UseCaseMapping is set.
+            constexpr ULONG code_page_section = 11;
+            constexpr ULONG casing_section = 14;
+            if (section_type == code_page_section || section_type == casing_section)
             {
-                const auto file_path = R"(C:\Windows\System32\C_)" + std::to_string(section_data) + ".NLS";
+                const auto file_path = section_type == casing_section ? std::string(R"(C:\Windows\System32\l_intl.nls)")
+                                                                      : R"(C:\Windows\System32\C_)" + std::to_string(section_data) + ".NLS";
                 const auto locale_file = utils::io::read_file(c.win_emu.file_sys.translate(file_path));
                 if (locale_file.empty())
                 {

@@ -139,8 +139,8 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            if (info_class == ThreadSchedulerSharedDataSlot || info_class == ThreadBasePriority || info_class == ThreadAffinityMask ||
-                info_class == ThreadPriorityBoost || info_class == ThreadEnableAlignmentFaultFixup)
+            if (info_class == ThreadSchedulerSharedDataSlot || info_class == ThreadPriority || info_class == ThreadBasePriority ||
+                info_class == ThreadAffinityMask || info_class == ThreadPriorityBoost || info_class == ThreadEnableAlignmentFaultFixup)
             {
                 return STATUS_SUCCESS;
             }

@@ -506,8 +506,9 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        // Deletions are kept in the registry overlay (the hives stay read-only).
         NTSTATUS handle_NtDeleteValueKey(const syscall_context& c, const handle key_handle,
-                                         const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> /*value_name*/)
+                                         const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> value_name)
         {
             const auto* key = c.proc.registry_keys.get(key_handle);
             if (!key)
@@ -515,9 +516,27 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
-            // Deleting registry values is not supported; the backing hives are read-only and the
-            // overlay has no tombstone concept. Reject the deletion instead of silently succeeding.
-            return STATUS_ACCESS_DENIED;
+            const auto name = value_name.value() ? u16_to_u8(read_unicode_string(c.emu, value_name)) : std::string{};
+            return c.win_emu.registry.delete_value(*key, name) ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+
+        NTSTATUS handle_NtDeleteKey(const syscall_context& c, const handle key_handle)
+        {
+            const auto* key = c.proc.registry_keys.get(key_handle);
+            if (!key)
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+
+            // A key with sub keys cannot be deleted (RegDeleteTree deletes them first).
+            constexpr auto status_cannot_delete = static_cast<NTSTATUS>(0xC0000121);
+            if (key->path.get().empty() || c.win_emu.registry.get_sub_key_count(*key) != 0)
+            {
+                return status_cannot_delete;
+            }
+
+            c.win_emu.registry.delete_key(*key);
+            return STATUS_SUCCESS;
         }
 
         NTSTATUS handle_NtNotifyChangeKey()
