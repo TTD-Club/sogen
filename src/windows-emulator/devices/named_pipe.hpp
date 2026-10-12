@@ -1,5 +1,6 @@
 #pragma once
 #include "../io_device.hpp"
+#include "../windows_emulator.hpp"
 
 namespace sogen
 {
@@ -24,14 +25,51 @@ namespace sogen
         ULONG completion_mode;
     };
 
+    constexpr ULONG FILE_PIPE_MESSAGE_MODE_VALUE = 1;
+    constexpr ULONG FILE_PIPE_COMPLETE_OPERATION_VALUE = 1;
+
+    // An overlapped read waiting for data: the read goes to output_buffer/output_buffer_length, and its completion
+    // APC (ReadFileEx) to the thread that issued it.
+    struct pending_pipe_read
+    {
+        io_device_context context;
+        uint32_t thread_id{};
+
+        pending_pipe_read(memory_interface& emu)
+            : context(emu)
+        {
+        }
+
+        pending_pipe_read(utils::buffer_deserializer& buffer)
+            : context(buffer)
+        {
+        }
+
+        void serialize(utils::buffer_serializer& buffer) const
+        {
+            buffer.write(this->context);
+            buffer.write(this->thread_id);
+        }
+
+        void deserialize(utils::buffer_deserializer& buffer)
+        {
+            buffer.read(this->context);
+            buffer.read(this->thread_id);
+        }
+    };
+
     // One end of a pipe. The two ends of a pipe instance share `instance` (0: no instance, e.g. the
     // \Device\NamedPipe\ root a CreatePipe opens first); what one end writes waits in the other end's read_queue.
     class named_pipe : public io_device
     {
       public:
         std::u16string name;
-        // Data written by the other end, not read yet.
+        // Data written by the other end, not read yet, one entry per write.
         std::deque<std::string> read_queue;
+        // Overlapped reads waiting for data, oldest first. Reads through a synchronous handle wait in their thread.
+        std::vector<pending_pipe_read> pending_reads;
+        // Opened for synchronous I/O (FILE_SYNCHRONOUS_IO_*): a read that has to wait blocks its thread.
+        bool synchronous{};
         uint64_t instance{};
         // The end NtCreateNamedPipeFile created, as opposed to a client that opened it.
         bool server{};
@@ -50,8 +88,55 @@ namespace sogen
         {
         }
 
-        void work(windows_emulator&) override
+        // Completes the overlapped reads that can complete.
+        void work(windows_emulator& win_emu) override;
+
+        bool cancel_io(windows_emulator& win_emu, uint64_t io_status_block) override;
+
+        // Takes up to `length` bytes of what the other end wrote: in message mode the rest of the oldest message (sets
+        // `more` when it does not fit), in byte mode as much as is queued.
+        std::string take(size_t length, bool& more)
         {
+            std::string data{};
+            more = false;
+            if (this->read_queue.empty())
+            {
+                return data;
+            }
+
+            if (this->read_mode == FILE_PIPE_MESSAGE_MODE_VALUE)
+            {
+                auto& message = this->read_queue.front();
+                data = message.substr(0, length);
+                more = data.size() < message.size();
+                if (more)
+                {
+                    message.erase(0, data.size());
+                }
+                else
+                {
+                    this->read_queue.pop_front();
+                }
+
+                return data;
+            }
+
+            while (!this->read_queue.empty() && data.size() < length)
+            {
+                auto& chunk = this->read_queue.front();
+                const auto count = std::min(chunk.size(), length - data.size());
+                data.append(chunk, 0, count);
+                if (count == chunk.size())
+                {
+                    this->read_queue.pop_front();
+                }
+                else
+                {
+                    chunk.erase(0, count);
+                }
+            }
+
+            return data;
         }
 
         NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& c) override
@@ -73,6 +158,8 @@ namespace sogen
             {
                 buffer.write_string(chunk);
             }
+            buffer.write_vector(this->pending_reads);
+            buffer.write(this->synchronous);
             buffer.write(this->instance);
             buffer.write(this->server);
             buffer.write(this->anonymous);
@@ -95,6 +182,8 @@ namespace sogen
             {
                 buffer.read_string(this->read_queue.emplace_back());
             }
+            buffer.read_vector(this->pending_reads);
+            buffer.read(this->synchronous);
             buffer.read(this->instance);
             buffer.read(this->server);
             buffer.read(this->anonymous);
@@ -158,5 +247,24 @@ namespace sogen
             return available > data.size() ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
         }
     };
+
+    // The end of pipe instance `instance` that is (or is not) the server, if it is open.
+    named_pipe* find_pipe_end(process_context& process, uint64_t instance, bool server);
+
+    inline named_pipe* find_pipe_peer(process_context& process, const named_pipe& end)
+    {
+        return find_pipe_end(process, end.instance, !end.server);
+    }
+
+    // A read of up to `length` bytes into `buffer`, if it can complete now: STATUS_SUCCESS with what the other end
+    // wrote (STATUS_BUFFER_OVERFLOW for part of a message), STATUS_PIPE_BROKEN when nothing is left and the other end
+    // is closed. Writes the I/O status block when it completes. Nothing while the read has to wait.
+    std::optional<NTSTATUS> read_pipe(windows_emulator& win_emu, named_pipe& pipe, uint64_t buffer, ULONG length,
+                                      emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block);
+
+    // Reports a completed pipe request: signals its event, posts it to the completion port (always when it had
+    // pended, otherwise on success unless the handle skips that), and queues its APC on thread `thread_id`.
+    void complete_pipe_io(windows_emulator& win_emu, const io_device_context& request, uint32_t thread_id, NTSTATUS status,
+                          uint64_t information, bool pended);
 
 } // namespace sogen

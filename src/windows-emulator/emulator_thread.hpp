@@ -201,6 +201,31 @@ namespace sogen
         }
     };
 
+    // A read of an empty pipe through a synchronous handle, waiting for data or for the other end to close.
+    struct pending_pipe_read_wait
+    {
+        handle file_handle{};
+        emulator_pointer data{};
+        ULONG length{};
+        emulator_pointer io_status_block{};
+
+        void serialize(utils::buffer_serializer& buffer) const
+        {
+            buffer.write(this->file_handle);
+            buffer.write(this->data);
+            buffer.write(this->length);
+            buffer.write(this->io_status_block);
+        }
+
+        void deserialize(utils::buffer_deserializer& buffer)
+        {
+            buffer.read(this->file_handle);
+            buffer.read(this->data);
+            buffer.read(this->length);
+            buffer.read(this->io_status_block);
+        }
+    };
+
     enum class callback_id : uint32_t
     {
         Invalid = 0,
@@ -376,6 +401,7 @@ namespace sogen
         std::optional<pending_msg> await_msg{};
         std::optional<DWORD> await_msg_mask{};
         std::optional<pending_io_completion_wait> await_io_completion{};
+        std::optional<pending_pipe_read_wait> await_pipe_read{};
 
         // When set, the thread is parked until this host-side predicate returns true. Used by the GPU
         // bridge to wait on a Vulkan semaphore cooperatively (other guest threads run while the GPU works)
@@ -509,6 +535,7 @@ namespace sogen
             buffer.write_optional(this->await_msg);
             buffer.write_optional(this->await_msg_mask);
             buffer.write_optional(this->await_io_completion);
+            buffer.write_optional(this->await_pipe_read);
 
             buffer.write(this->apc_alertable);
             buffer.write_vector(this->pending_apcs);
@@ -580,6 +607,7 @@ namespace sogen
             buffer.read_optional(this->await_msg, [this] { return pending_msg{*this->memory_ptr}; });
             buffer.read_optional(this->await_msg_mask);
             buffer.read_optional(this->await_io_completion, [] { return pending_io_completion_wait{}; });
+            buffer.read_optional(this->await_pipe_read, [] { return pending_pipe_read_wait{}; });
 
             buffer.read(this->apc_alertable);
             buffer.read_vector(this->pending_apcs);

@@ -105,31 +105,6 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            // The end of pipe instance `instance` that is (or is not) the server, if it is open.
-            named_pipe* find_pipe_end(process_context& process, const uint64_t instance, const bool server)
-            {
-                if (!instance)
-                {
-                    return nullptr;
-                }
-
-                for (auto& container : process.devices | std::views::values)
-                {
-                    auto* pipe = container.get_internal_device<named_pipe>();
-                    if (pipe && pipe->instance == instance && pipe->server == server)
-                    {
-                        return pipe;
-                    }
-                }
-
-                return nullptr;
-            }
-
-            named_pipe* find_pipe_peer(process_context& process, const named_pipe& end)
-            {
-                return find_pipe_end(process, end.instance, !end.server);
-            }
-
             // A pipe's name without the \Device\NamedPipe\ or \??\pipe\ prefix, lower case; empty for the prefix itself.
             std::u16string pipe_short_name(const std::u16string_view path)
             {
@@ -273,8 +248,8 @@ namespace sogen
                         device->set_completion_notification_flags(c.emu.read_memory<ULONG>(file_information));
                     }
 
-                    // Reads of an empty pipe already return STATUS_PIPE_EMPTY at once, so the completion mode is kept
-                    // for queries only.
+                    // The completion mode decides whether a read of an empty pipe waits (PIPE_WAIT) or returns
+                    // STATUS_PIPE_EMPTY (PIPE_NOWAIT).
                     if (auto* pipe = device->get_internal_device<named_pipe>(); pipe && info_class == FilePipeInformation)
                     {
                         if (length < sizeof(file_pipe_information))
@@ -1576,28 +1551,57 @@ namespace sogen
             {
                 if (auto* pipe = container->get_internal_device<named_pipe>())
                 {
-                    if (!pipe->read_queue.empty())
+                    if (auto* e = c.proc.events.get(event))
                     {
-                        std::string_view data = pipe->read_queue.front();
-                        const size_t to_copy = std::min<size_t>(data.size(), length);
+                        e->signaled = false;
+                    }
 
-                        commit_file_data(data.substr(0, to_copy), c.emu, io_status_block, buffer);
+                    pending_pipe_read read{c.emu};
+                    read.thread_id = c.thread().id;
+                    auto& request = read.context;
+                    request.event.bits = event;
+                    request.apc_routine = apc_routine;
+                    request.apc_context = apc_context;
+                    request.io_status_block = io_status_block;
+                    request.output_buffer = buffer;
+                    request.output_buffer_length = length;
+                    request = container->prepare_io_context(request);
 
-                        if (to_copy == data.size())
-                        {
-                            pipe->read_queue.pop_front();
-                        }
-                        else
-                        {
-                            pipe->read_queue.front().erase(0, to_copy);
-                        }
+                    // Reads complete in order: one that finds earlier reads waiting waits behind them.
+                    if (const auto status =
+                            pipe->pending_reads.empty() ? read_pipe(c.win_emu, *pipe, buffer, length, io_status_block) : std::nullopt)
+                    {
+                        const auto information = io_status_block ? io_status_block.read().Information : 0;
+                        complete_pipe_io(c.win_emu, request, read.thread_id, *status, information, false);
+                        return *status;
+                    }
 
+                    // An empty pipe whose other end is open: PIPE_NOWAIT returns at once, a synchronous handle blocks
+                    // the thread until data arrives or the other end closes, an overlapped read completes then.
+                    if (pipe->completion_mode == FILE_PIPE_COMPLETE_OPERATION_VALUE)
+                    {
+                        return STATUS_PIPE_EMPTY;
+                    }
+
+                    if (pipe->synchronous)
+                    {
+                        auto& t = c.thread();
+                        t.await_pipe_read = pending_pipe_read_wait{
+                            .file_handle = file_handle,
+                            .data = buffer,
+                            .length = length,
+                            .io_status_block = io_status_block.value(),
+                        };
+                        c.win_emu.yield_thread(c.vcpu, false);
                         return STATUS_SUCCESS;
                     }
 
-                    // Nothing left and nobody to write more: the end of the data. Reads of an empty pipe whose other
-                    // end is open do not wait (also in blocking mode).
-                    return pipe->instance && !find_pipe_peer(c.proc, *pipe) ? STATUS_PIPE_BROKEN : STATUS_PIPE_EMPTY;
+                    if (io_status_block)
+                    {
+                        io_status_block.write({.Status = STATUS_PENDING, .Information = 0});
+                    }
+                    pipe->pending_reads.push_back(read);
+                    return STATUS_PENDING;
                 }
             }
 
@@ -1675,8 +1679,8 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtWriteFile(const syscall_context& c, const handle file_handle, const uint64_t /*event*/,
-                                    const uint64_t /*apc_routine*/, const uint64_t /*apc_context*/,
+        NTSTATUS handle_NtWriteFile(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
+                                    const uint64_t apc_context,
                                     const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer,
                                     const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset,
                                     const emulator_object<ULONG> /*key*/)
@@ -1739,6 +1743,14 @@ namespace sogen
                         io_status_block.write(block);
                     }
 
+                    // Writes complete at once, overlapped ones included (the queue has no quota).
+                    io_device_context request{c.emu};
+                    request.event.bits = event;
+                    request.apc_routine = apc_routine;
+                    request.apc_context = apc_context;
+                    request.io_status_block = io_status_block;
+                    complete_pipe_io(c.win_emu, container->prepare_io_context(request), c.thread().id, STATUS_SUCCESS, temp_buffer.size(),
+                                     false);
                     return STATUS_SUCCESS;
                 }
             }
@@ -2040,7 +2052,7 @@ namespace sogen
 
         NTSTATUS handle_named_pipe_create(const syscall_context& c, const emulator_object<handle>& out_handle,
                                           const std::u16string_view filename, const OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>& attributes,
-                                          ACCESS_MASK desired_access)
+                                          ACCESS_MASK desired_access, const ULONG create_options)
         {
             (void)attributes; // This isn't being consumed atm, suppressing errors
 
@@ -2056,6 +2068,7 @@ namespace sogen
             {
                 pipe_device->name = std::u16string(filename);
                 pipe_device->access = desired_access;
+                pipe_device->synchronous = (create_options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
 
                 // A client connects to a server instance of that name that has no client yet.
                 if (const auto short_name = pipe_short_name(filename); !short_name.empty())
@@ -2119,6 +2132,7 @@ namespace sogen
                     pipe_device->instance = root_pipe->server ? root_pipe->instance : 0;
                     pipe_device->anonymous = root_pipe->anonymous;
                     pipe_device->access = desired_access;
+                    pipe_device->synchronous = (create_options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
                     pipe_device->pipe_type = root_pipe->pipe_type;
                     pipe_device->read_mode = root_pipe->read_mode;
                     pipe_device->completion_mode = root_pipe->completion_mode;
@@ -2164,7 +2178,7 @@ namespace sogen
 
             if (is_named_pipe_path(filename))
             {
-                return handle_named_pipe_create(c, file_handle, filename, attributes, desired_access);
+                return handle_named_pipe_create(c, file_handle, filename, attributes, desired_access, create_options);
             }
 
             auto printer = utils::finally([&] {
@@ -2649,7 +2663,6 @@ namespace sogen
 
             (void)share_access;
             (void)create_disposition;
-            (void)create_options;
 
             const auto attributes = object_attributes.read();
             const auto filename = read_unicode_string(c.emu, attributes.ObjectName);
@@ -2677,6 +2690,7 @@ namespace sogen
                 pipe_device->server = true;
                 pipe_device->anonymous = anonymous_pipe;
                 pipe_device->access = desired_access;
+                pipe_device->synchronous = (create_options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
                 pipe_device->pipe_type = named_pipe_type;
                 pipe_device->read_mode = read_mode;
                 pipe_device->completion_mode = completion_mode;

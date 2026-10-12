@@ -5,6 +5,7 @@
 #include "process_context.hpp"
 #include "io_completion_wait.hpp"
 #include "syscall_utils.hpp"
+#include "devices/named_pipe.hpp"
 
 namespace sogen
 {
@@ -765,6 +766,7 @@ namespace sogen
         this->await_msg = {};
         this->await_msg_mask = {};
         this->await_io_completion = {};
+        this->await_pipe_read = {};
         this->await_host_condition = {};
 
         // TODO: Find out if this is correct
@@ -1311,6 +1313,27 @@ namespace sogen
 
             this->mark_as_ready(STATUS_INVALID_PARAMETER);
             return true;
+        }
+
+        if (this->await_pipe_read.has_value())
+        {
+            const auto& wait = *this->await_pipe_read;
+            const auto* container = process.devices.get(wait.file_handle);
+            auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
+            if (!pipe)
+            {
+                this->mark_as_ready(STATUS_CANCELLED);
+                return true;
+            }
+
+            const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block{*this->memory_ptr, wait.io_status_block};
+            if (const auto status = read_pipe(win_emu, *pipe, wait.data, wait.length, io_status_block))
+            {
+                this->mark_as_ready(*status);
+                return true;
+            }
+
+            return false;
         }
 
         if (this->await_msg.has_value())

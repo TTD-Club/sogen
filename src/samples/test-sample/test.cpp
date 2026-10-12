@@ -2295,6 +2295,92 @@ namespace
         return true;
     }
 
+    // A blocking read of an empty pipe waits for the other end to write, and then for it to close; an overlapped read
+    // is pending until the data arrives.
+    bool test_pipe_waits()
+    {
+        HANDLE read_end{};
+        HANDLE write_end{};
+        if (!CreatePipe(&read_end, &write_end, nullptr, 0))
+        {
+            return false;
+        }
+
+        const auto close_read_end = sogen::utils::finally([&] { CloseHandle(read_end); });
+        auto close_write_end = sogen::utils::finally([&] { CloseHandle(write_end); });
+
+        constexpr std::string_view message = "late data";
+        std::atomic_bool wrote{false};
+        // Pauses wait on an event nothing signals (the Python bindings test expects Sleep only with 0 or 1).
+        auto* const never = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        const auto close_never = sogen::utils::finally([&] { CloseHandle(never); });
+        std::thread writer([&] {
+            WaitForSingleObject(never, 50);
+            wrote = true;
+            DWORD written{};
+            WriteFile(write_end, message.data(), static_cast<DWORD>(message.size()), &written, nullptr);
+            WaitForSingleObject(never, 50);
+            close_write_end.cancel();
+            CloseHandle(write_end);
+        });
+
+        std::array<char, 16> buffer{};
+        DWORD transferred{};
+        const auto first = ReadFile(read_end, buffer.data(), static_cast<DWORD>(buffer.size()), &transferred, nullptr);
+        const auto first_was_late = wrote.load();
+        const auto second = ReadFile(read_end, buffer.data(), static_cast<DWORD>(buffer.size()), nullptr, nullptr);
+        const auto second_error = GetLastError();
+        writer.join();
+
+        if (!first || !first_was_late || std::string_view(buffer.data(), transferred) != message)
+        {
+            puts("Blocking pipe read did not wait for the data");
+            return false;
+        }
+        if (second || second_error != ERROR_BROKEN_PIPE)
+        {
+            puts("Blocking pipe read did not wait for the write end to close");
+            return false;
+        }
+
+        const auto name = L"\\\\.\\pipe\\sogen-test-pipe-waits-" + std::to_wstring(GetCurrentProcessId());
+        auto* const server =
+            CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 64, 64, 0, nullptr);
+        if (server == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        const auto close_server = sogen::utils::finally([&] { CloseHandle(server); });
+
+        auto* const client = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (client == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        const auto close_client = sogen::utils::finally([&] { CloseHandle(client); });
+
+        auto* const event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        const auto close_event = sogen::utils::finally([&] { CloseHandle(event); });
+        OVERLAPPED overlapped{};
+        overlapped.hEvent = event;
+        if (ReadFile(server, buffer.data(), static_cast<DWORD>(buffer.size()), nullptr, &overlapped) ||
+            GetLastError() != ERROR_IO_PENDING || WaitForSingleObject(event, 0) != WAIT_TIMEOUT)
+        {
+            puts("Overlapped read of an empty pipe was not pending");
+            return false;
+        }
+
+        DWORD written{};
+        if (!WriteFile(client, message.data(), static_cast<DWORD>(message.size()), &written, nullptr) ||
+            !GetOverlappedResult(server, &overlapped, &transferred, TRUE) || std::string_view(buffer.data(), transferred) != message)
+        {
+            puts("Overlapped pipe read did not complete with the data");
+            return false;
+        }
+
+        return true;
+    }
+
     bool test_directory_name_collision()
     {
         // Several identical instances of this sample may run in one directory at once, so the check uses this
@@ -3012,6 +3098,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_oem_conversion, "OEM Conversion")
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
     RUN_TEST(test_pipe_data, "Pipe Data")
+    RUN_TEST(test_pipe_waits, "Pipe Waits")
     RUN_TEST(test_device_file_types, "Device File Types")
     RUN_TEST(test_file_ids_by_name, "File IDs by Name")
     RUN_TEST(test_directory_name_collision, "Directory Name Collision")
