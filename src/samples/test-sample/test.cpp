@@ -2841,16 +2841,93 @@ namespace
         auto* const first = open_client(name);
         auto* const second = open_client(name);
         const auto second_error = GetLastError();
+        // The pipe allows one instance.
+        auto* const extra = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr);
+        const auto extra_error = GetLastError();
 
+        CloseHandle(extra);
         CloseHandle(second);
         CloseHandle(first);
         CloseHandle(server);
 
         if (missing != INVALID_HANDLE_VALUE || missing_error != ERROR_FILE_NOT_FOUND || first == INVALID_HANDLE_VALUE ||
-            second != INVALID_HANDLE_VALUE || second_error != ERROR_PIPE_BUSY)
+            second != INVALID_HANDLE_VALUE || second_error != ERROR_PIPE_BUSY || extra != INVALID_HANDLE_VALUE ||
+            extra_error != ERROR_PIPE_BUSY)
         {
-            printf("Pipe open: missing error %lu, first ok %d, second error %lu\n", missing_error, first != INVALID_HANDLE_VALUE,
-                   second_error);
+            printf("Pipe open: missing error %lu, first ok %d, second error %lu, extra instance error %lu\n", missing_error,
+                   first != INVALID_HANDLE_VALUE, second_error, extra_error);
+            return false;
+        }
+
+        return true;
+    }
+
+    // ConnectNamedPipe waits for a client (overlapped: pending until one opens the pipe; blocking: in its thread), reports
+    // one that is there already, and DisconnectNamedPipe drops the client so the next one can connect.
+    bool test_pipe_connect()
+    {
+        const auto name = L"\\\\.\\pipe\\sogen-connect-test-" + std::to_wstring(GetCurrentProcessId());
+        const auto open_client = [&] {
+            return CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        };
+
+        auto* const server = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096,
+                                              4096, 0, nullptr);
+        auto* const event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (server == INVALID_HANDLE_VALUE || !event)
+        {
+            return false;
+        }
+
+        OVERLAPPED overlapped{};
+        overlapped.hEvent = event;
+        const auto pending = !ConnectNamedPipe(server, &overlapped) && GetLastError() == ERROR_IO_PENDING;
+        const auto waited_before_client = WaitForSingleObject(event, 0) == WAIT_TIMEOUT;
+        auto* const client = open_client();
+        DWORD transferred{};
+        const auto connected = GetOverlappedResult(server, &overlapped, &transferred, TRUE);
+        overlapped = {};
+        overlapped.hEvent = event;
+        const auto already = !ConnectNamedPipe(server, &overlapped) && GetLastError() == ERROR_PIPE_CONNECTED;
+
+        DWORD count{};
+        const auto client_wrote = WriteFile(client, "ping", 4, &count, nullptr);
+        const auto disconnected = DisconnectNamedPipe(server);
+        const auto write_after_disconnect = WriteFile(client, "ping", 4, &count, nullptr);
+        CloseHandle(client);
+        CloseHandle(event);
+        // The pipe allows one instance: close it before the next one.
+        CloseHandle(server);
+
+        if (!pending || !waited_before_client || !connected || !already || !client_wrote || !disconnected || write_after_disconnect)
+        {
+            printf("Pipe connect: pending %d, waited %d, connected %d, already %d, wrote %d, disconnected %d, write after %d\n", pending,
+                   waited_before_client, connected, already, client_wrote, disconnected, write_after_disconnect);
+            return false;
+        }
+
+        // A blocking ConnectNamedPipe returns once another thread opened the pipe.
+        auto* const blocking = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr);
+        if (blocking == INVALID_HANDLE_VALUE)
+        {
+            printf("Pipe blocking connect: create error %lu\n", GetLastError());
+            return false;
+        }
+
+        HANDLE second_client = INVALID_HANDLE_VALUE;
+        std::thread opener([&] {
+            Sleep(10);
+            second_client = open_client();
+        });
+        const auto blocking_connected = ConnectNamedPipe(blocking, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
+        opener.join();
+        const auto opened = second_client != INVALID_HANDLE_VALUE;
+        CloseHandle(second_client);
+        CloseHandle(blocking);
+
+        if (!blocking_connected || !opened)
+        {
+            printf("Pipe blocking connect: connected %d, opened %d\n", blocking_connected, opened);
             return false;
         }
 
@@ -3713,6 +3790,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_pipe_waits, "Pipe Waits")
     RUN_TEST(test_pipe_quota, "Pipe Quota")
     RUN_TEST(test_pipe_open, "Pipe Open")
+    RUN_TEST(test_pipe_connect, "Pipe Connect")
     RUN_TEST(test_device_file_types, "Device File Types")
     RUN_TEST(test_file_ids_by_name, "File IDs by Name")
     RUN_TEST(test_directory_name_collision, "Directory Name Collision")

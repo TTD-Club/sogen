@@ -201,13 +201,15 @@ namespace sogen
         }
     };
 
-    // A read of an empty pipe through a synchronous handle, waiting for data or for the other end to close.
+    // A read of an empty pipe through a synchronous handle, waiting for data or for the other end to close; or with
+    // `listen`, a ConnectNamedPipe waiting for a client.
     struct pending_pipe_read_wait
     {
         handle file_handle{};
         emulator_pointer data{};
         ULONG length{};
         emulator_pointer io_status_block{};
+        bool listen{};
 
         void serialize(utils::buffer_serializer& buffer) const
         {
@@ -215,6 +217,7 @@ namespace sogen
             buffer.write(this->data);
             buffer.write(this->length);
             buffer.write(this->io_status_block);
+            buffer.write(this->listen);
         }
 
         void deserialize(utils::buffer_deserializer& buffer)
@@ -223,6 +226,7 @@ namespace sogen
             buffer.read(this->data);
             buffer.read(this->length);
             buffer.read(this->io_status_block);
+            buffer.read(this->listen);
         }
     };
 

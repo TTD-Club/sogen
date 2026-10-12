@@ -27,6 +27,12 @@ namespace sogen
             return !is_escaping_relative_path(relative_path);
         }
 
+        // Host mode: guest paths are host paths (apart from mappings), with no emulation root.
+        bool is_host_mode() const
+        {
+            return this->root_.empty();
+        }
+
         std::set<char> list_drives() const
         {
             std::set<char> drives{};

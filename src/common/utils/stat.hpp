@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <vector>
 
 namespace sogen
 {
@@ -32,9 +33,19 @@ namespace sogen
     bool compat_set_file_times(const std::filesystem::path& file_name, std::optional<LARGE_INTEGER> access_time,
                                std::optional<LARGE_INTEGER> write_time);
 
-    // The 8.3 short names the host file system keeps for the entries of a directory that match `pattern` (a name, also
-    // matching short names, or "*") and have one, by entry name (Windows hosts only; empty elsewhere).
-    std::map<std::u16string, std::u16string> compat_short_names(const std::filesystem::path& directory, const std::u16string& pattern);
+    // What the host file system keeps for a directory entry beyond stat: its 8.3 short name and its reparse tag.
+    struct compat_host_entry
+    {
+        std::u16string short_name;
+        uint32_t reparse_tag{};
+    };
+
+    // The entries of a directory that match `pattern` (a name, also matching short names, or "*") and have a short name
+    // or are reparse points, by entry name (Windows hosts only; empty elsewhere).
+    std::map<std::u16string, compat_host_entry> compat_host_entries(const std::filesystem::path& directory, const std::u16string& pattern);
+
+    // The REPARSE_DATA_BUFFER of a host reparse point (Windows hosts only), nothing for other entries.
+    std::optional<std::vector<uint8_t>> compat_reparse_data(const std::filesystem::path& path);
 
     LARGE_INTEGER convert_timespec_to_filetime(timespec timespec);
 } // namespace sogen

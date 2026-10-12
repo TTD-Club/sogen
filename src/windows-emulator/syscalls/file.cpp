@@ -77,8 +77,8 @@ namespace sogen
                 return tag ? ((attributes & ~static_cast<ULONG>(FILE_ATTRIBUTE_NORMAL)) | file_attribute_reparse_point) : attributes;
             }
 
-            // The tag of the reparse point at `path`, 0 for none.
-            ULONG reparse_tag_at(const process_context& process, const std::u16string_view path)
+            // The tag of the reparse point the guest made at `path`, 0 for none.
+            ULONG emulated_reparse_tag_at(const process_context& process, const std::u16string_view path)
             {
                 if (process.reparse_points.empty())
                 {
@@ -87,6 +87,35 @@ namespace sogen
 
                 const auto entry = process.reparse_points.find(reparse_key(path));
                 return entry == process.reparse_points.end() ? 0 : reparse_tag(entry->second);
+            }
+
+            // The REPARSE_DATA_BUFFER of the reparse point at `path`: one the guest made, or in host mode one the host
+            // has (opens through it already follow it on the host). Nothing for other paths.
+            std::optional<std::vector<uint8_t>> reparse_data_at(const syscall_context& c, const std::u16string_view path)
+            {
+                if (const auto entry = c.proc.reparse_points.find(reparse_key(path)); entry != c.proc.reparse_points.end())
+                {
+                    return entry->second;
+                }
+
+                if (!c.win_emu.file_sys.is_host_mode())
+                {
+                    return std::nullopt;
+                }
+
+                return compat_reparse_data(c.win_emu.file_sys.translate(windows_path(path)));
+            }
+
+            // The tag of the reparse point at `path`, 0 for none.
+            ULONG reparse_tag_at(const syscall_context& c, const std::u16string_view path)
+            {
+                if (const auto tag = emulated_reparse_tag_at(c.proc, path); tag || !c.win_emu.file_sys.is_host_mode())
+                {
+                    return tag;
+                }
+
+                const auto data = reparse_data_at(c, path);
+                return data ? reparse_tag(*data) : 0;
             }
 
             // Appends the components of `path` (separated by \ or /) to `parts`, resolving "." and ".." (which stops at the
@@ -881,14 +910,17 @@ namespace sogen
             const auto dir = file_sys.translate(win_path);
             // An exact name (the usual lookup of one file, also by its short name) asks the host for that entry only.
             const auto exact = !file_mask.empty() && file_mask.find_first_of(u"*?<>\"") == std::u16string_view::npos;
-            const auto short_names = compat_short_names(dir, exact ? std::u16string(file_mask) : u"*");
-            const auto make_file_entry = [deterministic_time, &short_names](const std::filesystem::path& file_path,
-                                                                            const std::filesystem::path& host_path,
-                                                                            const bool is_directory) {
+            const auto host_entries = compat_host_entries(dir, exact ? std::u16string(file_mask) : u"*");
+            const auto host_reparse_points = file_sys.is_host_mode();
+            const auto make_file_entry = [deterministic_time, host_reparse_points, &host_entries](const std::filesystem::path& file_path,
+                                                                                                  const std::filesystem::path& host_path,
+                                                                                                  const bool is_directory) {
                 file_entry entry{.file_path = file_path, .is_directory = is_directory};
-                if (const auto short_name = short_names.find(file_path.u16string()); short_name != short_names.end())
+                if (const auto host_entry = host_entries.find(file_path.u16string()); host_entry != host_entries.end())
                 {
-                    entry.short_name = short_name->second;
+                    entry.short_name = host_entry->second.short_name;
+                    // The host's own junctions and links show in host mode (in root mode their targets are host paths).
+                    entry.reparse_tag = host_reparse_points ? host_entry->second.reparse_tag : 0;
                 }
 
                 struct compat_stat file_stat{};
@@ -964,7 +996,10 @@ namespace sogen
                 {
                     for (auto& entry : f->enumeration_state->files)
                     {
-                        entry.reparse_tag = reparse_tag_at(c.proc, f->name + u"\\" + entry.file_path.u16string());
+                        if (const auto tag = emulated_reparse_tag_at(c.proc, f->name + u"\\" + entry.file_path.u16string()))
+                        {
+                            entry.reparse_tag = tag;
+                        }
                     }
                 }
             }
@@ -1234,7 +1269,7 @@ namespace sogen
                 {
                     return ret(STATUS_INVALID_HANDLE);
                 }
-                i.ReparseTag = reparse_tag_at(c.proc, f->name);
+                i.ReparseTag = reparse_tag_at(c, f->name);
                 i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), i.ReparseTag);
 
                 info.write(i);
@@ -1393,7 +1428,7 @@ namespace sogen
                 i.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 i.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 i.ChangeTime = i.LastWriteTime;
-                i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c.proc, f->name));
+                i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c, f->name));
 
                 info.write(i);
 
@@ -1759,7 +1794,7 @@ namespace sogen
                 i.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 i.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 i.ChangeTime = i.LastWriteTime;
-                i.ReparseTag = reparse_tag_at(c.proc, *resolved);
+                i.ReparseTag = reparse_tag_at(c, *resolved);
                 i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), i.ReparseTag);
                 i.NumberOfLinks = file_stat.st_nlink > 0 ? file_stat.st_nlink : 1;
                 i.FileId.QuadPart = static_cast<LONGLONG>(file_stat.st_ino);
@@ -2898,7 +2933,7 @@ namespace sogen
                 info.AllocationSize.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
                 info.EndOfFile.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
                 info.ChangeTime = info.LastWriteTime;
-                info.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c.proc, filename));
+                info.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c, filename));
             });
 
             return STATUS_SUCCESS;
@@ -2972,7 +3007,7 @@ namespace sogen
                 info.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 info.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 info.ChangeTime = info.LastWriteTime;
-                info.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c.proc, filename));
+                info.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c, filename));
             });
 
             return STATUS_SUCCESS;
@@ -3119,6 +3154,28 @@ namespace sogen
             const auto& pipe_name = anonymous_pipe ? root_pipe->name : filename;
             c.win_emu.callbacks.on_generic_access("Creating named pipe", pipe_name);
 
+            // The first instance of a name sets how many it may have (unlimited: -1); one more fails (ERROR_PIPE_BUSY).
+            if (const auto short_name = anonymous_pipe ? std::u16string{} : pipe_short_name(filename); !short_name.empty())
+            {
+                ULONG instances = 0;
+                std::optional<ULONG> limit{};
+                for (auto& entry : c.proc.devices | std::views::values)
+                {
+                    const auto* server = entry.get_internal_device<named_pipe>();
+                    if (server && server->server && !server->anonymous && pipe_short_name(server->name) == short_name)
+                    {
+                        ++instances;
+                        limit = limit.value_or(server->max_instances);
+                    }
+                }
+
+                constexpr auto status_instance_not_available = static_cast<NTSTATUS>(0xC00000AB);
+                if (limit && *limit != std::numeric_limits<ULONG>::max() && instances >= *limit)
+                {
+                    return status_instance_not_available;
+                }
+            }
+
             io_device_creation_data data{};
             io_device_container container{u"NamedPipe", c.win_emu, data};
 
@@ -3223,13 +3280,13 @@ namespace sogen
                 return complete(STATUS_SUCCESS, 0);
             }
             case fsctl_get_reparse_point: {
-                const auto entry = c.proc.reparse_points.find(key);
-                if (entry == c.proc.reparse_points.end())
+                const auto found = reparse_data_at(c, f.name);
+                if (!found)
                 {
                     return complete(STATUS_NOT_A_REPARSE_POINT, 0);
                 }
 
-                const auto& data = entry->second;
+                const auto& data = *found;
                 if (output_buffer_length < header_size)
                 {
                     return complete(STATUS_BUFFER_TOO_SMALL, 0);

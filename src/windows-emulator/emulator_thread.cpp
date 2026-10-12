@@ -1329,6 +1329,21 @@ namespace sogen
             }
 
             const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block{*this->memory_ptr, wait.io_status_block};
+            if (wait.listen)
+            {
+                if (!find_pipe_peer(process, *pipe))
+                {
+                    return false;
+                }
+
+                if (io_status_block)
+                {
+                    io_status_block.write({.Status = STATUS_SUCCESS, .Information = 0});
+                }
+                this->mark_as_ready(STATUS_SUCCESS);
+                return true;
+            }
+
             if (const auto status = read_pipe(win_emu, *pipe, wait.data, wait.length, io_status_block))
             {
                 this->mark_as_ready(*status);

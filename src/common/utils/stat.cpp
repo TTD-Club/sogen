@@ -227,25 +227,34 @@ namespace sogen
 
 #endif
 
-    std::map<std::u16string, std::u16string> compat_short_names(const std::filesystem::path& directory, const std::u16string& pattern)
+    std::map<std::u16string, compat_host_entry> compat_host_entries(const std::filesystem::path& directory, const std::u16string& pattern)
     {
-        std::map<std::u16string, std::u16string> names{};
+        std::map<std::u16string, compat_host_entry> entries{};
 #if defined(_WIN32) && !defined(__MINGW64__)
         WIN32_FIND_DATAW data{};
         auto* const find = FindFirstFileExW((directory / std::filesystem::path(pattern)).c_str(), FindExInfoStandard, &data,
                                             FindExSearchNameMatch, nullptr, 0);
         if (find == INVALID_HANDLE_VALUE)
         {
-            return names;
+            return entries;
         }
 
         do
         {
+            compat_host_entry entry{};
             if (data.cAlternateFileName[0] != L'\0')
             {
-                const std::filesystem::path name{data.cFileName};
-                const std::filesystem::path short_name{data.cAlternateFileName};
-                names.emplace(name.u16string(), short_name.u16string());
+                entry.short_name = std::filesystem::path{data.cAlternateFileName}.u16string();
+            }
+            // FindFirstFile reports a reparse point's tag in dwReserved0.
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            {
+                entry.reparse_tag = data.dwReserved0;
+            }
+
+            if (!entry.short_name.empty() || entry.reparse_tag)
+            {
+                entries.emplace(std::filesystem::path{data.cFileName}.u16string(), std::move(entry));
             }
         } while (FindNextFileW(find, &data));
 
@@ -254,6 +263,42 @@ namespace sogen
         (void)directory;
         (void)pattern;
 #endif
-        return names;
+        return entries;
+    }
+
+    std::optional<std::vector<uint8_t>> compat_reparse_data(const std::filesystem::path& path)
+    {
+#if defined(_WIN32) && !defined(__MINGW64__)
+        const auto attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        {
+            return std::nullopt;
+        }
+
+        auto* const handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                         nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return std::nullopt;
+        }
+
+        // FSCTL_GET_REPARSE_POINT (winioctl.h clashes with the platform headers' CTL_CODE).
+        constexpr DWORD fsctl_get_reparse_point = 0x000900A8;
+        std::vector<uint8_t> data(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+        DWORD returned{};
+        const auto read =
+            DeviceIoControl(handle, fsctl_get_reparse_point, nullptr, 0, data.data(), static_cast<DWORD>(data.size()), &returned, nullptr);
+        CloseHandle(handle);
+        if (!read)
+        {
+            return std::nullopt;
+        }
+
+        data.resize(returned);
+        return data;
+#else
+        (void)path;
+        return std::nullopt;
+#endif
     }
 } // namespace sogen

@@ -8,6 +8,9 @@ namespace sogen
     constexpr ULONG FSCTL_PIPE_PEEK = 0x11400C;
     // FSCTL_PIPE_WAIT = CTL_CODE(FILE_DEVICE_NAMED_PIPE, 6, METHOD_BUFFERED, FILE_ANY_ACCESS), on the \Device\NamedPipe\ root.
     constexpr ULONG FSCTL_PIPE_WAIT = 0x110018;
+    // FSCTL_PIPE_LISTEN (ConnectNamedPipe) and FSCTL_PIPE_DISCONNECT (DisconnectNamedPipe), on a server end.
+    constexpr ULONG FSCTL_PIPE_LISTEN = 0x110008;
+    constexpr ULONG FSCTL_PIPE_DISCONNECT = 0x110004;
     constexpr ULONG FILE_PIPE_CONNECTED_STATE = 3;
 
     // Header of FILE_PIPE_PEEK_BUFFER; the peeked data follows immediately after.
@@ -70,6 +73,8 @@ namespace sogen
         std::deque<std::string> read_queue;
         // Overlapped reads waiting for data, oldest first. Reads through a synchronous handle wait in their thread.
         std::vector<pending_pipe_read> pending_reads;
+        // Overlapped ConnectNamedPipe requests of a server end waiting for a client (the context's buffers are unused).
+        std::vector<pending_pipe_read> pending_listens;
         // Opened for synchronous I/O (FILE_SYNCHRONOUS_IO_*): a read that has to wait blocks its thread.
         bool synchronous{};
         uint64_t instance{};
@@ -164,6 +169,16 @@ namespace sogen
                 return wait(win_emu, c);
             }
 
+            if (c.io_control_code == FSCTL_PIPE_LISTEN)
+            {
+                return this->listen(win_emu, c);
+            }
+
+            if (c.io_control_code == FSCTL_PIPE_DISCONNECT)
+            {
+                return this->disconnect(win_emu);
+            }
+
             win_emu.log.warn("Unsupported named pipe FSCTL: 0x%X\n", static_cast<uint32_t>(c.io_control_code));
             return STATUS_NOT_SUPPORTED;
         }
@@ -177,6 +192,7 @@ namespace sogen
                 buffer.write_string(chunk);
             }
             buffer.write_vector(this->pending_reads);
+            buffer.write_vector(this->pending_listens);
             buffer.write(this->synchronous);
             buffer.write(this->instance);
             buffer.write(this->server);
@@ -201,6 +217,7 @@ namespace sogen
                 buffer.read_string(this->read_queue.emplace_back());
             }
             buffer.read_vector(this->pending_reads);
+            buffer.read_vector(this->pending_listens);
             buffer.read(this->synchronous);
             buffer.read(this->instance);
             buffer.read(this->server);
@@ -218,6 +235,14 @@ namespace sogen
       private:
         // FSCTL_PIPE_WAIT (WaitNamedPipe): whether a server instance of the name has no client yet.
         static NTSTATUS wait(windows_emulator& win_emu, const io_device_context& c);
+
+        // FSCTL_PIPE_LISTEN (ConnectNamedPipe): waits for a client of this server end; at once when one is connected
+        // (STATUS_PIPE_CONNECTED) or the pipe does not wait (PIPE_NOWAIT: STATUS_PIPE_LISTENING).
+        NTSTATUS listen(windows_emulator& win_emu, const io_device_context& c);
+
+        // FSCTL_PIPE_DISCONNECT (DisconnectNamedPipe): drops the client (its end breaks) and what it wrote; the server
+        // end can listen for the next client.
+        NTSTATUS disconnect(windows_emulator& win_emu);
 
         NTSTATUS peek(windows_emulator& win_emu, const io_device_context& c)
         {

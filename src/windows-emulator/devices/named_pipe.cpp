@@ -60,6 +60,65 @@ namespace sogen
         return exists ? status_io_timeout : STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
+    NTSTATUS named_pipe::listen(windows_emulator& win_emu, const io_device_context& c)
+    {
+        if (!this->server || this->anonymous)
+        {
+            return STATUS_ILLEGAL_FUNCTION;
+        }
+
+        if (find_pipe_peer(win_emu.process, *this))
+        {
+            return STATUS_PIPE_CONNECTED;
+        }
+
+        if (this->completion_mode == FILE_PIPE_COMPLETE_OPERATION_VALUE)
+        {
+            return STATUS_PIPE_LISTENING;
+        }
+
+        auto& thread = c.thread();
+        if (this->synchronous)
+        {
+            // Blocks until a client opens the pipe (emulator_thread::is_thread_ready).
+            for (const auto& [id, container] : win_emu.process.devices)
+            {
+                if (container.get_internal_device<named_pipe>() == this)
+                {
+                    thread.await_pipe_read = pending_pipe_read_wait{
+                        .file_handle = win_emu.process.devices.make_handle(id),
+                        .io_status_block = c.io_status_block.value(),
+                        .listen = true,
+                    };
+                    win_emu.yield_thread(*c.vcpu, false);
+                    return STATUS_SUCCESS;
+                }
+            }
+
+            return STATUS_INVALID_HANDLE;
+        }
+
+        pending_pipe_read listen_request{win_emu.emu()};
+        listen_request.context = c;
+        listen_request.thread_id = thread.id;
+        this->pending_listens.push_back(listen_request);
+        return STATUS_PENDING;
+    }
+
+    NTSTATUS named_pipe::disconnect(windows_emulator& win_emu)
+    {
+        if (!this->server || this->anonymous)
+        {
+            return STATUS_ILLEGAL_FUNCTION;
+        }
+
+        // The client keeps the old instance, which no server end has any more: its reads and writes find the pipe
+        // broken. A new client connects to the new one.
+        this->instance = win_emu.process.next_pipe_instance++;
+        this->read_queue.clear();
+        return STATUS_SUCCESS;
+    }
+
     size_t pipe_room(process_context& process, const named_pipe& reader)
     {
         constexpr size_t default_quota = 4096;
@@ -189,6 +248,20 @@ namespace sogen
 
     void named_pipe::work(windows_emulator& win_emu)
     {
+        if (!this->pending_listens.empty() && find_pipe_peer(win_emu.process, *this))
+        {
+            const auto listens = std::move(this->pending_listens);
+            this->pending_listens.clear();
+            for (const auto& listen : listens)
+            {
+                if (listen.context.io_status_block)
+                {
+                    listen.context.io_status_block.write({.Status = STATUS_SUCCESS, .Information = 0});
+                }
+                complete_pipe_io(win_emu, listen.context, listen.thread_id, STATUS_SUCCESS, 0, true);
+            }
+        }
+
         while (!this->pending_reads.empty())
         {
             const auto& read = this->pending_reads.front();
@@ -207,21 +280,24 @@ namespace sogen
 
     bool named_pipe::cancel_io(windows_emulator& win_emu, const uint64_t io_status_block)
     {
-        for (auto it = this->pending_reads.begin(); it != this->pending_reads.end(); ++it)
+        for (auto* requests : {&this->pending_reads, &this->pending_listens})
         {
-            if (it->context.io_status_block.value() != io_status_block)
+            for (auto it = requests->begin(); it != requests->end(); ++it)
             {
-                continue;
-            }
+                if (it->context.io_status_block.value() != io_status_block)
+                {
+                    continue;
+                }
 
-            const auto read = *it;
-            this->pending_reads.erase(it);
-            if (read.context.io_status_block)
-            {
-                read.context.io_status_block.write({.Status = STATUS_CANCELLED, .Information = 0});
+                const auto request = *it;
+                requests->erase(it);
+                if (request.context.io_status_block)
+                {
+                    request.context.io_status_block.write({.Status = STATUS_CANCELLED, .Information = 0});
+                }
+                complete_pipe_io(win_emu, request.context, request.thread_id, STATUS_CANCELLED, 0, true);
+                return true;
             }
-            complete_pipe_io(win_emu, read.context, read.thread_id, STATUS_CANCELLED, 0, true);
-            return true;
         }
 
         return false;
