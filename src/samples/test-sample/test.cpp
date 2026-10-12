@@ -2406,6 +2406,14 @@ namespace
             return false;
         }
 
+        // A directory cannot move below itself.
+        const auto below_itself = directory + L"\\Sub";
+        if (MoveFileW(directory.c_str(), below_itself.c_str()) || GetLastError() != ERROR_INVALID_PARAMETER)
+        {
+            puts("Moved a directory below itself");
+            return false;
+        }
+
         return true;
     }
 

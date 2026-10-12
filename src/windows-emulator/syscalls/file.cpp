@@ -315,6 +315,15 @@ namespace sogen
 
                 c.win_emu.log.warn("--> File rename requested: %s --> %s\n", u16_to_u8(f->name).c_str(), u16_to_u8(new_name).c_str());
 
+                // A directory cannot move below itself. The rename happens when the handle closes, where a host
+                // failure would go unreported, so this is refused now, as Windows refuses it.
+                const windows_path source_path{f->name};
+                const windows_path target_path{new_name};
+                if (target_path != source_path && target_path.relative_to(source_path).has_value())
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
                 std::error_code ec{};
                 bool file_exists = std::filesystem::exists(c.win_emu.file_sys.translate(new_name), ec);
 
