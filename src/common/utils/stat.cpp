@@ -56,7 +56,7 @@ namespace sogen
         stat->st_rdev = 0;
         stat->st_uid = 0;
         stat->st_gid = 0;
-        stat->st_nlink = 1;
+        stat->st_nlink = file_info.nNumberOfLinks;
 
         auto st_mode = (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? _S_IFDIR | _S_IEXEC : _S_IFREG;
         st_mode |= (file_info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? _S_IREAD : _S_IREAD | _S_IWRITE;
@@ -146,7 +146,7 @@ namespace sogen
         dst->st_rdev = 0;
         dst->st_uid = 0;
         dst->st_gid = 0;
-        dst->st_nlink = 1;
+        dst->st_nlink = static_cast<uint32_t>(src->st_nlink);
         dst->st_mode = src->st_mode & (S_IFMT | 0700);
         dst->st_mode |= (src->st_mode & 0700) >> 3;
         dst->st_mode |= (src->st_mode & 0700) >> 6;

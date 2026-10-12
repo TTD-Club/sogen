@@ -1407,7 +1407,9 @@ namespace sogen
                 const emulator_object<FILE_STANDARD_INFORMATION> info{c.emu, address};
                 FILE_STANDARD_INFORMATION i{};
                 i.Directory = f->is_directory() ? TRUE : FALSE;
-                i.NumberOfLinks = 1;
+                // Hard links (CreateHardLink, os.link) count.
+                struct compat_stat link_stat{};
+                i.NumberOfLinks = stat_open_file(*f, link_stat) && link_stat.st_nlink > 0 ? link_stat.st_nlink : 1;
 
                 if (f->handle)
                 {
@@ -1742,7 +1744,7 @@ namespace sogen
                 i.ChangeTime = i.LastWriteTime;
                 i.ReparseTag = reparse_tag_at(c.proc, *resolved);
                 i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), i.ReparseTag);
-                i.NumberOfLinks = 1;
+                i.NumberOfLinks = file_stat.st_nlink > 0 ? file_stat.st_nlink : 1;
                 i.FileId.QuadPart = static_cast<LONGLONG>(file_stat.st_ino);
                 memcpy(&i.FileId128.Identifier[0], &file_stat.st_ino, sizeof(file_stat.st_ino));
                 if (const auto drive = filepath.get_drive())
