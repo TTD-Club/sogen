@@ -15,9 +15,61 @@ namespace sogen
             constexpr uint32_t token_id = 0x1001;
             constexpr uint32_t token_modified_id = 0x1002;
 
-            constexpr std::array<uint8_t, 12> interactive_sid = {
-                0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x04, 0x00, 0x00, 0x00,
+            // SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED.
+            constexpr uint32_t group_enabled = 0x7;
+            constexpr uint32_t group_logon_id = 0xC0000000;
+            // SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED.
+            constexpr uint32_t group_integrity = 0x60;
+
+            // The binary SID S-1-<authority>-<sub authorities>.
+            std::vector<uint8_t> make_sid(const uint8_t authority, const std::initializer_list<uint32_t> sub_authorities)
+            {
+                std::vector<uint8_t> sid{1, static_cast<uint8_t>(sub_authorities.size()), 0, 0, 0, 0, 0, authority};
+                for (const auto sub_authority : sub_authorities)
+                {
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(&sub_authority);
+                    sid.insert(sid.end(), bytes, bytes + sizeof(sub_authority));
+                }
+                return sid;
+            }
+
+            struct token_group
+            {
+                std::vector<uint8_t> sid{};
+                uint32_t attributes{};
             };
+
+            // The groups of a medium-integrity local user's token, in Windows' order: the account domain's None group
+            // (for an S-1-5-21 user), Everyone, BUILTIN\Users, INTERACTIVE, CONSOLE LOGON, Authenticated Users, This
+            // Organization, Local account, the logon session, LOCAL, NTLM Authentication, and the integrity label.
+            std::vector<token_group> token_groups(const process_context& process)
+            {
+                std::vector<token_group> groups{};
+                const auto& user = process.sid;
+                constexpr uint32_t security_nt_non_unique = 21;
+                if (user.size() >= 12 && user[1] >= 2 && user[7] == 5 && user[8] == security_nt_non_unique && user[9] == 0 &&
+                    user[10] == 0 && user[11] == 0)
+                {
+                    // The user's SID with its RID replaced by DOMAIN_GROUP_RID_USERS (513).
+                    auto none_group = user;
+                    constexpr uint32_t domain_group_rid_users = 513;
+                    memcpy(none_group.data() + none_group.size() - sizeof(uint32_t), &domain_group_rid_users, sizeof(uint32_t));
+                    groups.push_back({.sid = std::move(none_group), .attributes = group_enabled});
+                }
+
+                groups.push_back({.sid = make_sid(1, {0}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {32, 545}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {4}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(2, {1}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {11}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {15}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {113}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {5, 0, token_authentication_id}), .attributes = group_enabled | group_logon_id});
+                groups.push_back({.sid = make_sid(2, {0}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {64, 10}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(16, {0x2000}), .attributes = group_integrity});
+                return groups;
+            }
 
             struct token_privilege
             {
@@ -152,8 +204,14 @@ namespace sogen
 
             if (token_information_class == TokenGroups)
             {
-                constexpr auto group_entry_size = sizeof(SID_AND_ATTRIBUTES64);
-                const auto required_size = sizeof(TOKEN_GROUPS64) + group_entry_size + sid.size() + interactive_sid.size();
+                // TOKEN_GROUPS: the count, the SID_AND_ATTRIBUTES entries, then the SIDs they point to.
+                const auto groups = token_groups(c.proc);
+                const auto entries_offset = offsetof(TOKEN_GROUPS64, Groups);
+                auto required_size = entries_offset + groups.size() * sizeof(SID_AND_ATTRIBUTES64);
+                for (const auto& group : groups)
+                {
+                    required_size += group.sid.size();
+                }
                 return_length.write(static_cast<ULONG>(required_size));
 
                 if (required_size > token_information_length)
@@ -161,19 +219,15 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                TOKEN_GROUPS64 groups{};
-                groups.GroupCount = 2;
-                groups.Groups[0].Attributes = 0;
-                groups.Groups[0].Sid = token_information + sizeof(TOKEN_GROUPS64) + group_entry_size;
-
-                SID_AND_ATTRIBUTES64 interactive_group{};
-                interactive_group.Attributes = 0x7; // SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED
-                interactive_group.Sid = groups.Groups[0].Sid + sid.size();
-
-                emulator_object<TOKEN_GROUPS64>{c.emu, token_information}.write(groups);
-                c.emu.write_memory(token_information + sizeof(TOKEN_GROUPS64), interactive_group);
-                c.emu.write_memory(groups.Groups[0].Sid, sid.data(), sid.size());
-                c.emu.write_memory(interactive_group.Sid, interactive_sid);
+                c.emu.write_memory(token_information, static_cast<ULONG>(groups.size()));
+                auto sid_address = token_information + entries_offset + groups.size() * sizeof(SID_AND_ATTRIBUTES64);
+                for (size_t i = 0; i < groups.size(); ++i)
+                {
+                    const SID_AND_ATTRIBUTES64 entry{.Sid = sid_address, .Attributes = groups[i].attributes};
+                    c.emu.write_memory(token_information + entries_offset + i * sizeof(SID_AND_ATTRIBUTES64), entry);
+                    c.emu.write_memory(sid_address, groups[i].sid.data(), groups[i].sid.size());
+                    sid_address += groups[i].sid.size();
+                }
                 return STATUS_SUCCESS;
             }
 
@@ -553,6 +607,13 @@ namespace sogen
             {
                 const auto acl = emulator_object<ACL>{c.emu, dacl_address}.read();
                 auto ace_address = dacl_address + sizeof(ACL);
+                // An ACE applies to the user and to the token's groups (not its integrity label).
+                const auto groups = token_groups(c.proc);
+                const auto applies_to_token = [&](const uint64_t ace_sid) {
+                    return sid_matches(c.emu.memory(), ace_sid, c.proc.sid) || std::ranges::any_of(groups, [&](const token_group& group) {
+                               return group.attributes != group_integrity && sid_matches(c.emu.memory(), ace_sid, group.sid);
+                           });
+                };
                 for (USHORT i = 0; i < acl.AceCount; ++i)
                 {
                     const auto ace = emulator_object<ACCESS_ALLOWED_ACE>{c.emu, ace_address}.read();
@@ -563,8 +624,7 @@ namespace sogen
 
                     const auto ace_mask = map_generic_access(ace.Mask, mapping);
                     const auto ace_sid = ace_address + offsetof(ACCESS_ALLOWED_ACE, SidStart);
-                    const bool applies =
-                        sid_matches(c.emu.memory(), ace_sid, c.proc.sid) || sid_matches(c.emu.memory(), ace_sid, interactive_sid);
+                    const bool applies = applies_to_token(ace_sid);
                     if (applies && ace.Header.AceType == 1 && (ace_mask & remaining) != 0)
                     {
                         denied = true;

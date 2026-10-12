@@ -182,7 +182,11 @@ namespace sogen
         constexpr uint32_t k_sid_type_alias = 4;
         constexpr uint32_t k_sid_type_well_known_group = 5;
 
-        // A well-known SID of the NT authority (S-1-5-...) with the name LSA gives it.
+        constexpr uint32_t k_sid_type_label = 10;
+        constexpr uint32_t k_sid_type_logon_session = 11;
+        constexpr uint8_t k_nt_authority = 5;
+
+        // A well-known SID (S-<authority>-...) with the name LSA gives it.
         struct well_known_sid
         {
             std::vector<uint32_t> sub_authorities{};
@@ -190,11 +194,18 @@ namespace sogen
             std::u16string_view domain{};
             std::u16string_view name{};
             uint32_t type{};
+            uint8_t authority{k_nt_authority};
         };
 
         well_known_sid nt_authority_group(const uint32_t rid, const std::u16string_view name)
         {
             return {.sub_authorities = {rid}, .domain = u"NT AUTHORITY", .name = name, .type = k_sid_type_well_known_group};
+        }
+
+        // A group outside the NT authority (Everyone, LOCAL, CONSOLE LOGON), which LSA names without a domain.
+        well_known_sid authority_group(const uint8_t authority, const uint32_t rid, const std::u16string_view name)
+        {
+            return {.sub_authorities = {rid}, .name = name, .type = k_sid_type_well_known_group, .authority = authority};
         }
 
         well_known_sid builtin_alias(const uint32_t rid, const std::u16string_view name)
@@ -207,7 +218,11 @@ namespace sogen
                     .type = k_sid_type_alias};
         }
 
-        const std::array<well_known_sid, 9> k_well_known_sids = {
+        // The token's groups (see NtQueryInformationToken's TokenGroups) and other common ones.
+        const std::array<well_known_sid, 17> k_well_known_sids = {
+            authority_group(1, 0, u"Everyone"),
+            authority_group(2, 0, u"LOCAL"),
+            authority_group(2, 1, u"CONSOLE LOGON"),
             nt_authority_group(2, u"NETWORK"),
             nt_authority_group(4, u"INTERACTIVE"),
             nt_authority_group(11, u"Authenticated Users"),
@@ -215,14 +230,27 @@ namespace sogen
             nt_authority_group(18, u"SYSTEM"),
             nt_authority_group(19, u"LOCAL SERVICE"),
             nt_authority_group(20, u"NETWORK SERVICE"),
+            nt_authority_group(113, u"Local account"),
+            {.sub_authorities = {64, 10}, .domain = u"NT AUTHORITY", .name = u"NTLM Authentication", .type = k_sid_type_well_known_group},
+            // The logon session's SID, S-1-5-5-0-<authentication id> (NtQueryInformationToken's token_authentication_id).
+            {.sub_authorities = {5, 0, 0x1000},
+             .domain = u"NT AUTHORITY",
+             .name = u"LogonSessionId_0_4096",
+             .type = k_sid_type_logon_session},
+            {.sub_authorities = {8192},
+             .domain = u"Mandatory Label",
+             .name = u"Medium Mandatory Level",
+             .type = k_sid_type_label,
+             .authority = 16},
             builtin_alias(544, u"Administrators"),
             builtin_alias(545, u"Users"),
+            builtin_alias(555, u"Remote Desktop Users"),
         };
 
-        // The binary SID S-1-5-<sub authorities>.
-        std::vector<uint8_t> make_sid(const std::span<const uint32_t> sub_authorities)
+        // The binary SID S-1-<authority>-<sub authorities>.
+        std::vector<uint8_t> make_sid(const std::span<const uint32_t> sub_authorities, const uint8_t authority = k_nt_authority)
         {
-            std::vector<uint8_t> sid{1, static_cast<uint8_t>(sub_authorities.size()), 0, 0, 0, 0, 0, 5};
+            std::vector<uint8_t> sid{1, static_cast<uint8_t>(sub_authorities.size()), 0, 0, 0, 0, 0, authority};
             for (const auto sub_authority : sub_authorities)
             {
                 const auto* bytes = reinterpret_cast<const uint8_t*>(&sub_authority);
@@ -607,12 +635,29 @@ namespace sogen
                     return STATUS_SUCCESS;
                 }
 
+                // The account domain's "None" group (RID 513), every local user's primary group.
+                if (auto none_group = derive_account_domain_sid(win_emu.process.sid); !none_group.empty())
+                {
+                    constexpr uint32_t domain_group_rid_users = 513;
+                    constexpr uint32_t sid_type_group = 2;
+                    const auto domain_sid = none_group;
+                    none_group[1] = static_cast<uint8_t>(none_group[1] + 1);
+                    const auto* rid = reinterpret_cast<const uint8_t*>(&domain_group_rid_users);
+                    none_group.insert(none_group.end(), rid, rid + sizeof(domain_group_rid_users));
+                    if (request_contains_sid(win_emu, c, none_group))
+                    {
+                        write_lookup_sids_success_reply(writer, registry_utils::get_account_domain(win_emu.registry), domain_sid, u"None",
+                                                        sid_type_group);
+                        return STATUS_SUCCESS;
+                    }
+                }
+
                 for (const auto& known : k_well_known_sids)
                 {
-                    const auto sid = make_sid(known.sub_authorities);
+                    const auto sid = make_sid(known.sub_authorities, known.authority);
                     if (request_contains_sid(win_emu, c, sid))
                     {
-                        const auto domain_sid = make_sid(known.domain_sub_authorities);
+                        const auto domain_sid = make_sid(known.domain_sub_authorities, known.authority);
                         write_lookup_sids_success_reply(writer, known.domain, domain_sid, known.name, known.type);
                         return STATUS_SUCCESS;
                     }
