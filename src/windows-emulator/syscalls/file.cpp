@@ -481,6 +481,12 @@ namespace sogen
             auto* f = c.proc.files.get(file_handle);
             if (!f)
             {
+                // NUL has no position: setting it is ignored (CPython opens os.devnull with mode 'a').
+                if (file_handle == NUL_HANDLE && info_class == FilePositionInformation)
+                {
+                    return length < sizeof(FILE_POSITION_INFORMATION) ? STATUS_INFO_LENGTH_MISMATCH : STATUS_SUCCESS;
+                }
+
                 auto* device = c.proc.devices.get(file_handle);
                 if (device)
                 {
@@ -1212,6 +1218,29 @@ namespace sogen
                     c.emu.write_memory(file_information,
                                        file_pipe_information{.read_mode = pipe->read_mode, .completion_mode = pipe->completion_mode});
                     return ret(STATUS_SUCCESS, sizeof(file_pipe_information));
+                }
+
+                // NUL is an empty file at position 0 whatever is written to it.
+                if (file_handle == NUL_HANDLE && (info_class == FilePositionInformation || info_class == FileStandardInformation))
+                {
+                    if (info_class == FilePositionInformation)
+                    {
+                        if (length < sizeof(FILE_POSITION_INFORMATION))
+                        {
+                            return ret(STATUS_INFO_LENGTH_MISMATCH);
+                        }
+                        c.emu.write_memory(file_information, FILE_POSITION_INFORMATION{});
+                        return ret(STATUS_SUCCESS, sizeof(FILE_POSITION_INFORMATION));
+                    }
+
+                    if (length < sizeof(FILE_STANDARD_INFORMATION))
+                    {
+                        return ret(STATUS_INFO_LENGTH_MISMATCH);
+                    }
+                    FILE_STANDARD_INFORMATION i{};
+                    i.NumberOfLinks = 1;
+                    c.emu.write_memory(file_information, i);
+                    return ret(STATUS_SUCCESS, sizeof(FILE_STANDARD_INFORMATION));
                 }
 
                 // A pipe has no position: it reads as 0, and setting it is ignored (so SetFilePointerEx succeeds, and

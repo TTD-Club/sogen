@@ -893,8 +893,6 @@ namespace
         return true;
     }
 
-    // A read-only file says so and is not deleted until it is writable again; a handle names its file in the case the file
-    // system keeps, whatever the case it was opened with.
     // Reads right after a write, and writes right after a read, continue at the file position.
     bool test_read_after_write()
     {
@@ -932,9 +930,43 @@ namespace
             return false;
         }
 
+        // Another handle of the file sees each write at once, also after it read the file before.
+        const auto other_file = file + L".shared";
+        auto* const writer = CreateFileW(other_file.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                         CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        auto* const reader = CreateFileW(other_file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                         OPEN_EXISTING, 0, nullptr);
+        std::array<char, 16> shared{};
+        DWORD first_read{};
+        DWORD second_read{};
+        WriteFile(writer, "foo\n", 4, &count, nullptr);
+        ReadFile(reader, shared.data(), static_cast<DWORD>(shared.size()), &first_read, nullptr);
+        WriteFile(writer, "bar\n", 4, &count, nullptr);
+        ReadFile(reader, shared.data() + first_read, static_cast<DWORD>(shared.size()) - first_read, &second_read, nullptr);
+        CloseHandle(reader);
+        CloseHandle(writer);
+        if (first_read != 4 || second_read != 4 || std::string_view(shared.data(), 8) != "foo\nbar\n")
+        {
+            printf("Shared file: first read %lu, second read %lu\n", first_read, second_read);
+            return false;
+        }
+
+        // NUL is an empty file: it seeks to its end at 0 (CPython opens os.devnull with mode 'a').
+        auto* const nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        LARGE_INTEGER end{.QuadPart = -1};
+        const auto seeked = nul != INVALID_HANDLE_VALUE && SetFilePointerEx(nul, {}, &end, FILE_END);
+        CloseHandle(nul);
+        if (!seeked || end.QuadPart != 0)
+        {
+            printf("NUL seek to end: %lld, error %lu\n", end.QuadPart, GetLastError());
+            return false;
+        }
+
         return true;
     }
 
+    // A read-only file says so and is not deleted until it is writable again; a handle names its file in the case the file
+    // system keeps, whatever the case it was opened with.
     bool test_read_only_and_final_names()
     {
         const auto base = scratch_directory() + L"ReadOnly" + std::to_wstring(GetCurrentProcessId());

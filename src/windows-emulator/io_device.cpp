@@ -203,13 +203,25 @@ namespace sogen
     NTSTATUS io_device::execute_ioctl(windows_emulator& win_emu, const io_device_context& c)
     {
         auto request = this->prepare_io_context(c);
+        IO_STATUS_BLOCK<EmulatorTraits<Emu64>> caller_status{};
         if (request.io_status_block)
         {
+            caller_status = request.io_status_block.read();
             request.io_status_block.write({});
         }
 
         const auto result = this->io_control(win_emu, request);
-        write_io_status(request, result);
+        const auto is_error = (static_cast<ULONG>(result) >> 30) == 3; // NT_ERROR: severity "error"
+        if (is_error && request.io_status_block)
+        {
+            // A request that fails at once leaves the I/O status block as it was (OVERLAPPED.Internal stays
+            // STATUS_PENDING: CPython's ConnectNamedPipe on a connected pipe then reads a success).
+            request.io_status_block.write(caller_status);
+        }
+        else
+        {
+            write_io_status(request, result);
+        }
 
         // A synchronously-completing IOCTL must signal the optional completion event the caller passed, so a
         // thread that issues the request and then waits on the event is released. Asynchronous devices return

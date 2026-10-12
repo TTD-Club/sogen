@@ -55,6 +55,7 @@ namespace sogen
             file_handle(FILE* file)
                 : file_(file)
             {
+                make_unbuffered(file);
             }
 
             ~file_handle()
@@ -94,6 +95,7 @@ namespace sogen
                 this->release();
                 this->file_ = file;
                 this->last_io_ = {};
+                make_unbuffered(file);
 
                 return *this;
             }
@@ -212,6 +214,16 @@ namespace sogen
             mutable io_direction last_io_{io_direction::none};
             std::optional<rename_information> deferred_rename_;
             std::optional<delete_information> deferred_delete_;
+
+            // Reads and writes go to the host file directly: the guest's other handles to the file (other streams) see a
+            // write once it returns and never read data this stream buffered before another handle changed it.
+            static void make_unbuffered(FILE* file)
+            {
+                if (file)
+                {
+                    (void)setvbuf(file, nullptr, _IONBF, 0);
+                }
+            }
 
             void switch_direction(const io_direction direction) const
             {
