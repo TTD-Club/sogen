@@ -28,6 +28,7 @@
 #include <combaseapi.h>
 #include <knownfolders.h>
 #include <sddl.h>
+#include <ntsecapi.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
 
@@ -270,6 +271,61 @@ namespace
         }
 
         return std::wstring_view(group_name.data()) == L"INTERACTIVE" && use == SidTypeWellKnownGroup;
+    }
+
+    // LSA policy queries: the account domain is the computer's (its name and a S-1-5-21 SID); a machine without a domain
+    // has no DNS domain.
+    bool test_lsa_policy()
+    {
+        LSA_OBJECT_ATTRIBUTES attributes{};
+        LSA_HANDLE policy{};
+        if (LsaOpenPolicy(nullptr, &attributes, POLICY_VIEW_LOCAL_INFORMATION, &policy) != 0)
+        {
+            puts("LsaOpenPolicy failed");
+            return false;
+        }
+        const auto close_policy = sogen::utils::finally([&] { LsaClose(policy); });
+
+        void* account_information{};
+        if (LsaQueryInformationPolicy(policy, PolicyAccountDomainInformation, &account_information) != 0 || !account_information)
+        {
+            puts("Querying the account domain failed");
+            return false;
+        }
+        const auto free_account = sogen::utils::finally([&] { LsaFreeMemory(account_information); });
+
+        std::array<wchar_t, MAX_COMPUTERNAME_LENGTH + 1> computer{};
+        auto computer_size = static_cast<DWORD>(computer.size());
+        GetComputerNameW(computer.data(), &computer_size);
+
+        const auto& account = *static_cast<const POLICY_ACCOUNT_DOMAIN_INFO*>(account_information);
+        const std::wstring_view domain_name(account.DomainName.Buffer, account.DomainName.Length / sizeof(wchar_t));
+        const auto* authority = account.DomainSid ? GetSidIdentifierAuthority(account.DomainSid) : nullptr;
+        if (CompareStringOrdinal(domain_name.data(), static_cast<int>(domain_name.size()), computer.data(), static_cast<int>(computer_size),
+                                 TRUE) != CSTR_EQUAL ||
+            !account.DomainSid || !IsValidSid(account.DomainSid) || authority->Value[5] != 5 ||
+            *GetSidSubAuthorityCount(account.DomainSid) != 4 || *GetSidSubAuthority(account.DomainSid, 0) != SECURITY_NT_NON_UNIQUE)
+        {
+            puts("The account domain is not the computer's");
+            return false;
+        }
+
+        void* dns_information{};
+        if (LsaQueryInformationPolicy(policy, PolicyDnsDomainInformation, &dns_information) != 0 || !dns_information)
+        {
+            puts("Querying the DNS domain failed");
+            return false;
+        }
+        const auto free_dns = sogen::utils::finally([&] { LsaFreeMemory(dns_information); });
+
+        const auto& dns = *static_cast<const POLICY_DNS_DOMAIN_INFO*>(dns_information);
+        if (!dns.Sid && (dns.DnsDomainName.Length != 0 || dns.Name.Length == 0))
+        {
+            puts("A machine without a domain reported a DNS domain");
+            return false;
+        }
+
+        return true;
     }
 
     bool test_file_path_io(const std::filesystem::path& filename)
@@ -3106,6 +3162,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_file_sharing, "File Sharing")
     RUN_TEST(test_token_information, "Token Information")
     RUN_TEST(test_privileges, "Privileges")
+    RUN_TEST(test_lsa_policy, "LSA Policy")
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")
     RUN_TEST(test_stack_guarantee, "Stack Guarantee")

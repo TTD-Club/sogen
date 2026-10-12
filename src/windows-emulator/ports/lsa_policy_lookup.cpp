@@ -37,6 +37,15 @@ namespace sogen
             0x78, 0x57, 0x34, 0x12, 0x34, 0x12, 0xCD, 0xAB, 0xEF, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
         };
         constexpr uint32_t k_lsar_close = 0;
+        constexpr uint32_t k_lsar_query_information_policy = 7;
+        constexpr uint32_t k_lsar_query_information_policy2 = 46;
+        // POLICY_INFORMATION_CLASS values the queries answer.
+        constexpr uint16_t k_policy_primary_domain_information = 3;
+        constexpr uint16_t k_policy_account_domain_information = 5;
+        constexpr uint16_t k_policy_dns_domain_information = 12;
+        constexpr NTSTATUS k_status_invalid_info_class = static_cast<NTSTATUS>(0xC0000003);
+        // The emulated machine is in a workgroup, not a domain.
+        constexpr std::u16string_view k_workgroup_name = u"WORKGROUP";
         constexpr uint32_t k_lsar_lookup_privilege_value = 31;
         constexpr uint32_t k_lsar_lookup_privilege_name = 32;
         constexpr uint32_t k_lsar_lookup_privilege_display_name = 33;
@@ -350,6 +359,9 @@ namespace sogen
                     return handle_lookup_privilege_display_name(win_emu, c, writer);
                 case k_lsar_open_policy3:
                     return STATUS_NOT_SUPPORTED;
+                case k_lsar_query_information_policy:
+                case k_lsar_query_information_policy2:
+                    return handle_query_information_policy(win_emu, c, writer);
                 default:
                     return this->unsupported(win_emu, procedure_id);
                 }
@@ -438,6 +450,86 @@ namespace sogen
 
                 write_unicode_string_pointer(writer, privilege->display_name);
                 writer.write(k_language_english_united_states);
+                writer.write(STATUS_SUCCESS);
+                return STATUS_SUCCESS;
+            }
+
+            // LsarQueryInformationPolicy(2) (NDR64): a unique pointer to the LSAPR_POLICY_INFORMATION union (its
+            // discriminant, then the arm, aligned to 8), the arm's deferred strings and SID, and the status. As on a
+            // workgroup machine, the primary and DNS domain are the workgroup without a SID, and the account domain is
+            // the machine's.
+            static NTSTATUS handle_query_information_policy(windows_emulator& win_emu, const lpc_request_context& c,
+                                                            utils::aligned_binary_writer& writer)
+            {
+                // The class follows the 20-byte policy handle.
+                const auto information_class = c.send_buffer_length >= k_context_handle_size + sizeof(uint16_t)
+                                                   ? win_emu.emu().read_memory<uint16_t>(c.send_buffer + k_context_handle_size)
+                                                   : uint16_t{};
+
+                const auto write_string_header = [&](const std::u16string_view value) {
+                    if (value.empty())
+                    {
+                        writer.write<uint16_t>(0);
+                        writer.write<uint16_t>(0);
+                        writer.write_ndr_pointer(false);
+                        return;
+                    }
+
+                    write_lsa_unicode_string_header(writer, value);
+                };
+                const auto write_string_characters = [&](const std::u16string_view value) {
+                    if (!value.empty())
+                    {
+                        writer.write_ndr_u16string(value, false);
+                    }
+                };
+                const auto write_sid = [&](const std::span<const uint8_t> sid) {
+                    if (!sid.empty())
+                    {
+                        writer.write_pointer_sized(sid[1]);
+                        writer.write(sid.data(), sid.size(), alignof(uint32_t));
+                    }
+                };
+                const auto begin_arm = [&] {
+                    writer.write_ndr_pointer(true);
+                    writer.write<uint32_t>(information_class);
+                    writer.align_to(sizeof(uint64_t));
+                };
+
+                switch (information_class)
+                {
+                case k_policy_primary_domain_information:
+                    begin_arm();
+                    write_string_header(k_workgroup_name);
+                    writer.write_ndr_pointer(false);
+                    write_string_characters(k_workgroup_name);
+                    break;
+                case k_policy_account_domain_information: {
+                    const auto domain = registry_utils::get_account_domain(win_emu.registry);
+                    const auto domain_sid = derive_account_domain_sid(win_emu.process.sid);
+                    begin_arm();
+                    write_string_header(domain);
+                    writer.write_ndr_pointer(!domain_sid.empty());
+                    write_string_characters(domain);
+                    write_sid(domain_sid);
+                    break;
+                }
+                case k_policy_dns_domain_information:
+                    begin_arm();
+                    write_string_header(k_workgroup_name);
+                    write_string_header({});
+                    write_string_header({});
+                    writer.pad(16); // DomainGuid: none
+                    writer.write_ndr_pointer(false);
+                    write_string_characters(k_workgroup_name);
+                    break;
+                default:
+                    win_emu.log.warn("Unsupported LSA policy information class %u\n", static_cast<uint32_t>(information_class));
+                    writer.write_ndr_pointer(false);
+                    writer.write(k_status_invalid_info_class);
+                    return STATUS_SUCCESS;
+                }
+
                 writer.write(STATUS_SUCCESS);
                 return STATUS_SUCCESS;
             }
