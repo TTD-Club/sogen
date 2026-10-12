@@ -27,17 +27,20 @@ namespace sogen
 
             static_assert(sizeof(token_privilege) == 12);
 
-            constexpr DWORD privilege_enabled_by_default = 0x1;
             constexpr DWORD privilege_enabled = 0x2;
+            constexpr DWORD privilege_removed = 0x4;
+            constexpr NTSTATUS status_not_all_assigned = 0x00000106;
 
-            // A non-elevated user's privileges: shutdown, change notify, undock, increase working set, time zone.
-            constexpr std::array<token_privilege, 5> user_privileges = {{
-                {.Luid = {.LowPart = 19, .HighPart = 0}, .Attributes = 0},
-                {.Luid = {.LowPart = 23, .HighPart = 0}, .Attributes = privilege_enabled_by_default | privilege_enabled},
-                {.Luid = {.LowPart = 25, .HighPart = 0}, .Attributes = 0},
-                {.Luid = {.LowPart = 33, .HighPart = 0}, .Attributes = 0},
-                {.Luid = {.LowPart = 34, .HighPart = 0}, .Attributes = 0},
-            }};
+            // The token's privileges (process_context::token_privileges) as LUID_AND_ATTRIBUTES entries.
+            std::vector<token_privilege> held_privileges(const process_context& process)
+            {
+                std::vector<token_privilege> privileges{};
+                for (const auto& [luid, attributes] : process.token_privileges)
+                {
+                    privileges.push_back({.Luid = {.LowPart = luid, .HighPart = 0}, .Attributes = attributes});
+                }
+                return privileges;
+            }
 
             bool sid_matches(const memory_manager& memory, const uint64_t address, const std::span<const uint8_t> expected)
             {
@@ -175,7 +178,9 @@ namespace sogen
 
             if (token_information_class == TokenPrivileges)
             {
-                constexpr auto required_size = sizeof(DWORD) + sizeof(user_privileges);
+                const auto privileges = held_privileges(c.proc);
+                const auto privileges_size = privileges.size() * sizeof(token_privilege);
+                const auto required_size = sizeof(DWORD) + privileges_size;
                 return_length.write(static_cast<ULONG>(required_size));
 
                 if (required_size > token_information_length)
@@ -183,8 +188,8 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                c.emu.write_memory(token_information, static_cast<DWORD>(user_privileges.size()));
-                c.emu.write_memory(token_information + sizeof(DWORD), user_privileges.data(), sizeof(user_privileges));
+                c.emu.write_memory(token_information, static_cast<DWORD>(privileges.size()));
+                c.emu.write_memory(token_information + sizeof(DWORD), privileges.data(), privileges_size);
                 return STATUS_SUCCESS;
             }
 
@@ -413,7 +418,7 @@ namespace sogen
                 stats.TokenType = get_token_type(token_handle);
                 stats.ImpersonationLevel = stats.TokenType == TokenImpersonation ? SecurityImpersonation : SecurityAnonymous;
                 stats.GroupCount = 2;
-                stats.PrivilegeCount = static_cast<DWORD>(user_privileges.size());
+                stats.PrivilegeCount = static_cast<DWORD>(c.proc.token_privileges.size());
                 stats.ModifiedId.LowPart = token_modified_id;
 
                 c.emu.write_memory(token_information, stats);
@@ -659,9 +664,82 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtAdjustPrivilegesToken()
+        // Enables, disables, or removes the token's privileges. Changes to privileges the token does not hold are
+        // skipped with STATUS_NOT_ALL_ASSIGNED; PreviousState receives the old attributes of what changed.
+        NTSTATUS handle_NtAdjustPrivilegesToken(const syscall_context& c, const handle /*token_handle*/, const BOOLEAN disable_all,
+                                                const uint64_t new_state, const ULONG /*buffer_length*/, const uint64_t previous_state,
+                                                const ULONG previous_state_length, const emulator_object<ULONG> return_length)
         {
-            return STATUS_NOT_SUPPORTED;
+            if (!disable_all && !new_state)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            auto updated = c.proc.token_privileges;
+            std::vector<token_privilege> previous{};
+            bool all_assigned = true;
+
+            const auto change = [&](const uint32_t luid, const DWORD attributes) {
+                const auto held = updated.find(luid);
+                if (held == updated.end())
+                {
+                    all_assigned = false;
+                    return;
+                }
+
+                if (attributes & privilege_removed)
+                {
+                    previous.push_back({.Luid = {.LowPart = luid, .HighPart = 0}, .Attributes = held->second});
+                    updated.erase(held);
+                    return;
+                }
+
+                const auto new_attributes = (held->second & ~privilege_enabled) | (attributes & privilege_enabled);
+                if (new_attributes != held->second)
+                {
+                    previous.push_back({.Luid = {.LowPart = luid, .HighPart = 0}, .Attributes = held->second});
+                    held->second = new_attributes;
+                }
+            };
+
+            if (disable_all)
+            {
+                for (const auto& [luid, attributes] : c.proc.token_privileges)
+                {
+                    change(luid, 0);
+                }
+            }
+            else
+            {
+                const auto count = c.emu.read_memory<DWORD>(new_state);
+                for (DWORD i = 0; i < count; ++i)
+                {
+                    const auto entry = c.emu.read_memory<token_privilege>(new_state + sizeof(DWORD) + i * sizeof(token_privilege));
+                    if (entry.Luid.HighPart != 0)
+                    {
+                        all_assigned = false;
+                        continue;
+                    }
+                    change(entry.Luid.LowPart, entry.Attributes);
+                }
+            }
+
+            // The previous state must fit before anything changes.
+            if (previous_state)
+            {
+                const auto required_size = static_cast<ULONG>(sizeof(DWORD) + previous.size() * sizeof(token_privilege));
+                return_length.write_if_valid(required_size);
+                if (required_size > previous_state_length)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                c.emu.write_memory(previous_state, static_cast<DWORD>(previous.size()));
+                c.emu.write_memory(previous_state + sizeof(DWORD), previous.data(), previous.size() * sizeof(token_privilege));
+            }
+
+            c.proc.token_privileges = std::move(updated);
+            return all_assigned ? STATUS_SUCCESS : status_not_all_assigned;
         }
 
         NTSTATUS handle_NtQuerySecurityPolicy()

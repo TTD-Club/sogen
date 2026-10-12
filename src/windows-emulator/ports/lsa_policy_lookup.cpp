@@ -31,6 +31,77 @@ namespace sogen
             0xBA, 0xA3, 0xDA, 0x01, 0x6E, 0x16, 0x62, 0x49, 0x81, 0x46, 0x13, 0x9B, 0x8A, 0x70, 0x69, 0xE7,
         };
 
+        // MS-LSAD's lsarpc interface, 12345778-1234-abcd-ef00-0123456789ab, which shares this endpoint with the lookup
+        // interface above; its opnums are those of the specification.
+        constexpr std::array<uint8_t, 16> k_lsarpc_interface = {
+            0x78, 0x57, 0x34, 0x12, 0x34, 0x12, 0xCD, 0xAB, 0xEF, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+        };
+        constexpr uint32_t k_lsar_close = 0;
+        constexpr uint32_t k_lsar_lookup_privilege_value = 31;
+        constexpr uint32_t k_lsar_lookup_privilege_name = 32;
+        constexpr uint32_t k_lsar_lookup_privilege_display_name = 33;
+        constexpr uint32_t k_lsar_open_policy2 = 44;
+        constexpr uint32_t k_lsar_open_policy3 = 130;
+        // An LSAPR_HANDLE: attributes and a GUID.
+        constexpr size_t k_context_handle_size = 20;
+        constexpr NTSTATUS k_status_no_such_privilege = static_cast<NTSTATUS>(0xC0000060);
+        constexpr uint16_t k_language_english_united_states = 0x409;
+
+        struct privilege_entry
+        {
+            uint32_t luid{};
+            std::u16string_view name{};
+            std::u16string_view display_name{};
+        };
+
+        // The privileges every Windows system defines, with their fixed LUIDs (SE_*_PRIVILEGE) and English display names.
+        constexpr std::array<privilege_entry, 35> k_privileges = {{
+            {2, u"SeCreateTokenPrivilege", u"Create a token object"},
+            {3, u"SeAssignPrimaryTokenPrivilege", u"Replace a process level token"},
+            {4, u"SeLockMemoryPrivilege", u"Lock pages in memory"},
+            {5, u"SeIncreaseQuotaPrivilege", u"Adjust memory quotas for a process"},
+            {6, u"SeMachineAccountPrivilege", u"Add workstations to domain"},
+            {7, u"SeTcbPrivilege", u"Act as part of the operating system"},
+            {8, u"SeSecurityPrivilege", u"Manage auditing and security log"},
+            {9, u"SeTakeOwnershipPrivilege", u"Take ownership of files or other objects"},
+            {10, u"SeLoadDriverPrivilege", u"Load and unload device drivers"},
+            {11, u"SeSystemProfilePrivilege", u"Profile system performance"},
+            {12, u"SeSystemtimePrivilege", u"Change the system time"},
+            {13, u"SeProfileSingleProcessPrivilege", u"Profile single process"},
+            {14, u"SeIncreaseBasePriorityPrivilege", u"Increase scheduling priority"},
+            {15, u"SeCreatePagefilePrivilege", u"Create a pagefile"},
+            {16, u"SeCreatePermanentPrivilege", u"Create permanent shared objects"},
+            {17, u"SeBackupPrivilege", u"Back up files and directories"},
+            {18, u"SeRestorePrivilege", u"Restore files and directories"},
+            {19, u"SeShutdownPrivilege", u"Shut down the system"},
+            {20, u"SeDebugPrivilege", u"Debug programs"},
+            {21, u"SeAuditPrivilege", u"Generate security audits"},
+            {22, u"SeSystemEnvironmentPrivilege", u"Modify firmware environment values"},
+            {23, u"SeChangeNotifyPrivilege", u"Bypass traverse checking"},
+            {24, u"SeRemoteShutdownPrivilege", u"Force shutdown from a remote system"},
+            {25, u"SeUndockPrivilege", u"Remove computer from docking station"},
+            {26, u"SeSyncAgentPrivilege", u"Synchronize directory service data"},
+            {27, u"SeEnableDelegationPrivilege", u"Enable computer and user accounts to be trusted for delegation"},
+            {28, u"SeManageVolumePrivilege", u"Perform volume maintenance tasks"},
+            {29, u"SeImpersonatePrivilege", u"Impersonate a client after authentication"},
+            {30, u"SeCreateGlobalPrivilege", u"Create global objects"},
+            {31, u"SeTrustedCredManAccessPrivilege", u"Access Credential Manager as a trusted caller"},
+            {32, u"SeRelabelPrivilege", u"Modify an object label"},
+            {33, u"SeIncreaseWorkingSetPrivilege", u"Increase a process working set"},
+            {34, u"SeTimeZonePrivilege", u"Change the time zone"},
+            {35, u"SeCreateSymbolicLinkPrivilege", u"Create symbolic links"},
+            {36, u"SeDelegateSessionUserImpersonatePrivilege", u"Obtain an impersonation token for another user in the same session"},
+        }};
+
+        // Privilege names compare without regard to case, as LSA compares them.
+        const privilege_entry* find_privilege(const std::u16string_view name)
+        {
+            const auto lower = [](const char16_t c) { return utils::string::char_to_lower(c); };
+            const auto entry = std::ranges::find_if(
+                k_privileges, [&](const privilege_entry& privilege) { return std::ranges::equal(privilege.name, name, {}, lower, lower); });
+            return entry == k_privileges.end() ? nullptr : &*entry;
+        }
+
         ULONG select_by_pointer_size(const utils::aligned_binary_writer& writer, const ULONG size_32, const ULONG size_64)
         {
             return writer.pointer_size() == utils::aligned_binary_writer::pointer_size_32 ? size_32 : size_64;
@@ -160,6 +231,11 @@ namespace sogen
             NTSTATUS handle_rpc(windows_emulator& win_emu, const uint32_t procedure_id, const lpc_request_context& c,
                                 utils::aligned_binary_writer& writer, std::vector<alpc_reply_handle>& /*reply_handles*/) override
             {
+                if (this->bound_interface() == k_lsarpc_interface)
+                {
+                    return handle_lsarpc(win_emu, procedure_id, c, writer);
+                }
+
                 switch (procedure_id)
                 {
                 case 0:
@@ -180,11 +256,136 @@ namespace sogen
                 case k_sspi_get_user_name_procedure:
                     return handle_get_user_name(win_emu, writer);
                 default:
-                    return STATUS_NOT_SUPPORTED;
+                    return unsupported(win_emu, procedure_id);
                 }
             }
 
           private:
+            NTSTATUS unsupported(windows_emulator& win_emu, const uint32_t procedure_id) const
+            {
+                const auto& id = this->bound_interface();
+                win_emu.log.warn("Unsupported LSA RPC procedure %u on interface %02X%02X%02X%02X\n", procedure_id, id[3], id[2], id[1],
+                                 id[0]);
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            // MS-LSAD (lsarpc) as advapi32 uses it on this endpoint: opening and closing a policy handle and the privilege
+            // lookups. LsarOpenPolicy3 (130) stays unsupported: the client then falls back to LsarOpenPolicy2.
+            NTSTATUS handle_lsarpc(windows_emulator& win_emu, const uint32_t procedure_id, const lpc_request_context& c,
+                                   utils::aligned_binary_writer& writer) const
+            {
+                switch (procedure_id)
+                {
+                case k_lsar_close:
+                    // The [in, out] handle comes back zeroed.
+                    writer.pad(k_context_handle_size);
+                    writer.write(STATUS_SUCCESS);
+                    return STATUS_SUCCESS;
+                case k_lsar_open_policy2:
+                    writer.write<uint32_t>(0);
+                    writer.write(k_policy_context_uuid.data(), k_policy_context_uuid.size());
+                    writer.write(STATUS_SUCCESS);
+                    return STATUS_SUCCESS;
+                case k_lsar_lookup_privilege_value:
+                    return handle_lookup_privilege_value(win_emu, c, writer);
+                case k_lsar_lookup_privilege_name:
+                    return handle_lookup_privilege_name(win_emu, c, writer);
+                case k_lsar_lookup_privilege_display_name:
+                    return handle_lookup_privilege_display_name(win_emu, c, writer);
+                case k_lsar_open_policy3:
+                    return STATUS_NOT_SUPPORTED;
+                default:
+                    return this->unsupported(win_emu, procedure_id);
+                }
+            }
+
+            // The RPC_UNICODE_STRING the request carries after the policy handle (NDR64: length, maximum length, buffer
+            // pointer, then the conformant varying array). Nothing if the request does not hold one.
+            static std::optional<std::u16string> read_request_string(windows_emulator& win_emu, const lpc_request_context& c)
+            {
+                constexpr size_t length_offset = 0x18;
+                constexpr size_t actual_count_offset = 0x38;
+                constexpr size_t characters_offset = 0x40;
+                if (c.send_buffer_length < characters_offset)
+                {
+                    return std::nullopt;
+                }
+
+                const auto length = win_emu.emu().read_memory<uint16_t>(c.send_buffer + length_offset);
+                const auto count = win_emu.emu().read_memory<uint64_t>(c.send_buffer + actual_count_offset);
+                if (count * sizeof(char16_t) != length || characters_offset + length > c.send_buffer_length)
+                {
+                    return std::nullopt;
+                }
+
+                std::u16string value(count, u'\0');
+                win_emu.emu().read_memory(c.send_buffer + characters_offset, value.data(), length);
+                return value;
+            }
+
+            // A unique pointer to an RPC_UNICODE_STRING: referent, header, and characters (NDR64).
+            static void write_unicode_string_pointer(utils::aligned_binary_writer& writer, const std::u16string_view value)
+            {
+                writer.write_ndr_pointer(true);
+                write_lsa_unicode_string_header(writer, value);
+                writer.write_ndr_u16string(value, false);
+            }
+
+            static NTSTATUS handle_lookup_privilege_value(windows_emulator& win_emu, const lpc_request_context& c,
+                                                          utils::aligned_binary_writer& writer)
+            {
+                const auto name = read_request_string(win_emu, c);
+                const auto* privilege = name ? find_privilege(*name) : nullptr;
+                writer.write<uint32_t>(privilege ? privilege->luid : 0);
+                writer.write<int32_t>(0);
+                writer.write(privilege ? STATUS_SUCCESS : k_status_no_such_privilege);
+                return STATUS_SUCCESS;
+            }
+
+            static NTSTATUS handle_lookup_privilege_name(windows_emulator& win_emu, const lpc_request_context& c,
+                                                         utils::aligned_binary_writer& writer)
+            {
+                // The LUID follows the 20-byte policy handle.
+                const privilege_entry* privilege = nullptr;
+                if (c.send_buffer_length >= k_context_handle_size + sizeof(uint64_t))
+                {
+                    const auto low = win_emu.emu().read_memory<uint32_t>(c.send_buffer + k_context_handle_size);
+                    const auto high = win_emu.emu().read_memory<int32_t>(c.send_buffer + k_context_handle_size + sizeof(uint32_t));
+                    const auto entry = std::ranges::find(k_privileges, low, &privilege_entry::luid);
+                    privilege = high == 0 && entry != k_privileges.end() ? &*entry : nullptr;
+                }
+
+                if (!privilege)
+                {
+                    writer.write_ndr_pointer(false);
+                    writer.write(k_status_no_such_privilege);
+                    return STATUS_SUCCESS;
+                }
+
+                write_unicode_string_pointer(writer, privilege->name);
+                writer.write(STATUS_SUCCESS);
+                return STATUS_SUCCESS;
+            }
+
+            static NTSTATUS handle_lookup_privilege_display_name(windows_emulator& win_emu, const lpc_request_context& c,
+                                                                 utils::aligned_binary_writer& writer)
+            {
+                const auto name = read_request_string(win_emu, c);
+                const auto* privilege = name ? find_privilege(*name) : nullptr;
+                if (!privilege)
+                {
+                    writer.write_ndr_pointer(false);
+                    writer.write<uint16_t>(0);
+                    writer.write(k_status_no_such_privilege);
+                    return STATUS_SUCCESS;
+                }
+
+                write_unicode_string_pointer(writer, privilege->display_name);
+                writer.write(k_language_english_united_states);
+                writer.write(STATUS_SUCCESS);
+                return STATUS_SUCCESS;
+            }
+
             static NTSTATUS handle_lookup_account(windows_emulator& win_emu, utils::aligned_binary_writer& writer)
             {
                 const auto domain = utils::string::to_lower(registry_utils::get_account_domain(win_emu.registry));

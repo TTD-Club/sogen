@@ -847,6 +847,7 @@ namespace sogen
         buffer.write(this->raw_keyboard_target);
         buffer.write_map(this->raw_inputs);
         buffer.write(this->next_raw_input_token);
+        buffer.write_map(this->token_privileges);
         buffer.write_atomic(this->audio_render_event);
 
         buffer.write(this->user_handles);
@@ -952,6 +953,7 @@ namespace sogen
         buffer.read(this->raw_keyboard_target);
         buffer.read_map(this->raw_inputs);
         buffer.read(this->next_raw_input_token);
+        buffer.read_map(this->token_privileges);
         buffer.read_atomic(this->audio_render_event);
 
         buffer.read(this->user_handles);

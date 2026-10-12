@@ -518,6 +518,11 @@ namespace sogen
         std::map<uint32_t, raw_input_payload> raw_inputs{};
         uint32_t next_raw_input_token{1};
 
+        // The privileges the user's token holds, by LUID, with their SE_PRIVILEGE_* attributes: a non-elevated user's
+        // shutdown, change notify (enabled), undock, increase working set, and time zone. Every token of the process
+        // shares them; NtAdjustPrivilegesToken changes them.
+        std::map<uint32_t, uint32_t> token_privileges{{19, 0}, {23, 3}, {25, 0}, {33, 0}, {34, 0}};
+
         // For WOW64 processes
         std::optional<emulator_object<PEB32>> peb32;
         std::optional<emulator_object<RTL_USER_PROCESS_PARAMETERS32>> process_params32;

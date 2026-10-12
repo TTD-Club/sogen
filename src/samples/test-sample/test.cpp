@@ -2448,6 +2448,82 @@ namespace
         return buffer;
     }
 
+    // Privilege names and values through LSA, and enabling a held privilege (shutdown, which every interactive user
+    // holds) while one no user holds (create token) stays unassigned.
+    bool test_privileges()
+    {
+        LUID shutdown{};
+        std::array<wchar_t, 64> name{};
+        auto name_length = static_cast<DWORD>(name.size());
+        std::array<wchar_t, 128> display_name{};
+        auto display_length = static_cast<DWORD>(display_name.size());
+        DWORD language{};
+        LUID change_notify{.LowPart = 23, .HighPart = 0};
+        if (!LookupPrivilegeValueW(nullptr, L"seshutdownprivilege", &shutdown) || shutdown.LowPart != 19 || shutdown.HighPart != 0 ||
+            !LookupPrivilegeNameW(nullptr, &change_notify, name.data(), &name_length) ||
+            std::wstring_view(name.data()) != L"SeChangeNotifyPrivilege" ||
+            !LookupPrivilegeDisplayNameW(nullptr, L"SeShutdownPrivilege", display_name.data(), &display_length, &language) ||
+            display_length == 0)
+        {
+            puts("Privilege lookups failed");
+            return false;
+        }
+
+        LUID unknown{};
+        if (LookupPrivilegeValueW(nullptr, L"SeNoSuchPrivilege", &unknown) || GetLastError() != ERROR_NO_SUCH_PRIVILEGE)
+        {
+            puts("Looked up a privilege that does not exist");
+            return false;
+        }
+
+        HANDLE token{};
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        {
+            return false;
+        }
+        const auto close_token = sogen::utils::finally([&] { CloseHandle(token); });
+
+        const auto shutdown_enabled = [&] {
+            const auto data = query_token_information(token, TokenPrivileges);
+            const auto* privileges = reinterpret_cast<const TOKEN_PRIVILEGES*>(data.data());
+            for (DWORD i = 0; data.size() >= sizeof(TOKEN_PRIVILEGES) && i < privileges->PrivilegeCount; ++i)
+            {
+                if (privileges->Privileges[i].Luid.LowPart == shutdown.LowPart && privileges->Privileges[i].Luid.HighPart == 0)
+                {
+                    return (privileges->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
+                }
+            }
+            return false;
+        };
+
+        TOKEN_PRIVILEGES enable{.PrivilegeCount = 1, .Privileges = {{.Luid = shutdown, .Attributes = SE_PRIVILEGE_ENABLED}}};
+        TOKEN_PRIVILEGES previous{};
+        DWORD previous_length{};
+        if (!AdjustTokenPrivileges(token, FALSE, &enable, sizeof(previous), &previous, &previous_length) ||
+            GetLastError() != ERROR_SUCCESS || !shutdown_enabled())
+        {
+            puts("Enabling a held privilege failed");
+            return false;
+        }
+
+        AdjustTokenPrivileges(token, FALSE, &previous, 0, nullptr, nullptr);
+        if (shutdown_enabled())
+        {
+            puts("Restoring a privilege's previous state failed");
+            return false;
+        }
+
+        TOKEN_PRIVILEGES create_token{.PrivilegeCount = 1,
+                                      .Privileges = {{.Luid = {.LowPart = 2, .HighPart = 0}, .Attributes = SE_PRIVILEGE_ENABLED}}};
+        if (!AdjustTokenPrivileges(token, FALSE, &create_token, 0, nullptr, nullptr) || GetLastError() != ERROR_NOT_ALL_ASSIGNED)
+        {
+            puts("Enabled a privilege the token does not hold");
+            return false;
+        }
+
+        return true;
+    }
+
     bool test_token_information()
     {
         HANDLE token{};
@@ -2701,6 +2777,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_created_name_case, "Created Name Case")
     RUN_TEST(test_file_sharing, "File Sharing")
     RUN_TEST(test_token_information, "Token Information")
+    RUN_TEST(test_privileges, "Privileges")
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")
     RUN_TEST(test_stack_guarantee, "Stack Guarantee")
