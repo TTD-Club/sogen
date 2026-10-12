@@ -93,6 +93,32 @@ namespace sogen
             return confine(this->root_ / root_drive.data(), this->root_ / win_path.to_portable_path());
         }
 
+        // The host path at which to create `win_path`, a new entry the guest named `spelled`. Windows keeps the case a
+        // name was created with, while windows_path (and so translate) lowercases every component. Where the host
+        // file system ignores case (Windows hosts), the new entry takes the guest's spelling of its last component and
+        // later lookups through translate still find it. Case-sensitive hosts keep the lowercase name every lookup uses.
+        std::filesystem::path translate_for_creation(const windows_path& win_path, [[maybe_unused]] const std::u16string_view spelled) const
+        {
+            auto host_path = this->translate(win_path);
+#ifdef OS_WINDOWS
+            auto leaf = spelled;
+            while (!leaf.empty() && (leaf.back() == u'\\' || leaf.back() == u'/'))
+            {
+                leaf.remove_suffix(1);
+            }
+            if (const auto separator = leaf.find_last_of(u"\\/"); separator != std::u16string_view::npos)
+            {
+                leaf = leaf.substr(separator + 1);
+            }
+            if (!leaf.empty() && windows_path(std::u16string(leaf)).u16string() == win_path.leaf() &&
+                host_path.filename().u16string() == win_path.leaf())
+            {
+                host_path.replace_filename(std::filesystem::path(std::u16string(leaf)));
+            }
+#endif
+            return host_path;
+        }
+
         template <typename F>
         void access_mapped_entries(const windows_path& win_path, const F& accessor) const
         {

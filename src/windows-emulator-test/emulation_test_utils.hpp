@@ -117,6 +117,16 @@ namespace sogen::test
         return settings;
     }
 
+    // Tests run in parallel in one emulation root, and every emulated test-sample has the same process id, so a
+    // sample that creates files does so in C:\sogen-test-scratch, mapped to a directory of this host process.
+    inline void add_scratch_directory(emulator_settings& settings)
+    {
+        const auto scratch = std::filesystem::temp_directory_path() / ("emulator-test-scratch-" + std::to_string(getpid()));
+        std::error_code ec{};
+        std::filesystem::create_directories(scratch, ec);
+        settings.path_mappings["C:\\sogen-test-scratch"] = scratch;
+    }
+
     inline windows_emulator create_emulator(emulator_settings settings, emulator_callbacks callbacks = {},
                                             emulator_interfaces interfaces = {})
     {
@@ -133,6 +143,7 @@ namespace sogen::test
 
         settings.path_mappings["C:\\a.txt"] =
             std::filesystem::temp_directory_path() / ("emulator-test-file-" + std::to_string(getpid()) + ".txt");
+        add_scratch_directory(settings);
 
         if (!interfaces.socket_factory)
         {
@@ -172,6 +183,7 @@ namespace sogen::test
 
         settings.path_mappings["C:\\a.txt"] =
             std::filesystem::temp_directory_path() / ("emulator-test-file-" + std::to_string(getpid()) + ".txt");
+        add_scratch_directory(settings);
 
         if (!interfaces.socket_factory)
         {

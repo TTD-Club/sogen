@@ -204,7 +204,7 @@ namespace sogen
                 }
 
                 const auto source = c.win_emu.file_sys.translate(f->name);
-                const auto target = c.win_emu.file_sys.translate(*link_name);
+                const auto target = c.win_emu.file_sys.translate_for_creation(*link_name, *link_name);
                 std::error_code ec{};
                 if (std::filesystem::is_directory(source, ec))
                 {
@@ -255,7 +255,8 @@ namespace sogen
                     return STATUS_OBJECT_NAME_EXISTS;
                 }
 
-                f->handle.defer_rename(c.win_emu.file_sys.translate(f->name), c.win_emu.file_sys.translate(new_name));
+                f->handle.defer_rename(c.win_emu.file_sys.translate(f->name),
+                                       c.win_emu.file_sys.translate_for_creation(new_name, new_name));
 
                 return STATUS_SUCCESS;
             }
@@ -2081,7 +2082,7 @@ namespace sogen
                     return STATUS_OBJECT_PATH_NOT_FOUND;
                 }
 
-                create_directory(host_path, ec);
+                create_directory(c.win_emu.file_sys.translate_for_creation(path, f.name), ec);
 
                 if (ec)
                 {
@@ -2108,9 +2109,13 @@ namespace sogen
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
 
-            if (create_disposition == FILE_OPEN_IF && !file_exists)
+            // A new file is created here, under the name the guest spelled (see translate_for_creation); opening it
+            // below then finds it whatever the mode.
+            const auto creates = create_disposition == FILE_CREATE || create_disposition == FILE_OPEN_IF ||
+                                 create_disposition == FILE_SUPERSEDE || create_disposition == FILE_OVERWRITE_IF;
+            if (creates && !file_exists)
             {
-                std::ofstream touch(host_path, std::ios::binary | std::ios::app);
+                std::ofstream touch(c.win_emu.file_sys.translate_for_creation(path, f.name), std::ios::binary | std::ios::app);
                 if (!touch)
                 {
                     return STATUS_ACCESS_DENIED;
@@ -2121,12 +2126,6 @@ namespace sogen
 
             if (mode.empty() && create_disposition == FILE_CREATE)
             {
-                std::ofstream touch(host_path, std::ios::binary | std::ios::app);
-                if (!touch)
-                {
-                    return STATUS_ACCESS_DENIED;
-                }
-
                 mode = u"rb";
             }
 

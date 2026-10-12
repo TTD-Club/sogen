@@ -2228,6 +2228,87 @@ namespace
         return !CreateDirectoryW(executable.data(), nullptr) && GetLastError() == ERROR_ALREADY_EXISTS;
     }
 
+    // Created and renamed entries keep the case they were given. Sogen on a case-sensitive host (Linux, macOS)
+    // stores names in lower case, which this accepts too; on Windows hosts and natively the case must match exactly.
+    bool test_created_name_case()
+    {
+        // Several instances of this sample can run in one directory at once. Natively their process ids differ; the
+        // emulator tests give each emulated instance (all with one process id) its own C:\sogen-test-scratch.
+        const auto scratch = GetFileAttributesW(L"C:\\sogen-test-scratch");
+        const std::wstring base =
+            scratch != INVALID_FILE_ATTRIBUTES && (scratch & FILE_ATTRIBUTE_DIRECTORY) ? L"C:\\sogen-test-scratch\\" : L"";
+        const auto leaf = L"NameCase" + std::to_wstring(GetCurrentProcessId());
+        const auto directory = base + leaf;
+        const auto file = directory + L"\\Inner.Py";
+        const auto renamed = directory + L"\\Renamed.TXT";
+
+        const auto to_lower = [](std::wstring text) {
+            std::ranges::transform(text, text.begin(), [](const wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+            return text;
+        };
+        const auto spelled = [&](const std::wstring& found, const std::wstring& expected) {
+            return found == expected || found == to_lower(expected);
+        };
+        const auto list = [](const std::wstring& pattern) {
+            std::vector<std::wstring> names{};
+            WIN32_FIND_DATAW data{};
+            const auto search = FindFirstFileW(pattern.c_str(), &data);
+            if (search == INVALID_HANDLE_VALUE)
+            {
+                return names;
+            }
+            do
+            {
+                if (wcscmp(data.cFileName, L".") != 0 && wcscmp(data.cFileName, L"..") != 0)
+                {
+                    names.emplace_back(data.cFileName);
+                }
+            } while (FindNextFileW(search, &data));
+            FindClose(search);
+            return names;
+        };
+
+        if (!CreateDirectoryW(directory.c_str(), nullptr))
+        {
+            return false;
+        }
+
+        const auto cleanup = sogen::utils::finally([&] {
+            DeleteFileW(file.c_str());
+            DeleteFileW(renamed.c_str());
+            RemoveDirectoryW(directory.c_str());
+        });
+
+        const auto handle = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        CloseHandle(handle);
+
+        const auto directories = list(directory);
+        auto files = list(directory + L"\\*");
+        if (directories.size() != 1 || !spelled(directories[0], leaf) || files.size() != 1 || !spelled(files[0], L"Inner.Py"))
+        {
+            puts("Created names lost their case");
+            return false;
+        }
+
+        if (!MoveFileW(file.c_str(), renamed.c_str()))
+        {
+            return false;
+        }
+
+        files = list(directory + L"\\*");
+        if (files.size() != 1 || !spelled(files[0], L"Renamed.TXT"))
+        {
+            puts("Renamed file lost its case");
+            return false;
+        }
+
+        return true;
+    }
+
     bool test_file_ids_by_name()
     {
         // FILE_STAT_BASIC_INFORMATION; older SDKs lack it and GetFileInformationByName.
@@ -2557,6 +2638,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_device_file_types, "Device File Types")
     RUN_TEST(test_file_ids_by_name, "File IDs by Name")
     RUN_TEST(test_directory_name_collision, "Directory Name Collision")
+    RUN_TEST(test_created_name_case, "Created Name Case")
     RUN_TEST(test_token_information, "Token Information")
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")
