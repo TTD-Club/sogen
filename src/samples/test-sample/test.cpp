@@ -893,6 +893,42 @@ namespace
         return true;
     }
 
+    // A directory is not replaced (moving a file onto it fails and leaves both), while a directory may replace a file.
+    bool test_replace_refusals()
+    {
+        const auto base = scratch_directory() + L"Replace" + std::to_wstring(GetCurrentProcessId());
+        const auto file = base + L"\\file.txt";
+        const auto directory = base + L"\\dir";
+        const auto cleanup = sogen::utils::finally([&] {
+            DeleteFileW(file.c_str());
+            RemoveDirectoryW(file.c_str());
+            RemoveDirectoryW(directory.c_str());
+            RemoveDirectoryW(base.c_str());
+        });
+
+        if (!CreateDirectoryW(base.c_str(), nullptr) || !CreateDirectoryW(directory.c_str(), nullptr))
+        {
+            return false;
+        }
+        CloseHandle(CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr));
+
+        const auto file_onto_directory =
+            !MoveFileExW(file.c_str(), directory.c_str(), MOVEFILE_REPLACE_EXISTING) && GetLastError() == ERROR_ACCESS_DENIED;
+        const auto both_left = GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES &&
+                               (GetFileAttributesW(directory.c_str()) & FILE_ATTRIBUTE_DIRECTORY);
+        const auto directory_onto_file = MoveFileExW(directory.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING) &&
+                                         (GetFileAttributesW(file.c_str()) & FILE_ATTRIBUTE_DIRECTORY) &&
+                                         GetFileAttributesW(directory.c_str()) == INVALID_FILE_ATTRIBUTES;
+        if (!file_onto_directory || !both_left || !directory_onto_file)
+        {
+            printf("Replace: file onto directory refused %d, both left %d, directory onto file %d\n", file_onto_directory, both_left,
+                   directory_onto_file);
+            return false;
+        }
+
+        return true;
+    }
+
     // The drives are listed, a volume's name leads back to its drive, and a directory has a file index.
     bool test_drives_and_volumes()
     {
@@ -3529,6 +3565,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_case_mapping, "Case Mapping")
     RUN_TEST(test_volume_path, "Volume Path")
     RUN_TEST(test_drives_and_volumes, "Drives and Volumes")
+    RUN_TEST(test_replace_refusals, "Replace Refusals")
     RUN_TEST(test_file_mappings, "File Mappings")
     RUN_TEST(test_environment_and_names, "Environment and Names")
     RUN_TEST(test_reparse_points, "Reparse Points")

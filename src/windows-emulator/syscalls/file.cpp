@@ -592,6 +592,15 @@ namespace sogen
                     return STATUS_OBJECT_NAME_EXISTS;
                 }
 
+                // A directory is not replaced (os.replace onto a directory fails; a file may be replaced by a
+                // directory). A rename onto itself (another spelling of the name) is not a replacement.
+                const auto target_host_path = c.win_emu.file_sys.translate(new_name);
+                if (file_exists && !std::filesystem::equivalent(c.win_emu.file_sys.translate(f->name), target_host_path, ec) &&
+                    std::filesystem::is_directory(target_host_path, ec))
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+
                 f->handle.defer_rename(c.win_emu.file_sys.translate(f->name),
                                        c.win_emu.file_sys.translate_for_creation(new_name, new_name));
                 f->renamed_to = new_name;
