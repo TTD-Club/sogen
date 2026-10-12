@@ -502,6 +502,9 @@ namespace sogen
             case SystemFeatureConfigurationSectionInformation:
             case SystemFirmwareTableInformation:
             case SystemPolicyInformation:
+            // Performance counter providers (HKEY_PERFORMANCE_DATA) skip what fails.
+            case SystemSuperfetchInformation:
+            case SystemMemoryTopologyInformation:
                 return STATUS_NOT_SUPPORTED;
 
             case SystemControlFlowTransition:

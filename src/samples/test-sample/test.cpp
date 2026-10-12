@@ -2822,8 +2822,43 @@ namespace
         return true;
     }
 
-    // A non-blocking write takes only what the pipe's buffer has room for, nothing once it is full, and again after a
-    // read made room.
+    // A client open needs a server instance without a client: no such pipe is not found, and a busy one is busy.
+    bool test_pipe_open()
+    {
+        const auto name = L"\\\\.\\pipe\\sogen-open-test-" + std::to_wstring(GetCurrentProcessId());
+        const auto open_client = [&](const std::wstring& pipe) {
+            return CreateFileW(pipe.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        };
+
+        auto* const missing = open_client(name + L"-missing");
+        const auto missing_error = GetLastError();
+
+        auto* const server = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr);
+        if (server == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        auto* const first = open_client(name);
+        auto* const second = open_client(name);
+        const auto second_error = GetLastError();
+
+        CloseHandle(second);
+        CloseHandle(first);
+        CloseHandle(server);
+
+        if (missing != INVALID_HANDLE_VALUE || missing_error != ERROR_FILE_NOT_FOUND || first == INVALID_HANDLE_VALUE ||
+            second != INVALID_HANDLE_VALUE || second_error != ERROR_PIPE_BUSY)
+        {
+            printf("Pipe open: missing error %lu, first ok %d, second error %lu\n", missing_error, first != INVALID_HANDLE_VALUE,
+                   second_error);
+            return false;
+        }
+
+        return true;
+    }
+
+    // A non-blocking write that does not fit in the room left in the pipe's buffer writes nothing (also in byte mode);
+    // once a read made room it fits again.
     bool test_pipe_quota()
     {
         HANDLE read_end{};
@@ -3677,6 +3712,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_pipe_data, "Pipe Data")
     RUN_TEST(test_pipe_waits, "Pipe Waits")
     RUN_TEST(test_pipe_quota, "Pipe Quota")
+    RUN_TEST(test_pipe_open, "Pipe Open")
     RUN_TEST(test_device_file_types, "Device File Types")
     RUN_TEST(test_file_ids_by_name, "File IDs by Name")
     RUN_TEST(test_directory_name_collision, "Directory Name Collision")

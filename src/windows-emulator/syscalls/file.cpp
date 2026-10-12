@@ -2447,18 +2447,31 @@ namespace sogen
                 pipe_device->access = desired_access;
                 pipe_device->synchronous = (create_options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
 
-                // A client connects to a server instance of that name that has no client yet.
+                // A client connects to a server instance of that name that has no client yet. Without one the open fails
+                // as on Windows (no emulated service listens on \PIPE\wkssvc and the like; RPC then reports the server
+                // unavailable instead of talking to a dead pipe).
                 if (const auto short_name = pipe_short_name(filename); !short_name.empty())
                 {
+                    auto exists = false;
                     for (auto& entry : c.proc.devices | std::views::values)
                     {
                         const auto* server = entry.get_internal_device<named_pipe>();
-                        if (server && server->server && !server->anonymous && pipe_short_name(server->name) == short_name &&
-                            !find_pipe_end(c.proc, server->instance, false))
+                        if (!server || !server->server || server->anonymous || pipe_short_name(server->name) != short_name)
+                        {
+                            continue;
+                        }
+
+                        exists = true;
+                        if (!find_pipe_end(c.proc, server->instance, false))
                         {
                             pipe_device->instance = server->instance;
                             break;
                         }
+                    }
+
+                    if (!pipe_device->instance)
+                    {
+                        return exists ? STATUS_PIPE_NOT_AVAILABLE : STATUS_OBJECT_NAME_NOT_FOUND;
                     }
                 }
             }
