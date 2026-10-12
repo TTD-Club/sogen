@@ -29,6 +29,14 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            constexpr uint32_t handle_flag_protect_from_close = 2;
+            constexpr auto status_handle_not_closable = static_cast<NTSTATUS>(0xC0000235);
+            const auto flags = c.proc.handle_flags.find(process_context::handle_flags_key(h));
+            if (flags != c.proc.handle_flags.end() && (flags->second & handle_flag_protect_from_close))
+            {
+                return status_handle_not_closable;
+            }
+
             if (value.type == handle_types::wait_completion_packet)
             {
                 auto* wait_packet = c.proc.wait_completion_packets.get(h);
@@ -111,6 +119,10 @@ namespace sogen
                 {
                     c.win_emu.memory.release_memory(section_backing_address, 0);
                 }
+                if (flags != c.proc.handle_flags.end())
+                {
+                    c.proc.handle_flags.erase(flags);
+                }
                 return STATUS_SUCCESS;
             }
 
@@ -119,8 +131,13 @@ namespace sogen
 
         NTSTATUS handle_NtDuplicateObject(const syscall_context& c, const handle source_process_handle, const handle source_handle,
                                           const handle target_process_handle, const emulator_object<handle> target_handle,
-                                          const ACCESS_MASK /*desired_access*/, const ULONG /*handle_attributes*/, const ULONG /*options*/)
+                                          const ACCESS_MASK /*desired_access*/, const ULONG handle_attributes, const ULONG options)
         {
+            constexpr ULONG duplicate_close_source = 0x1;
+            constexpr ULONG duplicate_same_attributes = 0x4;
+            constexpr ULONG obj_inherit = 0x2;
+            constexpr uint32_t handle_flag_inherit = 1;
+
             if (!c.proc.is_current_process_handle(source_process_handle) || !c.proc.is_current_process_handle(target_process_handle))
             {
                 return STATUS_NOT_SUPPORTED;
@@ -144,6 +161,27 @@ namespace sogen
             if (!new_handle)
             {
                 return STATUS_INVALID_HANDLE;
+            }
+
+            // Duplicates share their source's value, and so its flags: closing the source drops them first.
+            const auto key = process_context::handle_flags_key(*new_handle);
+            const auto source_flags = c.proc.handle_flags.contains(key) ? c.proc.handle_flags.at(key) : 0;
+            if (options & duplicate_close_source)
+            {
+                (void)handle_NtClose(c, resolved_source_handle);
+            }
+
+            // The new handle is inheritable as asked, or as the source was with DUPLICATE_SAME_ATTRIBUTES.
+            const auto inherit =
+                (options & duplicate_same_attributes) ? (source_flags & handle_flag_inherit) != 0 : (handle_attributes & obj_inherit) != 0;
+            const auto flags = (source_flags & ~handle_flag_inherit) | (inherit ? handle_flag_inherit : 0);
+            if (flags)
+            {
+                c.proc.handle_flags[key] = flags;
+            }
+            else
+            {
+                c.proc.handle_flags.erase(key);
             }
 
             target_handle.write(*new_handle);
@@ -457,10 +495,12 @@ namespace sogen
 
             if (object_information_class == ObjectHandleFlagInformation)
             {
+                const auto key = process_context::handle_flags_key(c.proc.resolve_object_pseudo_handle(handle, c.vcpu.active_thread));
+                const auto flags = c.proc.handle_flags.contains(key) ? c.proc.handle_flags.at(key) : 0;
                 return handle_query<OBJECT_HANDLE_FLAG_INFORMATION>(c.emu, object_information, object_information_length, return_length,
                                                                     [&](OBJECT_HANDLE_FLAG_INFORMATION& info) {
-                                                                        info.Inherit = 0;
-                                                                        info.ProtectFromClose = 0;
+                                                                        info.Inherit = (flags & 1) ? TRUE : FALSE;
+                                                                        info.ProtectFromClose = (flags & 2) ? TRUE : FALSE;
                                                                     });
             }
 
@@ -861,12 +901,18 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
-            // Validate the buffer, then drop the flags: NtQueryObject reports both
-            // as 0 because neither is tracked per handle. Failing instead breaks
-            // callers that only set them defensively -- winhttp aborts session
-            // creation with ERROR_NOT_SUPPORTED and returns a NULL session.
             const emulator_object<OBJECT_HANDLE_FLAG_INFORMATION> info{c.emu, object_information};
-            (void)info.read();
+            const auto requested = info.read();
+            const auto flags = (requested.Inherit ? 1U : 0U) | (requested.ProtectFromClose ? 2U : 0U);
+            const auto key = process_context::handle_flags_key(effective_handle);
+            if (flags)
+            {
+                c.proc.handle_flags[key] = flags;
+            }
+            else
+            {
+                c.proc.handle_flags.erase(key);
+            }
 
             return STATUS_SUCCESS;
         }

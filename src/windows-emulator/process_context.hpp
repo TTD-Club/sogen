@@ -420,6 +420,8 @@ namespace sogen
         void restore_windows_after_state_restore(windows_emulator& win_emu);
 
         generic_handle_store* get_handle_store(handle handle);
+        // Open kernel object handles (ProcessHandleCount).
+        uint32_t count_handles() const;
         emulator_thread* find_thread_by_id(uint32_t thread_id);
         const emulator_thread* find_thread_by_id(uint32_t thread_id) const;
         bool is_window_effectively_visible(hwnd window) const;
@@ -525,6 +527,16 @@ namespace sogen
 
         // The next pipe instance id (named_pipe::instance) NtCreateNamedPipeFile hands out.
         uint64_t next_pipe_instance{1};
+
+        // HANDLE_FLAG_INHERIT and HANDLE_FLAG_PROTECT_FROM_CLOSE of the handles that have any, by handle_flags_key
+        // (duplicates share their source's value, and so its flags).
+        std::map<uint64_t, uint32_t> handle_flags{};
+
+        // A handle's identity for handle_flags, without the tag bits user mode may set.
+        static uint64_t handle_flags_key(const handle h)
+        {
+            return h.bits & 0xFFFFFFFC;
+        }
 
         // For WOW64 processes
         std::optional<emulator_object<PEB32>> peb32;

@@ -849,6 +849,7 @@ namespace sogen
         buffer.write(this->next_raw_input_token);
         buffer.write_map(this->token_privileges);
         buffer.write(this->next_pipe_instance);
+        buffer.write_map(this->handle_flags);
         buffer.write_atomic(this->audio_render_event);
 
         buffer.write(this->user_handles);
@@ -956,6 +957,7 @@ namespace sogen
         buffer.read(this->next_raw_input_token);
         buffer.read_map(this->token_privileges);
         buffer.read(this->next_pipe_instance);
+        buffer.read_map(this->handle_flags);
         buffer.read_atomic(this->audio_render_event);
 
         buffer.read(this->user_handles);
@@ -1194,6 +1196,40 @@ namespace sogen
         default:
             return nullptr;
         }
+    }
+
+    uint32_t process_context::count_handles() const
+    {
+        // Every open handle holds a reference on its object (some objects also hold internal ones).
+        uint64_t count = 0;
+        const auto add = [&](const auto& store) {
+            for (const auto& object : store | std::views::values)
+            {
+                count += object.ref_count;
+            }
+        };
+
+        add(this->processes);
+        add(this->managed_threads);
+        add(this->threads);
+        add(this->events);
+        add(this->files);
+        add(this->devices);
+        add(this->semaphores);
+        add(this->io_completions);
+        add(this->wait_completion_packets);
+        add(this->worker_factories);
+        add(this->jobs);
+        add(this->registry_keys);
+        add(this->mutants);
+        add(this->timers);
+        add(this->desktops);
+        add(this->ports);
+        add(this->sections);
+        add(this->private_namespaces);
+        add(this->deferred_window_position_batches);
+
+        return static_cast<uint32_t>(std::min<uint64_t>(count, UINT32_MAX));
     }
 
     emulator_thread* process_context::find_thread_by_id(const uint32_t thread_id)

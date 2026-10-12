@@ -2794,6 +2794,82 @@ namespace
         return result == WAIT_OBJECT_0;
     }
 
+    // Handle flags read back as set, DUPLICATE_CLOSE_SOURCE leaves the handle count as it was, and file times set with
+    // SetFileTime read back.
+    bool test_handles_and_file_times()
+    {
+        auto* const event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!event)
+        {
+            return false;
+        }
+
+        DWORD flags{};
+        if (!GetHandleInformation(event, &flags) || flags != 0 || !SetHandleInformation(event, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) ||
+            !GetHandleInformation(event, &flags) || flags != HANDLE_FLAG_INHERIT)
+        {
+            CloseHandle(event);
+            puts("Handle flags did not read back");
+            return false;
+        }
+
+        const auto handle_count = [] {
+            DWORD count{};
+            GetProcessHandleCount(GetCurrentProcess(), &count);
+            return count;
+        };
+
+        const auto before = handle_count();
+        HANDLE moved{};
+        auto* const current_process = GetCurrentProcess();
+        if (!DuplicateHandle(current_process, event, current_process, &moved, 0, FALSE, DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE) ||
+            handle_count() != before)
+        {
+            puts("DUPLICATE_CLOSE_SOURCE did not close the source");
+            return false;
+        }
+        CloseHandle(moved);
+
+        const auto path = scratch_directory() + L"Times" + std::to_wstring(GetCurrentProcessId()) + L".txt";
+        auto* const file =
+            CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        const auto close_file = sogen::utils::finally([&] { CloseHandle(file); });
+
+        // 2001-02-03 04:05:06.7 UTC.
+        constexpr uint64_t time_value = 126257475067000000;
+        const FILETIME time{.dwLowDateTime = static_cast<DWORD>(time_value), .dwHighDateTime = static_cast<DWORD>(time_value >> 32)};
+        if (!SetFileTime(file, nullptr, &time, &time))
+        {
+            puts("SetFileTime failed");
+            return false;
+        }
+
+        // With relative time the emulator reports every file time as 2023-11-14 00:00 UTC, so there is nothing to read back.
+        constexpr uint64_t deterministic_value = 133444736000000000;
+        FILETIME creation{};
+        FILETIME access{};
+        FILETIME write{};
+        if (!GetFileTime(file, &creation, &access, &write))
+        {
+            return false;
+        }
+        if (((static_cast<uint64_t>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime) == deterministic_value)
+        {
+            return true;
+        }
+        if (CompareFileTime(&write, &time) != 0 || CompareFileTime(&access, &time) != 0)
+        {
+            puts("File times did not read back");
+            return false;
+        }
+
+        return true;
+    }
+
     // A thread's description reads back as it was set, including from another thread through a handle.
     bool test_thread_description()
     {
@@ -2913,6 +2989,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_system_random, "System Random")
     RUN_TEST(test_stack_guarantee, "Stack Guarantee")
     RUN_TEST(test_thread_description, "Thread Description")
+    RUN_TEST(test_handles_and_file_times, "Handle Flags and File Times")
     RUN_TEST(test_high_resolution_timer, "High Resolution Timer")
     RUN_TEST(test_waitable_timers, "Waitable Timers")
 #ifdef _WIN64

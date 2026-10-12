@@ -518,6 +518,10 @@ namespace sogen
                 return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
                                            [](ULONG& priority) { priority = 2; }); // IoPriorityNormal
 
+            case ProcessHandleCount:
+                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
+                                           [&](ULONG& count) { count = c.proc.count_handles(); });
+
             case ProcessWow64Information:
                 return handle_query<EmulatorTraits<Emu64>::ULONG_PTR>(
                     c.emu, process_information, process_information_length, return_length,

@@ -295,6 +295,23 @@ namespace sogen
 
             if (info_class == FileBasicInformation)
             {
+                if (length < sizeof(FILE_BASIC_INFORMATION))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                // Access and write times go to the host file (SetFileTime, os.utime). 0 keeps a time, and -1 and -2
+                // switch its automatic updates off and on, so only positive values are times. Creation times and
+                // attributes are not kept.
+                const auto info = c.emu.read_memory<FILE_BASIC_INFORMATION>(file_information);
+                const auto time = [](const LARGE_INTEGER value) { return value.QuadPart > 0 ? std::optional(value) : std::nullopt; };
+                const auto access_time = time(info.LastAccessTime);
+                const auto write_time = time(info.LastWriteTime);
+                if ((access_time || write_time) && !f->host_path.empty() && !compat_set_file_times(f->host_path, access_time, write_time))
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+
                 return STATUS_SUCCESS;
             }
 
@@ -2062,12 +2079,10 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtCreateFile(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
-                                     const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
-                                     const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
-                                     const emulator_object<LARGE_INTEGER> /*allocation_size*/, ULONG /*file_attributes*/,
-                                     ULONG share_access, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
-                                     ULONG ea_length)
+        static NTSTATUS create_file(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
+                                    const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                    const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, ULONG share_access,
+                                    ULONG create_disposition, ULONG create_options, uint64_t ea_buffer, ULONG ea_length)
         {
             constexpr ULONG file_opened = 1;
 
@@ -2358,6 +2373,26 @@ namespace sogen
             file_handle.write(handle);
 
             return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtCreateFile(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
+                                     const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                     const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                     const emulator_object<LARGE_INTEGER> /*allocation_size*/, ULONG /*file_attributes*/,
+                                     ULONG share_access, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
+                                     ULONG ea_length)
+        {
+            const auto status = create_file(c, file_handle, desired_access, object_attributes, io_status_block, share_access,
+                                            create_disposition, create_options, ea_buffer, ea_length);
+
+            // OBJ_INHERIT makes the new handle inheritable (CreateFile with an inheritable SECURITY_ATTRIBUTES).
+            constexpr ULONG obj_inherit = 0x2;
+            if (NT_SUCCESS(status) && (object_attributes.read().Attributes & obj_inherit))
+            {
+                c.proc.handle_flags[process_context::handle_flags_key(file_handle.read())] |= 1;
+            }
+
+            return status;
         }
 
         NTSTATUS handle_NtQueryFullAttributesFile(const syscall_context& c,
@@ -2657,6 +2692,12 @@ namespace sogen
 
             handle pipe_handle = c.proc.devices.store(std::move(container));
             file_handle.write(pipe_handle);
+
+            constexpr ULONG obj_inherit = 0x2;
+            if (attributes.Attributes & obj_inherit)
+            {
+                c.proc.handle_flags[process_context::handle_flags_key(pipe_handle)] |= 1;
+            }
 
             IO_STATUS_BLOCK<EmulatorTraits<Emu64>> iosb{};
             iosb.Status = STATUS_SUCCESS;

@@ -7,10 +7,14 @@
 #include <corecrt_io.h>
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
 #include <sys/stat.h>
+
+#include <array>
+#include <chrono>
 
 #undef st_atime
 #undef st_mtime
@@ -103,6 +107,28 @@ namespace sogen
         return result;
     }
 
+    bool compat_set_file_times(const std::filesystem::path& file_name, const std::optional<LARGE_INTEGER> access_time,
+                               const std::optional<LARGE_INTEGER> write_time)
+    {
+        auto* const file_handle =
+            CreateFileW(file_name.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (file_handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        const auto to_filetime = [](const std::optional<LARGE_INTEGER> time) {
+            return time ? FILETIME{.dwLowDateTime = time->LowPart, .dwHighDateTime = static_cast<DWORD>(time->HighPart)} : FILETIME{};
+        };
+        const auto access = to_filetime(access_time);
+        const auto write = to_filetime(write_time);
+        const auto result = SetFileTime(file_handle, nullptr, access_time ? &access : nullptr, write_time ? &write : nullptr) != FALSE;
+        CloseHandle(file_handle);
+
+        return result;
+    }
+
 #else
 
 #if defined(__MINGW64__)
@@ -165,6 +191,38 @@ namespace sogen
         set_stat(stat, &file_stat);
 
         return true;
+    }
+
+    bool compat_set_file_times(const std::filesystem::path& file_name, const std::optional<LARGE_INTEGER> access_time,
+                               const std::optional<LARGE_INTEGER> write_time)
+    {
+#if defined(__MINGW64__)
+        // No utimensat: only the write time, through the standard library.
+        (void)access_time;
+        if (!write_time)
+        {
+            return true;
+        }
+        const auto since_1601 = std::chrono::duration<int64_t, std::ratio<1, HUNDRED_NANOSECONDS_IN_ONE_SECOND>>{write_time->QuadPart};
+        const auto since_1970 = since_1601 - std::chrono::seconds{EPOCH_DIFFERENCE_1601_TO_1970_SECONDS};
+        const auto system_time =
+            std::chrono::system_clock::time_point{std::chrono::duration_cast<std::chrono::system_clock::duration>(since_1970)};
+        std::error_code ec{};
+        std::filesystem::last_write_time(file_name, std::chrono::clock_cast<std::filesystem::file_time_type::clock>(system_time), ec);
+        return !ec;
+#else
+        const auto to_timespec = [](const std::optional<LARGE_INTEGER> time) {
+            if (!time)
+            {
+                return timespec{.tv_sec = 0, .tv_nsec = UTIME_OMIT};
+            }
+            const auto value = time->QuadPart - WINDOWS_EPOCH_DIFFERENCE;
+            return timespec{.tv_sec = static_cast<time_t>(value / HUNDRED_NANOSECONDS_IN_ONE_SECOND),
+                            .tv_nsec = static_cast<long>((value % HUNDRED_NANOSECONDS_IN_ONE_SECOND) * 100)};
+        };
+        const std::array<timespec, 2> times{to_timespec(access_time), to_timespec(write_time)};
+        return utimensat(AT_FDCWD, file_name.string().c_str(), times.data(), 0) == 0;
+#endif
     }
 
 #endif
