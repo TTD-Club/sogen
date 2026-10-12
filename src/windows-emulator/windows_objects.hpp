@@ -722,9 +722,11 @@ namespace sogen
         std::u16string short_name{};
         // The tag of a junction or symbolic link, 0 for other entries.
         uint32_t reparse_tag{};
+        bool read_only{};
 
         void serialize(utils::buffer_serializer& buffer) const
         {
+            buffer.write(this->read_only);
             buffer.write(this->file_path);
             buffer.write(this->file_size);
             buffer.write(this->is_directory);
@@ -737,6 +739,7 @@ namespace sogen
 
         void deserialize(utils::buffer_deserializer& buffer)
         {
+            buffer.read(this->read_only);
             buffer.read(this->file_path);
             buffer.read(this->file_size);
             buffer.read(this->is_directory);

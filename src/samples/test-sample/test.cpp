@@ -893,6 +893,51 @@ namespace
         return true;
     }
 
+    // A read-only file says so and is not deleted until it is writable again; a handle names its file in the case the file
+    // system keeps, whatever the case it was opened with.
+    bool test_read_only_and_final_names()
+    {
+        const auto base = scratch_directory() + L"ReadOnly" + std::to_wstring(GetCurrentProcessId());
+        const auto file = base + L"\\MixedCase.txt";
+        const auto cleanup = sogen::utils::finally([&] {
+            SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(file.c_str());
+            RemoveDirectoryW(base.c_str());
+        });
+
+        if (!CreateDirectoryW(base.c_str(), nullptr))
+        {
+            return false;
+        }
+        CloseHandle(CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr));
+
+        const auto marked =
+            SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_READONLY) && (GetFileAttributesW(file.c_str()) & FILE_ATTRIBUTE_READONLY);
+        const auto delete_refused = !DeleteFileW(file.c_str()) && GetLastError() == ERROR_ACCESS_DENIED;
+        const auto cleared =
+            SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_NORMAL) && !(GetFileAttributesW(file.c_str()) & FILE_ATTRIBUTE_READONLY);
+        if (!marked || !delete_refused || !cleared)
+        {
+            printf("Read-only: marked %d, delete refused %d, cleared %d\n", marked, delete_refused, cleared);
+            return false;
+        }
+
+        // Opened with another case, named with the created one.
+        std::wstring lower_case = file;
+        std::ranges::transform(lower_case, lower_case.begin(), [](const wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+        auto* const handle = CreateFileW(lower_case.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        std::array<wchar_t, MAX_PATH> final_name{};
+        const auto length = GetFinalPathNameByHandleW(handle, final_name.data(), static_cast<DWORD>(final_name.size()), 0);
+        CloseHandle(handle);
+        if (length == 0 || !std::wstring_view(final_name.data(), length).ends_with(L"\\MixedCase.txt"))
+        {
+            printf("Final name: %ls\n", final_name.data());
+            return false;
+        }
+
+        return true;
+    }
+
     // A directory is not replaced (moving a file onto it fails and leaves both), while a directory may replace a file.
     bool test_replace_refusals()
     {
@@ -3566,6 +3611,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_volume_path, "Volume Path")
     RUN_TEST(test_drives_and_volumes, "Drives and Volumes")
     RUN_TEST(test_replace_refusals, "Replace Refusals")
+    RUN_TEST(test_read_only_and_final_names, "Read-Only and Final Names")
     RUN_TEST(test_file_mappings, "File Mappings")
     RUN_TEST(test_environment_and_names, "Environment and Names")
     RUN_TEST(test_reparse_points, "Reparse Points")

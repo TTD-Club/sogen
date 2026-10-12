@@ -119,6 +119,87 @@ namespace sogen
             return host_path;
         }
 
+        // The part of a guest path after its drive ("\Users\x"), its components in the case the file system keeps for
+        // them, as Windows reports names (GetFinalPathNameByHandle). On Windows hosts that is the host's case of each
+        // existing component (the guest's spelling of components the host lacks or reaches through a link); elsewhere
+        // the guest's spelling.
+        std::u16string true_case(std::u16string_view spelled) const
+        {
+            for (const std::u16string_view prefix : {u"\\??\\", u"\\\\?\\"})
+            {
+                if (spelled.starts_with(prefix))
+                {
+                    spelled.remove_prefix(prefix.size());
+                    break;
+                }
+            }
+            std::u16string drive{};
+            if (spelled.size() >= 2 && spelled[1] == u':')
+            {
+                drive = spelled.substr(0, 2);
+                spelled.remove_prefix(2);
+            }
+
+            std::vector<std::u16string> parts{};
+            size_t start = 0;
+            while (start <= spelled.size())
+            {
+                const auto end = spelled.find_first_of(u"\\/", start);
+                const auto part = spelled.substr(start, end == std::u16string_view::npos ? std::u16string_view::npos : end - start);
+                if (part == u"..")
+                {
+                    if (!parts.empty())
+                    {
+                        parts.pop_back();
+                    }
+                }
+                else if (!part.empty() && part != u".")
+                {
+                    parts.emplace_back(part);
+                }
+                if (end == std::u16string_view::npos)
+                {
+                    break;
+                }
+                start = end + 1;
+            }
+
+#ifdef OS_WINDOWS
+            if (!drive.empty() && !parts.empty())
+            {
+                // The host's spelling of the trailing components that name the same entries.
+                std::error_code ec{};
+                const auto canonical =
+                    std::filesystem::canonical(this->translate(windows_path{drive + u"\\" + std::u16string(spelled)}), ec);
+                if (!ec)
+                {
+                    std::vector<std::u16string> host_parts{};
+                    for (const auto& component : canonical.relative_path())
+                    {
+                        host_parts.emplace_back(component.u16string());
+                    }
+
+                    auto host = host_parts.rbegin();
+                    for (auto part = parts.rbegin(); part != parts.rend() && host != host_parts.rend(); ++part, ++host)
+                    {
+                        if (!utils::string::equals_ignore_case(std::u16string_view{*part}, std::u16string_view{*host}))
+                        {
+                            break;
+                        }
+                        *part = *host;
+                    }
+                }
+            }
+#endif
+
+            std::u16string result{};
+            for (const auto& part : parts)
+            {
+                result += u"\\" + part;
+            }
+            return result.empty() ? u"\\" : result;
+        }
+
         template <typename F>
         void access_mapped_entries(const windows_path& win_path, const F& accessor) const
         {

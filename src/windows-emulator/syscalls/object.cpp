@@ -328,7 +328,10 @@ namespace sogen
                         return STATUS_INVALID_HANDLE;
                     }
 
-                    device_path = windows_path(file->name).to_device_path();
+                    // \Device\HarddiskVolume<n>, then the path in the case the file system keeps (GetFinalPathNameByHandle).
+                    const auto volume_path = windows_path(file->name).to_device_path();
+                    const auto volume_end = volume_path.find(u'\\', std::u16string_view{u"\\Device\\"}.size());
+                    device_path = volume_path.substr(0, volume_end) + c.win_emu.file_sys.true_case(file->name);
                     break;
                 }
                 case handle_types::device: {

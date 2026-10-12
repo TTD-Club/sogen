@@ -55,6 +55,21 @@ namespace sogen
                 return tag;
             }
 
+            constexpr ULONG file_attribute_readonly = 0x1;
+            constexpr auto status_cannot_delete = static_cast<NTSTATUS>(0xC0000121);
+
+            // The attributes a host stat shows: a directory, or a file, read-only without write permission.
+            // Files carry FILE_ATTRIBUTE_ARCHIVE, as Windows sets it on files it creates or changes: clearing read-only
+            // then leaves a value that is not 0 (which would mean "keep the attributes").
+            ULONG host_file_attributes(const struct compat_stat& file_stat)
+            {
+                constexpr uint32_t owner_write = 0200;
+                constexpr ULONG file_attribute_archive = 0x20;
+                const auto read_only = (file_stat.st_mode & owner_write) == 0;
+                const auto base = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : file_attribute_archive;
+                return base | (read_only ? file_attribute_readonly : 0);
+            }
+
             // A file's attributes with FILE_ATTRIBUTE_REPARSE_POINT if it is one (FILE_ATTRIBUTE_NORMAL stands alone).
             ULONG with_reparse_attribute(const ULONG attributes, const ULONG tag)
             {
@@ -245,8 +260,20 @@ namespace sogen
                     return compat_fstat(f.handle.file_descriptor(), &file_stat);
                 }
 
-                (void)compat_stat(f.host_path, &file_stat);
+                if (!compat_stat(f.host_path, &file_stat))
+                {
+                    constexpr uint32_t writable_directory = S_IFDIR | 0700;
+                    file_stat = {};
+                    file_stat.st_mode = writable_directory;
+                }
                 return true;
+            }
+
+            // A read-only file cannot be deleted (STATUS_CANNOT_DELETE), as on Windows.
+            bool is_read_only_file(const file& f)
+            {
+                struct compat_stat file_stat{};
+                return stat_open_file(f, file_stat) && (host_file_attributes(file_stat) & file_attribute_readonly) != 0;
             }
 
             // The access an open holds for sharing purposes (IoCheckShareAccess): reading, writing, and deleting.
@@ -477,8 +504,8 @@ namespace sogen
                 }
 
                 // Access and write times go to the host file (SetFileTime, os.utime). 0 keeps a time, and -1 and -2
-                // switch its automatic updates off and on, so only positive values are times. Creation times and
-                // attributes are not kept.
+                // switch its automatic updates off and on, so only positive values are times. Creation times are not
+                // kept.
                 const auto info = c.emu.read_memory<FILE_BASIC_INFORMATION>(file_information);
                 const auto time = [](const LARGE_INTEGER value) { return value.QuadPart > 0 ? std::optional(value) : std::nullopt; };
                 const auto access_time = time(info.LastAccessTime);
@@ -486,6 +513,23 @@ namespace sogen
                 if ((access_time || write_time) && !f->host_path.empty() && !compat_set_file_times(f->host_path, access_time, write_time))
                 {
                     return STATUS_ACCESS_DENIED;
+                }
+
+                // Of the attributes (0 keeps them), a file's read-only one is kept as the host file's write permission
+                // (SetFileAttributes, os.chmod); others are not kept.
+                if (info.FileAttributes != 0 && !f->host_path.empty())
+                {
+                    constexpr auto write_permissions =
+                        std::filesystem::perms::owner_write | std::filesystem::perms::group_write | std::filesystem::perms::others_write;
+                    std::error_code ec{};
+                    std::filesystem::permissions(f->host_path, write_permissions,
+                                                 (info.FileAttributes & file_attribute_readonly) ? std::filesystem::perm_options::remove
+                                                                                                 : std::filesystem::perm_options::add,
+                                                 ec);
+                    if (ec)
+                    {
+                        return STATUS_ACCESS_DENIED;
+                    }
                 }
 
                 return STATUS_SUCCESS;
@@ -621,6 +665,10 @@ namespace sogen
                 }
 
                 const auto info = c.emu.read_memory<FILE_DISPOSITION_INFORMATION>(file_information);
+                if (info.DeleteFile && is_read_only_file(*f))
+                {
+                    return status_cannot_delete;
+                }
 
                 f->handle.defer_delete(info.DeleteFile ? c.win_emu.file_sys.translate(f->name) : std::filesystem::path{});
 
@@ -640,6 +688,12 @@ namespace sogen
                 if (wants_delete && !(f->access_mask & DELETE))
                 {
                     return STATUS_ACCESS_DENIED;
+                }
+
+                constexpr ULONG file_disposition_ignore_readonly_attribute = 0x10;
+                if (wants_delete && !(info.Flags & file_disposition_ignore_readonly_attribute) && is_read_only_file(*f))
+                {
+                    return status_cannot_delete;
                 }
 
                 f->handle.defer_delete(wants_delete ? c.win_emu.file_sys.translate(f->name) : std::filesystem::path{});
@@ -841,6 +895,7 @@ namespace sogen
                 if (compat_stat(host_path, &file_stat))
                 {
                     entry.file_size = is_directory ? 0 : static_cast<uint64_t>(file_stat.st_size);
+                    entry.read_only = (host_file_attributes(file_stat) & file_attribute_readonly) != 0;
                     entry.creation_time = get_file_time(deterministic_time, file_stat.st_ctimespec);
                     entry.last_access_time = get_file_time(deterministic_time, file_stat.st_atimespec);
                     entry.last_write_time = get_file_time(deterministic_time, file_stat.st_mtimespec);
@@ -970,8 +1025,11 @@ namespace sogen
                 info.LastWriteTime = current_file.last_write_time;
                 info.ChangeTime = info.LastWriteTime;
 
-                info.FileAttributes = with_reparse_attribute(current_file.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
-                                                             current_file.reparse_tag);
+                // As host_file_attributes: directories, or archived files, read-only where the host says so.
+                constexpr ULONG file_attribute_archive = 0x20;
+                const ULONG attributes = (current_file.is_directory ? FILE_ATTRIBUTE_DIRECTORY : file_attribute_archive) |
+                                         (current_file.read_only ? file_attribute_readonly : 0);
+                info.FileAttributes = with_reparse_attribute(attributes, current_file.reparse_tag);
                 info.FileNameLength = static_cast<ULONG>(file_name.size() * 2);
                 info.EndOfFile.QuadPart = current_file.file_size;
 
@@ -1154,9 +1212,13 @@ namespace sogen
                 const emulator_object<FILE_ATTRIBUTE_TAG_INFORMATION> info{c.emu, file_information};
                 FILE_ATTRIBUTE_TAG_INFORMATION i{};
 
+                struct compat_stat file_stat{};
+                if (!stat_open_file(*f, file_stat))
+                {
+                    return ret(STATUS_INVALID_HANDLE);
+                }
                 i.ReparseTag = reparse_tag_at(c.proc, f->name);
-                i.FileAttributes =
-                    with_reparse_attribute(f->is_directory() ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL, i.ReparseTag);
+                i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), i.ReparseTag);
 
                 info.write(i);
 
@@ -1302,8 +1364,6 @@ namespace sogen
                     return STATUS_INVALID_HANDLE;
                 }
 
-                const bool is_directory = f->handle ? (file_stat.st_mode & S_IFDIR) != 0 : f->is_directory();
-
                 auto address = file_information;
                 if (all_info)
                 {
@@ -1316,8 +1376,7 @@ namespace sogen
                 i.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 i.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 i.ChangeTime = i.LastWriteTime;
-                i.FileAttributes = with_reparse_attribute(is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
-                                                          reparse_tag_at(c.proc, f->name));
+                i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c.proc, f->name));
 
                 info.write(i);
 
@@ -1560,7 +1619,8 @@ namespace sogen
 
             if (info_class == FileNameInformation || info_class == FileNormalizedNameInformation || all_info)
             {
-                const auto relative_path = u"\\" + windows_path(f->name).without_drive().u16string();
+                // In the case the file system keeps, as GetFinalPathNameByHandle reports it.
+                const auto relative_path = c.win_emu.file_sys.true_case(f->name);
                 const auto required_length = static_cast<uint32_t>((relative_path.size() * 2) + offsetof(FILE_NAME_INFORMATION, FileName));
 
                 if (length < sizeof(FILE_NAME_INFORMATION))
@@ -1681,7 +1741,7 @@ namespace sogen
                 i.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 i.ChangeTime = i.LastWriteTime;
                 i.ReparseTag = reparse_tag_at(c.proc, *resolved);
-                i.FileAttributes = with_reparse_attribute(is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL, i.ReparseTag);
+                i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), i.ReparseTag);
                 i.NumberOfLinks = 1;
                 i.FileId.QuadPart = static_cast<LONGLONG>(file_stat.st_ino);
                 memcpy(&i.FileId128.Identifier[0], &file_stat.st_ino, sizeof(file_stat.st_ino));
@@ -2257,9 +2317,11 @@ namespace sogen
 
         constexpr std::u16string map_mode(const ACCESS_MASK desired_access, const ULONG create_disposition)
         {
-            const auto wants_write = (desired_access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0;
-            const auto wants_read =
-                (desired_access & (GENERIC_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE)) != 0;
+            // Changing attributes or extended attributes writes no data: such an open reads the stream, so that it works
+            // on a read-only file (os.chmod), as on Windows.
+            const auto wants_write = (desired_access & (GENERIC_WRITE | FILE_WRITE_DATA)) != 0;
+            const auto wants_read = (desired_access & (GENERIC_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE |
+                                                       FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0;
 
             if (desired_access & FILE_APPEND_DATA)
             {
@@ -2792,9 +2854,7 @@ namespace sogen
                 info.AllocationSize.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
                 info.EndOfFile.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
                 info.ChangeTime = info.LastWriteTime;
-                info.FileAttributes =
-                    with_reparse_attribute((file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
-                                           reparse_tag_at(c.proc, filename));
+                info.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c.proc, filename));
             });
 
             return STATUS_SUCCESS;
@@ -2868,9 +2928,7 @@ namespace sogen
                 info.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 info.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 info.ChangeTime = info.LastWriteTime;
-                info.FileAttributes =
-                    with_reparse_attribute((file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
-                                           reparse_tag_at(c.proc, filename));
+                info.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c.proc, filename));
             });
 
             return STATUS_SUCCESS;

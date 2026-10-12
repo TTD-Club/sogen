@@ -527,7 +527,19 @@ namespace sogen
             }
 
             allocator.make_unicode_string(proc_params.CommandLine, command_line);
-            allocator.make_unicode_string(proc_params.CurrentDirectory.DosPath, app_settings.working_directory.u16string() + u"\\", 1024);
+            // The current directory as Windows shows it: an upper case drive letter, components in the case the file
+            // system keeps (windows_path lowercases them), ending in a separator.
+            auto current_directory = app_settings.working_directory.u16string();
+            if (const auto drive = app_settings.working_directory.get_drive())
+            {
+                current_directory = std::u16string(1, static_cast<char16_t>(std::toupper(static_cast<unsigned char>(*drive)))) + u":" +
+                                    win_emu.file_sys.true_case(current_directory);
+            }
+            if (!current_directory.ends_with(u'\\'))
+            {
+                current_directory.push_back(u'\\');
+            }
+            allocator.make_unicode_string(proc_params.CurrentDirectory.DosPath, current_directory, 1024);
             allocator.make_unicode_string(proc_params.ImagePathName, application_str);
 
             const auto total_length = allocator.get_next_address() - this->process_params64.value();
