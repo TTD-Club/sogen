@@ -84,7 +84,7 @@ namespace sogen
 #ifdef OS_WINDOWS
             if (this->root_.empty())
             {
-                return win_path.u16string();
+                return keep_trailing_spaces_and_dots(win_path.u16string());
             }
 #endif
 
@@ -146,10 +146,36 @@ namespace sogen
         {
             if (is_subpath(base.lexically_normal(), candidate.lexically_normal()))
             {
-                return weakly_canonical(candidate);
+                // weakly_canonical resolves "dir " to "dir" even in the \\?\ form, so such names skip it.
+                auto kept = keep_trailing_spaces_and_dots(candidate);
+                return kept.native() != candidate.native() ? std::move(kept) : weakly_canonical(candidate);
             }
 
             return base;
+        }
+
+        // Windows strips trailing spaces and dots from every component of a host path that is not in the \\?\ form,
+        // so "dir " would open "dir". Guest NT paths keep them (only Win32 path conversion strips them, in the guest),
+        // so a host path with such a component takes the \\?\ form.
+        static std::filesystem::path keep_trailing_spaces_and_dots(std::filesystem::path path)
+        {
+#ifdef OS_WINDOWS
+            const auto& native = path.native();
+            if (!path.is_absolute() || native.starts_with(LR"(\\)"))
+            {
+                return path;
+            }
+
+            for (const auto& component : path.relative_path())
+            {
+                const auto& name = component.native();
+                if (name != L"." && name != L".." && !name.empty() && (name.back() == L' ' || name.back() == L'.'))
+                {
+                    return {LR"(\\?\)" + path.lexically_normal().make_preferred().native()};
+                }
+            }
+#endif
+            return path;
         }
 
         // If a mapped directory is an ancestor of `win_path`, resolve the remaining path against the mapped

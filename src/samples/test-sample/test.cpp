@@ -2870,6 +2870,40 @@ namespace
         return true;
     }
 
+    // Win32 paths drop a trailing space or dot from their last component, \\?\ paths keep it: "dir " and "dir." are other
+    // names than "dir" there.
+    bool test_trailing_space_paths()
+    {
+        const auto relative = scratch_directory() + L"Trail" + std::to_wstring(GetCurrentProcessId());
+        std::array<wchar_t, MAX_PATH> full{};
+        if (!GetFullPathNameW(relative.c_str(), static_cast<DWORD>(full.size()), full.data(), nullptr))
+        {
+            return false;
+        }
+
+        const std::wstring directory = full.data();
+        if (!CreateDirectoryW(directory.c_str(), nullptr))
+        {
+            return false;
+        }
+        const auto remove_directory = sogen::utils::finally([&] { RemoveDirectoryW(directory.c_str()); });
+
+        const auto exists = [](const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; };
+        const auto extended = L"\\\\?\\" + directory;
+        if (!exists(directory + L" ") || !exists(directory + L".") || !exists(extended))
+        {
+            puts("Win32 paths with a trailing space or dot did not find the directory");
+            return false;
+        }
+        if (exists(extended + L" ") || exists(extended + L"."))
+        {
+            puts("Extended-length paths with a trailing space or dot found the directory");
+            return false;
+        }
+
+        return true;
+    }
+
     // A thread's description reads back as it was set, including from another thread through a handle.
     bool test_thread_description()
     {
@@ -2990,6 +3024,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_stack_guarantee, "Stack Guarantee")
     RUN_TEST(test_thread_description, "Thread Description")
     RUN_TEST(test_handles_and_file_times, "Handle Flags and File Times")
+    RUN_TEST(test_trailing_space_paths, "Trailing Space Paths")
     RUN_TEST(test_high_resolution_timer, "High Resolution Timer")
     RUN_TEST(test_waitable_timers, "Waitable Timers")
 #ifdef _WIN64
