@@ -473,6 +473,18 @@ namespace sogen
 
                 const auto info = c.emu.read_memory<FILE_END_OF_FILE_INFORMATION>(file_information);
 
+                // A mapped view keeps the file from shrinking under it.
+                constexpr auto status_user_mapped_file = static_cast<NTSTATUS>(0xC0000243);
+                const windows_path file_path{f->name};
+                for (const auto& view : c.proc.file_section_views | std::views::values)
+                {
+                    if (windows_path{view.file_name} == file_path &&
+                        static_cast<uint64_t>(info.EndOfFile.QuadPart) < view.offset + view.length)
+                    {
+                        return status_user_mapped_file;
+                    }
+                }
+
                 if (!f->handle.resize(info.EndOfFile.QuadPart))
                 {
                     return STATUS_INVALID_PARAMETER;

@@ -918,24 +918,29 @@ namespace sogen
             const auto address = base_address.read();
             const auto size = region_size.read();
 
-            if (!address || !size)
+            if (!address)
             {
                 return STATUS_INVALID_PARAMETER;
             }
 
+            const auto region_info = c.win_emu.memory.get_region_info(page_align_down(address));
+
+            // A size of 0 flushes to the end of the view (FlushViewOfFile(address, 0)).
             const auto aligned_start = page_align_down(address);
-            const auto aligned_end = page_align_up(address + size);
+            const auto aligned_end = size ? page_align_up(address + size) : region_info.start + region_info.length;
 
             if (aligned_end <= aligned_start)
             {
                 return STATUS_INVALID_PARAMETER;
             }
 
-            const auto region_info = c.win_emu.memory.get_region_info(aligned_start);
             if (!region_info.is_committed || region_info.start > aligned_start || region_info.start + region_info.length < aligned_end)
             {
                 return STATUS_INVALID_PARAMETER;
             }
+
+            // A file view's changes go to its file.
+            c.proc.write_back_file_section_view(c.win_emu, region_info.allocation_base, aligned_start, aligned_end);
 
             base_address.write(aligned_start);
             region_size.write(aligned_end - aligned_start);

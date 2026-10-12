@@ -115,7 +115,12 @@ namespace sogen
             auto* handle_store = c.proc.get_handle_store(h);
             if (handle_store && handle_store->erase(h))
             {
-                if (section_backing_address != 0)
+                // Mapped views keep the section's pages: the backing goes with the last of them.
+                if (section_backing_address != 0 && c.proc.pagefile_view_counts.contains(section_backing_address))
+                {
+                    c.proc.closed_pagefile_backings[section_backing_address] = true;
+                }
+                else if (section_backing_address != 0)
                 {
                     c.win_emu.memory.release_memory(section_backing_address, 0);
                 }

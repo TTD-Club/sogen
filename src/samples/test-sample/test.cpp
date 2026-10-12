@@ -668,6 +668,80 @@ namespace
         return true;
     }
 
+    std::wstring scratch_directory();
+
+    // File mappings: a second mapping of the same name shares the memory, a view outlives its closed section, a shared
+    // writable view of a file writes back to it, and a mapped file does not shrink.
+    bool test_file_mappings()
+    {
+        const auto name = L"Local\\SogenMapping" + std::to_wstring(GetCurrentProcessId());
+        auto* const first = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 0x1000, name.c_str());
+        auto* const second = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 0x1000, name.c_str());
+        const auto second_existed = GetLastError() == ERROR_ALREADY_EXISTS;
+        auto* const first_view = static_cast<char*>(MapViewOfFile(first, FILE_MAP_WRITE, 0, 0, 0));
+        auto* const second_view = static_cast<char*>(MapViewOfFile(second, FILE_MAP_WRITE, 0, 0, 0));
+        if (!first_view || !second_view)
+        {
+            printf("Mapping named sections failed (%lu)\n", GetLastError());
+            return false;
+        }
+
+        first_view[0] = 'm';
+        const auto shared = second_existed && second_view[0] == 'm';
+        CloseHandle(first);
+        CloseHandle(second);
+        // Both section handles are closed; the views still hold the memory.
+        first_view[1] = 'n';
+        const auto outlived = second_view[1] == 'n';
+        UnmapViewOfFile(first_view);
+        UnmapViewOfFile(second_view);
+        if (!shared || !outlived)
+        {
+            printf("Named mappings: shared %d, views outlive the section %d\n", shared, outlived);
+            return false;
+        }
+
+        const auto path = scratch_directory() + L"Mapped" + std::to_wstring(GetCurrentProcessId()) + L".bin";
+        auto* const file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                       CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            printf("Creating the mapped file failed (%lu)\n", GetLastError());
+            return false;
+        }
+        const auto close_file = sogen::utils::finally([&] { CloseHandle(file); });
+
+        constexpr std::string_view original = "aaaaaaaaaa";
+        DWORD transferred{};
+        WriteFile(file, original.data(), static_cast<DWORD>(original.size()), &transferred, nullptr);
+        auto* const mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+        auto* const view = static_cast<char*>(mapping ? MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0) : nullptr);
+        if (!view)
+        {
+            printf("Mapping the file failed (%lu)\n", GetLastError());
+            return false;
+        }
+
+        std::memset(view, 'c', original.size());
+        FlushViewOfFile(view, 0);
+        std::array<char, 16> contents{};
+        SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+        const auto written_back = ReadFile(file, contents.data(), static_cast<DWORD>(contents.size()), &transferred, nullptr) &&
+                                  std::string_view(contents.data(), transferred) == "cccccccccc";
+
+        SetFilePointer(file, 2, nullptr, FILE_BEGIN);
+        const auto shrink_refused = !SetEndOfFile(file) && GetLastError() == ERROR_USER_MAPPED_FILE;
+        UnmapViewOfFile(view);
+        CloseHandle(mapping);
+        if (!written_back || !shrink_refused)
+        {
+            printf("File mappings: written back %d, shrink refused %d\n", written_back, shrink_refused);
+            return false;
+        }
+
+        return true;
+    }
+
     // The volume of a path is its drive's root.
     bool test_volume_path()
     {
@@ -3264,6 +3338,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_registry_deletion, "Registry Deletion")
     RUN_TEST(test_case_mapping, "Case Mapping")
     RUN_TEST(test_volume_path, "Volume Path")
+    RUN_TEST(test_file_mappings, "File Mappings")
     RUN_TEST(test_system_info, "System Info")
     RUN_TEST(test_monitor_info, "Monitor Info")
     RUN_TEST(test_time_zone, "Time Zone")

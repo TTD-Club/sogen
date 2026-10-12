@@ -538,6 +538,44 @@ namespace sogen
             return h.bits & 0xFFFFFFFC;
         }
 
+        // Views of file sections, by base address; a file does not shrink under them. The pages of writable shared views
+        // (those with page_hashes) go back to the file when the view is flushed or unmapped; only pages that changed
+        // since they were mapped (by page hash), so that writes made to the file in between survive.
+        struct file_section_view
+        {
+            std::u16string file_name{};
+            uint64_t offset{};
+            uint64_t length{};
+            std::vector<uint64_t> page_hashes{};
+
+            void serialize(utils::buffer_serializer& buffer) const
+            {
+                buffer.write(this->file_name);
+                buffer.write(this->offset);
+                buffer.write(this->length);
+                buffer.write_vector(this->page_hashes);
+            }
+
+            void deserialize(utils::buffer_deserializer& buffer)
+            {
+                buffer.read(this->file_name);
+                buffer.read(this->offset);
+                buffer.read(this->length);
+                buffer.read_vector(this->page_hashes);
+            }
+        };
+
+        std::map<uint64_t, file_section_view> file_section_views{};
+
+        // Views mapped of each pagefile section's backing (by its address), and the backings whose section is closed:
+        // such a backing stays until its last view is unmapped, as a view keeps its section's pages.
+        std::map<uint64_t, uint32_t> pagefile_view_counts{};
+        std::map<uint64_t, bool> closed_pagefile_backings{};
+
+        static uint64_t hash_page(std::span<const std::byte> page);
+        // Writes the changed pages of the view at `base` overlapping [start, end) back to its file.
+        void write_back_file_section_view(windows_emulator& win_emu, uint64_t base, uint64_t start, uint64_t end);
+
         // For WOW64 processes
         std::optional<emulator_object<PEB32>> peb32;
         std::optional<emulator_object<RTL_USER_PROCESS_PARAMETERS32>> process_params32;

@@ -855,6 +855,9 @@ namespace sogen
         buffer.write_map(this->token_privileges);
         buffer.write(this->next_pipe_instance);
         buffer.write_map(this->handle_flags);
+        buffer.write_map(this->file_section_views);
+        buffer.write_map(this->pagefile_view_counts);
+        buffer.write_map(this->closed_pagefile_backings);
         buffer.write_atomic(this->audio_render_event);
 
         buffer.write(this->user_handles);
@@ -963,6 +966,9 @@ namespace sogen
         buffer.read_map(this->token_privileges);
         buffer.read(this->next_pipe_instance);
         buffer.read_map(this->handle_flags);
+        buffer.read_map(this->file_section_views);
+        buffer.read_map(this->pagefile_view_counts);
+        buffer.read_map(this->closed_pagefile_backings);
         buffer.read_atomic(this->audio_render_event);
 
         buffer.read(this->user_handles);
@@ -1200,6 +1206,61 @@ namespace sogen
             return &deferred_window_position_batches;
         default:
             return nullptr;
+        }
+    }
+
+    uint64_t process_context::hash_page(const std::span<const std::byte> page)
+    {
+        // FNV-1a: stable across hosts, so serialized hashes stay valid.
+        uint64_t hash = 0xCBF29CE484222325;
+        for (const auto value : page)
+        {
+            hash ^= static_cast<uint8_t>(value);
+            hash *= 0x100000001B3;
+        }
+        return hash;
+    }
+
+    void process_context::write_back_file_section_view(windows_emulator& win_emu, const uint64_t base, const uint64_t start,
+                                                       const uint64_t end)
+    {
+        const auto entry = this->file_section_views.find(base);
+        if (entry == this->file_section_views.end())
+        {
+            return;
+        }
+
+        constexpr uint64_t page_size = 0x1000;
+        auto& view = entry->second;
+        std::fstream file{};
+        std::vector<std::byte> page(page_size);
+        for (size_t index = 0; index < view.page_hashes.size(); ++index)
+        {
+            const auto page_start = base + index * page_size;
+            const auto length = std::min<uint64_t>(page_size, view.length - index * page_size);
+            if (page_start + length <= start || page_start >= end)
+            {
+                continue;
+            }
+
+            const auto bytes = std::span(page).first(static_cast<size_t>(length));
+            if (!win_emu.memory.try_read_memory(page_start, bytes.data(), bytes.size()) || hash_page(bytes) == view.page_hashes[index])
+            {
+                continue;
+            }
+
+            if (!file.is_open())
+            {
+                file.open(win_emu.file_sys.translate(windows_path{view.file_name}), std::ios::in | std::ios::out | std::ios::binary);
+                if (!file)
+                {
+                    return;
+                }
+            }
+
+            file.seekp(static_cast<std::streamoff>(view.offset + index * page_size));
+            file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            view.page_hashes[index] = hash_page(bytes);
         }
     }
 
