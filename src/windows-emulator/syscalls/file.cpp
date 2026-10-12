@@ -105,6 +105,47 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            // The end of pipe instance `instance` that is (or is not) the server, if it is open.
+            named_pipe* find_pipe_end(process_context& process, const uint64_t instance, const bool server)
+            {
+                if (!instance)
+                {
+                    return nullptr;
+                }
+
+                for (auto& container : process.devices | std::views::values)
+                {
+                    auto* pipe = container.get_internal_device<named_pipe>();
+                    if (pipe && pipe->instance == instance && pipe->server == server)
+                    {
+                        return pipe;
+                    }
+                }
+
+                return nullptr;
+            }
+
+            named_pipe* find_pipe_peer(process_context& process, const named_pipe& end)
+            {
+                return find_pipe_end(process, end.instance, !end.server);
+            }
+
+            // A pipe's name without the \Device\NamedPipe\ or \??\pipe\ prefix, lower case; empty for the prefix itself.
+            std::u16string pipe_short_name(const std::u16string_view path)
+            {
+                for (const std::u16string_view prefix : {u"\\Device\\NamedPipe\\", u"\\??\\pipe\\"})
+                {
+                    if (utils::string::starts_with_ignore_case(path, prefix))
+                    {
+                        std::u16string name(path.substr(prefix.size()));
+                        std::ranges::transform(name, name.begin(), [](const char16_t c) { return utils::string::char_to_lower(c); });
+                        return name;
+                    }
+                }
+
+                return {};
+            }
+
             std::u16string resolve_system_root_path(const syscall_context& c, std::u16string filename)
             {
                 auto filename_upper = filename;
@@ -230,6 +271,20 @@ namespace sogen
                         }
 
                         device->set_completion_notification_flags(c.emu.read_memory<ULONG>(file_information));
+                    }
+
+                    // Reads of an empty pipe already return STATUS_PIPE_EMPTY at once, so the completion mode is kept
+                    // for queries only.
+                    if (auto* pipe = device->get_internal_device<named_pipe>(); pipe && info_class == FilePipeInformation)
+                    {
+                        if (length < sizeof(file_pipe_information))
+                        {
+                            return STATUS_INFO_LENGTH_MISMATCH;
+                        }
+
+                        const auto info = c.emu.read_memory<file_pipe_information>(file_information);
+                        pipe->read_mode = info.read_mode;
+                        pipe->completion_mode = info.completion_mode;
                     }
 
                     return STATUS_SUCCESS;
@@ -794,6 +849,21 @@ namespace sogen
             const auto* f = c.proc.files.get(file_handle);
             if (!f)
             {
+                // A pipe's read and completion modes (FILE_PIPE_INFORMATION), as SetNamedPipeHandleState reads them.
+                const auto* container = c.proc.devices.get(file_handle);
+                const auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
+                if (pipe && info_class == FilePipeInformation)
+                {
+                    if (length < sizeof(file_pipe_information))
+                    {
+                        return ret(STATUS_INFO_LENGTH_MISMATCH);
+                    }
+
+                    c.emu.write_memory(file_information,
+                                       file_pipe_information{.read_mode = pipe->read_mode, .completion_mode = pipe->completion_mode});
+                    return ret(STATUS_SUCCESS, sizeof(file_pipe_information));
+                }
+
                 return ret(STATUS_INVALID_HANDLE);
             }
 
@@ -1489,26 +1559,28 @@ namespace sogen
             {
                 if (auto* pipe = container->get_internal_device<named_pipe>())
                 {
-                    if (!pipe->write_queue.empty())
+                    if (!pipe->read_queue.empty())
                     {
-                        std::string_view data = pipe->write_queue.front();
+                        std::string_view data = pipe->read_queue.front();
                         const size_t to_copy = std::min<size_t>(data.size(), length);
 
                         commit_file_data(data.substr(0, to_copy), c.emu, io_status_block, buffer);
 
                         if (to_copy == data.size())
                         {
-                            pipe->write_queue.pop_front();
+                            pipe->read_queue.pop_front();
                         }
                         else
                         {
-                            pipe->write_queue.front().erase(0, to_copy);
+                            pipe->read_queue.front().erase(0, to_copy);
                         }
 
                         return STATUS_SUCCESS;
                     }
 
-                    return STATUS_PIPE_EMPTY;
+                    // Nothing left and nobody to write more: the end of the data. Reads of an empty pipe whose other
+                    // end is open do not wait (also in blocking mode).
+                    return pipe->instance && !find_pipe_peer(c.proc, *pipe) ? STATUS_PIPE_BROKEN : STATUS_PIPE_EMPTY;
                 }
             }
 
@@ -1627,10 +1699,21 @@ namespace sogen
             {
                 if (auto* pipe = container->get_internal_device<named_pipe>())
                 {
-                    (void)pipe; // For future use: suppressing compiler issues
-                    // TODO c.win_emu.callbacks.on_named_pipe_write(pipe->name, temp_buffer);
+                    // What one end writes waits for the other end's reads. A pipe without an instance (no server or
+                    // client to talk to) takes the data without delivering it.
+                    if (pipe->instance)
+                    {
+                        auto* peer = find_pipe_peer(c.proc, *pipe);
+                        if (!peer)
+                        {
+                            return STATUS_PIPE_CLOSING;
+                        }
 
-                    // TODO pipe->write_queue.push_back(temp_buffer);
+                        if (!temp_buffer.empty())
+                        {
+                            peer->read_queue.emplace_back(temp_buffer.begin(), temp_buffer.end());
+                        }
+                    }
 
                     if (io_status_block)
                     {
@@ -1956,6 +2039,21 @@ namespace sogen
             {
                 pipe_device->name = std::u16string(filename);
                 pipe_device->access = desired_access;
+
+                // A client connects to a server instance of that name that has no client yet.
+                if (const auto short_name = pipe_short_name(filename); !short_name.empty())
+                {
+                    for (auto& entry : c.proc.devices | std::views::values)
+                    {
+                        const auto* server = entry.get_internal_device<named_pipe>();
+                        if (server && server->server && !server->anonymous && pipe_short_name(server->name) == short_name &&
+                            !find_pipe_end(c.proc, server->instance, false))
+                        {
+                            pipe_device->instance = server->instance;
+                            break;
+                        }
+                    }
+                }
             }
 
             const auto handle = c.proc.devices.store(std::move(container));
@@ -2002,6 +2100,9 @@ namespace sogen
                     io_device_container container{u"NamedPipe", c.win_emu, data};
                     auto* pipe_device = container.get_internal_device<named_pipe>();
                     pipe_device->name = root_pipe->name;
+                    // The client end of the pipe whose server the root handle is.
+                    pipe_device->instance = root_pipe->server ? root_pipe->instance : 0;
+                    pipe_device->anonymous = root_pipe->anonymous;
                     pipe_device->access = desired_access;
                     pipe_device->pipe_type = root_pipe->pipe_type;
                     pipe_device->read_mode = root_pipe->read_mode;
@@ -2537,6 +2638,9 @@ namespace sogen
             if (auto* pipe_device = container.get_internal_device<named_pipe>())
             {
                 pipe_device->name = pipe_name;
+                pipe_device->instance = c.proc.next_pipe_instance++;
+                pipe_device->server = true;
+                pipe_device->anonymous = anonymous_pipe;
                 pipe_device->access = desired_access;
                 pipe_device->pipe_type = named_pipe_type;
                 pipe_device->read_mode = read_mode;

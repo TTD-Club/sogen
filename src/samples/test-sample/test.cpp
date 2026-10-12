@@ -2243,6 +2243,58 @@ namespace
         return duplicated && closed_write_end && closed_duplicate && closed_read_end;
     }
 
+    // Data written to one end of a pipe is read at the other; a non-blocking read of an empty pipe fails with
+    // ERROR_NO_DATA, and once the write end is closed, reads report the end of the data (ERROR_BROKEN_PIPE).
+    bool test_pipe_data()
+    {
+        HANDLE read_end{};
+        HANDLE write_end{};
+        if (!CreatePipe(&read_end, &write_end, nullptr, 0))
+        {
+            return false;
+        }
+
+        const auto close_read_end = sogen::utils::finally([&] { CloseHandle(read_end); });
+        auto close_write_end = sogen::utils::finally([&] { CloseHandle(write_end); });
+
+        DWORD mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        std::array<char, 16> buffer{};
+        DWORD transferred{};
+        if (!SetNamedPipeHandleState(read_end, &mode, nullptr, nullptr) ||
+            ReadFile(read_end, buffer.data(), static_cast<DWORD>(buffer.size()), &transferred, nullptr) || GetLastError() != ERROR_NO_DATA)
+        {
+            puts("Non-blocking read of an empty pipe did not fail with ERROR_NO_DATA");
+            return false;
+        }
+
+        DWORD state{};
+        if (!GetNamedPipeHandleStateW(read_end, &state, nullptr, nullptr, nullptr, nullptr, 0) || !(state & PIPE_NOWAIT))
+        {
+            puts("Pipe state lost PIPE_NOWAIT");
+            return false;
+        }
+
+        constexpr std::string_view message = "pipe data";
+        if (!WriteFile(write_end, message.data(), static_cast<DWORD>(message.size()), &transferred, nullptr) ||
+            transferred != message.size() || !ReadFile(read_end, buffer.data(), static_cast<DWORD>(buffer.size()), &transferred, nullptr) ||
+            std::string_view(buffer.data(), transferred) != message)
+        {
+            puts("Pipe data did not arrive at the read end");
+            return false;
+        }
+
+        close_write_end.cancel();
+        CloseHandle(write_end);
+        if (ReadFile(read_end, buffer.data(), static_cast<DWORD>(buffer.size()), &transferred, nullptr) ||
+            GetLastError() != ERROR_BROKEN_PIPE)
+        {
+            puts("Read of a pipe without a write end did not report its end");
+            return false;
+        }
+
+        return true;
+    }
+
     bool test_directory_name_collision()
     {
         // Several identical instances of this sample may run in one directory at once, so the check uses this
@@ -2742,6 +2794,35 @@ namespace
         return result == WAIT_OBJECT_0;
     }
 
+    // A thread's description reads back as it was set, including from another thread through a handle.
+    bool test_thread_description()
+    {
+        PWSTR initial{};
+        if (FAILED(GetThreadDescription(GetCurrentThread(), &initial)))
+        {
+            return false;
+        }
+        LocalFree(initial);
+
+        bool success = false;
+        std::thread([&] {
+            const wchar_t* const name = L"Sogen Worker";
+            if (FAILED(SetThreadDescription(GetCurrentThread(), name)))
+            {
+                return;
+            }
+
+            PWSTR description{};
+            if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)))
+            {
+                success = description && std::wstring_view(name) == description;
+                LocalFree(description);
+            }
+        }).join();
+
+        return success;
+    }
+
     bool test_stack_guarantee()
     {
         bool success = false;
@@ -2820,6 +2901,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_console_write, "Console Write")
     RUN_TEST(test_oem_conversion, "OEM Conversion")
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
+    RUN_TEST(test_pipe_data, "Pipe Data")
     RUN_TEST(test_device_file_types, "Device File Types")
     RUN_TEST(test_file_ids_by_name, "File IDs by Name")
     RUN_TEST(test_directory_name_collision, "Directory Name Collision")
@@ -2830,6 +2912,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")
     RUN_TEST(test_stack_guarantee, "Stack Guarantee")
+    RUN_TEST(test_thread_description, "Thread Description")
     RUN_TEST(test_high_resolution_timer, "High Resolution Timer")
     RUN_TEST(test_waitable_timers, "Waitable Timers")
 #ifdef _WIN64

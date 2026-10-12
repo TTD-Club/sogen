@@ -505,6 +505,32 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            if (info_class == ThreadNameInformation)
+            {
+                // The UNICODE_STRING, then its characters, which its Buffer points to (GetThreadDescription).
+                using name_information = THREAD_NAME_INFORMATION<EmulatorTraits<Emu64>>;
+                const auto name_bytes = thread->name.size() * sizeof(char16_t);
+                const auto required_size = sizeof(name_information) + name_bytes;
+                if (return_length)
+                {
+                    return_length.write(static_cast<ULONG>(required_size));
+                }
+
+                if (thread_information_length < required_size)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                name_information info{};
+                info.ThreadName.Length = static_cast<USHORT>(name_bytes);
+                info.ThreadName.MaximumLength = static_cast<USHORT>(name_bytes);
+                info.ThreadName.Buffer = name_bytes ? thread_information + sizeof(name_information) : 0;
+                c.emu.write_memory(thread_information, info);
+                c.emu.write_memory(thread_information + sizeof(name_information), thread->name.data(), name_bytes);
+
+                return STATUS_SUCCESS;
+            }
+
             if (info_class == ThreadGroupInformation)
             {
                 if (return_length)

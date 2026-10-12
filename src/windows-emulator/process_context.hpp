@@ -523,6 +523,9 @@ namespace sogen
         // shares them; NtAdjustPrivilegesToken changes them.
         std::map<uint32_t, uint32_t> token_privileges{{19, 0}, {23, 3}, {25, 0}, {33, 0}, {34, 0}};
 
+        // The next pipe instance id (named_pipe::instance) NtCreateNamedPipeFile hands out.
+        uint64_t next_pipe_instance{1};
+
         // For WOW64 processes
         std::optional<emulator_object<PEB32>> peb32;
         std::optional<emulator_object<RTL_USER_PROCESS_PARAMETERS32>> process_params32;

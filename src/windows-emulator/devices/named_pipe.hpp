@@ -16,11 +16,27 @@ namespace sogen
         ULONG message_length;
     };
 
+    // FILE_PIPE_INFORMATION (FilePipeInformation): FILE_PIPE_BYTE_STREAM_MODE or _MESSAGE_MODE, and
+    // FILE_PIPE_QUEUE_OPERATION or _COMPLETE_OPERATION (PIPE_NOWAIT).
+    struct file_pipe_information
+    {
+        ULONG read_mode;
+        ULONG completion_mode;
+    };
+
+    // One end of a pipe. The two ends of a pipe instance share `instance` (0: no instance, e.g. the
+    // \Device\NamedPipe\ root a CreatePipe opens first); what one end writes waits in the other end's read_queue.
     class named_pipe : public io_device
     {
       public:
         std::u16string name;
-        std::deque<std::string> write_queue;
+        // Data written by the other end, not read yet.
+        std::deque<std::string> read_queue;
+        uint64_t instance{};
+        // The end NtCreateNamedPipeFile created, as opposed to a client that opened it.
+        bool server{};
+        // Clients reach an anonymous pipe's server only through its handle, never by name.
+        bool anonymous{};
         ACCESS_MASK access = 0;
         ULONG pipe_type{};
         ULONG read_mode{};
@@ -52,11 +68,14 @@ namespace sogen
         void serialize_object(utils::buffer_serializer& buffer) const override
         {
             buffer.write_string(this->name);
-            buffer.write(static_cast<uint64_t>(this->write_queue.size()));
-            for (const auto& chunk : this->write_queue)
+            buffer.write(static_cast<uint64_t>(this->read_queue.size()));
+            for (const auto& chunk : this->read_queue)
             {
                 buffer.write_string(chunk);
             }
+            buffer.write(this->instance);
+            buffer.write(this->server);
+            buffer.write(this->anonymous);
             buffer.write(this->access);
             buffer.write(this->pipe_type);
             buffer.write(this->read_mode);
@@ -71,11 +90,14 @@ namespace sogen
         {
             buffer.read_string(this->name);
             const auto chunks = buffer.read<uint64_t>();
-            this->write_queue.clear();
+            this->read_queue.clear();
             for (uint64_t i = 0; i < chunks; ++i)
             {
-                buffer.read_string(this->write_queue.emplace_back());
+                buffer.read_string(this->read_queue.emplace_back());
             }
+            buffer.read(this->instance);
+            buffer.read(this->server);
+            buffer.read(this->anonymous);
             buffer.read(this->access);
             buffer.read(this->pipe_type);
             buffer.read(this->read_mode);
@@ -96,7 +118,7 @@ namespace sogen
             }
 
             size_t available = 0;
-            for (const auto& chunk : this->write_queue)
+            for (const auto& chunk : this->read_queue)
             {
                 available += chunk.size();
             }
@@ -104,7 +126,7 @@ namespace sogen
             // Peeking is non-destructive: copy as much queued data as the caller's buffer holds.
             const auto data_capacity = static_cast<size_t>(c.output_buffer_length - header_size);
             std::string data;
-            for (const auto& chunk : this->write_queue)
+            for (const auto& chunk : this->read_queue)
             {
                 if (data.size() >= data_capacity)
                 {
@@ -118,7 +140,7 @@ namespace sogen
             header.named_pipe_state = FILE_PIPE_CONNECTED_STATE;
             header.read_data_available = static_cast<ULONG>(available);
             header.number_of_messages = 0;
-            header.message_length = this->write_queue.empty() ? 0 : static_cast<ULONG>(this->write_queue.front().size());
+            header.message_length = this->read_queue.empty() ? 0 : static_cast<ULONG>(this->read_queue.front().size());
 
             auto& emu = win_emu.emu();
             emu.write_memory(c.output_buffer, &header, sizeof(header));
