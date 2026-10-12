@@ -359,6 +359,44 @@ namespace sogen
             return false;
         }
 
+        // The earliest time after `now` at which a waiting thread, a waitable timer, or a window timer becomes due, if
+        // any does. Deadlines already past are left out: whatever they could wake would not be idle.
+        std::optional<std::chrono::steady_clock::time_point> next_deadline(const process_context& process,
+                                                                           const std::chrono::steady_clock::time_point now)
+        {
+            std::optional<std::chrono::steady_clock::time_point> deadline{};
+            const auto consider = [&](const std::optional<std::chrono::steady_clock::time_point>& time) {
+                if (time.has_value() && *time > now && (!deadline || *time < *deadline))
+                {
+                    deadline = *time;
+                }
+            };
+
+            for (const auto& thread : process.threads | std::views::values)
+            {
+                if (thread.is_terminated())
+                {
+                    continue;
+                }
+                consider(thread.await_time);
+                if (thread.await_io_completion)
+                {
+                    consider(thread.await_io_completion->timeout);
+                }
+                for (const auto& timer : thread.user_timers | std::views::values)
+                {
+                    consider(timer.due_time);
+                }
+            }
+
+            for (const auto& timer : process.timers | std::views::values)
+            {
+                consider(timer.due_time);
+            }
+
+            return deadline;
+        }
+
         vcpu_context* find_vcpu_running_thread(windows_emulator& win_emu, const emulator_thread& thread);
 
         void perform_context_switch_work(windows_emulator& win_emu, vcpu_context& vcpu)
@@ -867,6 +905,20 @@ namespace sogen
 
             const auto host_wait_pending = has_pending_host_wait(this->process);
 
+            // Under relative time, idling skips to the next deadline (at most a time slice ahead), so that waits and
+            // timers wake in the order of their due times. The relative clock ticks once per millisecond.
+            uint64_t idle_advance = MAX_INSTRUCTIONS_PER_TIME_SLICE;
+            if (this->use_relative_time_)
+            {
+                const auto now = this->clock_->steady_now();
+                if (const auto deadline = next_deadline(this->process, now))
+                {
+                    // One tick past it: timed-out waits compare strictly.
+                    const auto until = std::chrono::ceil<std::chrono::milliseconds>(*deadline - now).count();
+                    idle_advance = std::clamp<uint64_t>(static_cast<uint64_t>(until) + 1, 1, MAX_INSTRUCTIONS_PER_TIME_SLICE);
+                }
+            }
+
             // Idle: nothing is ready. Release the kernel lock while pumping UI events
             // and sleeping so other threads (UI delivery, vCPU workers) can run.
             lock.unlock();
@@ -879,7 +931,7 @@ namespace sogen
 
             if (this->use_relative_time_)
             {
-                this->idle_ticks_ += MAX_INSTRUCTIONS_PER_TIME_SLICE;
+                this->idle_ticks_ += idle_advance;
             }
             else if (host_wait_pending)
             {

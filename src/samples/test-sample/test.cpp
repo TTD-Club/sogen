@@ -2356,6 +2356,127 @@ namespace
         return SetWaitableTimerEx(timer, &due_time, 0, nullptr, nullptr, nullptr, 0) && WaitForSingleObject(timer, 5000) == WAIT_OBJECT_0;
     }
 
+    bool test_waitable_timer_semantics(const DWORD flags)
+    {
+        const auto manual_reset = (flags & CREATE_WAITABLE_TIMER_MANUAL_RESET) != 0;
+        const auto timer = CreateWaitableTimerExW(nullptr, nullptr, flags, TIMER_ALL_ACCESS);
+        if (!timer)
+        {
+            return false;
+        }
+
+        const auto close_timer = sogen::utils::finally([&] { CloseHandle(timer); });
+
+        // An unset timer is not signaled, and one due in a minute does not expire early.
+        LARGE_INTEGER due_time{};
+        due_time.QuadPart = -600'000'000;
+        if (WaitForSingleObject(timer, 0) != WAIT_TIMEOUT || !SetWaitableTimer(timer, &due_time, 0, nullptr, nullptr, FALSE) ||
+            WaitForSingleObject(timer, 20) != WAIT_TIMEOUT)
+        {
+            puts("Timer signaled before its due time");
+            return false;
+        }
+
+        // A cancelled timer never fires.
+        due_time.QuadPart = -10'000;
+        if (!SetWaitableTimer(timer, &due_time, 0, nullptr, nullptr, FALSE) || !CancelWaitableTimer(timer) ||
+            WaitForSingleObject(timer, 20) != WAIT_TIMEOUT)
+        {
+            puts("Cancelled timer signaled");
+            return false;
+        }
+
+        // Synchronization timers release one wait; notification timers stay signaled.
+        if (!SetWaitableTimer(timer, &due_time, 0, nullptr, nullptr, FALSE) || WaitForSingleObject(timer, 5000) != WAIT_OBJECT_0)
+        {
+            puts("Timer did not signal");
+            return false;
+        }
+
+        if (WaitForSingleObject(timer, 0) != (manual_reset ? WAIT_OBJECT_0 : WAIT_TIMEOUT))
+        {
+            puts("Timer kept the wrong signal state after a wait");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool test_waitable_timers()
+    {
+        if (!test_waitable_timer_semantics(0) || !test_waitable_timer_semantics(CREATE_WAITABLE_TIMER_MANUAL_RESET) ||
+            !test_waitable_timer_semantics(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) ||
+            !test_waitable_timer_semantics(CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION))
+        {
+            return false;
+        }
+
+        // A periodic timer re-arms and queues its completion routine to the setting thread.
+        const auto timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+        if (!timer)
+        {
+            return false;
+        }
+
+        const auto close_timer = sogen::utils::finally([&] { CloseHandle(timer); });
+
+        int apc_count = 0;
+        const PTIMERAPCROUTINE on_timer = [](void* context, DWORD, DWORD) { ++*static_cast<int*>(context); };
+
+        // The period must outlast running the routine: under the emulator's relative clock an instruction takes a
+        // millisecond, and a timer that is due again whenever its APC returns starves the thread (as on Windows).
+        LARGE_INTEGER due_time{};
+        due_time.QuadPart = -10'000;
+        if (!SetWaitableTimer(timer, &due_time, 500, on_timer, &apc_count, FALSE))
+        {
+            return false;
+        }
+
+        for (int i = 0; i < 100 && apc_count < 3; ++i)
+        {
+            SleepEx(1000, TRUE);
+        }
+
+        CancelWaitableTimer(timer);
+        if (apc_count < 3)
+        {
+            puts("Periodic timer did not run its completion routine");
+            return false;
+        }
+
+        // Thread pool timers wait on a timer through a wait completion packet.
+        const auto fired = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!fired)
+        {
+            return false;
+        }
+
+        const auto close_event = sogen::utils::finally([&] { CloseHandle(fired); });
+
+        auto* pool_timer =
+            CreateThreadpoolTimer([](PTP_CALLBACK_INSTANCE, void* context, PTP_TIMER) { SetEvent(context); }, fired, nullptr);
+        if (!pool_timer)
+        {
+            return false;
+        }
+
+        FILETIME pool_due_time{};
+        pool_due_time.dwLowDateTime = static_cast<DWORD>(-10'000);
+        pool_due_time.dwHighDateTime = static_cast<DWORD>(-1);
+        SetThreadpoolTimer(pool_timer, &pool_due_time, 0, 0);
+
+        const auto result = WaitForSingleObject(fired, 5000);
+        if (result != WAIT_OBJECT_0)
+        {
+            puts("Thread pool timer did not fire");
+        }
+        SetThreadpoolTimer(pool_timer, nullptr, 0, 0);
+        WaitForThreadpoolTimerCallbacks(pool_timer, TRUE);
+        CloseThreadpoolTimer(pool_timer);
+
+        return result == WAIT_OBJECT_0;
+    }
+
     bool test_stack_guarantee()
     {
         bool success = false;
@@ -2441,6 +2562,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_system_random, "System Random")
     RUN_TEST(test_stack_guarantee, "Stack Guarantee")
     RUN_TEST(test_high_resolution_timer, "High Resolution Timer")
+    RUN_TEST(test_waitable_timers, "Waitable Timers")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif

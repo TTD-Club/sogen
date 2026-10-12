@@ -40,8 +40,11 @@ namespace sogen
                     return mutant && mutant->locked_count == 0;
                 }
 
-                case handle_types::timer:
-                    return false;
+                case handle_types::timer: {
+                    // Expired by the scheduler (emulator_thread::is_thread_ready) before waits are evaluated.
+                    const auto* t = process.timers.get(target_object_handle);
+                    return t && t->signaled;
+                }
 
                 default:
                     return false;
@@ -74,8 +77,17 @@ namespace sogen
                     break;
                 }
 
+                case handle_types::timer: {
+                    auto* t = process.timers.get(target_object_handle);
+                    if (t && !t->notification)
+                    {
+                        t->signaled = false;
+                    }
+                    break;
+                }
+
                 default:
-                    // process/thread/timer are level-triggered or terminal; ports and mutants are left
+                    // process/thread are level-triggered or terminal; ports and mutants are left
                     // untouched (a wait packet does not take mutant ownership).
                     break;
                 }

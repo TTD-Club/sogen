@@ -38,6 +38,40 @@ namespace sogen
             memory.write_memory(fs_gdt_offset, &descriptor, sizeof(descriptor));
         }
 
+        void expire_timer(windows_emulator& win_emu, timer& t)
+        {
+            auto& clock = win_emu.clock();
+            if (!t.expire_if_due(clock.steady_now()) || !t.apc_routine)
+            {
+                return;
+            }
+
+            auto* thread = win_emu.process.find_thread_by_id(t.apc_thread_id);
+            if (!thread || thread->is_terminated())
+            {
+                return;
+            }
+
+            // A timer has a single APC object: an expiry while its APC is still queued adds nothing.
+            const auto already_queued = std::ranges::any_of(thread->pending_apcs, [&](const pending_apc& apc) {
+                return apc.apc_routine == t.apc_routine && apc.apc_argument1 == t.apc_context;
+            });
+
+            if (already_queued)
+            {
+                return;
+            }
+
+            // TIMER_APC_ROUTINE(context, low, high) receives the expiry as a FILETIME.
+            const auto time = utils::convert_to_ksystem_time(clock.system_now());
+            thread->pending_apcs.push_back({
+                .apc_routine = t.apc_routine,
+                .apc_argument1 = t.apc_context,
+                .apc_argument2 = time.LowPart,
+                .apc_argument3 = static_cast<uint32_t>(time.High1Time),
+            });
+        }
+
         template <typename T>
         emulator_object<T> allocate_object_on_stack(x86_64_cpu& emu)
         {
@@ -147,7 +181,17 @@ namespace sogen
             }
 
             case handle_types::timer: {
-                return wait_state::signaled; // TODO
+                auto* t = c.timers.get(h);
+                if (t)
+                {
+                    expire_timer(win_emu, *t);
+                    if (t->signaled)
+                    {
+                        return wait_state::signaled;
+                    }
+                }
+
+                break;
             }
 
             case handle_types::semaphore: {
@@ -274,8 +318,26 @@ namespace sogen
                 return *acquired ? wait_state::abandoned : wait_state::signaled;
             }
 
-            case handle_types::timer:
-                return wait_state::signaled; // TODO
+            case handle_types::timer: {
+                auto* t = c.timers.get(h);
+                if (!t)
+                {
+                    return std::nullopt;
+                }
+
+                expire_timer(win_emu, *t);
+                if (!t->signaled)
+                {
+                    return std::nullopt;
+                }
+
+                if (!t->notification)
+                {
+                    t->signaled = false;
+                }
+
+                return wait_state::signaled;
+            }
 
             case handle_types::semaphore: {
                 auto* semaphore = c.semaphores.get(h);
@@ -1069,6 +1131,12 @@ namespace sogen
 
         auto& process = win_emu.process;
         auto& clock = win_emu.clock();
+
+        // Expiries queue timer APCs and signal timers that wait-completion packets watch.
+        for (auto& t : process.timers | std::views::values)
+        {
+            expire_timer(win_emu, t);
+        }
 
         const auto complete_if_timed_out = [&](const NTSTATUS status) {
             if (!this->is_await_time_over(clock) || this->has_pending_alertable_apc())

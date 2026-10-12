@@ -36,14 +36,65 @@ namespace sogen
     {
         std::u16string name{};
 
+        // Notification (manual-reset) timers stay signaled until set again; synchronization timers
+        // release one waiter and reset.
+        bool notification{};
+        bool signaled{};
+        std::optional<std::chrono::steady_clock::time_point> due_time{};
+        std::chrono::steady_clock::duration period{};
+
+        // The APC goes to the thread that set the timer, once per expiry.
+        uint64_t apc_routine{};
+        uint64_t apc_context{};
+        uint32_t apc_thread_id{};
+
+        // Signals the timer if its due time has passed and re-arms a periodic timer. Returns whether
+        // it expired.
+        bool expire_if_due(const std::chrono::steady_clock::time_point now)
+        {
+            if (!this->due_time.has_value() || *this->due_time > now)
+            {
+                return false;
+            }
+
+            this->signaled = true;
+
+            if (this->period.count() > 0)
+            {
+                // A periodic timer that fell behind expires once and resumes its schedule.
+                const auto missed = (now - *this->due_time) / this->period;
+                *this->due_time += this->period * (missed + 1);
+            }
+            else
+            {
+                this->due_time.reset();
+            }
+
+            return true;
+        }
+
         void serialize_object(utils::buffer_serializer& buffer) const override
         {
             buffer.write(this->name);
+            buffer.write(this->notification);
+            buffer.write(this->signaled);
+            buffer.write_optional(this->due_time);
+            buffer.write(static_cast<int64_t>(this->period.count()));
+            buffer.write(this->apc_routine);
+            buffer.write(this->apc_context);
+            buffer.write(this->apc_thread_id);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
         {
             buffer.read(this->name);
+            buffer.read(this->notification);
+            buffer.read(this->signaled);
+            buffer.read_optional(this->due_time);
+            this->period = std::chrono::steady_clock::duration{buffer.read<int64_t>()};
+            buffer.read(this->apc_routine);
+            buffer.read(this->apc_context);
+            buffer.read(this->apc_thread_id);
         }
     };
 
