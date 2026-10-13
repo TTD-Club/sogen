@@ -875,7 +875,8 @@ namespace sogen::ttd
         while (checkpoints_.at(static_cast<size_t>(chain.back())).base != no_base_checkpoint)
         {
             chain.push_back(checkpoints_.at(static_cast<size_t>(chain.back())).base);
-            if ((cached_base = cached_checkpoint(state_cache_, chain.back())))
+            cached_base = cached_checkpoint(state_cache_, chain.back());
+            if (cached_base)
             {
                 break;
             }
@@ -1675,8 +1676,8 @@ namespace sogen::ttd
                                                   : memory_from_checkpoint(position, address, size, control);
     }
 
-    std::vector<std::optional<uint8_t>> trace::memory_from_checkpoint(const uint64_t position, const uint64_t address,
-                                                                      const uint64_t size, const operation_control& control)
+    std::vector<std::optional<uint8_t>> trace::memory_from_checkpoint(const uint64_t position, const uint64_t address, const uint64_t size,
+                                                                      const operation_control& control)
     {
         std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
         const auto last = last_byte(address, size);
@@ -1710,9 +1711,9 @@ namespace sogen::ttd
 
         // The latest write since the checkpoint settles a byte, walking back from the position, so a busy page stops
         // after a few writes; a byte whose latest write came before a later mapping change of it was lost to that.
-        const auto ranges = candidates(address / page_size, last / page_size,
-                                       static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::host_write),
-                                       after, boundary);
+        const auto ranges =
+            candidates(address / page_size, last / page_size,
+                       static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::host_write), after, boundary);
         uint64_t done = 0;
         for (const auto& candidate : std::views::reverse(ranges))
         {
@@ -1876,8 +1877,8 @@ namespace sogen::ttd
         return value;
     }
 
-    std::vector<std::optional<uint8_t>> trace::memory_from_accesses(const uint64_t position, const uint64_t address,
-                                                                    const uint64_t size, const operation_control& control)
+    std::vector<std::optional<uint8_t>> trace::memory_from_accesses(const uint64_t position, const uint64_t address, const uint64_t size,
+                                                                    const operation_control& control)
     {
         std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
         // Per byte: whether an access settled it, and whether the latest access up to the position was found (an older

@@ -525,7 +525,6 @@ namespace sogen
         // shares them; NtAdjustPrivilegesToken changes them.
         std::map<uint32_t, uint32_t> token_privileges{{19, 0}, {23, 3}, {25, 0}, {33, 0}, {34, 0}};
 
-
         // Views of file sections, by base address; a file does not shrink under them. The pages of writable shared views
         // (those with page_hashes) go back to the file when the view is flushed or unmapped; only pages that changed
         // since they were mapped (by page hash), so that writes made to the file in between survive.

@@ -484,7 +484,7 @@ namespace sogen
             // LsaCallAuthenticationPackage: only Kerberos' domain extended policies query (whoami's claims check), answered
             // as for a machine outside a domain, Dynamic Access Control disabled. lsass allocates the return buffer in the
             // caller, which frees it with LsaFreeReturnBuffer.
-            NTSTATUS call_package_api(windows_emulator& win_emu, std::vector<uint8_t>& message)
+            static NTSTATUS call_package_api(windows_emulator& win_emu, std::vector<uint8_t>& message)
             {
                 constexpr uint32_t kerberos_package = 2;
                 constexpr uint32_t kerb_query_domain_extended_policies_message = 32;
@@ -536,8 +536,8 @@ namespace sogen
             }
 
             // Replies with the request's SPM message, its arguments updated by the API and its status set.
-            NTSTATUS handle_spm_message_rpc(windows_emulator& win_emu, const std::span<const uint8_t> request,
-                                            utils::aligned_binary_writer& writer)
+            static NTSTATUS handle_spm_message_rpc(windows_emulator& win_emu, const std::span<const uint8_t> request,
+                                                   utils::aligned_binary_writer& writer)
             {
                 uint32_t declared_length{};
                 uint64_t conformant_count{};

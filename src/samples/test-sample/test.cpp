@@ -340,13 +340,13 @@ namespace
             return false;
         }
 
-        char kerberos_name[] = "kerberos";
-        LSA_STRING kerberos{static_cast<USHORT>(strlen(kerberos_name)), sizeof(kerberos_name), kerberos_name};
+        auto kerberos_name = std::to_array("kerberos");
+        LSA_STRING kerberos{static_cast<USHORT>(kerberos_name.size() - 1), static_cast<USHORT>(kerberos_name.size()), kerberos_name.data()};
         ULONG package = ~0UL;
-        char missing_name[] = "NoSuchPackage";
-        LSA_STRING missing{static_cast<USHORT>(strlen(missing_name)), sizeof(missing_name), missing_name};
+        auto missing_name = std::to_array("NoSuchPackage");
+        LSA_STRING missing{static_cast<USHORT>(missing_name.size() - 1), static_cast<USHORT>(missing_name.size()), missing_name.data()};
         ULONG missing_package{};
-        constexpr NTSTATUS status_no_such_package = static_cast<NTSTATUS>(0xC00000FE);
+        constexpr auto status_no_such_package = static_cast<NTSTATUS>(0xC00000FE);
         if (LsaLookupAuthenticationPackage(lsa, &kerberos, &package) != 0 || package != 2 ||
             LsaLookupAuthenticationPackage(lsa, &missing, &missing_package) != status_no_such_package)
         {
