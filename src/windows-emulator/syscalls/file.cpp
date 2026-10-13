@@ -1224,18 +1224,40 @@ namespace sogen
                 return status;
             };
 
+            const auto write_information = [&](const auto& information) {
+                if (length < sizeof(information))
+                {
+                    return ret(STATUS_INFO_LENGTH_MISMATCH);
+                }
+                c.emu.write_memory(file_information, information);
+                return ret(STATUS_SUCCESS, sizeof(information));
+            };
+
+            // As console handles (ConDrv) answer on Windows 11: these four classes, nothing else. Callers such as Python's
+            // stdio setup take STATUS_INVALID_HANDLE for a closed stream.
+            if (file_handle == STDOUT_HANDLE || file_handle == STDIN_HANDLE)
+            {
+                switch (info_class)
+                {
+                case FileAccessInformation: {
+                    constexpr ACCESS_MASK file_generic_read_write = 0x12019F;
+                    return write_information(FILE_ACCESS_INFORMATION{file_generic_read_write});
+                }
+                case FilePositionInformation:
+                    return write_information(FILE_POSITION_INFORMATION{});
+                case FileModeInformation:
+                    return write_information(FILE_MODE_INFORMATION{FILE_SYNCHRONOUS_IO_NONALERT});
+                case FileAlignmentInformation:
+                    return write_information(FILE_ALIGNMENT_INFORMATION{FILE_BYTE_ALIGNMENT});
+                default:
+                    return ret(STATUS_INVALID_DEVICE_REQUEST);
+                }
+            }
+
             if (const auto* container = c.proc.devices.get(file_handle))
             {
                 if (const auto* pipe = container->get_internal_device<named_pipe>())
                 {
-                    const auto write_information = [&](const auto& information) {
-                        if (length < sizeof(information))
-                        {
-                            return ret(STATUS_INFO_LENGTH_MISMATCH);
-                        }
-                        c.emu.write_memory(file_information, information);
-                        return ret(STATUS_SUCCESS, sizeof(information));
-                    };
                     switch (info_class)
                     {
                     case FileModeInformation:
