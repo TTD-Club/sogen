@@ -3601,6 +3601,79 @@ namespace
         return result == WAIT_OBJECT_0;
     }
 
+    struct long_callback_state
+    {
+        HANDLE release_first{};
+        LONG may_run_long_count{};
+        LONG finished{};
+    };
+
+    // A callback that announces it may run long (NtReleaseWorkerFactoryWorker) lets other work proceed, here the
+    // work item it waits for.
+    bool test_thread_pool_long_callbacks()
+    {
+        constexpr LONG rounds = 5;
+
+        long_callback_state state{};
+        state.release_first = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!state.release_first)
+        {
+            return false;
+        }
+
+        const auto close_event = sogen::utils::finally([&] { CloseHandle(state.release_first); });
+
+        auto* const waiter = CreateThreadpoolWork(
+            [](PTP_CALLBACK_INSTANCE instance, void* context, PTP_WORK) {
+                auto& s = *static_cast<long_callback_state*>(context);
+                if (CallbackMayRunLong(instance))
+                {
+                    InterlockedIncrement(&s.may_run_long_count);
+                }
+
+                // Long enough for a new worker to start under the emulator's relative clock, where an instruction
+                // takes a millisecond.
+                if (WaitForSingleObject(s.release_first, 100'000) == WAIT_OBJECT_0)
+                {
+                    InterlockedIncrement(&s.finished);
+                }
+            },
+            &state, nullptr);
+
+        auto* const releaser = CreateThreadpoolWork(
+            [](PTP_CALLBACK_INSTANCE instance, void* context, PTP_WORK) {
+                auto& s = *static_cast<long_callback_state*>(context);
+                CallbackMayRunLong(instance);
+                SetEvent(s.release_first);
+            },
+            &state, nullptr);
+
+        if (!waiter || !releaser)
+        {
+            return false;
+        }
+
+        for (LONG i = 0; i < rounds; ++i)
+        {
+            ResetEvent(state.release_first);
+            SubmitThreadpoolWork(waiter);
+            SubmitThreadpoolWork(releaser);
+            WaitForThreadpoolWorkCallbacks(waiter, FALSE);
+            WaitForThreadpoolWorkCallbacks(releaser, FALSE);
+        }
+
+        CloseThreadpoolWork(waiter);
+        CloseThreadpoolWork(releaser);
+
+        if (state.finished != rounds)
+        {
+            printf("%ld of %ld long callbacks finished\n", state.finished, rounds);
+            return false;
+        }
+
+        return state.may_run_long_count > 0;
+    }
+
     // Handle flags read back as set, DUPLICATE_CLOSE_SOURCE leaves the handle count as it was, and file times set with
     // SetFileTime read back.
     bool test_handles_and_file_times()
@@ -3839,6 +3912,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_trailing_space_paths, "Trailing Space Paths")
     RUN_TEST(test_high_resolution_timer, "High Resolution Timer")
     RUN_TEST(test_waitable_timers, "Waitable Timers")
+    RUN_TEST(test_thread_pool_long_callbacks, "Thread Pool Long Callbacks")
 #ifdef _WIN64
     RUN_TEST(test_working_directory, "Working Directory")
 #endif

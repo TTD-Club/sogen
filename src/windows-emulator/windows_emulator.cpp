@@ -14,6 +14,7 @@
 
 #include "network/static_socket_factory.hpp"
 #include "memory_permission_ext.hpp"
+#include "worker_factory_support.hpp"
 
 namespace sogen
 {
@@ -444,6 +445,8 @@ namespace sogen
             {
                 dev.work(win_emu);
             }
+
+            worker_factory_support::start_workers_for_queued_work(win_emu);
         }
 
         emulator_thread* get_thread_by_id(process_context& process, const uint32_t id)
