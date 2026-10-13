@@ -329,6 +329,70 @@ namespace
         return true;
     }
 
+    // whoami's claims check: Kerberos reports Dynamic Access Control disabled outside a domain.
+    bool test_lsa_authentication_packages()
+    {
+        HANDLE lsa{};
+        if (LsaConnectUntrusted(&lsa) != 0)
+        {
+            puts("LsaConnectUntrusted failed");
+            return false;
+        }
+
+        char kerberos_name[] = "kerberos";
+        LSA_STRING kerberos{static_cast<USHORT>(strlen(kerberos_name)), sizeof(kerberos_name), kerberos_name};
+        ULONG package = ~0UL;
+        char missing_name[] = "NoSuchPackage";
+        LSA_STRING missing{static_cast<USHORT>(strlen(missing_name)), sizeof(missing_name), missing_name};
+        ULONG missing_package{};
+        constexpr NTSTATUS status_no_such_package = static_cast<NTSTATUS>(0xC00000FE);
+        if (LsaLookupAuthenticationPackage(lsa, &kerberos, &package) != 0 || package != 2 ||
+            LsaLookupAuthenticationPackage(lsa, &missing, &missing_package) != status_no_such_package)
+        {
+            printf("Looking up packages failed (Kerberos is %lu)\n", package);
+            LsaDeregisterLogonProcess(lsa);
+            return false;
+        }
+
+        // KERB_QUERY_DOMAIN_EXTENDED_POLICIES_REQUEST and _RESPONSE (not in every SDK).
+        struct
+        {
+            ULONG message_type;
+            ULONG flags;
+            UNICODE_STRING domain_name;
+        } request{.message_type = 32, .flags = 0, .domain_name = {}};
+
+        struct extended_policies
+        {
+            ULONG message_type;
+            ULONG flags;
+            ULONG extended_policies;
+            ULONG ds_flags;
+        };
+
+        void* response{};
+        ULONG response_length{};
+        NTSTATUS protocol_status{};
+        const auto status =
+            LsaCallAuthenticationPackage(lsa, package, &request, sizeof(request), &response, &response_length, &protocol_status);
+        const auto* policies = static_cast<const extended_policies*>(response);
+        constexpr ULONG dac_disabled = 1;
+        const auto ok = status == 0 && protocol_status == 0 && response_length == sizeof(extended_policies) && policies &&
+                        policies->message_type == 32 && policies->flags == dac_disabled;
+        if (response)
+        {
+            LsaFreeReturnBuffer(response);
+        }
+
+        if (!ok)
+        {
+            printf("Kerberos extended policies: status %lX, protocol %lX, length %lu\n", static_cast<ULONG>(status),
+                   static_cast<ULONG>(protocol_status), response_length);
+        }
+
+        return LsaDeregisterLogonProcess(lsa) == 0 && ok;
+    }
+
     bool test_file_path_io(const std::filesystem::path& filename)
     {
         std::error_code ec{};
@@ -3970,6 +4034,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_token_information, "Token Information")
     RUN_TEST(test_privileges, "Privileges")
     RUN_TEST(test_lsa_policy, "LSA Policy")
+    RUN_TEST(test_lsa_authentication_packages, "LSA Authentication Packages")
     RUN_TEST(test_memory_priority, "Memory Priority")
     RUN_TEST(test_system_random, "System Random")
     RUN_TEST(test_stack_guarantee, "Stack Guarantee")
