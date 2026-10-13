@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <string_view>
 #include <array>
+#include <algorithm>
 
 #include "../../common/utils/finally.hpp"
 
@@ -1980,6 +1981,21 @@ namespace
         return true;
     }
 
+    bool test_desktop_window_text()
+    {
+        auto* const desktop = GetDesktopWindow();
+        if (desktop == nullptr)
+        {
+            return false;
+        }
+
+        std::array<char, 32> text{};
+        text.fill('x');
+
+        return GetWindowTextA(desktop, text.data(), static_cast<int>(text.size())) == 0 && text.front() == '\0' &&
+               GetWindowTextLengthA(desktop) == 0;
+    }
+
     bool test_message_queue()
     {
         thread_local UINT wnd_proc_num = 0;
@@ -2488,6 +2504,7 @@ namespace
         auto* ctx = CreateActCtxA(&actctx);
         if (ctx == INVALID_HANDLE_VALUE)
         {
+            printf("CreateActCtxA failed: %lu\n", GetLastError());
             return false;
         }
 
@@ -2625,6 +2642,24 @@ namespace
         return valid;
     }
 
+    bool test_unicode_case_mapping()
+    {
+        using rtl_case_unicode_char_t = WCHAR(NTAPI*)(WCHAR);
+        auto* const ntdll = GetModuleHandleA("ntdll.dll");
+        const auto upcase =
+            reinterpret_cast<rtl_case_unicode_char_t>(reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlUpcaseUnicodeChar")));
+        const auto downcase =
+            reinterpret_cast<rtl_case_unicode_char_t>(reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlDowncaseUnicodeChar")));
+        if (!upcase || !downcase)
+        {
+            puts("ntdll case mapping functions not found");
+            return false;
+        }
+
+        return upcase(L'a') == L'A' && upcase(0x00E4) == 0x00C4 && upcase(0x0430) == 0x0410 && downcase(0x00C4) == 0x00E4 &&
+               downcase(0x0410) == 0x0430;
+    }
+
     bool test_gdi()
     {
         const wchar_t* cursor_path = L"C:\\Windows\\Cursors\\aero_arrow.cur";
@@ -2682,6 +2717,56 @@ namespace
 
         DestroyWindow(hwnd);
         return true;
+    }
+
+    bool test_ansi_oem_translation()
+    {
+        std::array<char, 256> source{};
+        std::array<char, 256> converted{};
+        for (size_t i = 0; i < source.size(); ++i)
+        {
+            source[i] = static_cast<char>(i);
+        }
+        if (!CharToOemBuffA(source.data(), converted.data(), static_cast<DWORD>(source.size())))
+        {
+            return false;
+        }
+        for (size_t i = 0; i < source.size(); ++i)
+        {
+            // win32k's table turns characters the OEM code page lacks into '_'.
+            wchar_t wide{};
+            char expected{};
+            if (!MultiByteToWideChar(CP_ACP, 0, &source[i], 1, &wide, 1) ||
+                !WideCharToMultiByte(CP_OEMCP, 0, &wide, 1, &expected, 1, "_", nullptr) || converted[i] != expected)
+            {
+                return false;
+            }
+        }
+        auto inplace = std::to_array("shell-arguments");
+        return CharToOemA(inplace.data(), inplace.data()) && std::string_view{inplace.data()} == "shell-arguments";
+    }
+
+    bool test_bcrypt_random()
+    {
+        std::array<UCHAR, 8192> first{};
+        std::array<UCHAR, 8192> second{};
+        const auto status = BCryptGenRandom(nullptr, first.data(), static_cast<ULONG>(first.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (!BCRYPT_SUCCESS(status))
+        {
+            printf("BCryptGenRandom failed: 0x%08lX\n", status);
+            return false;
+        }
+
+        BCRYPT_ALG_HANDLE algorithm{};
+        const auto open_status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_RNG_ALGORITHM, nullptr, 0);
+        if (!BCRYPT_SUCCESS(open_status))
+        {
+            printf("BCryptOpenAlgorithmProvider(RNG) failed: 0x%08lX\n", open_status);
+            return false;
+        }
+        const auto close_algorithm = sogen::utils::finally([&] { BCryptCloseAlgorithmProvider(algorithm, 0); });
+        const auto second_status = BCryptGenRandom(algorithm, second.data(), static_cast<ULONG>(second.size()), 0);
+        return BCRYPT_SUCCESS(second_status) && first != second && std::ranges::any_of(first, [](UCHAR value) { return value != 0; });
     }
 
     bool test_bcrypt_hash()
@@ -3078,7 +3163,10 @@ namespace
 
         HANDLE second_client = INVALID_HANDLE_VALUE;
         std::thread opener([&] {
-            Sleep(10);
+            // A pause that lets the main thread block in ConnectNamedPipe first.
+            auto* const never = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            WaitForSingleObject(never, 10);
+            CloseHandle(never);
             second_client = open_client();
         });
         const auto blocking_connected = ConnectNamedPipe(blocking, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
@@ -4077,6 +4165,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_tls, "TLS")
     RUN_TEST(test_socket, "Socket")
     RUN_TEST(test_apc, "APC")
+    RUN_TEST(test_desktop_window_text, "Desktop Window Text")
     RUN_TEST(test_window_geometry, "Window Geometry")
     RUN_TEST(test_user_callback, "User Callback")
     RUN_TEST(test_mutable_callbacks, "Mutable User Callback")
@@ -4085,11 +4174,14 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_settimer, "User Timer")
     RUN_TEST(test_private_namespace, "Private Namespace")
     RUN_TEST(test_handle_tag_bits, "Handle Tag Bits")
+    RUN_TEST(test_unicode_case_mapping, "Unicode Case Mapping")
     RUN_TEST(test_actctx, "Activation Context")
     RUN_TEST(test_mmio, "MMIO")
     RUN_TEST(test_gdi, "GDI")
     RUN_TEST(test_dialog_table, "Dialog Table")
     RUN_TEST(test_bcrypt_hash, "BCrypt Hash")
+    RUN_TEST(test_bcrypt_random, "BCrypt Random")
+    RUN_TEST(test_ansi_oem_translation, "ANSI/OEM Translation")
     RUN_TEST(test_crypt_protect, "CryptProtect")
     RUN_TEST(test_set_dib_bits_to_device, "GDI DIB")
 

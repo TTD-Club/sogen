@@ -525,18 +525,6 @@ namespace sogen
         // shares them; NtAdjustPrivilegesToken changes them.
         std::map<uint32_t, uint32_t> token_privileges{{19, 0}, {23, 3}, {25, 0}, {33, 0}, {34, 0}};
 
-        // The next pipe instance id (named_pipe::instance) NtCreateNamedPipeFile hands out.
-        uint64_t next_pipe_instance{1};
-
-        // HANDLE_FLAG_INHERIT and HANDLE_FLAG_PROTECT_FROM_CLOSE of the handles that have any, by handle_flags_key
-        // (duplicates share their source's value, and so its flags).
-        std::map<uint64_t, uint32_t> handle_flags{};
-
-        // A handle's identity for handle_flags, without the tag bits user mode may set.
-        static uint64_t handle_flags_key(const handle h)
-        {
-            return h.bits & 0xFFFFFFFC;
-        }
 
         // Views of file sections, by base address; a file does not shrink under them. The pages of writable shared views
         // (those with page_hashes) go back to the file when the view is flushed or unmapped; only pages that changed
@@ -624,7 +612,7 @@ namespace sogen
         std::vector<std::byte> default_register_set{};
 
         // Process and thread ids share Windows' 4-aligned client ID space.
-        uint32_t process_id{4};
+        uint32_t process_id{default_guest_process_id};
         uint32_t initial_thread_id{8};
         uint32_t spawned_thread_count{0};
         handle_store<handle_types::thread, emulator_thread> threads{};
@@ -652,7 +640,6 @@ namespace sogen
         std::array<uint8_t, 6> uuid_seed{};
         uint64_t next_uuid_time{};
         uint32_t uuid_sequence{};
-        uint64_t random_state{};
     };
 
 } // namespace sogen

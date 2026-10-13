@@ -5,6 +5,7 @@
 #include "devices/afd_endpoint.hpp"
 #include "devices/mount_point_manager.hpp"
 #include "devices/security_support_provider.hpp"
+#include "devices/cryptography.hpp"
 #include "devices/named_pipe.hpp"
 #include "devices/network_store_interface.hpp"
 #include "devices/gpu_bridge.hpp"
@@ -56,66 +57,11 @@ namespace sogen
             }
         };
 
-        // bcryptprimitives seeds the process-wide generator behind BCryptGenRandom, RtlGenRandom, and rand_s from
-        // IOCTL_KSEC_RNG on \Device\CNG and fails them all when it returns fewer bytes than asked for. The bytes come
-        // from a generator seeded like NtAllocateUuids, from the emulated clock, so reproducible runs see the same ones.
-        struct cng_device : stateless_device
-        {
-            NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override
-            {
-                constexpr ULONG ioctl_ksec_rng = 0x390008;
-                if (context.io_control_code != ioctl_ksec_rng)
-                {
-                    return STATUS_SUCCESS;
-                }
-
-                std::vector<std::byte> bytes(context.output_buffer_length);
-                for (size_t offset = 0; offset < bytes.size(); offset += sizeof(uint64_t))
-                {
-                    const auto value = next_random(win_emu);
-                    std::memcpy(bytes.data() + offset, &value, std::min(sizeof(value), bytes.size() - offset));
-                }
-                win_emu.emu().write_memory(context.output_buffer, bytes.data(), bytes.size());
-
-                if (context.io_status_block)
-                {
-                    IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
-                    block.Information = bytes.size();
-                    context.io_status_block.write(block);
-                }
-
-                return STATUS_SUCCESS;
-            }
-
-          private:
-            static uint64_t next_random(windows_emulator& win_emu)
-            {
-                auto& state = win_emu.process.random_state;
-                if (!state)
-                {
-                    state = static_cast<uint64_t>(win_emu.clock().system_now().time_since_epoch().count()) ^
-                            win_emu.clock().timestamp_counter() ^ win_emu.process.ntdll_image_base;
-                }
-
-                // SplitMix64
-                state += 0x9E3779B97F4A7C15;
-                auto value = state;
-                value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9;
-                value = (value ^ (value >> 27)) * 0x94D049BB133111EB;
-                return value ^ (value >> 31);
-            }
-        };
-
         // Factories for the devices defined locally in this file, matching the shared create_*
         // (device_creation_context) signature so they slot straight into the registry.
         std::unique_ptr<io_device> create_dummy_device(const device_creation_context&)
         {
             return std::make_unique<dummy_device>();
-        }
-
-        std::unique_ptr<io_device> create_cng_device(const device_creation_context&)
-        {
-            return std::make_unique<cng_device>();
         }
 
         std::unique_ptr<io_device> create_transport_stub_device(const device_creation_context&)
@@ -140,7 +86,6 @@ namespace sogen
         using namespace std::string_view_literals;
 
         static const std::map<std::u16string_view, device_factory> registry = {
-            {u"CNG"sv, create_cng_device},
             // Dummy
             {u"RasAcd"sv, create_dummy_device},
             {u"PcwDrv"sv, create_dummy_device},
@@ -157,6 +102,7 @@ namespace sogen
             {u"Nsi"sv, create_network_store_interface},
             {u"MountPointManager"sv, create_mount_point_manager},
             {u"KsecDD"sv, create_security_support_provider},
+            {u"CNG"sv, create_cryptography_device},
             {u"NamedPipe"sv, create_named_pipe_device},
             {u"SogenGpu"sv, create_gpu_bridge},
             {u"SogenSteam"sv, create_steam_bridge},
@@ -267,33 +213,34 @@ namespace sogen
     NTSTATUS io_device_container::io_control(windows_emulator& win_emu, const io_device_context& context)
     {
         this->assert_validity();
-        win_emu.callbacks.on_ioctrl(*this->device_, this->device_name_, context.io_control_code);
-        return this->device_->io_control(win_emu, context);
+        win_emu.callbacks.on_ioctrl(*this->file_->device, this->device_name_, context.io_control_code);
+        return this->file_->device->io_control(win_emu, context);
     }
 
     io_device_context io_device_container::prepare_io_context(const io_device_context& context) const
     {
         auto request = context;
-        if (this->completion_association_)
+        if (this->file_->completion_association)
         {
-            request.completion_port = this->completion_association_->completion_port;
-            request.completion_key = this->completion_association_->key;
+            request.completion_port = this->file_->completion_association->completion_port;
+            request.completion_key = this->file_->completion_association->key;
         }
-        request.completion_notification_flags = this->completion_notification_flags_;
+        request.completion_notification_flags = this->file_->completion_notification_flags;
+        request.granted_access = this->granted_access;
         return request;
     }
 
     bool io_device_container::cancel_io(windows_emulator& win_emu, const uint64_t io_status_block)
     {
         this->assert_validity();
-        return this->device_->cancel_io(win_emu, io_status_block);
+        return this->file_->device->cancel_io(win_emu, io_status_block);
     }
 
     NTSTATUS io_device_container::set_completion_association(process_context& process, const emulator_thread* active_thread,
                                                              const handle completion_port, const uint64_t key)
     {
         this->assert_validity();
-        if (this->completion_association_)
+        if (this->file_->completion_association)
         {
             return STATUS_INVALID_PARAMETER;
         }
@@ -310,37 +257,41 @@ namespace sogen
             return STATUS_INVALID_HANDLE;
         }
 
-        this->completion_association_ = device_completion_association{.completion_port = retained_port, .key = key};
+        this->file_->completion_association = device_completion_association{.completion_port = retained_port, .key = key};
         return STATUS_SUCCESS;
     }
 
     void io_device_container::set_completion_notification_flags(const ULONG flags)
     {
         this->assert_validity();
-        this->completion_notification_flags_ = flags;
+        this->file_->completion_notification_flags = flags;
     }
 
     void io_device_container::release_references(process_context& process)
     {
         this->assert_validity();
-        this->device_->release_references(process);
-        if (this->completion_association_)
+        if (!this->is_last_file_reference())
         {
-            io_completion_wait::release_handle_reference(process, this->completion_association_->completion_port);
-            this->completion_association_.reset();
+            return;
+        }
+        this->file_->device->release_references(process);
+        if (this->file_->completion_association)
+        {
+            io_completion_wait::release_handle_reference(process, this->file_->completion_association->completion_port);
+            this->file_->completion_association.reset();
         }
     }
 
     void io_device_container::work(windows_emulator& win_emu)
     {
         this->assert_validity();
-        this->device_->work(win_emu);
+        this->file_->device->work(win_emu);
     }
 
     void io_device_container::restore_after_state_restore(windows_emulator& win_emu)
     {
         this->assert_validity();
-        this->device_->restore_after_state_restore(win_emu);
+        this->file_->device->restore_after_state_restore(win_emu);
     }
 
     void io_device_container::serialize_object(utils::buffer_serializer& buffer) const
@@ -349,20 +300,37 @@ namespace sogen
 
         buffer.write(this->is_32_bit_);
         buffer.write_string(this->device_name_);
-        buffer.write_optional(this->completion_association_);
-        buffer.write(this->completion_notification_flags_);
-        this->device_->serialize(buffer);
+        buffer.write(this->granted_access);
+        buffer.write_shared(this->file_, [&](const file_state& file) {
+            buffer.write_optional(file.completion_association);
+            buffer.write(file.completion_notification_flags);
+            file.device->serialize(buffer);
+        });
     }
 
     void io_device_container::deserialize_object(utils::buffer_deserializer& buffer)
     {
         buffer.read(this->is_32_bit_);
         buffer.read_string(this->device_name_);
-        buffer.read_optional(this->completion_association_);
-        buffer.read(this->completion_notification_flags_);
+        buffer.read(this->granted_access);
+        buffer.read_shared(this->file_, [&](file_state& file) {
+            buffer.read_optional(file.completion_association);
+            buffer.read(file.completion_notification_flags);
+            file.device = create_device(this->device_name_, {.is_32_bit = this->is_32_bit_});
+            file.device->deserialize(buffer);
+        });
+    }
 
-        this->setup();
-        this->device_->deserialize(buffer);
+    io_device_container io_device_container::duplicate(const ACCESS_MASK access, const bool inheritable) const
+    {
+        this->assert_validity();
+        io_device_container result;
+        result.is_32_bit_ = this->is_32_bit_;
+        result.device_name_ = this->device_name_;
+        result.file_ = this->file_;
+        result.granted_access = access;
+        result.inherit = inheritable;
+        return result;
     }
 
 } // namespace sogen

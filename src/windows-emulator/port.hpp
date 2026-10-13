@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -158,6 +159,8 @@ namespace sogen
         emulator_object<PORT_MESSAGE64> receive_message;
         EmulatorTraits<Emu64>::SIZE_T receive_buffer_length{};
         uint64_t send_handle{}; // handle delivered by a client->server ALPC HANDLE attribute (0 = none)
+        uint64_t send_view_base{};
+        uint64_t send_view_size{};
 
         lpc_message_context(memory_interface& emu)
             : send_message(emu),
@@ -175,6 +178,9 @@ namespace sogen
             buffer.write(send_message);
             buffer.write(receive_message);
             buffer.write(receive_buffer_length);
+            buffer.write(send_handle);
+            buffer.write(send_view_base);
+            buffer.write(send_view_size);
         }
 
         void deserialize(utils::buffer_deserializer& buffer)
@@ -182,6 +188,9 @@ namespace sogen
             buffer.read(send_message);
             buffer.read(receive_message);
             buffer.read(receive_buffer_length);
+            buffer.read(send_handle);
+            buffer.read(send_view_base);
+            buffer.read(send_view_size);
         }
     };
 
@@ -192,6 +201,8 @@ namespace sogen
         emulator_pointer recv_buffer{};
         ULONG recv_buffer_length{};
         uint64_t send_handle{}; // handle delivered by a client->server ALPC HANDLE attribute (0 = none)
+        uint64_t send_view_base{};
+        uint64_t send_view_size{};
 
         void serialize(utils::buffer_serializer& buffer) const
         {
@@ -200,6 +211,8 @@ namespace sogen
             buffer.write(recv_buffer);
             buffer.write(recv_buffer_length);
             buffer.write(send_handle);
+            buffer.write(send_view_base);
+            buffer.write(send_view_size);
         }
 
         void deserialize(utils::buffer_deserializer& buffer)
@@ -209,6 +222,8 @@ namespace sogen
             buffer.read(recv_buffer);
             buffer.read(recv_buffer_length);
             buffer.read(send_handle);
+            buffer.read(send_view_base);
+            buffer.read(send_view_size);
         }
     };
 
@@ -314,6 +329,51 @@ namespace sogen
         ULONG sequence_number{};
     };
 
+    struct alpc_section_view
+    {
+        uint64_t base{};
+        uint64_t size{};
+        uint64_t reserved_size{};
+
+        void serialize(utils::buffer_serializer& buffer) const
+        {
+            buffer.write(this->base);
+            buffer.write(this->size);
+            buffer.write(this->reserved_size);
+        }
+
+        void deserialize(utils::buffer_deserializer& buffer)
+        {
+            buffer.read(this->base);
+            buffer.read(this->size);
+            buffer.read(this->reserved_size);
+        }
+    };
+
+    struct alpc_port_section
+    {
+        uint64_t size{};
+        bool closed{};
+        std::map<uint64_t, alpc_section_view> views{};
+        std::map<uint64_t, std::array<uint8_t, 0x1000>> saved_pages{};
+
+        void serialize(utils::buffer_serializer& buffer) const
+        {
+            buffer.write(this->size);
+            buffer.write(this->closed);
+            buffer.write_map(this->views);
+            buffer.write_map(this->saved_pages);
+        }
+
+        void deserialize(utils::buffer_deserializer& buffer)
+        {
+            buffer.read(this->size);
+            buffer.read(this->closed);
+            buffer.read_map(this->views);
+            buffer.read_map(this->saved_pages);
+        }
+    };
+
     struct port : ref_counted_object
     {
         uint64_t view_base{};
@@ -323,11 +383,14 @@ namespace sogen
         bool disconnected{};
         uint64_t next_security_context_handle{4};
         std::vector<uint64_t> security_context_handles{};
+        uint64_t next_section_handle{0x10};
+        std::map<uint64_t, alpc_port_section> sections{};
 
         port() = default;
         ~port() override = default;
 
-        port(port&&) = default;
+        // MSVC's std::map move constructor allocates a replacement sentinel and can throw.
+        port(port&&) noexcept(false) = default;
         port& operator=(port&&) = default;
 
         port(const port&) = delete;
@@ -342,6 +405,8 @@ namespace sogen
             buffer.write(this->disconnected);
             buffer.write(this->next_security_context_handle);
             buffer.write_vector(this->security_context_handles);
+            buffer.write(this->next_section_handle);
+            buffer.write_map(this->sections);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -353,6 +418,8 @@ namespace sogen
             buffer.read(this->disconnected);
             buffer.read(this->next_security_context_handle);
             buffer.read_vector(this->security_context_handles);
+            buffer.read(this->next_section_handle);
+            buffer.read_map(this->sections);
         }
 
         virtual void create(windows_emulator& win_emu, const port_creation_data& data)
@@ -405,6 +472,14 @@ namespace sogen
             return true;
         }
 
+        NTSTATUS create_section(uint64_t size, uint64_t& section_handle, uint64_t& actual_size);
+        NTSTATUS delete_section(uint64_t section_handle);
+        NTSTATUS create_section_view(windows_emulator& win_emu, uint64_t section_handle, uint64_t requested_size, uint64_t& result_base,
+                                     uint64_t& actual_size);
+        NTSTATUS delete_section_view(windows_emulator& win_emu, uint64_t address);
+        bool owns_section_view(uint64_t section_handle, uint64_t address, uint64_t size) const;
+        void release_sections(windows_emulator& win_emu);
+
         virtual lpc_message_result handle_message(windows_emulator& win_emu, const lpc_message_context& c);
 
         virtual bool accepts_send_only_messages() const
@@ -428,12 +503,14 @@ namespace sogen
         {
             port::serialize_object(buffer);
             buffer.write(this->bound_interface_);
+            buffer.write_map(this->bindings_);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
         {
             port::deserialize_object(buffer);
             buffer.read(this->bound_interface_);
+            buffer.read_map(this->bindings_);
         }
 
         virtual NTSTATUS handle_rpc(windows_emulator& win_emu, uint32_t procedure_id, const lpc_request_context& c,
@@ -450,6 +527,26 @@ namespace sogen
         std::array<uint8_t, 16> bound_interface_{};
 
       private:
+        struct rpc_binding
+        {
+            std::array<uint8_t, 16> interface_id{};
+            bool ndr64{};
+
+            void serialize(utils::buffer_serializer& buffer) const
+            {
+                buffer.write(this->interface_id);
+                buffer.write(this->ndr64);
+            }
+
+            void deserialize(utils::buffer_deserializer& buffer)
+            {
+                buffer.read(this->interface_id);
+                buffer.read(this->ndr64);
+            }
+        };
+
+        std::map<uint16_t, rpc_binding> bindings_{};
+
         lpc_request_result handle_handshake(windows_emulator& win_emu, const lpc_request_context& c);
         lpc_request_result handle_rpc_call(windows_emulator& win_emu, const lpc_request_context& c);
     };

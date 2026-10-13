@@ -120,7 +120,7 @@ namespace sogen
             {
                 return thread.suspended > 0 || thread.waiting_for_alert || !thread.await_objects.empty() || thread.await_time.has_value() ||
                        thread.await_msg.has_value() || thread.await_msg_mask.has_value() || thread.await_io_completion.has_value() ||
-                       thread.await_pipe_read.has_value() || static_cast<bool>(thread.await_host_condition);
+                       thread.await_file_io.has_value() || static_cast<bool>(thread.await_host_condition);
             }
 
             bool has_waiter_on_port(const process_context& process, const handle io_completion_handle)
@@ -272,6 +272,7 @@ namespace sogen
 
             worker_factory factory{};
             factory.name = name;
+            factory.inherit = object_attributes && (object_attributes.read().Attributes & OBJ_INHERIT) != 0;
 
             handle retained_io_completion_handle{};
             if (!io_completion_wait::retain_handle_reference(c.proc, c.vcpu.active_thread, io_completion_handle,
@@ -341,6 +342,28 @@ namespace sogen
 
             switch (info_class)
             {
+            case WorkerFactoryStackInformation: {
+                struct stack_information
+                {
+                    uint64_t reserve;
+                    uint64_t commit;
+                };
+
+                if (worker_factory_information_length != sizeof(stack_information))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                stack_information information{};
+                if (!c.emu.try_read_memory(worker_factory_information, &information, sizeof(information)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                factory->stack_reserve = information.reserve;
+                factory->stack_commit = information.commit;
+                return STATUS_SUCCESS;
+            }
+
             case WorkerFactoryTimeout:
             case WorkerFactoryRetryTimeout:
             case WorkerFactoryIdleTimeout: {
@@ -537,7 +560,7 @@ namespace sogen
             }
 
             const auto removed =
-                io_completion_wait::dequeue_io_completion_entries(c.proc, factory->io_completion_handle, mini_packets, count);
+                io_completion_wait::dequeue_io_completion_entries(c.win_emu, factory->io_completion_handle, mini_packets, count);
             packets_returned.write_if_valid(removed);
             if (removed > 0)
             {

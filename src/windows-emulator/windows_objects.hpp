@@ -8,6 +8,7 @@
 #include <serialization_helper.hpp>
 #include <utils/file_handle.hpp>
 #include <utils/stat.hpp>
+#include <utils/time.hpp>
 #include <platform/synchronisation.hpp>
 #include <platform/win_pefile.hpp>
 #include <platform/window.hpp>
@@ -37,6 +38,10 @@ namespace sogen
     {
         std::u16string name{};
 
+        // Created by NtCreateTimer2 (a KTIMER2): set and cancelled by the classic and the Timer2 calls, where a classic
+        // timer only takes the classic ones.
+        bool extended{};
+
         // Notification (manual-reset) timers stay signaled until set again; synchronization timers
         // release one waiter and reset.
         bool notification{};
@@ -62,9 +67,12 @@ namespace sogen
 
             if (this->period.count() > 0)
             {
-                // A periodic timer that fell behind expires once and resumes its schedule.
+                // A periodic timer that fell behind expires once and resumes its schedule; one too far out to
+                // represent never comes due again.
                 const auto missed = (now - *this->due_time) / this->period;
-                *this->due_time += this->period * (missed + 1);
+                const auto until_next = this->period - (now - *this->due_time - this->period * missed);
+                const auto latest = std::chrono::steady_clock::time_point::max();
+                *this->due_time = until_next > latest - now ? latest : now + until_next;
             }
             else
             {
@@ -74,9 +82,25 @@ namespace sogen
             return true;
         }
 
+        void consume_signal()
+        {
+            if (!this->notification)
+            {
+                this->signaled = false;
+            }
+        }
+
+        void cancel()
+        {
+            this->due_time.reset();
+            this->period = {};
+            this->apc_routine = 0;
+        }
+
         void serialize_object(utils::buffer_serializer& buffer) const override
         {
             buffer.write(this->name);
+            buffer.write(this->extended);
             buffer.write(this->notification);
             buffer.write(this->signaled);
             buffer.write_optional(this->due_time);
@@ -89,6 +113,7 @@ namespace sogen
         void deserialize_object(utils::buffer_deserializer& buffer) override
         {
             buffer.read(this->name);
+            buffer.read(this->extended);
             buffer.read(this->notification);
             buffer.read(this->signaled);
             buffer.read_optional(this->due_time);

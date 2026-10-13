@@ -35,14 +35,64 @@ namespace sogen
 
         namespace
         {
+            // The timer behind a handle. The Timer2 calls (NtSetTimer2, NtCancelTimer2) take only NtCreateTimer2's
+            // timers; the classic calls take both kinds.
+            std::pair<timer*, NTSTATUS> find_timer(const syscall_context& c, const handle timer_handle, const bool timer2_call)
+            {
+                const auto effective = c.proc.resolve_object_pseudo_handle(timer_handle, c.vcpu.active_thread);
+                auto* store = c.proc.get_handle_store(effective);
+                if (!store || !store->get_object(effective))
+                {
+                    return {nullptr, STATUS_INVALID_HANDLE};
+                }
+
+                auto* entry = c.proc.timers.get(effective);
+                if (!entry || (timer2_call && !entry->extended))
+                {
+                    return {nullptr, STATUS_OBJECT_TYPE_MISMATCH};
+                }
+
+                return {entry, STATUS_SUCCESS};
+            }
+
+            // A due time in 100 ns units, relative when not positive, as a steady-clock deadline; one too far out to
+            // represent saturates.
+            std::chrono::steady_clock::time_point timer_deadline(utils::clock& clock, const LARGE_INTEGER due)
+            {
+                const auto now = clock.steady_now();
+                uint64_t ticks{};
+                if (due.QuadPart <= 0)
+                {
+                    ticks = static_cast<uint64_t>(-(due.QuadPart + 1)) + 1;
+                }
+                else
+                {
+                    const auto system_ticks =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(clock.system_now().time_since_epoch()).count() / 100 +
+                        WINDOWS_EPOCH_DIFFERENCE;
+                    ticks = due.QuadPart > system_ticks ? static_cast<uint64_t>(due.QuadPart - system_ticks) : 0;
+                }
+
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::time_point::max() - now).count();
+                if (ticks > static_cast<uint64_t>(remaining / 100))
+                {
+                    return std::chrono::steady_clock::time_point::max();
+                }
+
+                return now + std::chrono::nanoseconds(ticks * 100);
+            }
+
             NTSTATUS create_timer(const syscall_context& c, const emulator_object<handle> timer_handle,
                                   const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
-                                  const bool notification)
+                                  const bool notification, const bool extended)
             {
                 std::u16string name{};
+                bool inherit{};
                 if (object_attributes)
                 {
                     const auto attributes = object_attributes.read();
+                    inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
                     if (attributes.ObjectName)
                     {
                         name = read_unicode_string(c.emu, attributes.ObjectName);
@@ -66,6 +116,8 @@ namespace sogen
                 timer t{};
                 t.name = std::move(name);
                 t.notification = notification;
+                t.extended = extended;
+                t.inherit = inherit;
 
                 const auto h = c.proc.timers.store(std::move(t));
                 timer_handle.write(h);
@@ -75,56 +127,18 @@ namespace sogen
 
             // Arms a timer like KeSetTimerEx: clears its signal, sets the due time and period, and
             // records the APC for the calling thread.
-            NTSTATUS set_timer(const syscall_context& c, const handle timer_handle, const LARGE_INTEGER due_time,
-                               const std::chrono::steady_clock::duration period, const uint64_t apc_routine, const uint64_t apc_context,
-                               const uint64_t previous_state)
+            void set_timer(const syscall_context& c, timer& t, const LARGE_INTEGER due_time,
+                           const std::chrono::steady_clock::duration period, const uint64_t apc_routine, const uint64_t apc_context,
+                           const emulator_object<BOOLEAN> previous_state)
             {
-                auto* t = c.proc.timers.get(timer_handle);
-                if (!t)
-                {
-                    return STATUS_INVALID_HANDLE;
-                }
+                previous_state.write_if_valid(t.signaled ? TRUE : FALSE);
 
-                if (period.count() < 0)
-                {
-                    return STATUS_INVALID_PARAMETER_6;
-                }
-
-                if (previous_state)
-                {
-                    c.emu.write_memory<BOOLEAN>(previous_state, t->signaled ? TRUE : FALSE);
-                }
-
-                const auto due = utils::convert_delay_interval_to_time_point(c.win_emu.clock(), due_time);
-
-                t->signaled = false;
-                t->due_time = due;
-                t->period = period;
-                t->apc_routine = apc_routine;
-                t->apc_context = apc_context;
-                t->apc_thread_id = apc_routine ? c.win_emu.current_thread().id : 0;
-
-                return STATUS_SUCCESS;
-            }
-
-            NTSTATUS cancel_timer(const syscall_context& c, const handle timer_handle, const uint64_t current_state)
-            {
-                auto* t = c.proc.timers.get(timer_handle);
-                if (!t)
-                {
-                    return STATUS_INVALID_HANDLE;
-                }
-
-                t->due_time.reset();
-                t->period = {};
-                t->apc_routine = 0;
-
-                if (current_state)
-                {
-                    c.emu.write_memory<BOOLEAN>(current_state, t->signaled ? TRUE : FALSE);
-                }
-
-                return STATUS_SUCCESS;
+                t.signaled = false;
+                t.due_time = timer_deadline(c.win_emu.clock(), due_time);
+                t.period = period;
+                t.apc_routine = apc_routine;
+                t.apc_context = apc_context;
+                t.apc_thread_id = apc_routine ? c.win_emu.current_thread().id : 0;
             }
 
             std::chrono::steady_clock::duration period_from_milliseconds(const LONG period)
@@ -134,12 +148,35 @@ namespace sogen
         }
 
         // NtCreateTimer2's attributes come from CreateWaitableTimerExW: bit 31 is a manual-reset
-        // (notification) timer, 4 marks a high-resolution one.
-        NTSTATUS handle_NtCreateTimer2(const syscall_context& c, const emulator_object<handle> timer_handle, uint64_t /*reserved*/,
-                                       const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
-                                       const ULONG attributes, ACCESS_MASK /*desired_access*/)
+        // (notification) timer, 4 marks a high-resolution one. Such timers have no name: the object
+        // attributes must be null.
+        NTSTATUS handle_NtCreateTimer2(const syscall_context& c, const emulator_object<handle> timer_handle, const uint64_t reserved,
+                                       const uint64_t object_attributes, const ULONG attributes, ACCESS_MASK /*desired_access*/)
         {
-            return create_timer(c, timer_handle, object_attributes, (attributes & 0x80000000) != 0);
+            if (reserved != 0)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            if (object_attributes != 0)
+            {
+                return STATUS_INVALID_PARAMETER_3;
+            }
+
+            constexpr ULONG manual_reset = 0x80000000;
+            constexpr ULONG high_resolution = 0x4;
+            constexpr ULONG no_wake = 0x8;
+            if (attributes == 2 || attributes == 6)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            if (attributes & ~(manual_reset | high_resolution | no_wake))
+            {
+                return STATUS_INVALID_PARAMETER_4;
+            }
+
+            return create_timer(c, timer_handle, {c.win_emu.memory}, (attributes & manual_reset) != 0, true);
         }
 
         NTSTATUS handle_NtCreateTimer(const syscall_context& c, const emulator_object<handle> timer_handle, ACCESS_MASK /*desired_access*/,
@@ -153,7 +190,7 @@ namespace sogen
                 return STATUS_INVALID_PARAMETER_4;
             }
 
-            return create_timer(c, timer_handle, object_attributes, timer_type == notification_timer);
+            return create_timer(c, timer_handle, object_attributes, timer_type == notification_timer, false);
         }
 
         NTSTATUS handle_NtOpenTimer(const syscall_context& c, const emulator_object<handle> timer_handle, ACCESS_MASK /*desired_access*/,
@@ -199,20 +236,38 @@ namespace sogen
 
         NTSTATUS handle_NtSetTimer(const syscall_context& c, const handle timer_handle, const emulator_object<LARGE_INTEGER> due_time,
                                    const uint64_t apc_routine, const uint64_t apc_context, const BOOLEAN /*resume_timer*/,
-                                   const LONG period, const uint64_t previous_state)
+                                   const LONG period, const emulator_object<BOOLEAN> previous_state)
         {
+            const auto [entry, status] = find_timer(c, timer_handle, false);
+            if (!entry)
+            {
+                return status;
+            }
+
+            if (period < 0)
+            {
+                return STATUS_INVALID_PARAMETER_6;
+            }
+
             if (!due_time)
             {
                 return STATUS_ACCESS_VIOLATION;
             }
 
-            return set_timer(c, timer_handle, due_time.read(), period_from_milliseconds(period), apc_routine, apc_context, previous_state);
+            set_timer(c, *entry, due_time.read(), period_from_milliseconds(period), apc_routine, apc_context, previous_state);
+            return STATUS_SUCCESS;
         }
 
         // NtSetTimer2's period is in 100 ns units; its parameters only carry a wake tolerance.
         NTSTATUS handle_NtSetTimer2(const syscall_context& c, const handle timer_handle, const emulator_object<LARGE_INTEGER> due_time,
                                     const emulator_object<LARGE_INTEGER> period, const uint64_t /*parameters*/)
         {
+            const auto [entry, status] = find_timer(c, timer_handle, true);
+            if (!entry)
+            {
+                return status;
+            }
+
             if (!due_time)
             {
                 return STATUS_ACCESS_VIOLATION;
@@ -222,16 +277,16 @@ namespace sogen
             if (period)
             {
                 const auto hundred_ns = period.read().QuadPart;
-                if (hundred_ns < 0)
+                if (hundred_ns < 0 || hundred_ns > std::numeric_limits<int64_t>::max() / 100)
                 {
                     return STATUS_INVALID_PARAMETER_3;
                 }
 
-                timer_period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                    std::chrono::duration<int64_t, std::ratio<1, HUNDRED_NANOSECONDS_IN_ONE_SECOND>>{hundred_ns});
+                timer_period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds{hundred_ns * 100});
             }
 
-            return set_timer(c, timer_handle, due_time.read(), timer_period, 0, 0, 0);
+            set_timer(c, *entry, due_time.read(), timer_period, 0, 0, {c.win_emu.memory});
+            return STATUS_SUCCESS;
         }
 
         // SetWaitableTimerEx (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timers, e.g. Python's time.sleep) sets timers through
@@ -263,22 +318,44 @@ namespace sogen
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
 
+            const auto [entry, status] = find_timer(c, timer_handle, false);
+            if (!entry)
+            {
+                return status;
+            }
+
             const auto info = c.emu.read_memory<timer_set_coalescable_timer_info>(timer_set_information);
-            return set_timer(c, timer_handle, info.DueTime, period_from_milliseconds(static_cast<LONG>(info.Period)), info.TimerApcRoutine,
-                             info.TimerContext, info.PreviousState);
+            set_timer(c, *entry, info.DueTime, period_from_milliseconds(static_cast<LONG>(info.Period)), info.TimerApcRoutine,
+                      info.TimerContext, {c.win_emu.memory, info.PreviousState});
+            return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtCancelTimer(const syscall_context& c, const handle timer_handle, const uint64_t current_state)
+        NTSTATUS handle_NtCancelTimer(const syscall_context& c, const handle timer_handle, const emulator_object<BOOLEAN> current_state)
         {
-            return cancel_timer(c, timer_handle, current_state);
+            const auto [entry, status] = find_timer(c, timer_handle, false);
+            if (!entry)
+            {
+                return status;
+            }
+
+            entry->cancel();
+            current_state.write_if_valid(entry->signaled ? TRUE : FALSE);
+            return STATUS_SUCCESS;
         }
 
         NTSTATUS handle_NtCancelTimer2(const syscall_context& c, const handle timer_handle, const uint64_t /*parameters*/)
         {
-            return cancel_timer(c, timer_handle, 0);
+            const auto [entry, status] = find_timer(c, timer_handle, true);
+            if (!entry)
+            {
+                return status;
+            }
+
+            entry->cancel();
+            return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtQueryTimer(const syscall_context& c, const handle timer_handle, const uint32_t timer_information_class,
+        NTSTATUS handle_NtQueryTimer(const syscall_context& c, const handle timer_handle, const ULONG timer_information_class,
                                      const uint64_t timer_information, const ULONG timer_information_length,
                                      const emulator_object<ULONG> return_length)
         {
@@ -288,7 +365,7 @@ namespace sogen
                 BOOLEAN TimerState;
             };
 
-            constexpr uint32_t timer_basic_information_class = 0;
+            constexpr ULONG timer_basic_information_class = 0;
             if (timer_information_class != timer_basic_information_class)
             {
                 return STATUS_INVALID_INFO_CLASS;
@@ -299,10 +376,10 @@ namespace sogen
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
 
-            const auto* t = c.proc.timers.get(timer_handle);
+            const auto [t, status] = find_timer(c, timer_handle, false);
             if (!t)
             {
-                return STATUS_INVALID_HANDLE;
+                return status;
             }
 
             timer_basic_information info{};

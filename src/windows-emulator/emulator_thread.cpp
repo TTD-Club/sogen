@@ -110,6 +110,11 @@ namespace sogen
 
             switch (type)
             {
+            case handle_types::device: {
+                const auto* container = c.devices.get(h);
+                const auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
+                return pipe && pipe->signaled ? wait_state::signaled : wait_state::not_signaled;
+            }
             default:
                 break;
 
@@ -216,7 +221,7 @@ namespace sogen
             }
 
             case handle_types::io_completion: {
-                io_completion_wait::materialize_signaled_wait_packets(c, h);
+                io_completion_wait::materialize_signaled_wait_packets(win_emu, h);
                 const auto* completion = c.io_completions.get(h);
                 if (completion && !completion->queue.empty())
                 {
@@ -247,6 +252,11 @@ namespace sogen
             auto& c = win_emu.process;
             switch (h.value.type)
             {
+            case handle_types::device: {
+                const auto* container = c.devices.get(h);
+                const auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
+                return pipe && pipe->signaled ? std::optional{wait_state::signaled} : std::nullopt;
+            }
             case handle_types::process: {
                 if (h == GUEST_PROCESS_HANDLE)
                 {
@@ -361,7 +371,7 @@ namespace sogen
             }
 
             case handle_types::io_completion: {
-                io_completion_wait::materialize_signaled_wait_packets(c, h);
+                io_completion_wait::materialize_signaled_wait_packets(win_emu, h);
                 const auto* completion = c.io_completions.get(h);
                 if (!completion || completion->queue.empty())
                 {
@@ -504,11 +514,6 @@ namespace sogen
             this->teb64 = this->gs_segment->reserve<TEB64>();
 
             this->teb64->access([&](TEB64& teb_obj) {
-                // Skips GetCurrentNlsCache
-                // This hack can be removed once this is fixed:
-                // https://github.com/momo5502/emulator/issues/128
-                reinterpret_cast<uint8_t*>(&teb_obj)[0x179C] = 1;
-
                 teb_obj.ClientId.UniqueProcess = context.process_id;
                 teb_obj.ClientId.UniqueThread = static_cast<uint64_t>(this->id);
                 teb_obj.DeallocationStack = this->stack_base;
@@ -774,7 +779,7 @@ namespace sogen
         this->await_msg = {};
         this->await_msg_mask = {};
         this->await_io_completion = {};
-        this->await_pipe_read = {};
+        this->await_file_io = {};
         this->await_host_condition = {};
 
         // TODO: Find out if this is correct
@@ -1234,6 +1239,18 @@ namespace sogen
             return complete_if_timed_out(STATUS_TIMEOUT);
         }
 
+        if (this->await_file_io)
+        {
+            const auto status =
+                emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>{*this->memory_ptr, *this->await_file_io}.read().Status;
+            if (status == STATUS_PENDING)
+            {
+                return false;
+            }
+            this->mark_as_ready(status);
+            return true;
+        }
+
         if (this->await_time.has_value())
         {
             return complete_if_timed_out(STATUS_SUCCESS);
@@ -1269,7 +1286,7 @@ namespace sogen
             if (wait.type == io_completion_wait_type::remove_single)
             {
                 io_completion_message message{};
-                if (io_completion_wait::dequeue_io_completion_message(process, wait.io_completion_handle, message))
+                if (io_completion_wait::dequeue_io_completion_message(win_emu, wait.io_completion_handle, message))
                 {
                     emulator_object<emulator_pointer>{*this->memory_ptr, wait.key_context_ptr}.write_if_valid(message.key_context);
                     emulator_object<emulator_pointer>{*this->memory_ptr, wait.apc_context_ptr}.write_if_valid(message.apc_context);
@@ -1292,7 +1309,7 @@ namespace sogen
             if (wait.type == io_completion_wait_type::remove_multiple)
             {
                 const auto removed = io_completion_wait::dequeue_io_completion_entries(
-                    process, wait.io_completion_handle,
+                    win_emu, wait.io_completion_handle,
                     emulator_object<FILE_IO_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>>{*this->memory_ptr, wait.completion_entries_ptr},
                     wait.max_entries);
 
@@ -1317,49 +1334,13 @@ namespace sogen
             return true;
         }
 
-        if (this->await_pipe_read.has_value())
-        {
-            const auto& wait = *this->await_pipe_read;
-            const auto* container = process.devices.get(wait.file_handle);
-            auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
-            if (!pipe)
-            {
-                this->mark_as_ready(STATUS_CANCELLED);
-                return true;
-            }
-
-            const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block{*this->memory_ptr, wait.io_status_block};
-            if (wait.listen)
-            {
-                if (!find_pipe_peer(process, *pipe))
-                {
-                    return false;
-                }
-
-                if (io_status_block)
-                {
-                    io_status_block.write({.Status = STATUS_SUCCESS, .Information = 0});
-                }
-                this->mark_as_ready(STATUS_SUCCESS);
-                return true;
-            }
-
-            if (const auto status = read_pipe(win_emu, *pipe, wait.data, wait.length, io_status_block))
-            {
-                this->mark_as_ready(*status);
-                return true;
-            }
-
-            return false;
-        }
-
         if (this->await_msg.has_value())
         {
             if (const auto m = this->peek_pending_message(win_emu, this->await_msg->hwnd_filter, this->await_msg->filter_min,
                                                           this->await_msg->filter_max, true))
             {
                 this->await_msg->message.write(*m);
-                this->current_message_time = m->time;
+                this->record_current_message(*m);
 
                 uint64_t active_handle = 0;
                 uint64_t active_window_ptr = 0;

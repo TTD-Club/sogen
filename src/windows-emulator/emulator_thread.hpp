@@ -201,35 +201,6 @@ namespace sogen
         }
     };
 
-    // A read of an empty pipe through a synchronous handle, waiting for data or for the other end to close; or with
-    // `listen`, a ConnectNamedPipe waiting for a client.
-    struct pending_pipe_read_wait
-    {
-        handle file_handle{};
-        emulator_pointer data{};
-        ULONG length{};
-        emulator_pointer io_status_block{};
-        bool listen{};
-
-        void serialize(utils::buffer_serializer& buffer) const
-        {
-            buffer.write(this->file_handle);
-            buffer.write(this->data);
-            buffer.write(this->length);
-            buffer.write(this->io_status_block);
-            buffer.write(this->listen);
-        }
-
-        void deserialize(utils::buffer_deserializer& buffer)
-        {
-            buffer.read(this->file_handle);
-            buffer.read(this->data);
-            buffer.read(this->length);
-            buffer.read(this->io_status_block);
-            buffer.read(this->listen);
-        }
-    };
-
     enum class callback_id : uint32_t
     {
         Invalid = 0,
@@ -395,6 +366,7 @@ namespace sogen
         uint32_t id{};
 
         uint64_t current_ip{0};
+        handle impersonation_token{};
         uint64_t previous_ip{0};
 
         std::u16string name{};
@@ -410,7 +382,7 @@ namespace sogen
         std::optional<pending_msg> await_msg{};
         std::optional<DWORD> await_msg_mask{};
         std::optional<pending_io_completion_wait> await_io_completion{};
-        std::optional<pending_pipe_read_wait> await_pipe_read{};
+        std::optional<emulator_pointer> await_file_io{};
 
         // When set, the thread is parked until this host-side predicate returns true. Used by the GPU
         // bridge to wait on a Vulkan semaphore cooperatively (other guest threads run while the GPU works)
@@ -449,6 +421,7 @@ namespace sogen
         uint64_t next_user_timer_id{1};
         std::vector<msg> message_queue;
         DWORD current_message_time{};
+        DWORD current_message_position{};
         std::array<uint32_t, 32> message_queue_status_bit_counts{};
         uint32_t message_queue_status_bits{};
         uint32_t queue_status_changed_bits{};
@@ -464,6 +437,14 @@ namespace sogen
         bool has_pending_alertable_apc() const
         {
             return this->apc_alertable && !this->pending_apcs.empty();
+        }
+
+        void record_current_message(const msg& message)
+        {
+            this->current_message_time = message.time;
+            const auto x = static_cast<uint16_t>(message.pt.x);
+            const auto y = static_cast<uint16_t>(message.pt.y);
+            this->current_message_position = static_cast<DWORD>(x) | (static_cast<DWORD>(y) << 16);
         }
 
         user_timer* find_user_timer(hwnd hwnd, uint64_t timer_id);
@@ -527,6 +508,7 @@ namespace sogen
             buffer.write(this->setup_done);
             buffer.write(this->id);
             buffer.write(this->current_ip);
+            buffer.write(this->impersonation_token);
             buffer.write(this->previous_ip);
 
             buffer.write_string(this->name);
@@ -544,7 +526,7 @@ namespace sogen
             buffer.write_optional(this->await_msg);
             buffer.write_optional(this->await_msg_mask);
             buffer.write_optional(this->await_io_completion);
-            buffer.write_optional(this->await_pipe_read);
+            buffer.write_optional(this->await_file_io);
 
             buffer.write(this->apc_alertable);
             buffer.write_vector(this->pending_apcs);
@@ -576,6 +558,7 @@ namespace sogen
             buffer.write(this->next_user_timer_id);
             buffer.write_vector(this->message_queue);
             buffer.write(this->current_message_time);
+            buffer.write(this->current_message_position);
             buffer.write(this->message_queue_status_bit_counts);
             buffer.write(this->message_queue_status_bits);
             buffer.write(this->queue_status_changed_bits);
@@ -599,6 +582,7 @@ namespace sogen
             buffer.read(this->setup_done);
             buffer.read(this->id);
             buffer.read(this->current_ip);
+            buffer.read(this->impersonation_token);
             buffer.read(this->previous_ip);
 
             buffer.read_string(this->name);
@@ -616,7 +600,7 @@ namespace sogen
             buffer.read_optional(this->await_msg, [this] { return pending_msg{*this->memory_ptr}; });
             buffer.read_optional(this->await_msg_mask);
             buffer.read_optional(this->await_io_completion, [] { return pending_io_completion_wait{}; });
-            buffer.read_optional(this->await_pipe_read, [] { return pending_pipe_read_wait{}; });
+            buffer.read_optional(this->await_file_io);
 
             buffer.read(this->apc_alertable);
             buffer.read_vector(this->pending_apcs);
@@ -648,6 +632,7 @@ namespace sogen
             buffer.read(this->next_user_timer_id);
             buffer.read_vector(this->message_queue);
             buffer.read(this->current_message_time);
+            buffer.read(this->current_message_position);
             buffer.read(this->message_queue_status_bit_counts);
             buffer.read(this->message_queue_status_bits);
             buffer.read(this->queue_status_changed_bits);

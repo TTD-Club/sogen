@@ -48,8 +48,8 @@ namespace sogen
         uint64_t apfnClientW[FNID_ARRAY_SIZE];
         uint64_t apfnClientWorker[FNID_ARRAY_SIZE];
         uint8_t pad_3c8[0x19C];
-        uint8_t acOemToAnsi[0x100];
-        uint8_t acAnsiToOem[0x100];
+        uint8_t oemToAnsi[256];
+        uint8_t ansiToOem[256];
         uint8_t pad_764[0x4];
         int32_t systemMetrics[0x61];
         int32_t dpiDependentSystemMetrics[0x1E];
@@ -72,8 +72,8 @@ namespace sogen
     };
 
     static_assert(offsetof(USER_SERVERINFO, apfnClientA) == 0x188);
-    static_assert(offsetof(USER_SERVERINFO, acOemToAnsi) == 0x564);
-    static_assert(offsetof(USER_SERVERINFO, acAnsiToOem) == 0x664);
+    static_assert(offsetof(USER_SERVERINFO, oemToAnsi) == 0x564);
+    static_assert(offsetof(USER_SERVERINFO, ansiToOem) == 0x664);
     static_assert(offsetof(USER_SERVERINFO, systemMetrics) == 0x768);
     static_assert(offsetof(USER_SERVERINFO, dpiDependentSystemMetrics) == 0x8EC);
     static_assert(offsetof(USER_SERVERINFO, systemColors) == 0x11D8);

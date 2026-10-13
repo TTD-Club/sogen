@@ -13,7 +13,6 @@ namespace sogen
         constexpr NTSTATUS k_status_none_mapped = static_cast<NTSTATUS>(0xC0000073);
         constexpr ULONG k_open_policy_reply_size_32 = 0x40;
         constexpr ULONG k_open_policy_reply_size_64 = 0x44;
-        constexpr ULONG k_lookup_sids_not_mapped_reply_size = 0x18;
         constexpr ULONG k_lookup_sids_min_success_reply_size_32 = 0xCC;
         constexpr ULONG k_lookup_sids_min_success_reply_size_64 = 0x10C;
         constexpr ULONG k_close_policy_reply_size_32 = 0x40;
@@ -51,6 +50,7 @@ namespace sogen
         constexpr uint32_t k_lsar_lookup_privilege_display_name = 33;
         constexpr uint32_t k_lsar_open_policy2 = 44;
         constexpr uint32_t k_lsar_open_policy3 = 130;
+        constexpr uint32_t k_lsar_lookup_sids2 = 57;
         // An LSAPR_HANDLE: attributes and a GUID.
         constexpr size_t k_context_handle_size = 20;
         constexpr NTSTATUS k_status_no_such_privilege = static_cast<NTSTATUS>(0xC0000060);
@@ -337,15 +337,10 @@ namespace sogen
                     return handle_close_policy(win_emu, writer);
                 case 2:
                     return handle_lookup_sids(win_emu, c, writer);
+                case 5:
+                    return handle_query_information_policy(win_emu, c, writer);
                 case k_policy_lookup_account_procedure:
                     return handle_lookup_account(win_emu, writer);
-                case 5:
-                    // The shell's account-lookup path (e.g. SHGetKnownFolderPath, used while the engine sets
-                    // up its crash-report queue) issues this additional lookup. We don't resolve it, but we
-                    // must answer with a well-formed "none mapped" result: returning an RPC error makes the
-                    // runtime raise RPC_S_CALL_FAILED in the caller, whose vectored exception handler then
-                    // re-enters a half-initialized singleton and deadlocks.
-                    return write_lookup_not_mapped_reply(writer);
                 case k_sspi_get_user_name_procedure:
                     return handle_get_user_name(win_emu, writer);
                 default:
@@ -390,6 +385,8 @@ namespace sogen
                 case k_lsar_query_information_policy:
                 case k_lsar_query_information_policy2:
                     return handle_query_information_policy(win_emu, c, writer);
+                case k_lsar_lookup_sids2:
+                    return handle_lookup_sids(win_emu, c, writer);
                 default:
                     return this->unsupported(win_emu, procedure_id);
                 }
@@ -577,8 +574,12 @@ namespace sogen
                 writer.write_ndr_pointer(true);
                 writer.write_ndr_u16string(domain, false);
 
+                writer.align_to(writer.pointer_size());
+
                 writer.write(static_cast<uint32_t>(domain_sid[1]));
+                writer.align_to(writer.pointer_size());
                 writer.write(domain_sid.data(), domain_sid.size(), alignof(uint32_t));
+                writer.align_to(writer.pointer_size());
 
                 writer.write<uint32_t>(1);
                 writer.write_ndr_pointer(true);
@@ -588,6 +589,7 @@ namespace sogen
                 writer.write<uint32_t>(0);
                 writer.write<uint32_t>(0);
                 writer.write(static_cast<uint32_t>(win_emu.process.sid[1]));
+                writer.align_to(writer.pointer_size());
                 writer.write(win_emu.process.sid.data(), win_emu.process.sid.size(), alignof(uint32_t));
                 writer.write<uint32_t>(1);
 
@@ -668,9 +670,11 @@ namespace sogen
 
             static NTSTATUS write_lookup_not_mapped_reply(utils::aligned_binary_writer& writer)
             {
-                const auto reply_offset = writer.offset();
-                writer.pad(k_lookup_sids_not_mapped_reply_size);
-                writer.write_at(reply_offset + 0x14, k_status_none_mapped);
+                writer.write_ndr_pointer(false);
+                writer.write<uint32_t>(0);
+                writer.write_ndr_pointer(false);
+                writer.write<uint32_t>(0);
+                writer.write(k_status_none_mapped);
                 return STATUS_SUCCESS;
             }
 

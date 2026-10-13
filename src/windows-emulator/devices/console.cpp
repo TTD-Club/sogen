@@ -23,7 +23,12 @@ namespace sogen
             fill_console_output = 0x02000000,
             set_console_cursor_position = 0x0200000A,
             set_console_text_attribute = 0x0200000D,
+            get_console_title = 0x02000014,
+            set_console_title = 0x02000015,
             get_console_screen_buffer_info = 0x02000007,
+            get_largest_console_window_size = 0x0200000B,
+            get_current_console_font = 0x03000004,
+            set_current_console_font = 0x0300002C,
         };
 
         constexpr uint32_t default_input_mode = 0x00F7;
@@ -74,6 +79,30 @@ namespace sogen
         };
 
         static_assert(sizeof(console_screen_buffer_info_response) == 92);
+
+        struct console_font_info_response
+        {
+            uint8_t maximum_window;
+            std::array<uint8_t, 3> padding;
+            uint32_t index;
+            console_coordinate size;
+            uint32_t family;
+            uint32_t weight;
+            std::array<char16_t, 32> face_name;
+        };
+
+        static_assert(sizeof(console_font_info_response) == 84);
+
+        console_font_info_response default_console_font()
+        {
+            console_font_info_response font{};
+            font.size = {.x = 8, .y = 16};
+            font.family = 0x36;
+            font.weight = 400;
+            constexpr std::u16string_view face = u"Consolas";
+            std::ranges::copy(face, font.face_name.begin());
+            return font;
+        }
 
         struct console_io_buffer
         {
@@ -256,6 +285,9 @@ namespace sogen
                 buffer.write(cursor_position_);
                 buffer.write(input_mode_);
                 buffer.write(output_mode_);
+                buffer.write(font_info_);
+                buffer.write_string(title_);
+                buffer.write_string(original_title_);
             }
 
             void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -264,6 +296,9 @@ namespace sogen
                 buffer.read(cursor_position_);
                 buffer.read(input_mode_);
                 buffer.read(output_mode_);
+                buffer.read(font_info_);
+                buffer.read_string(title_);
+                buffer.read_string(original_title_);
             }
 
             void restore_after_state_restore(windows_emulator& win_emu) override
@@ -320,6 +355,82 @@ namespace sogen
 
                 switch (static_cast<console_api>(message.api_number))
                 {
+                case console_api::set_console_title: {
+                    if (header.input_count != 2 || header.output_count != 1 || message.data_size != sizeof(uint8_t))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    const auto unicode = win_emu.emu().read_memory<uint8_t>(data) != 0;
+                    const auto text_size = buffers[1].size;
+                    const auto text_address = buffers[1].address;
+                    if (text_size >= 65536 || (!text_address && text_size != 0) || (unicode && text_size % sizeof(char16_t) != 0))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    if (unicode)
+                    {
+                        std::u16string title(static_cast<size_t>(text_size / sizeof(char16_t)), u'\0');
+                        if (text_size != 0 && !win_emu.emu().try_read_memory(text_address, title.data(), static_cast<size_t>(text_size)))
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        this->title_ = std::move(title);
+                    }
+                    else
+                    {
+                        std::string title(static_cast<size_t>(text_size), '\0');
+                        if (text_size != 0 && !win_emu.emu().try_read_memory(text_address, title.data(), title.size()))
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        this->title_ = u8_to_u16(title);
+                    }
+                    return STATUS_SUCCESS;
+                }
+                case console_api::get_console_title: {
+                    struct title_request
+                    {
+                        uint32_t length;
+                        uint8_t unicode;
+                        uint8_t original;
+                        std::array<uint8_t, 2> padding;
+                    };
+
+                    if (header.input_count != 1 || header.output_count != 2 || message.data_size != sizeof(title_request))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    const auto& title_buffer = buffers[2];
+                    auto request = win_emu.emu().read_memory<title_request>(data);
+                    const auto& title = request.original ? this->original_title_ : this->title_;
+                    size_t written{};
+                    const auto copy_title = [&]<typename Char>(const std::basic_string<Char>& value) {
+                        const auto capacity = title_buffer.size / sizeof(Char);
+                        request.length = static_cast<uint32_t>(value.size());
+                        if (capacity == 0)
+                        {
+                            return true;
+                        }
+                        auto output = value.substr(0, std::min(value.size(), static_cast<size_t>(capacity - 1)));
+                        written = output.size() * sizeof(Char);
+                        output.push_back(Char{});
+                        return win_emu.emu().try_write_memory(title_buffer.address, output.data(), output.size() * sizeof(Char));
+                    };
+                    if (!(request.unicode ? copy_title(title) : copy_title(u16_to_u8(title))))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    win_emu.emu().write_memory(data, request);
+                    if (context.io_status_block)
+                    {
+                        context.io_status_block.access([&](auto& status) { status.Information = written; });
+                    }
+                    if (context.wow64_io_status_block)
+                    {
+                        context.wow64_io_status_block.access([&](auto& status) { status.Information = static_cast<uint32_t>(written); });
+                    }
+                    return STATUS_SUCCESS;
+                }
                 case console_api::get_console_mode: {
                     if (message.data_size != sizeof(uint32_t))
                     {
@@ -493,6 +604,49 @@ namespace sogen
                     return STATUS_SUCCESS;
                 }
 
+                case console_api::get_current_console_font: {
+                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(console_font_info_response))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    win_emu.emu().write_memory(data, font_info_);
+                    return STATUS_SUCCESS;
+                }
+
+                case console_api::set_current_console_font: {
+                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(console_font_info_response))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    auto font = win_emu.emu().read_memory<console_font_info_response>(data);
+                    if (font.size.x < 0 || font.size.y < 0)
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    font.size.x = font.size.x == 0 ? font_info_.size.x : font.size.x;
+                    font.size.y = font.size.y == 0 ? font_info_.size.y : font.size.y;
+                    font.family = font.family == 0 ? font_info_.family : font.family;
+                    font.weight = font.weight == 0 ? font_info_.weight : font.weight;
+                    if (font.face_name.front() == u'\0')
+                    {
+                        font.face_name = font_info_.face_name;
+                    }
+                    font.face_name.back() = u'\0';
+                    font_info_ = font;
+                    win_emu.emu().write_memory(data, font_info_);
+                    return STATUS_SUCCESS;
+                }
+
+                case console_api::get_largest_console_window_size: {
+                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(console_coordinate))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    constexpr console_coordinate size{.x = 80, .y = 25};
+                    win_emu.emu().write_memory(data, size);
+                    return STATUS_SUCCESS;
+                }
+
                 case console_api::get_console_screen_buffer_info: {
                     if (is_input_endpoint(endpoint) || message.data_size != sizeof(console_screen_buffer_info_response))
                     {
@@ -528,6 +682,9 @@ namespace sogen
             uint32_t input_mode_{default_input_mode};
             uint32_t output_mode_{default_output_mode};
             console_coordinate cursor_position_{};
+            console_font_info_response font_info_{default_console_font()};
+            std::u16string title_{};
+            std::u16string original_title_{};
         };
     }
 

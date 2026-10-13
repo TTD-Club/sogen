@@ -1674,8 +1674,11 @@ namespace sogen
     namespace syscalls
     {
         hdc handle_NtGdiGetDCforBitmap(const syscall_context& c, handle bitmap);
+        uint64_t handle_NtGdiCreateBitmap(const syscall_context& c, uint32_t width, uint32_t height, uint32_t planes, uint32_t bits_pixel,
+                                          emulator_pointer bits);
         hdc create_gdi_window_dc(const syscall_context& c, hwnd window);
         uint32_t handle_NtGdiDeleteObjectApp(const syscall_context& c, uint32_t handle_value);
+        bool set_gdi_region_rect(const syscall_context& c, handle region, const RECT& rect);
         BOOL handle_NtGdiFlush(const syscall_context& c);
         BOOL handle_NtGdiPatBlt(const syscall_context& c, hdc dc, LONG x, LONG y, LONG width, LONG height, DWORD rop);
         uint64_t handle_NtGdiSelectBrushLocal(const syscall_context& c, hdc dc, uint32_t brush, emulator_pointer old_brush_ptr);
@@ -2708,9 +2711,9 @@ namespace sogen
             return TRUE;
         }
 
-        NTSTATUS handle_NtUserFindExistingCursorIcon()
+        hicon handle_NtUserFindExistingCursorIcon()
         {
-            return STATUS_NOT_SUPPORTED;
+            return make_pseudo_handle(0x100, handle_types::reserved).bits;
         }
 
         BOOL handle_NtUserDestroyCursor(const syscall_context&, const hicon icon, const DWORD /*flags*/)
@@ -2755,14 +2758,27 @@ namespace sogen
                 return FALSE;
             }
 
-            // The emulator's icons/cursors are bare pseudo-handles with no backing pixel data, so report a
-            // standard 32x32 icon with a centered hotspot and no mask/color bitmaps.
+            const auto mask = handle_NtGdiCreateBitmap(c, 32, 32, 1, 1, 0);
+            const auto color = handle_NtGdiCreateBitmap(c, 32, 32, 1, 32, 0);
+            if (mask == 0 || color == 0)
+            {
+                if (mask != 0)
+                {
+                    handle_NtGdiDeleteObjectApp(c, static_cast<uint32_t>(mask));
+                }
+                if (color != 0)
+                {
+                    handle_NtGdiDeleteObjectApp(c, static_cast<uint32_t>(color));
+                }
+                return FALSE;
+            }
+
             const EMU_ICONINFO info{
                 .fIcon = TRUE,
                 .xHotspot = 16,
                 .yHotspot = 16,
-                .hbmMask = 0,
-                .hbmColor = 0,
+                .hbmMask = mask,
+                .hbmColor = color,
             };
             icon_info.write(info);
 
@@ -3931,6 +3947,11 @@ namespace sogen
                 return write_message_call_result(c, result_info, result) ? TRUE : FALSE;
             }
 
+            if (win->wnd_proc == 0)
+            {
+                return handle_default_window_proc_message(c, *win, msg, w_param, l_param, ansi);
+            }
+
             if (win->thread_id != c.vcpu.active_thread->id)
             {
                 // TODO: This is a bit incorrect. We're supposed to wait until the message is received, but this is fine for a first
@@ -4268,6 +4289,11 @@ namespace sogen
             return FALSE;
         }
 
+        DWORD handle_NtUserGetMessagePos(const syscall_context& c)
+        {
+            return c.vcpu.active_thread ? c.vcpu.active_thread->current_message_position : 0;
+        }
+
         BOOL handle_NtUserGetMessage(const syscall_context& c, const emulator_object<msg> message, const hwnd hwnd,
                                      const UINT msg_filter_min, const UINT msg_filter_max)
         {
@@ -4276,7 +4302,7 @@ namespace sogen
             if (auto pending_msg = t.peek_pending_message(c.win_emu, hwnd, msg_filter_min, msg_filter_max, true))
             {
                 message.write(*pending_msg);
-                t.current_message_time = pending_msg->time;
+                t.record_current_message(*pending_msg);
                 set_thread_window_context(c, pending_msg->window);
                 return pending_msg->message != WM_QUIT ? TRUE : FALSE;
             }
@@ -4298,7 +4324,7 @@ namespace sogen
             if (pending_msg)
             {
                 message.write(*pending_msg);
-                t.current_message_time = pending_msg->time;
+                t.record_current_message(*pending_msg);
                 set_thread_window_context(c, pending_msg->window);
                 return TRUE;
             }
@@ -4363,6 +4389,23 @@ namespace sogen
             }
 
             return win->update_pending ? TRUE : FALSE;
+        }
+
+        int32_t handle_NtUserGetUpdateRgn(const syscall_context& c, const hwnd hwnd, const handle region, const BOOL)
+        {
+            const auto* win = c.proc.windows.get(hwnd);
+            if (!win)
+            {
+                return 0;
+            }
+
+            const auto rect = win->update_pending ? win->update_rect : RECT{};
+            if (!set_gdi_region_rect(c, region, rect))
+            {
+                return 0;
+            }
+
+            return rect.left < rect.right && rect.top < rect.bottom ? 2 : 1;
         }
 
         void collect_pending_paint_tree(const syscall_context& c, window& win, std::vector<uint64_t>& order)
@@ -6388,9 +6431,78 @@ namespace sogen
             return TRUE;
         }
 
-        BOOL handle_NtUserGetObjectInformation()
+        BOOL handle_NtUserGetObjectInformation(const syscall_context& c, const handle object, const int index,
+                                               const emulator_pointer information, const DWORD length, const emulator_object<DWORD> needed)
         {
-            return FALSE;
+            constexpr uint32_t error_invalid_handle = 6;
+            constexpr uint32_t error_invalid_parameter = 87;
+            constexpr uint32_t error_insufficient_buffer = 122;
+            constexpr uint32_t error_no_access = 998;
+            const auto fail = [&](uint32_t error) {
+                set_guest_last_error(c, error);
+                return FALSE;
+            };
+            const bool window_station = object.bits == 1;
+            const auto* desktop_object = c.proc.desktops.get(object);
+            if (!window_station && !desktop_object)
+            {
+                return fail(error_invalid_handle);
+            }
+            const auto write = [&](const void* data, DWORD size) {
+                if (needed && !needed.try_write(size))
+                {
+                    return fail(error_no_access);
+                }
+                if (length < size)
+                {
+                    return fail(error_insufficient_buffer);
+                }
+                if (!information || !c.win_emu.memory.try_write_memory(information, data, size))
+                {
+                    return fail(error_no_access);
+                }
+                return TRUE;
+            };
+            switch (index)
+            {
+            case 1: {
+                struct user_object_flags
+                {
+                    BOOL inherit;
+                    BOOL reserved;
+                    DWORD flags;
+                };
+
+                const user_object_flags flags{
+                    .inherit = desktop_object && desktop_object->inherit, .reserved = FALSE, .flags = window_station ? 1u : 0u};
+                return write(&flags, sizeof(flags));
+            }
+            case 2:
+            case 3: {
+                std::u16string_view name = u"WinSta0";
+                if (!window_station)
+                {
+                    name = desktop_object->name;
+                }
+                if (index == 3)
+                {
+                    name = window_station ? u"WindowStation" : u"Desktop";
+                }
+                return write(name.data(), static_cast<DWORD>((name.size() + 1) * sizeof(char16_t)));
+            }
+            case 4:
+                return write(c.proc.sid.data(), static_cast<DWORD>(c.proc.sid.size()));
+            case 6: {
+                if (window_station)
+                {
+                    return fail(error_invalid_parameter);
+                }
+                const BOOL receives_input = object == c.proc.default_desktop;
+                return write(&receives_input, sizeof(receives_input));
+            }
+            default:
+                return fail(error_invalid_parameter);
+            }
         }
 
         uint64_t handle_NtUserQueryWindow(const syscall_context& c, const hwnd window_handle, const uint32_t query_type)
@@ -7008,6 +7120,23 @@ namespace sogen
             return 0;
         }
 
+        BOOL handle_NtUserThreadMessageQueueAttached(const syscall_context& c, const DWORD thread_id)
+        {
+            const auto thread_info = ensure_win32_thread_info(c);
+            publish_win32_thread_info(c, thread_info);
+            if (thread_id == 0)
+            {
+                return FALSE;
+            }
+            const auto* thread = c.proc.find_thread_by_id(thread_id);
+            if (thread == nullptr || thread->is_terminated())
+            {
+                set_guest_last_error(c, 87);
+                return FALSE;
+            }
+            return thread->win32k_thread_info != 0;
+        }
+
         BOOL handle_NtUserRegisterTouchHitTestingWindow()
         {
             return TRUE;
@@ -7098,6 +7227,41 @@ namespace sogen
         BOOL handle_NtUserSetLayeredWindowAttributes()
         {
             return TRUE;
+        }
+
+        BOOL handle_NtUserUpdateClientRect(const syscall_context&, const hwnd)
+        {
+            return TRUE;
+        }
+
+        int32_t handle_NtUserScrollWindowEx()
+        {
+            return 0;
+        }
+
+        BOOL handle_NtUserRedrawFrame(const syscall_context&, const hwnd)
+        {
+            return TRUE;
+        }
+
+        BOOL handle_NtUserThunkedMenuInfo(const syscall_context&, const hmenu, const emulator_pointer)
+        {
+            return TRUE;
+        }
+
+        BOOL handle_NtUserShowScrollBar()
+        {
+            return TRUE;
+        }
+
+        BOOL handle_NtUserSetWindowPlacement(const syscall_context&, const hwnd, const emulator_pointer)
+        {
+            return TRUE;
+        }
+
+        BOOL handle_NtUserIsChildWindowDpiMessageEnabled()
+        {
+            return FALSE;
         }
     }
 

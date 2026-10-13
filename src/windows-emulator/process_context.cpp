@@ -1,5 +1,6 @@
 #include "std_include.hpp"
 #include "process_context.hpp"
+#include "code_page.hpp"
 
 #include "emulator_utils.hpp"
 #include "registry/registry_utils.hpp"
@@ -69,127 +70,6 @@ namespace sogen
         {
             const auto sid_string = registry_utils::get_user_sid_string(registry);
             return sid_string_to_bytes(sid_string);
-        }
-
-        // A code page file (c_<number>.nls) as RtlInitCodePageTable reads it, in 16-bit words: a header whose first word
-        // is its size, then the multibyte table (its size, 256 characters, and a word that is non-zero when 256 glyph
-        // characters follow), then the wide character table: a byte per character in single-byte code pages, a word in
-        // double-byte ones.
-        class code_page_table
-        {
-          public:
-            static std::optional<code_page_table> load(windows_emulator& win_emu, const std::string_view registry_value)
-            {
-                const auto code_page = registry_utils::read_registry_string(
-                    win_emu.registry, R"(\Registry\Machine\System\CurrentControlSet\Control\Nls\CodePage)", registry_value);
-                if (!code_page || code_page->empty() ||
-                    !std::ranges::all_of(*code_page, [](const char16_t c) { return c >= u'0' && c <= u'9'; }))
-                {
-                    return std::nullopt;
-                }
-
-                code_page_table table{
-                    utils::io::read_file(win_emu.file_sys.translate(R"(C:\Windows\System32\C_)" + u16_to_u8(*code_page) + ".NLS"))};
-                if (!table.valid())
-                {
-                    return std::nullopt;
-                }
-                return table;
-            }
-
-            char16_t to_unicode(const uint8_t character, const bool glyphs) const
-            {
-                const auto multibyte_table = this->multibyte_table();
-                const auto has_glyphs = this->word(multibyte_table + 0x100) != 0;
-                return this->word((glyphs && has_glyphs ? multibyte_table + 0x101 : multibyte_table) + character);
-            }
-
-            std::optional<uint8_t> from_unicode(const char16_t character) const
-            {
-                const auto value = this->single_byte()
-                                       ? static_cast<uint16_t>(this->data_[this->wide_char_table() * sizeof(uint16_t) + character])
-                                       : this->word(this->wide_char_table() + character);
-                if (value > 0xFF || (value == this->word(default_char_index) && character != this->word(unicode_default_char_index)))
-                {
-                    return std::nullopt;
-                }
-                return static_cast<uint8_t>(value);
-            }
-
-          private:
-            static constexpr size_t maximum_character_size_index = 2;
-            static constexpr size_t default_char_index = 3;
-            static constexpr size_t unicode_default_char_index = 4;
-
-            std::vector<std::byte> data_{};
-
-            explicit code_page_table(std::vector<std::byte> data)
-                : data_(std::move(data))
-            {
-            }
-
-            size_t word_count() const
-            {
-                return this->data_.size() / sizeof(uint16_t);
-            }
-
-            uint16_t word(const size_t index) const
-            {
-                uint16_t value{};
-                memcpy(&value, this->data_.data() + index * sizeof(uint16_t), sizeof(value));
-                return value;
-            }
-
-            size_t multibyte_table() const
-            {
-                return static_cast<size_t>(this->word(0)) + 1;
-            }
-
-            size_t wide_char_table() const
-            {
-                return this->multibyte_table() + this->word(this->multibyte_table() - 1);
-            }
-
-            bool single_byte() const
-            {
-                return this->word(maximum_character_size_index) == 1;
-            }
-
-            bool valid() const
-            {
-                if (this->word_count() <= unicode_default_char_index || this->word_count() <= this->multibyte_table() + 0x100 ||
-                    (this->word(this->multibyte_table() + 0x100) && this->word_count() <= this->multibyte_table() + 0x200))
-                {
-                    return false;
-                }
-
-                const auto wide_char_words = this->single_byte() ? 0x10000 / sizeof(uint16_t) : 0x10000;
-                return this->word_count() >= this->wide_char_table() + wide_char_words;
-            }
-        };
-
-        // win32k fills these at boot; user32's CharToOem*/OemToChar* translate through them. Matching Windows 11's
-        // tables: characters the other code page lacks become '_', and the OEM sun, pilcrow, and section sign bytes
-        // translate through their glyphs, while the other OEM control bytes stay as they are.
-        void setup_ansi_oem_tables(windows_emulator& win_emu, const emulator_object<USER_SERVERINFO> server_info)
-        {
-            const auto ansi = code_page_table::load(win_emu, "ACP");
-            const auto oem = code_page_table::load(win_emu, "OEMCP");
-            if (!ansi || !oem)
-            {
-                return;
-            }
-
-            constexpr uint8_t unmapped = '_';
-            server_info.access([&](USER_SERVERINFO& info) {
-                for (size_t i = 0; i < 0x100; ++i)
-                {
-                    const auto character = static_cast<uint8_t>(i);
-                    const auto glyph = character == 0x0F || character == 0x14 || character == 0x15;
-                    info.acOemToAnsi[i] = ansi->from_unicode(oem->to_unicode(character, glyph)).value_or(unmapped);
-                    info.acAnsiToOem[i] = oem->from_unicode(ansi->to_unicode(character, false)).value_or(unmapped);
-                }
-            });
         }
 
         emulator_allocator create_allocator(memory_manager& memory, const size_t size, const bool is_wow64_process)
@@ -517,13 +397,15 @@ namespace sogen
             const auto application_str = app_settings.application.u16string();
 
             const auto& argument0 = app_settings.argument0.empty() ? application_str : app_settings.argument0;
-            std::u16string command_line{};
-            append_command_line_argument(command_line, argument0);
-
-            for (const auto& arg : app_settings.arguments)
+            auto command_line = app_settings.command_line.value_or(std::u16string{});
+            if (!app_settings.command_line)
             {
-                command_line.push_back(u' ');
-                append_command_line_argument(command_line, arg);
+                append_command_line_argument(command_line, argument0);
+                for (const auto& arg : app_settings.arguments)
+                {
+                    command_line.push_back(u' ');
+                    append_command_line_argument(command_line, arg);
+                }
             }
 
             allocator.make_unicode_string(proc_params.CommandLine, command_line);
@@ -745,7 +627,7 @@ namespace sogen
         this->default_register_set = emu.save_registers();
 
         this->user_handles.setup(is_wow64_process);
-        setup_ansi_oem_tables(win_emu, this->user_handles.get_server_info());
+        initialize_user_code_page_tables(win_emu);
 
         auto [mh, monitor_obj] = this->user_handles.allocate_object<USER_MONITOR>(handle_types::monitor);
         this->default_monitor_handle = mh;
@@ -900,8 +782,6 @@ namespace sogen
         buffer.write_map(this->raw_inputs);
         buffer.write(this->next_raw_input_token);
         buffer.write_map(this->token_privileges);
-        buffer.write(this->next_pipe_instance);
-        buffer.write_map(this->handle_flags);
         buffer.write_map(this->file_section_views);
         buffer.write_map(this->pagefile_view_counts);
         buffer.write_map(this->closed_pagefile_backings);
@@ -950,7 +830,6 @@ namespace sogen
         buffer.write(this->uuid_seed);
         buffer.write(this->next_uuid_time);
         buffer.write(this->uuid_sequence);
-        buffer.write(this->random_state);
 
         buffer.write_vector(this->default_register_set);
         buffer.write(this->process_id);
@@ -1012,8 +891,6 @@ namespace sogen
         buffer.read_map(this->raw_inputs);
         buffer.read(this->next_raw_input_token);
         buffer.read_map(this->token_privileges);
-        buffer.read(this->next_pipe_instance);
-        buffer.read_map(this->handle_flags);
         buffer.read_map(this->file_section_views);
         buffer.read_map(this->pagefile_view_counts);
         buffer.read_map(this->closed_pagefile_backings);
@@ -1062,7 +939,6 @@ namespace sogen
         buffer.read(this->uuid_seed);
         buffer.read(this->next_uuid_time);
         buffer.read(this->uuid_sequence);
-        buffer.read(this->random_state);
 
         buffer.read_vector(this->default_register_set);
         buffer.read(this->process_id);

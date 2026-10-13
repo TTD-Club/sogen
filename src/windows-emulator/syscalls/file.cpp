@@ -26,6 +26,16 @@ namespace sogen
                 uint64_t completion_key;
             };
 
+            std::u16string normalize_named_pipe_path(const std::u16string_view filename)
+            {
+                constexpr std::u16string_view dos_prefix = u"\\??\\Pipe\\";
+                if (utils::string::starts_with_ignore_case(filename, dos_prefix))
+                {
+                    return u"\\Device\\NamedPipe\\" + std::u16string(filename.substr(dos_prefix.size()));
+                }
+                return std::u16string(filename);
+            }
+
             bool has_valid_filename_characters(const std::u16string_view path)
             {
                 constexpr std::u16string_view invalid_characters = u"\"<>|*?";
@@ -474,6 +484,17 @@ namespace sogen
             }
         }
 
+        NTSTATUS handle_NtGetCachedSigningLevel(const syscall_context&, handle, emulator_object<ULONG>, emulator_object<UCHAR>, uint64_t,
+                                                emulator_object<ULONG>, emulator_object<ULONG>)
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        NTSTATUS handle_NtSetCachedSigningLevel()
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
+
         NTSTATUS handle_NtSetInformationFile(const syscall_context& c, const handle file_handle,
                                              const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
                                              const uint64_t file_information, const ULONG length, const FILE_INFORMATION_CLASS info_class)
@@ -823,7 +844,14 @@ namespace sogen
                     c.emu, fs_information, length, io_status_block, [&](FILE_FS_DEVICE_INFORMATION& info) {
                         const auto* device = c.proc.devices.get(file_handle);
                         const auto device_name = device ? device->get_device_name() : std::u16string_view{};
-                        if (file_handle == STDOUT_HANDLE || file_handle == STDIN_HANDLE || file_handle == CONSOLE_HANDLE)
+                        // GetFileType reports these as FILE_TYPE_PIPE: AFD registers its sockets as named pipe devices.
+                        if ((device && device->get_internal_device<named_pipe>()) || device_name == u"NamedPipe" ||
+                            device_name.starts_with(u"Afd"))
+                        {
+                            info.DeviceType = FILE_DEVICE_NAMED_PIPE;
+                            info.Characteristics = 0;
+                        }
+                        else if (file_handle == STDOUT_HANDLE || file_handle == STDIN_HANDLE || file_handle == CONSOLE_HANDLE)
                         {
                             info.DeviceType = FILE_DEVICE_CONSOLE;
                             info.Characteristics = 0x20000;
@@ -831,13 +859,7 @@ namespace sogen
                         else if (file_handle == NUL_HANDLE)
                         {
                             info.DeviceType = FILE_DEVICE_NULL;
-                            info.Characteristics = 0;
-                        }
-                        // GetFileType reports these as FILE_TYPE_PIPE: AFD registers its sockets as named pipe devices.
-                        else if (device_name == u"NamedPipe" || device_name.starts_with(u"Afd"))
-                        {
-                            info.DeviceType = FILE_DEVICE_NAMED_PIPE;
-                            info.Characteristics = 0;
+                            info.Characteristics = FILE_DEVICE_SECURE_OPEN;
                         }
                         else
                         {
@@ -1202,24 +1224,48 @@ namespace sogen
                 return status;
             };
 
+            if (const auto* container = c.proc.devices.get(file_handle))
+            {
+                if (const auto* pipe = container->get_internal_device<named_pipe>())
+                {
+                    const auto write_information = [&](const auto& information) {
+                        if (length < sizeof(information))
+                        {
+                            return ret(STATUS_INFO_LENGTH_MISMATCH);
+                        }
+                        c.emu.write_memory(file_information, information);
+                        return ret(STATUS_SUCCESS, sizeof(information));
+                    };
+                    switch (info_class)
+                    {
+                    case FileModeInformation:
+                        return write_information(FILE_MODE_INFORMATION{pipe->create_options & FILE_MODE_MASK});
+                    case FileAccessInformation:
+                        return write_information(FILE_ACCESS_INFORMATION{container->granted_access});
+                    case FilePipeInformation:
+                        return write_information(std::array<ULONG, 2>{pipe->read_mode, pipe->completion_mode});
+                    // A pipe has no position: it reads as 0, and setting it is ignored (so SetFilePointerEx succeeds, and
+                    // CPython opens a pipe with open(name, 'w+b')).
+                    case FilePositionInformation:
+                        return write_information(FILE_POSITION_INFORMATION{});
+                    // The end of a pipe is the data waiting to be read, which SetFilePointerEx(FILE_END) seeks past
+                    // (CPython opens a pipe with open(fd, 'a')).
+                    case FileStandardInformation: {
+                        FILE_STANDARD_INFORMATION information{};
+                        information.AllocationSize.QuadPart = static_cast<LONGLONG>(pipe->inbound_quota) + pipe->outbound_quota;
+                        information.EndOfFile.QuadPart = pipe->bytes_available();
+                        information.NumberOfLinks = 1;
+                        return write_information(information);
+                    }
+                    default:
+                        return ret(STATUS_INVALID_INFO_CLASS);
+                    }
+                }
+            }
+
             const auto* f = c.proc.files.get(file_handle);
             if (!f)
             {
-                // A pipe's read and completion modes (FILE_PIPE_INFORMATION), as SetNamedPipeHandleState reads them.
-                const auto* container = c.proc.devices.get(file_handle);
-                const auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
-                if (pipe && info_class == FilePipeInformation)
-                {
-                    if (length < sizeof(file_pipe_information))
-                    {
-                        return ret(STATUS_INFO_LENGTH_MISMATCH);
-                    }
-
-                    c.emu.write_memory(file_information,
-                                       file_pipe_information{.read_mode = pipe->read_mode, .completion_mode = pipe->completion_mode});
-                    return ret(STATUS_SUCCESS, sizeof(file_pipe_information));
-                }
-
                 // NUL is an empty file at position 0 whatever is written to it.
                 if (file_handle == NUL_HANDLE && (info_class == FilePositionInformation || info_class == FileStandardInformation))
                 {
@@ -1238,36 +1284,6 @@ namespace sogen
                         return ret(STATUS_INFO_LENGTH_MISMATCH);
                     }
                     FILE_STANDARD_INFORMATION i{};
-                    i.NumberOfLinks = 1;
-                    c.emu.write_memory(file_information, i);
-                    return ret(STATUS_SUCCESS, sizeof(FILE_STANDARD_INFORMATION));
-                }
-
-                // A pipe has no position: it reads as 0, and setting it is ignored (so SetFilePointerEx succeeds, and
-                // CPython opens a pipe with open(name, 'w+b')).
-                if (pipe && info_class == FilePositionInformation)
-                {
-                    if (length < sizeof(FILE_POSITION_INFORMATION))
-                    {
-                        return ret(STATUS_INFO_LENGTH_MISMATCH);
-                    }
-
-                    c.emu.write_memory(file_information, FILE_POSITION_INFORMATION{});
-                    return ret(STATUS_SUCCESS, sizeof(FILE_POSITION_INFORMATION));
-                }
-
-                // The end of a pipe is the data waiting to be read, which SetFilePointerEx(FILE_END) seeks past (CPython
-                // opens a pipe with open(fd, 'a')).
-                if (pipe && info_class == FileStandardInformation)
-                {
-                    if (length < sizeof(FILE_STANDARD_INFORMATION))
-                    {
-                        return ret(STATUS_INFO_LENGTH_MISMATCH);
-                    }
-
-                    FILE_STANDARD_INFORMATION i{};
-                    i.AllocationSize.QuadPart = static_cast<LONGLONG>(pipe->inbound_quota) + pipe->outbound_quota;
-                    i.EndOfFile.QuadPart = static_cast<LONGLONG>(pipe->queued_bytes());
                     i.NumberOfLinks = 1;
                     c.emu.write_memory(file_information, i);
                     return ret(STATUS_SUCCESS, sizeof(FILE_STANDARD_INFORMATION));
@@ -1945,6 +1961,34 @@ namespace sogen
             }
         }
 
+        NTSTATUS handle_pipe_io(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
+                                const uint64_t apc_context, const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                const uint64_t buffer, const ULONG length, const bool reading)
+        {
+            auto* container = c.proc.devices.get(file_handle);
+            auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
+            if (!pipe)
+            {
+                return STATUS_OBJECT_TYPE_MISMATCH;
+            }
+            io_device_context context{c.emu};
+            context.source_handle = file_handle;
+            context.event = make_handle(event);
+            context.apc_routine = apc_routine;
+            context.apc_context = apc_context;
+            context.io_status_block = io_status_block;
+            context.input_buffer = buffer;
+            context.input_buffer_length = length;
+            context.output_buffer = buffer;
+            context.output_buffer_length = length;
+            context.vcpu = &c.vcpu;
+            if (c.proc.is_wow64_process && io_status_block)
+            {
+                context.wow64_io_status_block.set_address(io_status_block.read().Pointer);
+            }
+            return pipe->start_io(c.win_emu, container->prepare_io_context(context), reading);
+        }
+
         NTSTATUS handle_NtReadFile(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
                                    const uint64_t apc_context,
                                    const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer,
@@ -1973,63 +2017,9 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            const auto* container = c.proc.devices.get(file_handle);
-            if (container)
+            if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
             {
-                if (auto* pipe = container->get_internal_device<named_pipe>())
-                {
-                    if (auto* e = c.proc.events.get(event))
-                    {
-                        e->signaled = false;
-                    }
-
-                    pending_pipe_read read{c.emu};
-                    read.thread_id = c.thread().id;
-                    auto& request = read.context;
-                    request.event.bits = event;
-                    request.apc_routine = apc_routine;
-                    request.apc_context = apc_context;
-                    request.io_status_block = io_status_block;
-                    request.output_buffer = buffer;
-                    request.output_buffer_length = length;
-                    request = container->prepare_io_context(request);
-
-                    // Reads complete in order: one that finds earlier reads waiting waits behind them.
-                    if (const auto status =
-                            pipe->pending_reads.empty() ? read_pipe(c.win_emu, *pipe, buffer, length, io_status_block) : std::nullopt)
-                    {
-                        const auto information = io_status_block ? io_status_block.read().Information : 0;
-                        complete_pipe_io(c.win_emu, request, read.thread_id, *status, information, false);
-                        return *status;
-                    }
-
-                    // An empty pipe whose other end is open: PIPE_NOWAIT returns at once, a synchronous handle blocks
-                    // the thread until data arrives or the other end closes, an overlapped read completes then.
-                    if (pipe->completion_mode == FILE_PIPE_COMPLETE_OPERATION_VALUE)
-                    {
-                        return STATUS_PIPE_EMPTY;
-                    }
-
-                    if (pipe->synchronous)
-                    {
-                        auto& t = c.thread();
-                        t.await_pipe_read = pending_pipe_read_wait{
-                            .file_handle = file_handle,
-                            .data = buffer,
-                            .length = length,
-                            .io_status_block = io_status_block.value(),
-                        };
-                        c.win_emu.yield_thread(c.vcpu, false);
-                        return STATUS_SUCCESS;
-                    }
-
-                    if (io_status_block)
-                    {
-                        io_status_block.write({.Status = STATUS_PENDING, .Information = 0});
-                    }
-                    pipe->pending_reads.push_back(read);
-                    return STATUS_PENDING;
-                }
+                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, buffer, length, true);
             }
 
             const auto* f = c.proc.files.get(file_handle);
@@ -2097,7 +2087,7 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
-            if (!io_request_to_cancel || !device->cancel_io(c.win_emu, io_request_to_cancel.value()))
+            if (!device->cancel_io(c.win_emu, io_request_to_cancel.value()))
             {
                 io_status_block.write(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>{.Status = STATUS_NOT_FOUND, .Information = 0});
                 return STATUS_NOT_FOUND;
@@ -2143,52 +2133,9 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            const auto* container = c.proc.devices.get(file_handle);
-            if (container)
+            if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
             {
-                if (auto* pipe = container->get_internal_device<named_pipe>())
-                {
-                    // What one end writes waits for the other end's reads. A pipe without an instance (no server or
-                    // client to talk to) takes the data without delivering it.
-                    if (pipe->instance)
-                    {
-                        auto* peer = find_pipe_peer(c.proc, *pipe);
-                        if (!peer)
-                        {
-                            return STATUS_PIPE_CLOSING;
-                        }
-
-                        // A non-blocking (PIPE_NOWAIT) write that does not fit in the reader's buffer quota writes nothing
-                        // and succeeds, as on Windows (also in byte mode); CPython reports it as BlockingIOError. Blocking
-                        // writes are not held back.
-                        if (pipe->completion_mode == FILE_PIPE_COMPLETE_OPERATION_VALUE && temp_buffer.size() > pipe_room(c.proc, *peer))
-                        {
-                            temp_buffer.clear();
-                        }
-
-                        if (!temp_buffer.empty())
-                        {
-                            peer->read_queue.emplace_back(temp_buffer.begin(), temp_buffer.end());
-                        }
-                    }
-
-                    if (io_status_block)
-                    {
-                        IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
-                        block.Information = static_cast<ULONG>(temp_buffer.size());
-                        io_status_block.write(block);
-                    }
-
-                    // Writes complete at once, overlapped ones included (the queue has no quota).
-                    io_device_context request{c.emu};
-                    request.event.bits = event;
-                    request.apc_routine = apc_routine;
-                    request.apc_context = apc_context;
-                    request.io_status_block = io_status_block;
-                    complete_pipe_io(c.win_emu, container->prepare_io_context(request), c.thread().id, STATUS_SUCCESS, temp_buffer.size(),
-                                     false);
-                    return STATUS_SUCCESS;
-                }
+                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, buffer, length, false);
             }
 
             const auto* f = c.proc.files.get(file_handle);
@@ -2495,8 +2442,6 @@ namespace sogen
                                           const std::u16string_view filename, const OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>& attributes,
                                           ACCESS_MASK desired_access, const ULONG create_options)
         {
-            (void)attributes; // This isn't being consumed atm, suppressing errors
-
             c.win_emu.callbacks.on_generic_access("Creating/opening named pipe", filename);
 
             io_device_creation_data data{};
@@ -2507,36 +2452,36 @@ namespace sogen
 
             if (auto* pipe_device = container.get_internal_device<named_pipe>())
             {
-                pipe_device->name = std::u16string(filename);
-                pipe_device->access = desired_access;
-                pipe_device->synchronous = (create_options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
+                pipe_device->name = normalize_named_pipe_path(filename);
+                container.granted_access = desired_access;
+                pipe_device->create_options = create_options;
+                container.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
 
-                // A client connects to a server instance of that name that has no client yet. Without one the open fails
-                // as on Windows (no emulated service listens on \PIPE\wkssvc and the like; RPC then reports the server
-                // unavailable instead of talking to a dead pipe).
-                if (const auto short_name = pipe_short_name(filename); !short_name.empty())
+                // A client connects to a server instance of that name that has no client yet; with every instance busy
+                // the open fails with STATUS_PIPE_NOT_AVAILABLE (ERROR_PIPE_BUSY), without any with NOT_FOUND.
+                auto server_exists = false;
+                for (const auto& [index, existing] : c.proc.devices)
                 {
-                    auto exists = false;
-                    for (auto& entry : c.proc.devices | std::views::values)
+                    (void)index;
+                    auto* server = existing.get_internal_device<named_pipe>();
+                    if (!server || !server->server || server->anonymous || windows_path(server->name) != windows_path(pipe_device->name))
                     {
-                        const auto* server = entry.get_internal_device<named_pipe>();
-                        if (!server || !server->server || server->anonymous || pipe_short_name(server->name) != short_name)
-                        {
-                            continue;
-                        }
-
-                        exists = true;
-                        if (!find_pipe_end(c.proc, server->instance, false))
-                        {
-                            pipe_device->instance = server->instance;
-                            break;
-                        }
+                        continue;
                     }
 
-                    if (!pipe_device->instance)
+                    server_exists = true;
+                    if (server->unopened_peer)
                     {
-                        return exists ? STATUS_PIPE_NOT_AVAILABLE : STATUS_OBJECT_NAME_NOT_FOUND;
+                        pipe_device->copy_configuration(*server);
+                        container.granted_access = desired_access;
+                        pipe_device->create_options = create_options;
+                        pipe_device->endpoint = std::move(server->unopened_peer);
+                        break;
                     }
+                }
+                if (!pipe_device->endpoint && windows_path(pipe_device->name) != windows_path(u"\\Device\\NamedPipe\\"))
+                {
+                    return server_exists ? STATUS_PIPE_NOT_AVAILABLE : STATUS_OBJECT_NAME_NOT_FOUND;
                 }
             }
 
@@ -2651,7 +2596,7 @@ namespace sogen
                 handle root_handle{};
                 root_handle.bits = attributes.RootDirectory;
                 const auto* root_container = c.proc.devices.get(root_handle);
-                const auto* root_pipe = root_container ? root_container->get_internal_device<named_pipe>() : nullptr;
+                auto* root_pipe = root_container ? root_container->get_internal_device<named_pipe>() : nullptr;
                 if (root_pipe)
                 {
                     c.win_emu.callbacks.on_generic_access("Opening anonymous pipe", root_pipe->name);
@@ -2659,19 +2604,15 @@ namespace sogen
                     io_device_creation_data data{};
                     io_device_container container{u"NamedPipe", c.win_emu, data};
                     auto* pipe_device = container.get_internal_device<named_pipe>();
-                    pipe_device->name = root_pipe->name;
-                    // The client end of the pipe whose server the root handle is.
-                    pipe_device->instance = root_pipe->server ? root_pipe->instance : 0;
-                    pipe_device->anonymous = root_pipe->anonymous;
-                    pipe_device->access = desired_access;
-                    pipe_device->synchronous = (create_options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
-                    pipe_device->pipe_type = root_pipe->pipe_type;
-                    pipe_device->read_mode = root_pipe->read_mode;
-                    pipe_device->completion_mode = root_pipe->completion_mode;
-                    pipe_device->max_instances = root_pipe->max_instances;
-                    pipe_device->inbound_quota = root_pipe->inbound_quota;
-                    pipe_device->outbound_quota = root_pipe->outbound_quota;
-                    pipe_device->default_timeout = root_pipe->default_timeout;
+                    if (!root_pipe->unopened_peer)
+                    {
+                        return STATUS_PIPE_NOT_AVAILABLE;
+                    }
+                    pipe_device->copy_configuration(*root_pipe);
+                    container.granted_access = desired_access;
+                    pipe_device->create_options = create_options;
+                    container.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
+                    pipe_device->endpoint = std::move(root_pipe->unopened_peer);
 
                     file_handle.write(c.proc.devices.store(std::move(container)));
 
@@ -2761,6 +2702,7 @@ namespace sogen
             file f{};
             f.access_mask = desired_access;
             f.share_access = share_access;
+            f.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
             f.file_mode = create_options & FILE_MODE_MASK;
             f.name = std::move(filename);
 
@@ -2955,17 +2897,8 @@ namespace sogen
                                      ULONG share_access, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
                                      ULONG ea_length)
         {
-            const auto status = create_file(c, file_handle, desired_access, object_attributes, io_status_block, share_access,
-                                            create_disposition, create_options, ea_buffer, ea_length);
-
-            // OBJ_INHERIT makes the new handle inheritable (CreateFile with an inheritable SECURITY_ATTRIBUTES).
-            constexpr ULONG obj_inherit = 0x2;
-            if (NT_SUCCESS(status) && (object_attributes.read().Attributes & obj_inherit))
-            {
-                c.proc.handle_flags[process_context::handle_flags_key(file_handle.read())] |= 1;
-            }
-
-            return status;
+            return create_file(c, file_handle, desired_access, object_attributes, io_status_block, share_access, create_disposition,
+                               create_options, ea_buffer, ea_length);
         }
 
         NTSTATUS handle_NtQueryFullAttributesFile(const syscall_context& c,
@@ -3260,14 +3193,15 @@ namespace sogen
             c.win_emu.callbacks.on_generic_access("Creating named pipe", pipe_name);
 
             // The first instance of a name sets how many it may have (unlimited: -1); one more fails (ERROR_PIPE_BUSY).
-            if (const auto short_name = anonymous_pipe ? std::u16string{} : pipe_short_name(filename); !short_name.empty())
+            if (!anonymous_pipe)
             {
+                const windows_path wanted = normalize_named_pipe_path(pipe_name);
                 ULONG instances = 0;
                 std::optional<ULONG> limit{};
-                for (auto& entry : c.proc.devices | std::views::values)
+                for (const auto& entry : c.proc.devices | std::views::values)
                 {
                     const auto* server = entry.get_internal_device<named_pipe>();
-                    if (server && server->server && !server->anonymous && pipe_short_name(server->name) == short_name)
+                    if (server && server->server && !server->anonymous && windows_path(server->name) == wanted)
                     {
                         ++instances;
                         limit = limit.value_or(server->max_instances);
@@ -3286,19 +3220,23 @@ namespace sogen
 
             if (auto* pipe_device = container.get_internal_device<named_pipe>())
             {
-                pipe_device->name = pipe_name;
-                pipe_device->instance = c.proc.next_pipe_instance++;
+                pipe_device->name = normalize_named_pipe_path(pipe_name);
                 pipe_device->server = true;
                 pipe_device->anonymous = anonymous_pipe;
-                pipe_device->access = desired_access;
-                pipe_device->synchronous = (create_options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
+                container.granted_access = desired_access;
                 pipe_device->pipe_type = named_pipe_type;
                 pipe_device->read_mode = read_mode;
                 pipe_device->completion_mode = completion_mode;
                 pipe_device->max_instances = maximum_instances;
                 pipe_device->inbound_quota = inbound_quota;
                 pipe_device->outbound_quota = outbound_quota;
+                pipe_device->create_options = create_options;
+                container.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
                 pipe_device->default_timeout = default_timeout.read();
+                auto endpoints =
+                    utils::host_pipe::create_pair(named_pipe_type != 0, std::max<ULONG>({inbound_quota, outbound_quota, 4096}));
+                pipe_device->endpoint = std::move(endpoints.first);
+                pipe_device->unopened_peer = std::move(endpoints.second);
             }
             else
             {
@@ -3307,12 +3245,6 @@ namespace sogen
 
             handle pipe_handle = c.proc.devices.store(std::move(container));
             file_handle.write(pipe_handle);
-
-            constexpr ULONG obj_inherit = 0x2;
-            if (attributes.Attributes & obj_inherit)
-            {
-                c.proc.handle_flags[process_context::handle_flags_key(pipe_handle)] |= 1;
-            }
 
             IO_STATUS_BLOCK<EmulatorTraits<Emu64>> iosb{};
             iosb.Status = STATUS_SUCCESS;
