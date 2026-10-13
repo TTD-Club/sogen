@@ -800,6 +800,10 @@ namespace sogen::py
                 .def_prop_ro(
                     "has_checkpoint_memory", [](const ttd_trace& self) { return self.native().has_checkpoint_memory(); },
                     "Whether memory_at takes bytes no access shows from checkpoints")
+                .def_prop_rw(
+                    "checkpoint_cache_size", [](const ttd_trace& self) { return self.native().checkpoint_cache_size(); },
+                    [](const ttd_trace& self, const size_t count) { self.native().set_checkpoint_cache_size(count); },
+                    "Decoded checkpoint states kept (default 4, at least 1); the least recently used are dropped beyond it")
                 .def(
                     "memory_regions_at",
                     [](const ttd_trace& self, const uint64_t position) { return self.native().memory_regions_at(position); },

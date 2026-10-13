@@ -567,16 +567,20 @@ found through the section table (24-byte entries `type, offset, size`):
 - Checkpoint memory (type 18, size = compressed bytes; absent in older
   traces): per checkpoint, the offset in its decoded state at which the
   memory manager's state (`serialize_memory_state`) begins. A zstd frame of
-  varints: the checkpoint count, then the offsets. With it, `memory_at` starts
-  from the memory of the checkpoint the position replays from and applies the
-  writes and host writes since, so its cost follows the writes to the memory,
-  not its reads and executions (all of ntdll page by page on test-sample:
-  0.12 s, was 2.7 min). Bytes a mapping change covered since and nothing wrote
-  after, and MMIO (host-aliased memory included), are read from the accesses
-  as before. The reader parses only that part of the state (reservations,
-  then committed contents; MMIO contents are not in it). The first read in a
-  checkpoint interval decodes that checkpoint's state, which is cached.
-  `Trace.has_checkpoint_memory`. The memory part's
+  varints: the checkpoint count, then the offsets. With it, `memory_at` takes
+  each byte from the latest write or host write since the checkpoint the
+  position replays from, walking back from the position, else from that
+  checkpoint's memory, so its cost follows the writes to the memory, not its
+  reads and executions (all of ntdll page by page on test-sample: 0.12 s, was
+  2.7 min). Bytes a mapping change covered since and nothing wrote after are
+  zero while committed (per the memory regions section) and nothing
+  otherwise: the emulator's own writes into new memory are recorded as host
+  writes. MMIO (host-aliased memory included) is read from the accesses as
+  before. The reader parses only that part of the state (reservations, then
+  committed contents; MMIO contents are not in it). The first read in a
+  checkpoint interval decodes that checkpoint's state; the reader keeps the
+  last few decoded states (`trace::set_checkpoint_cache_size`, default 4;
+  `Trace.checkpoint_cache_size`). `Trace.has_checkpoint_memory`. The memory part's
   layout is thereby read outside the emulator; `test/ttd_reader_test.py`
   compares `memory_at` with a replayed emulator's memory, so a change to it
   fails the test.

@@ -813,6 +813,50 @@ namespace sogen::ttd
         return static_cast<uint32_t>(next - chunks_.begin() - 1);
     }
 
+    namespace
+    {
+        // A least recently used cache of decoded checkpoints, by index, least recent first.
+        template <typename Value>
+        using checkpoint_cache = std::vector<std::pair<uint64_t, std::shared_ptr<const Value>>>;
+
+        // The cached value of checkpoint `index`, made the most recent; null when it is not cached.
+        template <typename Value>
+        std::shared_ptr<const Value> cached_checkpoint(checkpoint_cache<Value>& cache, const uint64_t index)
+        {
+            const auto found = std::ranges::find(cache, index, &std::pair<uint64_t, std::shared_ptr<const Value>>::first);
+            if (found == cache.end())
+            {
+                return nullptr;
+            }
+            std::rotate(found, std::next(found), cache.end());
+            return cache.back().second;
+        }
+
+        // Drops the least recent entries beyond `size`.
+        template <typename Value>
+        void trim_checkpoints(checkpoint_cache<Value>& cache, const size_t size)
+        {
+            if (cache.size() > size)
+            {
+                cache.erase(cache.begin(), cache.begin() + static_cast<ptrdiff_t>(cache.size() - size));
+            }
+        }
+
+        template <typename Value>
+        void cache_checkpoint(checkpoint_cache<Value>& cache, const uint64_t index, std::shared_ptr<const Value> value, const size_t size)
+        {
+            cache.emplace_back(index, std::move(value));
+            trim_checkpoints(cache, size);
+        }
+    }
+
+    void trace::set_checkpoint_cache_size(const size_t count)
+    {
+        checkpoint_cache_size_ = std::max<size_t>(count, 1);
+        trim_checkpoints(state_cache_, checkpoint_cache_size_);
+        trim_checkpoints(checkpoint_memory_cache_, checkpoint_cache_size_);
+    }
+
     std::shared_ptr<const std::vector<std::byte>> trace::checkpoint_state_at(const uint64_t index)
     {
         if (!this->chunked())
@@ -820,18 +864,23 @@ namespace sogen::ttd
             const auto& entry = checkpoints_.at(static_cast<size_t>(index));
             return std::make_shared<const std::vector<std::byte>>(snapshot::get_emulator_state(read_bytes(entry.offset, entry.size)));
         }
-        if (state_cache_ && state_cache_->first == index)
+        if (auto cached = cached_checkpoint(state_cache_, index))
         {
-            return state_cache_->second;
+            return cached;
         }
 
+        // The chain of deltas back to a full state, or to the nearest state in the cache.
         std::vector<uint64_t> chain{index};
-        while (checkpoints_.at(static_cast<size_t>(chain.back())).base != no_base_checkpoint &&
-               (!state_cache_ || state_cache_->first != chain.back()))
+        std::shared_ptr<const std::vector<std::byte>> cached_base{};
+        while (checkpoints_.at(static_cast<size_t>(chain.back())).base != no_base_checkpoint)
         {
             chain.push_back(checkpoints_.at(static_cast<size_t>(chain.back())).base);
+            if ((cached_base = cached_checkpoint(state_cache_, chain.back())))
+            {
+                break;
+            }
         }
-        const auto from_cache = state_cache_ && state_cache_->first == chain.back();
+        const auto from_cache = static_cast<bool>(cached_base);
 
         // A delta's reference is its base state followed by the bulk blocks in between. Each restored state is
         // decompressed with room for the next delta's blocks, so they can be appended in place instead of copying the
@@ -885,7 +934,7 @@ namespace sogen::ttd
         if (from_cache)
         {
             chain.pop_back();
-            const auto& cached = *state_cache_->second;
+            const auto& cached = *cached_base;
             if (!chain.empty())
             {
                 between = blocks_between(chain.back());
@@ -921,7 +970,7 @@ namespace sogen::ttd
             std::swap(state, next);
         }
         auto restored = std::make_shared<const std::vector<std::byte>>(std::move(state));
-        state_cache_ = std::make_pair(index, restored);
+        cache_checkpoint(state_cache_, index, restored, checkpoint_cache_size_);
         return restored;
     }
 
@@ -1632,43 +1681,18 @@ namespace sogen::ttd
         std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
         const auto last = last_byte(address, size);
         const auto checkpoint_step = checkpoint_step_for(position);
-        const auto memory = checkpoint_memory_at(checkpoint_index(checkpoint_step));
         // As in fill_from_checkpoint: the checkpoint's own events came before it, a mapping change numbered like an
         // event came before that event, and one numbered like the first event after the position counts as before it.
         const auto after = first_event_after(checkpoint_step);
         const auto boundary = first_event_after(position);
 
-        // Per byte: needs the accesses (MMIO, or remapped since the checkpoint and not written after), and the last
-        // mapping change since the checkpoint that covers it.
+        // Per byte: whether it is settled, whether it was remapped since the checkpoint and not written after, whether
+        // it needs the accesses (MMIO), and the last mapping change since the checkpoint that covers it.
+        std::vector<bool> settled(value.size());
+        std::vector<bool> fresh(value.size());
         std::vector<bool> from_accesses(value.size());
         std::vector<std::optional<uint64_t>> remapped_at(value.size());
-
-        auto range = memory->ranges.upper_bound(address);
-        if (range != memory->ranges.begin())
-        {
-            --range;
-        }
-        for (; range != memory->ranges.end() && range->first <= last; ++range)
-        {
-            const auto& [length, offset] = range->second;
-            if (!length)
-            {
-                continue;
-            }
-            const auto range_last = range->first + (length - 1);
-            for (auto byte = std::max(range->first, address); byte <= std::min(range_last, last); ++byte)
-            {
-                const auto index = static_cast<size_t>(byte - address);
-                if (offset == checkpoint_memory::no_contents)
-                {
-                    from_accesses[index] = true;
-                }
-                else
-                {
-                    value[index] = static_cast<uint8_t>((*memory->state)[offset + static_cast<size_t>(byte - range->first)]);
-                }
-            }
-        }
+        auto unsettled = value.size();
 
         for (auto change = std::ranges::lower_bound(mapping_changes_, after, {}, &mapping_change::event_number);
              change != mapping_changes_.end() && change->event_number <= boundary; ++change)
@@ -1680,21 +1704,24 @@ namespace sogen::ttd
             const auto change_last = change->address + (change->size - 1);
             for (auto byte = std::max(change->address, address); byte <= std::min(change_last, last); ++byte)
             {
-                const auto index = static_cast<size_t>(byte - address);
-                remapped_at[index] = change->event_number;
-                value[index].reset();
+                remapped_at[static_cast<size_t>(byte - address)] = change->event_number;
             }
         }
 
-        // The writes since the checkpoint, in order; one before a later mapping change of its byte is lost to it.
+        // The latest write since the checkpoint settles a byte, walking back from the position, so a busy page stops
+        // after a few writes; a byte whose latest write came before a later mapping change of it was lost to that.
         const auto ranges = candidates(address / page_size, last / page_size,
                                        static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::host_write),
                                        after, boundary);
         uint64_t done = 0;
-        for (const auto& candidate : ranges)
+        for (const auto& candidate : std::views::reverse(ranges))
         {
+            if (!unsettled)
+            {
+                break;
+            }
             control.report(done++, ranges.size());
-            for (auto number = candidate.begin; number < candidate.end; ++number)
+            for (auto number = candidate.end; unsettled && number-- > candidate.begin;)
             {
                 const auto event = event_at(number);
                 if ((event.kind != access_kind::write && event.kind != access_kind::host_write) ||
@@ -1706,8 +1733,15 @@ namespace sogen::ttd
                 for (auto byte = std::max(event.address, address); byte < std::min(event.address + event.size, address + size); ++byte)
                 {
                     const auto index = static_cast<size_t>(byte - address);
+                    if (settled[index])
+                    {
+                        continue;
+                    }
+                    settled[index] = true;
+                    --unsettled;
                     if (remapped_at[index] && number < *remapped_at[index])
                     {
+                        fresh[index] = true;
                         continue;
                     }
                     if (data.empty())
@@ -1719,26 +1753,123 @@ namespace sogen::ttd
             }
         }
 
+        // Bytes remapped since the checkpoint and not written after hold what the mapping left: the emulator's own
+        // writes into new memory (file views, images) are recorded as host writes, so committed memory is zero and the
+        // rest has no contents. Traces without the memory map read them from the accesses.
+        for (size_t index = 0; index < value.size(); ++index)
+        {
+            if (!settled[index] && remapped_at[index])
+            {
+                settled[index] = true;
+                fresh[index] = true;
+                --unsettled;
+            }
+        }
+        if (std::ranges::find(fresh, true) != fresh.end())
+        {
+            if (has_memory_regions_)
+            {
+                constexpr uint32_t mem_commit = 0x1000;
+                constexpr uint32_t mmio_region_kind = 5;
+                std::vector<const memory_region*> covering{};
+                for (const auto& region : memory_regions_.regions)
+                {
+                    if (region.step > position)
+                    {
+                        break;
+                    }
+                    if (overlaps(region.address, region.size, address, size))
+                    {
+                        covering.push_back(&region);
+                    }
+                }
+                for (size_t index = 0; index < value.size(); ++index)
+                {
+                    if (!fresh[index])
+                    {
+                        continue;
+                    }
+                    const auto byte = address + index;
+                    // The latest entry covering a byte describes it (memory_regions_at).
+                    const auto latest = std::ranges::find_if(std::views::reverse(covering), [byte](const memory_region* region) {
+                        return byte - region->address < region->size;
+                    });
+                    if (latest == std::views::reverse(covering).end() || (*latest)->state != mem_commit)
+                    {
+                        continue;
+                    }
+                    if ((*latest)->kind == mmio_region_kind)
+                    {
+                        from_accesses[index] = true;
+                    }
+                    else
+                    {
+                        value[index] = uint8_t{0};
+                    }
+                }
+            }
+            else
+            {
+                for (size_t index = 0; index < value.size(); ++index)
+                {
+                    from_accesses[index] = from_accesses[index] || fresh[index];
+                }
+            }
+        }
+        if (unsettled)
+        {
+            const auto memory = checkpoint_memory_at(checkpoint_index(checkpoint_step));
+            auto range = memory->ranges.upper_bound(address);
+            if (range != memory->ranges.begin())
+            {
+                --range;
+            }
+            for (; range != memory->ranges.end() && range->first <= last; ++range)
+            {
+                const auto& [length, offset] = range->second;
+                if (!length)
+                {
+                    continue;
+                }
+                const auto range_last = range->first + (length - 1);
+                for (auto byte = std::max(range->first, address); byte <= std::min(range_last, last); ++byte)
+                {
+                    const auto index = static_cast<size_t>(byte - address);
+                    if (settled[index])
+                    {
+                        continue;
+                    }
+                    if (offset == checkpoint_memory::no_contents)
+                    {
+                        from_accesses[index] = true;
+                    }
+                    else
+                    {
+                        value[index] = static_cast<uint8_t>((*memory->state)[offset + static_cast<size_t>(byte - range->first)]);
+                    }
+                }
+            }
+        }
+
         // Bytes the checkpoint and the writes don't settle come from the accesses, over the span that holds them.
         std::optional<size_t> first_unsettled{};
         size_t last_unsettled{};
         for (size_t index = 0; index < value.size(); ++index)
         {
-            if (from_accesses[index] || (remapped_at[index] && !value[index]))
+            if (from_accesses[index])
             {
-                from_accesses[index] = true;
                 first_unsettled = first_unsettled.value_or(index);
                 last_unsettled = index;
             }
         }
         if (first_unsettled)
         {
-            const auto settled = memory_from_accesses(position, address + *first_unsettled, last_unsettled - *first_unsettled + 1, {});
+            const auto shown = memory_from_accesses(position, address + *first_unsettled, last_unsettled - *first_unsettled + 1, {});
             for (auto index = *first_unsettled; index <= last_unsettled; ++index)
             {
                 if (from_accesses[index])
                 {
-                    value[index] = settled[index - *first_unsettled];
+                    value[index] = shown[index - *first_unsettled];
                 }
             }
         }
@@ -1949,15 +2080,15 @@ namespace sogen::ttd
 
     std::shared_ptr<const trace::checkpoint_memory> trace::checkpoint_memory_at(const uint64_t index)
     {
-        if (checkpoint_memory_cache_ && checkpoint_memory_cache_->first == index)
+        if (auto cached = cached_checkpoint(checkpoint_memory_cache_, index))
         {
-            return checkpoint_memory_cache_->second;
+            return cached;
         }
         auto memory = std::make_shared<checkpoint_memory>();
         memory->state = checkpoint_state_at(index);
         memory->ranges =
             parse_checkpoint_memory(*memory->state, static_cast<size_t>(checkpoint_memory_offsets_.at(static_cast<size_t>(index))));
-        checkpoint_memory_cache_.emplace(index, memory);
+        cache_checkpoint<checkpoint_memory>(checkpoint_memory_cache_, index, memory, checkpoint_cache_size_);
         return memory;
     }
 

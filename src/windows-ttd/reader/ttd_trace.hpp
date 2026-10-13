@@ -387,6 +387,17 @@ namespace sogen::ttd
             return this->chunked();
         }
 
+        // How many decoded checkpoint states the reader keeps, least recently used dropped first (default 4, at least
+        // 1). memory_at and cpu_view decode the checkpoint a position replays from, so callers that alternate between
+        // a few checkpoint intervals (a call and its return) pay for each once. A state is about the size of the
+        // guest's committed memory.
+        void set_checkpoint_cache_size(size_t count);
+
+        size_t checkpoint_cache_size() const
+        {
+            return checkpoint_cache_size_;
+        }
+
         // The position of the checkpoint that checkpoint_for_step(step) restores, without decoding it.
         uint64_t checkpoint_step_for(uint64_t step) const;
         checkpoint_state checkpoint_for_step(uint64_t step);
@@ -409,10 +420,11 @@ namespace sogen::ttd
         std::optional<access_event> next_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = all_access_kinds);
         std::optional<access_event> previous_access(uint64_t address, uint64_t size, uint64_t step, uint64_t kind_mask = all_access_kinds);
         // The bytes of [address, address + size) at `position` (before instruction position + 1 runs, like cpu_view).
-        // With has_checkpoint_memory: the memory of the checkpoint the position replays from, with the writes and host
-        // writes since applied, so the cost follows the writes to the memory, not its reads and executions. Bytes
-        // mapped or unmapped since the checkpoint and not written after, and MMIO (host-aliased memory included, whose
-        // contents checkpoints don't save), are read from accesses as below.
+        // With has_checkpoint_memory: the latest write or host write since the checkpoint the position replays from,
+        // found walking back from the position, else the checkpoint's memory, so the cost follows the writes to the
+        // memory, not its reads and executions. Bytes mapped since the checkpoint and not written after are zero while
+        // committed (has_memory_regions) and nothing otherwise. MMIO (host-aliased memory included, whose contents
+        // checkpoints don't save) is read from accesses as below.
         // Otherwise: each byte from the latest access at or before the position that shows it (a read, a write, a host
         // write, or executed bytes), else from the first later access if that one reads or executes it; an access
         // counts only when the memory was not mapped or unmapped between it and the position. Nothing for the rest.
@@ -485,7 +497,8 @@ namespace sogen::ttd
             std::map<uint64_t, std::pair<uint64_t, size_t>> ranges{};
         };
 
-        std::optional<std::pair<uint64_t, std::shared_ptr<const checkpoint_memory>>> checkpoint_memory_cache_{};
+        // Least recently used first, at most checkpoint_cache_size_ each (see set_checkpoint_cache_size).
+        std::vector<std::pair<uint64_t, std::shared_ptr<const checkpoint_memory>>> checkpoint_memory_cache_{};
         std::shared_ptr<const checkpoint_memory> checkpoint_memory_at(uint64_t index);
         // Fills the bytes of `value` (at `address`, `position`) that no access showed from the memory of the checkpoint
         // the position replays from, where nothing remapped them between it and `boundary`.
@@ -502,7 +515,8 @@ namespace sogen::ttd
         std::vector<bulk_entry> bulk_table_{};
         std::vector<cached_bulk> bulk_cache_{};
         std::vector<cached_chunk> chunk_cache_{};
-        std::optional<std::pair<uint64_t, std::shared_ptr<const std::vector<std::byte>>>> state_cache_{};
+        std::vector<std::pair<uint64_t, std::shared_ptr<const std::vector<std::byte>>>> state_cache_{};
+        size_t checkpoint_cache_size_{4};
         std::filesystem::path path_{};
         std::string id_{};
         // Created on first use by keyframes() (windows-ttd), so the reader does not need keyframe_store.
