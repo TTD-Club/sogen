@@ -10,41 +10,6 @@ namespace sogen
     {
         namespace
         {
-            struct snapshot_header
-            {
-                // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-                char magic[4] = {'S', 'N', 'A', 'P'};
-                uint32_t version{1};
-            };
-
-            static_assert(sizeof(snapshot_header) == 8);
-
-            std::span<const std::byte> validate_header(const std::span<const std::byte> snapshot)
-            {
-                snapshot_header header{};
-                constexpr snapshot_header default_header{};
-
-                if (snapshot.size() < sizeof(header))
-                {
-                    throw std::runtime_error("Snapshot is too small");
-                }
-
-                memcpy(&header, snapshot.data(), sizeof(header));
-
-                if (memcmp(default_header.magic, header.magic, sizeof(header.magic)) != 0)
-                {
-                    throw std::runtime_error("Invalid snapshot");
-                }
-
-                if (default_header.version != header.version)
-                {
-                    throw std::runtime_error("Unsupported snapshot version: " + std::to_string(header.version) +
-                                             "(needed: " + std::to_string(default_header.version) + ")");
-                }
-
-                return snapshot.subspan(sizeof(header));
-            }
-
             std::vector<std::byte> get_compressed_emulator_state(const windows_emulator& win_emu)
             {
                 return utils::compression::zstd::compress(create_emulator_state(win_emu));
@@ -77,12 +42,6 @@ namespace sogen
             return snapshot;
         }
 
-        std::vector<std::byte> get_emulator_state(const std::span<const std::byte> snapshot)
-        {
-            const auto data = validate_header(snapshot);
-            return utils::compression::zstd::decompress(data);
-        }
-
         std::filesystem::path write_emulator_snapshot(const windows_emulator& win_emu, const bool log)
         {
             std::filesystem::path snapshot_file = get_main_executable_name(win_emu) + "-" + std::to_string(time(nullptr)) + ".snap";
@@ -101,11 +60,21 @@ namespace sogen
             return snapshot_file;
         }
 
-        std::vector<std::byte> create_emulator_state(const windows_emulator& win_emu, const size_t expected_size)
+        std::vector<std::byte> create_emulator_state(const windows_emulator& win_emu, const size_t expected_size,
+                                                     std::vector<std::byte> storage)
         {
-            utils::buffer_serializer serializer{};
+            utils::buffer_serializer serializer{std::move(storage)};
             serializer.reserve(expected_size);
             win_emu.serialize(serializer);
+            return serializer.move_buffer();
+        }
+
+        std::vector<std::byte> create_emulator_state(const windows_emulator& win_emu, const size_t expected_size,
+                                                     std::vector<std::byte> storage, size_t& memory_offset)
+        {
+            utils::buffer_serializer serializer{std::move(storage)};
+            serializer.reserve(expected_size);
+            win_emu.serialize(serializer, memory_offset);
             return serializer.move_buffer();
         }
 

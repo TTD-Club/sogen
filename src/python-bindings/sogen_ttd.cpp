@@ -8,6 +8,7 @@
 #include <ttd_string_scan.hpp>
 #include <ttd_trace.hpp>
 #include <ttd_ui.hpp>
+#include <ttd_view.hpp>
 
 #include <sstream>
 
@@ -322,6 +323,11 @@ namespace sogen::py
             return end.value_or(UINT64_MAX);
         }
 
+        std::optional<uint64_t> optional_position(const uint64_t position)
+        {
+            return position == UINT64_MAX ? std::nullopt : std::optional(position);
+        }
+
         sogen_windows_emulator create_ttd_emulator(const nb::object& application, const nb::object& args, const nb::kwargs& kwargs)
         {
             for (const auto* forced : {"backend", "use_relative_time"})
@@ -356,6 +362,7 @@ namespace sogen::py
                 .export_values();
             m.attr("ALL") = static_cast<access_kind>(ttd::all_access_kinds);
             const nb::exception<ttd::divergence_error> divergence_error(m, "DivergenceError", PyExc_RuntimeError);
+            const nb::exception<ttd::operation_cancelled> operation_cancelled(m, "OperationCancelled", PyExc_RuntimeError);
 
             nb::class_<ttd_event>(m, "Event", "One recorded access. Position N is the state after instruction N.")
                 .def_ro("position", &ttd_event::position, "1-based number of the instruction performing the access")
@@ -405,9 +412,19 @@ namespace sogen::py
                 .def_ro("rva", &ttd::module_export::rva)
                 .def_ro("ordinal", &ttd::module_export::ordinal)
                 .def_ro("name", &ttd::module_export::name, "#<ordinal> for an export by ordinal only")
+                .def_prop_ro(
+                    "forwarder",
+                    [](const ttd::module_export& self) { return self.forwarder.empty() ? std::nullopt : std::optional(self.forwarder); },
+                    "For a forwarded export, its target as module.dll!name (API sets resolved), or None; rva then points "
+                    "at the forwarder string")
                 .def("__repr__", [](const ttd::module_export& self) {
                     std::ostringstream text;
-                    text << "Export(name=" << self.name << ", rva=0x" << std::hex << self.rva << ")";
+                    text << "Export(name=" << self.name << ", rva=0x" << std::hex << self.rva;
+                    if (!self.forwarder.empty())
+                    {
+                        text << ", forwarder=" << self.forwarder;
+                    }
+                    text << ")";
                     return text.str();
                 });
 
@@ -420,6 +437,8 @@ namespace sogen::py
                 .def_ro("load_event_number", &ttd::module_entry::load_event_number, "Number of events recorded before the load")
                 .def_ro("unload_position", &ttd::module_entry::unload_step, "None while still mapped at the end")
                 .def_ro("unload_event_number", &ttd::module_entry::unload_event_number)
+                .def_ro("machine", &ttd::module_entry::machine,
+                        "PE machine: 0x8664 for x64, 0x14c for 32-bit WoW64 code; 0 for traces recorded before it was")
                 .def_prop_ro(
                     "exports",
                     [](const ttd::module_entry& self) { return self.exports ? *self.exports : std::vector<ttd::module_export>{}; },
@@ -442,6 +461,49 @@ namespace sogen::py
                     return text.str();
                 });
 
+            nb::class_<ttd::thread_stack>(m, "ThreadStack",
+                                          "A thread's stack as its TEB described it when the thread first ran in the trace")
+                .def_ro("thread_id", &ttd::thread_stack::thread_id)
+                .def_ro("position", &ttd::thread_stack::step, "Position of the thread's first instruction in the trace")
+                .def_ro("event_number", &ttd::thread_stack::event_number)
+                .def_ro("teb", &ttd::thread_stack::teb)
+                .def_ro("stack_base", &ttd::thread_stack::stack_base, "High end of the stack (NT_TIB StackBase)")
+                .def_ro("stack_limit", &ttd::thread_stack::stack_limit, "Low end of the stack (NT_TIB StackLimit)")
+                .def_ro("teb32", &ttd::thread_stack::teb32, "The 32-bit TEB of a WoW64 thread, 0 otherwise")
+                .def_ro("stack32_base", &ttd::thread_stack::stack32_base)
+                .def_ro("stack32_limit", &ttd::thread_stack::stack32_limit)
+                .def("__repr__", [](const ttd::thread_stack& self) {
+                    std::ostringstream text;
+                    text << "ThreadStack(thread_id=" << self.thread_id << ", position=0x" << std::hex << self.step << ", teb=0x" << self.teb
+                         << ", stack=[0x" << self.stack_limit << ", 0x" << self.stack_base << "))";
+                    return text.str();
+                });
+
+            nb::class_<ttd::memory_region>(m, "MemoryRegion",
+                                           "What NtQueryVirtualMemory showed for a range from a position on (Windows MEM_* and "
+                                           "PAGE_* values)")
+                .def_ro("position", &ttd::memory_region::step)
+                .def_ro("event_number", &ttd::memory_region::event_number)
+                .def_ro("address", &ttd::memory_region::address)
+                .def_ro("size", &ttd::memory_region::size)
+                .def_ro("allocation_base", &ttd::memory_region::allocation_base, "0 for free memory")
+                .def_ro("allocation_protection", &ttd::memory_region::allocation_protection)
+                .def_ro("state", &ttd::memory_region::state, "MEM_COMMIT, MEM_RESERVE or MEM_FREE")
+                .def_ro("type", &ttd::memory_region::type, "MEM_PRIVATE, MEM_MAPPED or MEM_IMAGE; 0 for free memory")
+                .def_ro("protection", &ttd::memory_region::protection, "PAGE_* of committed memory (PAGE_GUARD included), else 0")
+                .def_ro("kind", &ttd::memory_region::kind,
+                        "0 free, 1 private, 2 file view, 3 pagefile-backed view, 4 image, 5 MMIO or host memory, 6 host-reserved")
+                .def_ro("name_index", &ttd::memory_region::name,
+                        "The mapped file of a file view, as an index into Trace.memory_region_names; 0xFFFFFFFF for none "
+                        "(images have none: see Trace.modules)")
+                .def("__repr__", [](const ttd::memory_region& self) {
+                    std::ostringstream text;
+                    text << "MemoryRegion(position=0x" << std::hex << self.step << ", address=0x" << self.address << ", size=0x"
+                         << self.size << ", state=0x" << self.state << ", type=0x" << self.type << ", protection=0x" << self.protection
+                         << ", allocation_base=0x" << self.allocation_base << ")";
+                    return text.str();
+                });
+
             nb::class_<ttd::recovered_string>(m, "RecoveredString")
                 .def_ro("address", &ttd::recovered_string::address)
                 .def_ro("position", &ttd::recovered_string::step, "Position at which the string was last seen extended")
@@ -459,6 +521,56 @@ namespace sogen::py
                 .def_ro("preview", &ttd::recovered_buffer::preview)
                 .def_prop_ro("data", [](const ttd::recovered_buffer& self) {
                     return nb::bytes(reinterpret_cast<const char*>(self.data.data()), self.data.size());
+                });
+
+            nb::class_<ttd::call_event>(m, "CallEvent", "An entry into a function, from Trace.calls_to")
+                .def_prop_ro(
+                    "position", [](const ttd::call_event& self) { return optional_position(self.step); },
+                    "Position of the instruction that led there (the call), or None at the thread's first instruction")
+                .def_ro("entry_position", &ttd::call_event::entry_step, "Position of the function's first instruction")
+                .def_prop_ro(
+                    "return_position", [](const ttd::call_event& self) { return optional_position(self.return_step); },
+                    "Position of the return instruction leaving this invocation (cpu_at there shows the return value), or None "
+                    "when the trace does not show one")
+                .def_ro("site", &ttd::call_event::site, "Address of the instruction at position")
+                .def_ro("target", &ttd::call_event::target)
+                .def_ro("thread_id", &ttd::call_event::thread_id)
+                .def_ro("is_call", &ttd::call_event::is_call, "False when a jump or anything else led there")
+                .def("__repr__", [](const ttd::call_event& self) {
+                    std::ostringstream text;
+                    text << std::hex << "CallEvent(position=0x" << self.step << ", entry_position=0x" << self.entry_step
+                         << ", return_position=0x" << self.return_step << ", site=0x" << self.site << ", is_call=" << self.is_call << ")";
+                    return text.str();
+                });
+
+            nb::class_<ttd::exception_event>(m, "ExceptionEvent", "An exception dispatched to user mode, from Trace.exceptions")
+                .def_ro("position", &ttd::exception_event::step, "Position of the dispatcher's first instruction")
+                .def_prop_ro(
+                    "raise_position", [](const ttd::exception_event& self) { return optional_position(self.raise_step); },
+                    "Position of the instruction that raised it, or None")
+                .def_ro("thread_id", &ttd::exception_event::thread_id)
+                .def_ro("code", &ttd::exception_event::code)
+                .def_ro("flags", &ttd::exception_event::flags)
+                .def_ro("address", &ttd::exception_event::address)
+                .def_ro("information", &ttd::exception_event::information, "ExceptionInformation[0..1]")
+                .def("__repr__", [](const ttd::exception_event& self) {
+                    std::ostringstream text;
+                    text << std::hex << "ExceptionEvent(position=0x" << self.step << ", code=0x" << self.code << ", address=0x"
+                         << self.address << ")";
+                    return text.str();
+                });
+
+            nb::class_<ttd::indirect_branch>(m, "IndirectBranch", "Where an indirect call or jump went, from Trace.indirect_branches")
+                .def_ro("site", &ttd::indirect_branch::site)
+                .def_ro("target", &ttd::indirect_branch::target)
+                .def_ro("hits", &ttd::indirect_branch::hits)
+                .def_ro("first_position", &ttd::indirect_branch::first_step)
+                .def_ro("is_call", &ttd::indirect_branch::is_call)
+                .def("__repr__", [](const ttd::indirect_branch& self) {
+                    std::ostringstream text;
+                    text << std::hex << "IndirectBranch(site=0x" << self.site << ", target=0x" << self.target << std::dec
+                         << ", hits=" << self.hits << ", is_call=" << self.is_call << ")";
+                    return text.str();
                 });
 
             nb::class_<ttd::seek_result>(m, "SeekResult")
@@ -481,6 +593,46 @@ namespace sogen::py
                 .def("__enter__", [](nb::handle self) { return self; })
                 .def(
                     "__exit__", [](ttd_trace& self, const nb::args&) { self.close(); }, nb::arg("args"))
+                .def(
+                    "prepare_seeks",
+                    [](const ttd_trace& self, const std::vector<sogen_windows_emulator*>& emulators, const nb::object& interrupted,
+                       const nb::object& progress) {
+                        std::vector<windows_emulator*> natives{};
+                        natives.reserve(emulators.size());
+                        for (auto* emulator : emulators)
+                        {
+                            natives.push_back(&emulator->native());
+                        }
+                        // The callbacks run on this thread while the GIL is released.
+                        ttd::operation_control control{};
+                        if (!interrupted.is_none())
+                        {
+                            control.interrupted = [&] {
+                                const nb::gil_scoped_acquire acquire{};
+                                return nb::cast<bool>(interrupted());
+                            };
+                        }
+                        if (!progress.is_none())
+                        {
+                            control.progress = [&](const uint64_t done, const uint64_t total) {
+                                const nb::gil_scoped_acquire acquire{};
+                                progress(done, total);
+                            };
+                        }
+                        const nb::gil_scoped_release release{};
+                        ttd::prepare_keyframes(self.native(), natives, control);
+                    },
+                    nb::arg("emulators"), nb::arg("interrupted") = nb::none(), nb::arg("progress") = nb::none(),
+                    "Replay the whole trace on these emulators in parallel (from ttd.create_emulator, one thread each) and keep "
+                    "keyframes, so that seeks anywhere become fast; the emulators end up at arbitrary positions. "
+                    "interrupted() returning True stops it with OperationCancelled (keyframes kept so far stay); "
+                    "progress(done, total) reports instructions replayed")
+                .def_prop_rw(
+                    "keyframe_budget", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).memory_budget(); },
+                    [](const ttd_trace& self, const size_t budget) { sogen::ttd::keyframes(self.native()).set_memory_budget(budget); },
+                    "Bytes of memory the keyframes of seeks may use; the least recently used are dropped beyond it")
+                .def_prop_ro("keyframe_count", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).size(); })
+                .def_prop_ro("keyframe_memory", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).memory_usage(); })
                 .def_prop_ro("instruction_count", [](const ttd_trace& self) { return self.native().metadata().instruction_count; })
                 .def_prop_ro("event_count", [](const ttd_trace& self) { return self.native().metadata().event_count; })
                 .def_prop_ro("access_mask", [](const ttd_trace& self) { return static_cast<access_kind>(self.native().access_mask()); })
@@ -639,15 +791,143 @@ namespace sogen::py
                 .def_prop_ro(
                     "thread_names", [](const ttd_trace& self) { return self.native().threads().names; },
                     "Name of each thread that ran, by id; empty for unnamed threads")
+                .def_prop_ro(
+                    "memory_regions", [](const ttd_trace& self) { return self.native().memory_regions().regions; },
+                    "The memory map at the start and every change to it, in order; empty for traces recorded before it was")
+                .def_prop_ro(
+                    "memory_region_names", [](const ttd_trace& self) { return self.native().memory_regions().names; },
+                    "The mapped files MemoryRegion.name_index refers to")
+                .def_prop_ro(
+                    "has_checkpoint_memory", [](const ttd_trace& self) { return self.native().has_checkpoint_memory(); },
+                    "Whether memory_at takes bytes no access shows from checkpoints")
+                .def_prop_rw(
+                    "checkpoint_cache_size", [](const ttd_trace& self) { return self.native().checkpoint_cache_size(); },
+                    [](const ttd_trace& self, const size_t count) { self.native().set_checkpoint_cache_size(count); },
+                    "Decoded checkpoint states kept (default 4, at least 1); the least recently used are dropped beyond it")
+                .def(
+                    "memory_regions_at",
+                    [](const ttd_trace& self, const uint64_t position) { return self.native().memory_regions_at(position); },
+                    nb::arg("position"),
+                    "The memory map at position, as NtQueryVirtualMemory would list it: reserved and committed ranges in "
+                    "address order, free memory left out")
+                .def_prop_ro(
+                    "thread_stacks",
+                    [](const ttd_trace& self) {
+                        const auto stacks = self.native().thread_stacks();
+                        return std::vector<ttd::thread_stack>(stacks.begin(), stacks.end());
+                    },
+                    "The stack of each thread that ran, in the order threads first ran; empty for traces recorded before "
+                    "stacks were")
                 .def(
                     "thread_at", [](const ttd_trace& self, const uint64_t position) { return self.native().thread_at(position); },
                     nb::arg("position"), "Id of the thread executing the instruction at position, or None before the first switch")
+                .def(
+                    "cpu_at",
+                    [](const ttd_trace& self, const uint64_t position) {
+                        auto& native = self.native();
+                        const nb::gil_scoped_release release{};
+                        return ttd::cpu_view(native, position);
+                    },
+                    nb::arg("position"),
+                    "The registers at position, replayed from the nearest register snapshot without an emulated process "
+                    "(verified against the recording; DivergenceError otherwise). Needs a trace with register snapshots")
+                .def(
+                    "memory_at",
+                    [](const ttd_trace& self, const uint64_t position, const uint64_t address, const uint64_t size) {
+                        auto& native = self.native();
+                        const nb::gil_scoped_release release{};
+                        return native.memory_at(position, address, size);
+                    },
+                    nb::arg("position"), nb::arg("address"), nb::arg("size"),
+                    "Each byte of [address, address + size) at position (as cpu_at sees it), from the nearest recorded access "
+                    "that shows it; None for bytes no access shows")
+                .def(
+                    "read_memory",
+                    [](const ttd_trace& self, const uint64_t position, const uint64_t address, const uint64_t size) {
+                        std::vector<std::optional<uint8_t>> value{};
+                        {
+                            auto& native = self.native();
+                            const nb::gil_scoped_release release{};
+                            value = native.memory_at(position, address, size);
+                        }
+                        std::vector<std::byte> bytes{};
+                        bytes.reserve(value.size());
+                        for (size_t i = 0; i < value.size(); ++i)
+                        {
+                            if (!value[i])
+                            {
+                                std::ostringstream text;
+                                text << "No recorded access shows the byte at 0x" << std::hex << address + i << " at this position";
+                                throw nb::value_error(text.str().c_str());
+                            }
+                            bytes.push_back(static_cast<std::byte>(*value[i]));
+                        }
+                        return to_bytes(bytes);
+                    },
+                    nb::arg("position"), nb::arg("address"), nb::arg("size"), "memory_at as bytes; ValueError when a byte is unknown")
+                .def_prop_ro(
+                    "has_register_snapshots", [](const ttd_trace& self) { return !self.native().register_snapshots().empty(); },
+                    "Whether cpu_at works on this trace (recorded with every access kind by a recorder that takes snapshots)")
                 .def(
                     "event", [](const ttd_trace& self, const uint64_t number) { return self.event(self.native().event_at(number)); },
                     nb::arg("number"))
                 .def(
                     "self_modifying_code", [](const ttd_trace& self) { return self.native().self_modifying_code(); },
-                    "Executed instructions whose bytes a guest instruction wrote earlier");
+                    "Executed instructions whose bytes a guest instruction wrote earlier")
+                .def_prop_ro(
+                    "id", [](const ttd_trace& self) { return self.native().id(); },
+                    "Identifies the recording (random per recording; a hash of the header and tables for older traces)")
+                .def_prop_ro(
+                    "version", [](const ttd_trace& self) { return self.native().version(); }, "Trace format version")
+                .def(
+                    "calls_to",
+                    [](const ttd_trace& self, const uint64_t address, const uint64_t start, const std::optional<uint64_t> end) {
+                        auto& native = self.native();
+                        const nb::gil_scoped_release release{};
+                        return native.calls_to(address, start, end_position(end));
+                    },
+                    nb::arg("address"), nb::arg("start") = 0, nb::arg("end") = nb::none(),
+                    "Every entry into the function at address, at positions start through end, with the instruction that led "
+                    "there and the matching return")
+                .def(
+                    "exceptions",
+                    [](const ttd_trace& self) {
+                        auto& native = self.native();
+                        const nb::gil_scoped_release release{};
+                        return native.exceptions();
+                    },
+                    "Every exception dispatched to user mode, in order")
+                .def(
+                    "indirect_branches",
+                    [](const ttd_trace& self, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const bool jumps) {
+                        auto& native = self.native();
+                        const nb::gil_scoped_release release{};
+                        return native.indirect_branches(ranges, jumps);
+                    },
+                    nb::arg("ranges"), nb::arg("jumps") = false,
+                    "Targets of the indirect calls (and with jumps, indirect jumps) starting in the (address, size) ranges, by "
+                    "site and target");
+
+            nb::class_<ttd::cpu_view>(m, "CpuView", "The CPU at a trace position, from Trace.cpu_at")
+                .def_prop_ro("position", &ttd::cpu_view::position)
+                .def_prop_ro("replayed_instructions", &ttd::cpu_view::replayed_instructions,
+                             "Instructions replayed from the register snapshot to the position")
+                .def(
+                    "read_register", [](ttd::cpu_view& self, const x86_register reg) { return self.cpu().reg<uint64_t>(reg); },
+                    nb::arg("register"), "The low 64 bits of a register")
+                .def(
+                    "read_register_bytes",
+                    [](ttd::cpu_view& self, const x86_register reg) {
+                        std::array<std::byte, 64> value{};
+                        const auto size = self.cpu().read_register(reg, value.data(), value.size());
+                        return to_bytes(std::span(value).first(size));
+                    },
+                    nb::arg("register"), "A register's full value, little-endian (16 bytes for xmm registers)")
+                .def("__repr__", [](const ttd::cpu_view& self) {
+                    std::ostringstream text;
+                    text << "CpuView(position=0x" << std::hex << self.position() << ")";
+                    return text.str();
+                });
 
             nb::class_<ttd_difference>(m, "Difference", "The first event two traces record differently")
                 .def_ro("first", &ttd_difference::first, "The first trace's event; None when it has no further event")
@@ -659,6 +939,11 @@ namespace sogen::py
                   "The first event the traces record differently (kinds both recorded, with their data), from the later "
                   "start_position to the earlier end; None when they agree. For a recorded fork and its parent this is where "
                   "the change first shows.");
+
+            m.def("trace_file_version", &ttd::trace_file_version, nb::arg("path"),
+                  "The format version of a Sogen TTD trace file (read from its first 8 bytes), or None if it is not one");
+            m.def("is_supported_trace_version", &ttd::is_supported_trace_version, nb::arg("version"),
+                  "Whether this build reads traces of that format version");
         }
 
         void register_replay(nb::module_& m)

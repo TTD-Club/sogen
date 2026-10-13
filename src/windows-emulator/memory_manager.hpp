@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <set>
 #include <vector>
 
 #include "memory_permission_ext.hpp"
@@ -32,6 +33,8 @@ namespace sogen
         section_image,
         mmio,
         host_reserved,
+        placeholder,
+        placeholder_backed_allocation,
     };
 
     // This maps to the `basic_memory_region` struct defined in
@@ -54,6 +57,16 @@ namespace sogen
         uint64_t reserved_memory = 0;
         uint64_t committed_memory = 0;
     };
+
+    struct restored_page
+    {
+        // Null for a page of zeros.
+        const std::byte* data{};
+        // The caller knows the page is mapped and already holds these bytes.
+        bool unchanged{};
+    };
+
+    using restored_page_source = std::function<restored_page(uint64_t page_address)>;
 
     class memory_manager : public memory_interface
     {
@@ -91,7 +104,20 @@ namespace sogen
             mapping_change_callback_ = std::move(callback);
         }
 
+        // Called with each range whose regions, as NtQueryVirtualMemory shows them (reservation, commit, protection,
+        // kind, mapped file), changed: get_region_info then describes it anew. Unlike the mapping change callback, it
+        // reports the guest's protections, not the backend's effective ones.
+        void set_region_change_callback(std::function<void(uint64_t, size_t)> callback)
+        {
+            if (callback && region_change_callback_)
+            {
+                throw std::logic_error("A memory region change callback is already installed");
+            }
+            region_change_callback_ = std::move(callback);
+        }
+
         using memory_interface::read_memory;
+        using memory_interface::write_memory;
 
         void read_memory(uint64_t address, void* data, size_t size) const final;
         bool try_read_memory(uint64_t address, void* data, size_t size) const final;
@@ -138,6 +164,11 @@ namespace sogen
         bool decommit_memory(uint64_t address, size_t size);
 
         bool release_memory(uint64_t address, size_t size);
+
+        bool split_placeholder(uint64_t address, size_t size);
+        bool coalesce_placeholders(uint64_t address, size_t size);
+        bool replace_placeholder(uint64_t address, size_t size, nt_memory_permission permissions, bool commit);
+        bool preserve_placeholder(uint64_t address, size_t size);
 
         void unmap_all_memory();
 
@@ -192,6 +223,8 @@ namespace sogen
 
         void serialize_memory_state(utils::buffer_serializer& buffer, bool is_snapshot) const;
         void deserialize_memory_state(utils::buffer_deserializer& buffer, bool is_snapshot);
+        // Restores a layout written with is_snapshot and fills its committed pages from `pages`.
+        void deserialize_memory_state(utils::buffer_deserializer& buffer, const restored_page_source& pages);
 
         memory_stats compute_memory_stats() const;
 
@@ -210,6 +243,11 @@ namespace sogen
         bool dep_enabled_{true};
         std::vector<uint64_t> host_reserved_addresses_{};
         std::function<void(uint64_t, size_t)> mapping_change_callback_{};
+        std::function<void(uint64_t, size_t)> region_change_callback_{};
+
+        // Returns the committed regions that stayed mapped; the others are mapped anew.
+        std::set<uint64_t> restore_memory_layout(utils::buffer_deserializer& buffer);
+        void restore_region_contents(uint64_t address, size_t length, bool kept, const restored_page_source& pages);
 
         void map_mmio(uint64_t address, size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) final;
         void map_memory(uint64_t address, size_t size, memory_permission permissions) final;
@@ -217,7 +255,8 @@ namespace sogen
         void unmap_memory(uint64_t address, size_t size) final;
         void apply_memory_protection(uint64_t address, size_t size, memory_permission permissions) final;
 
-        void update_layout_version();
+        // After a change to the regions in [address, address + size).
+        void update_layout_version(uint64_t address, uint64_t size);
         bool commit_memory(uint64_t address, size_t size, nt_memory_permission permissions, bool allow_image_section);
         memory_permission get_effective_permissions(nt_memory_permission permissions) const;
 
@@ -265,6 +304,8 @@ namespace sogen
             switch (kind)
             {
             case memory_region_kind::private_allocation:
+            case memory_region_kind::placeholder:
+            case memory_region_kind::placeholder_backed_allocation:
                 return 1 << 0;
             case memory_region_kind::file_section_view:
                 return 1 << 1;

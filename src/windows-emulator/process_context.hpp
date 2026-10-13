@@ -420,6 +420,8 @@ namespace sogen
         void restore_windows_after_state_restore(windows_emulator& win_emu);
 
         generic_handle_store* get_handle_store(handle handle);
+        // Open kernel object handles (ProcessHandleCount).
+        uint32_t count_handles() const;
         emulator_thread* find_thread_by_id(uint32_t thread_id);
         const emulator_thread* find_thread_by_id(uint32_t thread_id) const;
         bool is_window_effectively_visible(hwnd window) const;
@@ -518,6 +520,54 @@ namespace sogen
         std::map<uint32_t, raw_input_payload> raw_inputs{};
         uint32_t next_raw_input_token{1};
 
+        // The privileges the user's token holds, by LUID, with their SE_PRIVILEGE_* attributes: a non-elevated user's
+        // shutdown, change notify (enabled), undock, increase working set, and time zone. Every token of the process
+        // shares them; NtAdjustPrivilegesToken changes them.
+        std::map<uint32_t, uint32_t> token_privileges{{19, 0}, {23, 3}, {25, 0}, {33, 0}, {34, 0}};
+
+        // Views of file sections, by base address; a file does not shrink under them. The pages of writable shared views
+        // (those with page_hashes) go back to the file when the view is flushed or unmapped; only pages that changed
+        // since they were mapped (by page hash), so that writes made to the file in between survive.
+        struct file_section_view
+        {
+            std::u16string file_name{};
+            uint64_t offset{};
+            uint64_t length{};
+            std::vector<uint64_t> page_hashes{};
+
+            void serialize(utils::buffer_serializer& buffer) const
+            {
+                buffer.write(this->file_name);
+                buffer.write(this->offset);
+                buffer.write(this->length);
+                buffer.write_vector(this->page_hashes);
+            }
+
+            void deserialize(utils::buffer_deserializer& buffer)
+            {
+                buffer.read(this->file_name);
+                buffer.read(this->offset);
+                buffer.read(this->length);
+                buffer.read_vector(this->page_hashes);
+            }
+        };
+
+        std::map<uint64_t, file_section_view> file_section_views{};
+
+        // Reparse points (junctions, symbolic links) by guest path (windows_path::u16string, lower case): the
+        // REPARSE_DATA_BUFFER FSCTL_SET_REPARSE_POINT stored. The host keeps a plain directory or file in their place;
+        // opens follow them here.
+        std::map<std::u16string, std::vector<uint8_t>> reparse_points{};
+
+        // Views mapped of each pagefile section's backing (by its address), and the backings whose section is closed:
+        // such a backing stays until its last view is unmapped, as a view keeps its section's pages.
+        std::map<uint64_t, uint32_t> pagefile_view_counts{};
+        std::map<uint64_t, bool> closed_pagefile_backings{};
+
+        static uint64_t hash_page(std::span<const std::byte> page);
+        // Writes the changed pages of the view at `base` overlapping [start, end) back to its file.
+        void write_back_file_section_view(windows_emulator& win_emu, uint64_t base, uint64_t start, uint64_t end);
+
         // For WOW64 processes
         std::optional<emulator_object<PEB32>> peb32;
         std::optional<emulator_object<RTL_USER_PROCESS_PARAMETERS32>> process_params32;
@@ -561,7 +611,7 @@ namespace sogen
         std::vector<std::byte> default_register_set{};
 
         // Process and thread ids share Windows' 4-aligned client ID space.
-        uint32_t process_id{4};
+        uint32_t process_id{default_guest_process_id};
         uint32_t initial_thread_id{8};
         uint32_t spawned_thread_count{0};
         handle_store<handle_types::thread, emulator_thread> threads{};

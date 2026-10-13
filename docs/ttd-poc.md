@@ -49,6 +49,32 @@ with ttd.Trace("sample.sogttd") as trace:
     for call in trace.calls("ntdll!NtCreateFile", start=0, end=None):
         print(call.position, trace.thread_at(call.position))
     module, export = trace.find_exports("kernel32!CreateFileW")[0]   # address: module.base + export.rva
+    # A forwarded export names its target (export.forwarder, e.g. "ntdll.dll!RtlAllocateHeap" for kernel32's
+    # HeapAlloc), and calls() of it are the target's calls while both modules are mapped.
+
+    # By address, with the instruction that led there (call site) and the matching return (cpu_at there shows the
+    # return value): the return is the first ret that reads the stack slot the call pushed. ~0.3 ms per call.
+    for call in trace.calls_to(module.base + export.rva):
+        print(call.position, hex(call.site), call.entry_position, call.return_position, call.is_call)
+    # Where indirect calls (and jumps) in address ranges went, from the execute events alone (~1 s for every module of
+    # test-sample, 175k executed branches); faulting branches are left out.
+    for branch in trace.indirect_branches([(module.base, module.size)], jumps=True):
+        print(hex(branch.site), "->", hex(branch.target), branch.hits)
+    # Exceptions the system dispatched to user mode (faults, breakpoints, single steps; not RaiseException, which
+    # ntdll dispatches in user mode), from the records the dispatch wrote to the stack.
+    for exception in trace.exceptions():
+        print(exception.position, exception.raise_position, hex(exception.code), hex(exception.address))
+    print(trace.id, trace.version, module.machine)     # recording id (survives copies), format version, PE machine
+
+    # The CPU and memory at a position without an emulated process (~6 ms cold): registers from the nearest register
+    # snapshot, then at most 25,000 instructions replayed on a standalone CPU fed the recorded reads and verified
+    # against the recording. Like a debugger, the state is the one the next instruction starts from; it differs from
+    # Replay.seek only right before a thread switch, where cpu_at already has the next thread's registers.
+    cpu = trace.cpu_at(store.position)
+    rsp = cpu.read_register(sogen.Register.rsp)
+    xmm0 = cpu.read_register_bytes(sogen.Register.xmm0)
+    stack = trace.memory_at(store.position, rsp, 64)  # each byte from the nearest access showing it; None if none does
+    data = trace.read_memory(store.position, rsp, 8)  # bytes, or ValueError when a byte is unknown
 
     # Replay: every recorded event is verified on the way; ttd.DivergenceError (a RuntimeError) names the first
     # divergence. Syscalls whose live writes or result differ (a network answer, a missing file) and host writes with
@@ -58,8 +84,17 @@ with ttd.Trace("sample.sogttd") as trace:
     replay.seek(store.position - 1)                 # also seeks backwards
     rip = emu.read_register(sogen.Register.rip)
     # Forward from where the replay stopped, without restoring a checkpoint (a single step takes ~0.03 ms instead of
-    # a seek's 0.06-0.2 s). Refuses to move back or to go on after the emulator ran; seek after changing it.
+    # a seek's). Refuses to move back or to go on after the emulator ran; seek after changing it.
     replay.run_to(replay.position + 1)
+
+    # Keyframes: replayed states kept in memory (pages shared between them, ~0.15 MiB each), which later seeks restore
+    # instead of decoding a checkpoint and replaying from it. A seek keeps one at the last multiple of 25,000 before
+    # its target, so moving back from there is cheap. prepare_seeks replays the whole trace on extra emulators in
+    # parallel and keeps one at every multiple; afterwards a seek anywhere takes about 30 ms. Keyframes belong to the
+    # Trace object (all its replays share them) and the least recently used are dropped beyond keyframe_budget (1 GiB;
+    # 0 turns them off).
+    trace.prepare_seeks([ttd.create_emulator("c:/sample.exe", emulation_root="root") for _ in range(8)])
+    print(trace.keyframe_count, trace.keyframe_memory >> 20, "MiB")
 
     # Replay scans: each replays the whole trace with verification and leaves the emulator at its end.
     strings = replay.strings(minimum_length=6)       # RecoveredString: address, position, encoding, value
@@ -97,6 +132,28 @@ scans start from the trace's initial checkpoint, so they also work on a recorded
 `--ttd-buffers` and `--ttd-scan-selfmod` start from the application's setup and need a trace that starts at
 position 0. Every replay scan verifies all recorded events, takes recorded inputs unless strict, and delivers
 recorded window input.
+
+## Native library
+
+`src/windows-ttd` builds three static libraries, so a tool that only reads traces does not link the emulator:
+
+| Target | Headers | Needs | Provides |
+| --- | --- | --- | --- |
+| `windows-ttd-reader` | `ttd_trace.hpp`, `ttd_format.hpp`, `ttd_chunk.hpp` | `emulator-common` (zstd) | `ttd::trace` and every query that does not replay: accesses, `memory_at`, calls, `calls_to`, `indirect_branches`, `exceptions`, modules, threads, syscalls, ids |
+| `windows-ttd-view` | `ttd_view.hpp` | the reader, `emulator`, `unicorn-emulator` | `ttd::cpu_view` (`Trace.cpu_at`): registers at a position on a standalone Unicorn CPU |
+| `windows-ttd` | `ttd_record.hpp`, `ttd_session.hpp`, scans | both, `windows-emulator` | recording, replay (`seek`, `run_to`, `replay_to_end`), keyframes, replay scans |
+
+`ttd::keyframes(trace)` and `ttd::share_keyframes(reader, other)` are free functions of `windows-ttd`
+(`ttd_keyframes.hpp`, included by `ttd_session.hpp`), so a reader-only build that calls them fails to compile; the
+reader only holds the store's pointer (`trace::keyframes_slot`). A `trace` is not thread-safe (one file stream,
+caches, the view's CPU): open one per thread or cursor, which reads only the tables (about 25 ms for a 189 MB trace).
+`src/windows-ttd/inspect` (`ttd-inspect TRACE [exceptions | calls-to ADDRESS | branches ADDRESS SIZE [jumps]]`)
+is a reader-only consumer. The long operations take a `ttd::operation_control`: `interrupted()` returning true
+makes them throw `ttd::operation_cancelled`, and `progress(done, total)` reports work done; both run on the
+calling thread (`prepare_keyframes` polls them while its workers run, so they need not be thread-safe). In Python,
+`Trace.prepare_seeks(emulators, interrupted=..., progress=...)` raises `ttd.OperationCancelled`.
+`test/ttd_reader_test.py ANALYZER SAMPLE` covers the reader queries against `cpu_at` and cancellation (SAMPLE
+should raise hardware exceptions, like `test-sample`).
 
 ## Recording and querying
 
@@ -448,9 +505,94 @@ found through the section table (24-byte entries `type, offset, size`):
   varint length and UTF-8 bytes (empty for an export by ordinal only, read as
   `#<ordinal>`). `test-sample`: 27,250 exports of 50 modules, 150 KB (0.4% of
   the trace; 208 KB as one varint stream in RVA order).
+- Export forwarders (type 12, size = compressed bytes; absent in older
+  traces): the targets of forwarded exports, whose RVA points at a forwarder
+  string inside the export directory. One zstd frame of varints: the module
+  count, then per module the number of forwarded exports and per forwarded
+  export, in ordinal order, the ordinal delta and the target as a length and
+  UTF-8 bytes. The target is `module.dll!name` or `module.dll!#<ordinal>`, the
+  module lower case and an API set contract resolved to its host module with
+  the recording's API set schema (left as written when the schema has no
+  host). `test-sample`: 1,566 forwarders, 9 KB.
+- Register snapshots (type 13, size = compressed bytes; absent in older traces
+  and in traces without every access kind): the CPU registers as the backend
+  saves them (Unicorn's context), one zstd frame each, every 64th one whole and
+  the rest deltas against it. The recorder takes one before the first
+  instruction, right after anything but a guest instruction changed registers
+  or memory (a syscall, a thread switch, exception dispatch, CPUID or RDTSC, a
+  host write), at least every 25,000 instructions (at a translated block's
+  start), and at the end, so the instructions between two snapshots depend
+  only on registers and recorded bytes. The table is a zstd frame of varints:
+  count, then per snapshot the position and event-number deltas, the offset
+  relative to the end of the previous snapshot's bytes (zigzag), the size, and
+  the distance back to its base (0 for a whole one). `test-sample`: 5,768
+  snapshots, 0.7 MB (1.9%).
+- Mapping changes (type 14, size = compressed bytes; absent in older traces):
+  every guest memory mapping and unmapping, so `memory_at` knows when earlier
+  accesses stop showing a byte. A zstd frame of varints: count, then per
+  change the position and event-number deltas, the address relative to the
+  previous change's (zigzag), and the size. `test-sample`: 2.3 KB.
+- Module machines (type 15, size = compressed bytes; absent in older traces):
+  the PE machine of each module (`0x8664`, or `0x14c` for 32-bit code in a
+  WoW64 process). A zstd frame of varints: the module count (that of the
+  modules section), then each machine in module order.
+- Thread stacks (type 16, size = compressed bytes; absent in older traces):
+  per thread that ran, in the order threads first ran, its TEB and its
+  `NT_TIB` StackBase and StackLimit as the TEB held them at the thread's first
+  instruction in the trace (its creation, or the trace's start), plus the
+  32-bit TEB and stack of a WoW64 thread (0 otherwise). Sogen commits a
+  thread's whole stack when it creates it, so the bounds hold for the
+  thread's life unless the guest rewrites them (fibers; `memory_at` at the
+  TEB shows that). A zstd frame of varints: count, then per thread its id,
+  the position and event-number deltas, TEB, stack base, stack limit, 32-bit
+  TEB, 32-bit stack base, 32-bit stack limit. `trace::thread_stacks()`,
+  `Trace.thread_stacks`, `ttd-inspect TRACE stacks`.
+- Memory regions (type 17, size = compressed bytes; absent in older traces):
+  the memory map as NtQueryVirtualMemory shows it (the memory manager's
+  regions, not the backend's mappings, so guard pages and protections are the
+  guest's even with DEP off). First the reserved and committed ranges when
+  recording began (at the start position, event number 0), then, whenever a
+  reservation, commit, decommit, release, protection or view changes, the
+  ranges it touched as they became, free memory included. Each entry: position,
+  event number, address, size, allocation base, AllocationProtect, `MEM_*`
+  state and type, `PAGE_*` protection (`PAGE_GUARD` included), Sogen's region
+  kind, and the mapped file of a file view (images are named by the modules
+  section). A zstd frame of varints: the file names, then count and per
+  entry the position and event-number deltas, the address relative to the
+  previous entry's (zigzag), size, distance from the allocation base plus one
+  (0: free), allocation protection, state, type, protection, kind, and name
+  index plus one. `trace::memory_regions_at(position)` replays the entries up
+  to a position into the map at that position; `Trace.memory_regions_at`,
+  `ttd-inspect TRACE regions POSITION`.
+- Checkpoint memory (type 18, size = compressed bytes; absent in older
+  traces): per checkpoint, the offset in its decoded state at which the
+  memory manager's state (`serialize_memory_state`) begins. A zstd frame of
+  varints: the checkpoint count, then the offsets. With it, `memory_at` takes
+  each byte from the latest write or host write since the checkpoint the
+  position replays from, walking back from the position, else from that
+  checkpoint's memory, so its cost follows the writes to the memory, not its
+  reads and executions (all of ntdll page by page on test-sample: 0.12 s, was
+  2.7 min). Bytes a mapping change covered since and nothing wrote after are
+  zero while committed (per the memory regions section) and nothing
+  otherwise: the emulator's own writes into new memory are recorded as host
+  writes. MMIO (host-aliased memory included) is read from the accesses as
+  before. The reader parses only that part of the state (reservations, then
+  committed contents; MMIO contents are not in it). The first read in a
+  checkpoint interval decodes that checkpoint's state; the reader keeps the
+  last few decoded states (`trace::set_checkpoint_cache_size`, default 4;
+  `Trace.checkpoint_cache_size`). `Trace.has_checkpoint_memory`. The memory part's
+  layout is thereby read outside the emulator; `test/ttd_reader_test.py`
+  compares `memory_at` with a replayed emulator's memory, so a change to it
+  fails the test.
 
 Unknown section types are ignored, so sections can be added without a new
-version. Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
+version. The library reads versions 1-4 and 7-8 (`ttd::is_supported_trace_version`;
+5 and 6 were development formats) and refuses others; `ttd::is_trace_file` and
+`ttd::trace_file_version` recognize any version from the first 8 bytes. A file of a
+supported version with sections this build does not know opens without them.
+Since the trace id, the manifest also holds `trace_id`, 32 random hex digits per
+recording (`Trace.id`; older traces get `h` and 32 hex digits of a hash of their header and tables, 33
+characters). Kind is 1 for read, 2 for write, 4 for execute, and 8 for a host
 write. An event chunk is one zstd frame holding `event_count`, eight stream
 sizes, and the streams. Each stream predicts from earlier events of the same
 chunk only, so a chunk decodes on its own given the code table and the bulk
@@ -510,12 +652,33 @@ unfiltered). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take
 Address queries decode their candidate chunks on all cores, and queries for
 execute events only (`Trace.calls`) skip the chunks' data: the calls of a hot
 ntdll function (`RtlAllocateHeap`, 3,144 calls on a page most chunks touch)
-take 0.16 s, all accesses of that page 0.31 s (1.4 s and 1.2 s on one thread). A
-seek to a checkpoint takes 0.03-0.2 s (0.12 s on average over random
-checkpoints; up to 18 deltas, each decompressed with its base state and bulk
-blocks as the reference; all bulk blocks of a chain decode in parallel up
-front), plus up to 0.15 s to replay to a position between checkpoints.
-`Replay.run_to` moves forward without restoring: about 0.03 ms per step.
+take 0.16 s, all accesses of that page 0.31 s (1.4 s and 1.2 s on one thread).
+
+Seeks restore the nearest earlier state and replay from it with full verification
+(about 2.5-3M instructions/s). Without keyframes that state is a checkpoint:
+decoding one takes up to 18 zstd deltas against 64-98 MB states (about 0.1 s),
+loading it about 0.03 s (mappings that stay the same are kept and only changed
+pages written), and the replay up to 0.2 s (500,000 instructions). Keyframes
+(`ttd_keyframes.hpp`) are replayed states kept in memory: guest memory as 4 KiB
+pages shared by content across keyframes, the rest of the state (handles,
+threads, modules) as a zstd delta against an earlier keyframe's. Restoring one
+writes only the pages that differ from what the emulator holds; after a seek the
+emulator's state is known (keyframe plus the pages the replay wrote, checked by
+a memory generation counter that any other change to the emulator advances), so
+the next restore neither compares nor writes the rest. Measured on a full
+`test-sample` trace (30.2M instructions, 61 checkpoints at 500,000) with 60
+random positions each, same machine and load:
+
+| | Mean | Median | p90 |
+|---|---|---|---|
+| Random position, before keyframes | 256 ms | 259 ms | 388 ms |
+| Random position, cold (no keyframes yet) | 215 ms | 224 ms | 390 ms |
+| Random position after `prepare_seeks` (8 emulators, 5.6 s, 1,257 keyframes, 184 MiB) | 36 ms | 30 ms | 62 ms |
+| Checkpoint position after `prepare_seeks` | 25 ms | 23 ms | 44 ms |
+
+After preparation a seek spends about 20 ms restoring (mostly Unicorn
+remapping regions whose layout differs) and the rest replaying up to 25,000
+instructions. `Replay.run_to` moves forward without restoring: about 0.03 ms per step.
 
 Because every written and read value is recorded, a range's value history is
 available offline: `--ttd-history TRACE --ttd-address A --ttd-size N`
@@ -599,7 +762,10 @@ are wall clock, including process start; cdb's start (~0.3 s) is subtracted from
 | Trace after zstd 19 | 4.0 MiB | 5.75 MiB | 17.9 MiB | 33.4 MiB |
 | Bits per instruction, as stored | 214 | 13.1 | 92.7 | 9.5 |
 | Index | 30.4 MiB, built in ~0.2 s | in the trace | 87.5 MiB, ~0.2 s | in the trace (0.06 MiB) |
-| Seek to the middle / end | < 0.05 s | | < 0.05 s | 0.29 / 0.40 s |
+| Seek to the middle / end | < 0.05 s | | 0.031 / 0.068 s | 0.29 / 0.40 s; 0.012 / 0.042 s after `prepare_seeks` |
+| Seek to 40 random positions, mean / median | | | 34–40 / 30–35 ms, with or without the index | 215 / 224 ms; 36 / 30 ms after `prepare_seeks` |
+| Registers at 200 random positions (`Trace.cpu_at`, cold, random order), mean / median | | | | 7.0–8.0 / 6.0–6.5 ms |
+| Memory at a position (`Trace.memory_at`, stack and recently used addresses), mean / median | | | 31–39 ms (value at a random position) | 5.7 / 0.08 ms |
 | Writes / reads in the main image | | | 38 / 3,515, ~0.07 s each | 280 / 19,648, 0.06 / 0.48 s |
 
 Caveats: Sogen's runs execute about 4× the instructions of the native ones (its emulated loader and environment
@@ -613,8 +779,40 @@ Summary: Microsoft TTD records about 7× slower than native (≈10M instructions
 instructions/s (1.5M before the recorder work in `3ce3b19d`..`da4cc31f`), roughly 3× slower than its own untraced
 emulation (3.9 s) and over 100× slower than native. Per
 instruction, Sogen's traces are 10–16× smaller than Microsoft's files as written and 2.3–2.7× smaller than
-Microsoft's after zstd, before counting Microsoft's index. Microsoft seeks faster (its keyframes are much denser than
-Sogen's 500,000-instruction checkpoints); address queries are comparable.
+Microsoft's after zstd, before counting Microsoft's index. Microsoft's seeks are fast on a fresh trace and do not use
+the index (timed with `!tt` in cdb from a WinDbg script, `.run` alone or with its `.idx`: the same 34–40 ms mean); its
+keyframes are in the trace and much denser than Sogen's 500,000-instruction checkpoints. Sogen's seeks match them only
+after `Trace.prepare_seeks` (5.6 s on eight emulators for `test-sample`, a step Microsoft does not need) and are
+about 6× slower before that. Looking at a position the way Microsoft's replay does, registers and memory without a
+replayable process (`Trace.cpu_at`, `Trace.memory_at`), takes about 6–8 ms on a fresh trace: Microsoft's model of
+keyframes holding only CPU registers, with the replay fed recorded memory, applied to Sogen's traces, which already
+hold every value read. Address queries are comparable.
+
+### Memory queries and watchpoints
+
+Measured on 2026-10-08 with `tools/msttd_query_times.js` (cdb, Microsoft's `.run` with and without its `.idx`) and
+`tools/ttd_query_times.py` (Sogen, cold and after `prepare_seeks` with eight emulators) on the `test-sample` traces
+above. Targets come from each trace's main image: its entry point, its first IAT slot, the start and the most accessed
+qword of `.data`, and `ntdll!RtlAllocateHeap` (the same host DLL in both). Microsoft's watchpoints are `ba` plus
+`g`/`g-` from the trace's start/end, continuing past the exceptions test-sample raises on purpose (each stops the
+replay); Sogen's are `next_access`/`previous_access`, which answer offline, plus a seek to the hit. Microsoft's trace
+has 6.9M instructions, Sogen's 30.2M, so Sogen's queries cover over 4× more events. Single runs, milliseconds.
+
+| | Microsoft, no index | Microsoft, index | Sogen, cold | Sogen, prepared |
+|---|---|---|---|---|
+| All accesses to `.data` (1,584 bytes) | 89 | 89 | 72 | 77 |
+| All accesses to a qword (2-170 hits) | 81-99 | 71-84 | 22-99 | 17-117 |
+| All executions of `RtlAllocateHeap` (6,520 / 16,915) | 100 | 97 | 383 | 303 |
+| Execute watchpoint, forward (entry / `RtlAllocateHeap`) | 159 / 4 | 160 / 2 | 7 + 198 / 18 + 51 seek | 6 + 17 / 18 + 30 seek |
+| Execute watchpoint, backward | 568 / 614 | 406 / 621 | 164 + 12 / 2 + 390 seek | 124 + 12 / 2 + 85 seek |
+| Read/write watchpoints, forward | 7-426 | 6-439 | 6-58 + 12-224 seek | 0-49 + 12-33 seek |
+| Read/write watchpoints, backward | 71-615 | 70-598 | 5-193 + 11-312 seek | 2-193 + 11-86 seek |
+| Value of a qword at a random position (seek + read) | 31-39 | 32-38 | 139-208 | 26-32 |
+| The same offline, from `Trace.history` (bytes accessed so far) | | | 22-42 | 6-17 |
+
+The index changes little at this size: Microsoft's unindexed queries scan the 76 MiB trace in under 0.1 s. Where Sogen
+answers a query offline it is as fast or faster; where the answer needs the emulator at a position (a value at a
+position, landing on a watchpoint hit), Sogen pays a seek, which is 4-6× Microsoft's until the trace is prepared.
 
 ## Binary Ninja TTD adapter comparison
 

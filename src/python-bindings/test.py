@@ -4,6 +4,7 @@ import importlib
 import os
 import sys
 import tempfile
+import weakref
 from pathlib import Path
 
 sys.path.insert(0, os.getcwd())
@@ -254,6 +255,25 @@ assert dns_app.process.exit_status == 0, (
 )
 dns_app = None
 gc.collect()
+
+
+class CycleSentinel:
+    pass
+
+
+def make_emulator_cycle():
+    box = {"sentinel": CycleSentinel()}
+    cyclic = win.create_empty(emulation_root=emulator_root)
+    box["emu"] = cyclic
+    cyclic.callbacks.on_stdout = lambda text: box
+    cyclic.hooks.memory_execution(lambda address: box)
+    cyclic.hooks.apis["Sleep"] = win.api_call(cc=mod.CallingConvention.stdcall, params=[ctypes.c_uint32])(lambda call, params: box)
+    return weakref.ref(box["sentinel"])
+
+
+cycle_sentinel = make_emulator_cycle()
+gc.collect()
+assert cycle_sentinel() is None, "an emulator whose callbacks and hooks refer back to it was not garbage-collected"
 
 emu = None
 mod = None

@@ -53,6 +53,9 @@ namespace sogen
         utils::callback_list<void(std::string_view message)> on_debug_string{};
         utils::callback_list<void(const mapped_module& mod, const mapped_section& section, uint64_t address)> on_section_first_execution{};
         opt_func<void(uint64_t address)> on_instruction{};
+        // Each counted instruction with instruction precision, as it is about to run: its address and length (0 when the
+        // backend cannot tell).
+        utils::callback_list<void(uint64_t address, size_t size)> on_instruction_executed{};
         opt_func<void(io_device& device, std::u16string_view device_name, ULONG code)> on_ioctrl{};
         opt_func<void(uint32_t fail_code)> on_fast_fail{};
     };
@@ -63,8 +66,9 @@ namespace sogen
         std::u16string argument0{};
         windows_path working_directory{};
         std::vector<std::u16string> arguments{};
+        std::optional<std::u16string> command_line{};
         utils::unordered_insensitive_u16string_map<std::u16string> environment{};
-        uint32_t process_id{4};
+        uint32_t process_id{default_guest_process_id};
         uint32_t thread_id{8};
 
         void serialize(utils::buffer_serializer& buffer) const
@@ -73,6 +77,7 @@ namespace sogen
             buffer.write(this->argument0);
             buffer.write(this->working_directory);
             buffer.write_vector(this->arguments);
+            buffer.write_optional(this->command_line);
             buffer.write_map(this->environment);
             buffer.write(this->process_id);
             buffer.write(this->thread_id);
@@ -84,6 +89,7 @@ namespace sogen
             buffer.read(this->argument0);
             buffer.read(this->working_directory);
             buffer.read_vector(this->arguments);
+            buffer.read_optional(this->command_line);
             buffer.read_map(this->environment);
             buffer.read(this->process_id);
             buffer.read(this->thread_id);
@@ -163,6 +169,7 @@ namespace sogen
         application_settings application_settings_{};
 
         std::unique_ptr<x86_64_emulator> emu_{};
+        bool use_native_timestamp_counter_{};
         std::unique_ptr<utils::clock> clock_{};
         std::unique_ptr<network::dns_lookup> dns_lookup_{};
         std::unique_ptr<network::socket_factory> socket_factory_{};
@@ -432,7 +439,13 @@ namespace sogen
         void stop();
 
         void serialize(utils::buffer_serializer& buffer) const;
+        // Also tells where in the buffer the memory manager's state (serialize_memory_state) begins.
+        void serialize(utils::buffer_serializer& buffer, size_t& memory_offset) const;
         void deserialize(utils::buffer_deserializer& buffer);
+
+        // The same state without the contents of committed guest memory, which a restore takes from `pages`.
+        void serialize_without_memory_contents(utils::buffer_serializer& buffer) const;
+        void deserialize_without_memory_contents(utils::buffer_deserializer& buffer, const restored_page_source& pages);
 
         void save_snapshot();
         void restore_snapshot();
@@ -510,11 +523,19 @@ namespace sogen
         std::string last_stop_detail_{};
 
         std::map<uint64_t, std::vector<emulator_hook*>> section_first_execution_hooks_{};
+        // A section that already executed, so instructions in it skip first-execution tracking until modules change.
+        uint64_t executed_section_start_{};
+        uint64_t executed_section_size_{};
+
+        void forget_executed_section()
+        {
+            this->executed_section_size_ = 0;
+        }
 
         void setup_hooks();
         void setup_process();
         void vcpu_worker(vcpu_context& vcpu);
-        void on_instruction_execution(vcpu_context& vcpu, uint64_t address);
+        void on_instruction_execution(vcpu_context& vcpu, uint64_t address, size_t size);
         void on_basic_block_execution(vcpu_context& vcpu, const basic_block& block);
 
         bool uses_section_first_execution_hooks() const;
@@ -524,6 +545,8 @@ namespace sogen
         void track_section_first_execution(uint64_t address);
 
         void register_factories(utils::buffer_deserializer& buffer);
+        void serialize_state(utils::buffer_serializer& buffer, bool memory_contents, size_t* memory_offset = nullptr) const;
+        void deserialize_state(utils::buffer_deserializer& buffer, const std::function<void()>& restore_memory);
     };
 
 } // namespace sogen

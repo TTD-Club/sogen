@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string_view>
 
@@ -245,7 +247,17 @@ namespace sogen::ttd
             return compressed;
         }
 
-        // Guest memory as far as the chunk's own accesses have shown it, in pages with one validity byte per byte.
+        struct bulk_reference
+        {
+            uint64_t offset{};
+            uint64_t block{};
+        };
+
+        // Resolves `size` bytes of a bulk block.
+        using bulk_bytes = std::function<std::span<const std::byte>(const bulk_reference& reference, uint64_t size)>;
+
+        // Guest memory as far as the chunk's own accesses have shown it, in pages with one validity bit per byte. Large
+        // accesses can be stored as deferred ranges, whose bytes come from their bulk block only if a load needs them.
         class known_memory
         {
           public:
@@ -257,22 +269,39 @@ namespace sogen::ttd
                     const auto offset = static_cast<size_t>(address % known_page_size);
                     const auto count = std::min(data.size(), known_page_size - offset);
                     memcpy(page.bytes.data() + offset, data.data(), count);
-                    memset(page.valid.data() + offset, 1, count);
+                    page.mark_valid(offset, count);
                     address += count;
                     data = data.subspan(count);
                 }
             }
 
-            bool load(uint64_t address, std::span<std::byte> output)
+            // Like store() of the bulk bytes `reference` names, which load() resolves through `resolve` when it needs
+            // them: decoding a chunk then only decompresses bulk blocks whose bytes a later known-value read uses.
+            void store_deferred(const uint64_t address, const uint64_t size, const bulk_reference& reference)
+            {
+                const auto last = address + size - 1;
+                for (auto number = address / known_page_size; number <= last / known_page_size; ++number)
+                {
+                    if (auto* page = this->find_page(number * known_page_size))
+                    {
+                        const auto first_byte = std::max(address, number * known_page_size);
+                        const auto end_byte = std::min(address + size, (number + 1) * known_page_size);
+                        page->mark_invalid(static_cast<size_t>(first_byte % known_page_size), static_cast<size_t>(end_byte - first_byte));
+                    }
+                }
+                this->deferred_.push_back({.address = address, .size = size, .reference = reference});
+            }
+
+            bool load(uint64_t address, std::span<std::byte> output, const bulk_bytes* resolve = nullptr)
             {
                 while (!output.empty())
                 {
                     const auto* page = this->find_page(address);
                     const auto offset = static_cast<size_t>(address % known_page_size);
                     const auto count = std::min(output.size(), known_page_size - offset);
-                    if (!page || std::memchr(page->valid.data() + offset, 0, count))
+                    if (!page || !page->all_valid(offset, count))
                     {
-                        return false;
+                        return this->load_slow(address, output, resolve);
                     }
                     memcpy(output.data(), page->bytes.data() + offset, count);
                     address += count;
@@ -282,15 +311,91 @@ namespace sogen::ttd
             }
 
           private:
+            struct deferred_range
+            {
+                uint64_t address{};
+                uint64_t size{};
+                bulk_reference reference{};
+            };
+
+            // In storing order: a later range covers earlier ones.
+            std::vector<deferred_range> deferred_{};
+
+            // Byte by byte: from the pages where valid, else from the latest deferred range holding it.
+            bool load_slow(const uint64_t address, const std::span<std::byte> output, const bulk_bytes* resolve)
+            {
+                for (size_t i = 0; i < output.size(); ++i)
+                {
+                    const auto byte = address + i;
+                    const auto* page = this->find_page(byte);
+                    const auto offset = static_cast<size_t>(byte % known_page_size);
+                    if (page && page->all_valid(offset, 1))
+                    {
+                        output[i] = page->bytes[offset];
+                        continue;
+                    }
+                    const auto range = std::ranges::find_if(std::views::reverse(this->deferred_),
+                                                            [&](const deferred_range& r) { return byte - r.address < r.size; });
+                    if (!resolve || range == std::views::reverse(this->deferred_).end())
+                    {
+                        return false;
+                    }
+                    const auto bytes = (*resolve)(range->reference, range->size);
+                    output[i] = bytes[static_cast<size_t>(byte - range->address)];
+                }
+                return true;
+            }
+
             static constexpr size_t known_page_size = 4096;
 
             struct page
             {
-                std::array<std::byte, known_page_size> bytes{};
-                std::array<uint8_t, known_page_size> valid{};
+                // Only bytes marked valid are ever read, so the bytes need no initialization.
+                std::array<std::byte, known_page_size> bytes;
+                std::array<uint64_t, known_page_size / 64> valid{};
+
+                void mark_valid(size_t offset, const size_t count)
+                {
+                    const auto end = offset + count;
+                    while (offset < end)
+                    {
+                        const auto bits = std::min<size_t>(64 - offset % 64, end - offset);
+                        this->valid[offset / 64] |= (bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1)) << (offset % 64);
+                        offset += bits;
+                    }
+                }
+
+                void mark_invalid(size_t offset, const size_t count)
+                {
+                    const auto end = offset + count;
+                    while (offset < end)
+                    {
+                        const auto bits = std::min<size_t>(64 - offset % 64, end - offset);
+                        this->valid[offset / 64] &= ~((bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1)) << (offset % 64));
+                        offset += bits;
+                    }
+                }
+
+                bool all_valid(size_t offset, const size_t count) const
+                {
+                    const auto end = offset + count;
+                    while (offset < end)
+                    {
+                        const auto bits = std::min<size_t>(64 - offset % 64, end - offset);
+                        const auto mask = (bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1)) << (offset % 64);
+                        if ((this->valid[offset / 64] & mask) != mask)
+                        {
+                            return false;
+                        }
+                        offset += bits;
+                    }
+                    return true;
+                }
             };
 
-            std::unordered_map<uint64_t, std::unique_ptr<page>> pages_{};
+            std::vector<std::unique_ptr<page>> pages_{};
+            // Index in pages_ by page number.
+            flat_map page_index_{};
             uint64_t last_number_{UINT64_MAX};
             page* last_page_{};
 
@@ -299,13 +404,13 @@ namespace sogen::ttd
                 const auto number = address / known_page_size;
                 if (number != this->last_number_)
                 {
-                    const auto entry = this->pages_.find(number);
-                    if (entry == this->pages_.end())
+                    const auto* index = this->page_index_.find(number);
+                    if (!index)
                     {
                         return nullptr;
                     }
                     this->last_number_ = number;
-                    this->last_page_ = entry->second.get();
+                    this->last_page_ = this->pages_[static_cast<size_t>(*index)].get();
                 }
                 return this->last_page_;
             }
@@ -317,18 +422,12 @@ namespace sogen::ttd
                     return *existing;
                 }
                 const auto number = address / known_page_size;
-                auto& slot = this->pages_[number];
-                slot = std::make_unique<page>();
+                this->page_index_.set(number, this->pages_.size());
+                this->pages_.push_back(std::make_unique_for_overwrite<page>());
                 this->last_number_ = number;
-                this->last_page_ = slot.get();
-                return *slot;
+                this->last_page_ = this->pages_.back().get();
+                return *this->last_page_;
             }
-        };
-
-        struct bulk_reference
-        {
-            uint64_t offset{};
-            uint64_t block{};
         };
 
         bulk_reference bulk_reference_of(const access_event& event)
@@ -346,9 +445,9 @@ namespace sogen::ttd
             uint64_t ip{};
             uint64_t next_ip{};
             uint64_t next_code{};
-            std::unordered_map<uint64_t, uint64_t> code_at{};
+            flat_map code_at{};
             std::array<uint64_t, 16> last_address_of_kind{};
-            std::unordered_map<uint64_t, uint64_t> last_address_at{};
+            flat_map last_address_at{};
             known_memory memory{};
             uint64_t bulk_block_index{};
             uint64_t bulk_next_offset{};
@@ -371,15 +470,23 @@ namespace sogen::ttd
 
             uint64_t address_base(const access_event& event) const
             {
-                const auto entry = this->last_address_at.find(site(event));
-                return entry != this->last_address_at.end() ? entry->second : this->last_address_of_kind[static_cast<size_t>(event.kind)];
+                const auto* entry = this->last_address_at.find(site(event));
+                return entry ? *entry : this->last_address_of_kind[static_cast<size_t>(event.kind)];
             }
 
             void remember_access(const access_event& event, const std::span<const std::byte> data)
             {
-                this->last_address_at[site(event)] = event.address;
+                this->last_address_at.set(site(event), event.address);
                 this->last_address_of_kind[static_cast<size_t>(event.kind)] = event.address;
                 this->memory.store(event.address, data);
+            }
+
+            // remember_access for a large access, whose bytes stay in their bulk block until a load needs them.
+            void remember_deferred_access(const access_event& event, const bulk_reference& reference)
+            {
+                this->last_address_at.set(site(event), event.address);
+                this->last_address_of_kind[static_cast<size_t>(event.kind)] = event.address;
+                this->memory.store_deferred(event.address, event.size, reference);
             }
         };
 
@@ -431,10 +538,10 @@ namespace sogen::ttd
 
     uint64_t code_table::id_of(const access_event& execute)
     {
-        const auto latest = this->latest_version_.find(execute.address);
-        if (latest != this->latest_version_.end())
+        const auto* latest = this->latest_version_.find(execute.address);
+        if (latest)
         {
-            for (auto id = latest->second; id != no_previous_version; id = this->previous_version_[static_cast<size_t>(id)])
+            for (auto id = *latest; id != no_previous_version; id = this->previous_version_[static_cast<size_t>(id)])
             {
                 const auto& entry = this->entries_[static_cast<size_t>(id)];
                 if (entry.size == execute.size && entry.bytes == execute.payload)
@@ -445,8 +552,8 @@ namespace sogen::ttd
         }
         const auto id = static_cast<uint64_t>(this->entries_.size());
         this->entries_.push_back({.address = execute.address, .size = execute.size, .bytes = execute.payload});
-        this->previous_version_.push_back(latest != this->latest_version_.end() ? latest->second : no_previous_version);
-        this->latest_version_[execute.address] = id;
+        this->previous_version_.push_back(latest ? *latest : no_previous_version);
+        this->latest_version_.set(execute.address, id);
         return id;
     }
 
@@ -488,12 +595,12 @@ namespace sogen::ttd
                     throw std::runtime_error("Missing TTD code id");
                 }
                 const auto id = code_ids[next_code_id++];
-                const auto known = state.code_at.find(event.address);
-                if (known == state.code_at.end() || known->second != id)
+                const auto* known = state.code_at.find(event.address);
+                if (!known || *known != id)
                 {
                     tag |= tag_extra;
                     put_varint(streams[code_stream], zigzag(id - state.next_code));
-                    state.code_at[event.address] = id;
+                    state.code_at.set(event.address, id);
                     state.next_code = id + 1;
                 }
                 state.next_ip = event.ip + event.size;
@@ -554,6 +661,9 @@ namespace sogen::ttd
                                const bulk_resolver& bulk, const bool with_data)
     {
         bulk_cursor cursor(bulk);
+        const bulk_bytes resolve_bulk = [&cursor](const bulk_reference& reference, const uint64_t size) {
+            return cursor.data(reference, size);
+        };
         const auto raw = utils::compression::zstd::decompress(compressed);
         chunk_header header{};
         if (raw.size() < sizeof(header))
@@ -601,17 +711,17 @@ namespace sogen::ttd
                 if (tag & tag_extra)
                 {
                     id = state.next_code + unzigzag(streams[code_stream].varint());
-                    state.code_at[event.address] = id;
+                    state.code_at.set(event.address, id);
                     state.next_code = id + 1;
                 }
                 else
                 {
-                    const auto known = state.code_at.find(event.address);
-                    if (known == state.code_at.end())
+                    const auto* known = state.code_at.find(event.address);
+                    if (!known)
                     {
                         throw std::runtime_error("TTD execute event has no code entry");
                     }
-                    id = known->second;
+                    id = *known;
                 }
                 if (id >= code.size() || code[static_cast<size_t>(id)].address != event.address)
                 {
@@ -637,18 +747,24 @@ namespace sogen::ttd
                     bulk_reference reference{};
                     reference.block = state.bulk_block_index + unzigzag(streams[bulk_stream].varint());
                     reference.offset = state.bulk_offset_base(reference.block) + unzigzag(streams[bulk_stream].varint());
-                    if (with_data)
-                    {
-                        data = cursor.data(reference, event.size);
-                    }
                     state.remember_bulk(reference, event.size);
                     memcpy(event.payload.data(), &reference.offset, sizeof(reference.offset));
                     memcpy(event.payload.data() + sizeof(reference.offset), &reference.block, sizeof(reference.block));
+                    if (with_data)
+                    {
+                        state.remember_deferred_access(event, reference);
+                    }
+                    else
+                    {
+                        state.remember_access(event, {});
+                    }
+                    state.ip = event.ip;
+                    continue;
                 }
-                else if (tag & tag_extra)
+                if (tag & tag_extra)
                 {
                     if (event.kind != access_kind::read ||
-                        (with_data && !state.memory.load(event.address, output.first(static_cast<size_t>(event.size)))))
+                        (with_data && !state.memory.load(event.address, output.first(static_cast<size_t>(event.size)), &resolve_bulk)))
                     {
                         throw std::runtime_error("Invalid TTD known-value read");
                     }
@@ -1010,6 +1126,80 @@ namespace sogen::ttd
         }
     }
 
+    std::vector<std::byte> encode_export_forwarders(const std::span<const module_entry> modules)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, modules.size());
+        for (const auto& mod : modules)
+        {
+            std::vector<const module_export*> forwarded{};
+            if (mod.exports)
+            {
+                for (const auto& symbol : *mod.exports)
+                {
+                    if (!symbol.forwarder.empty())
+                    {
+                        forwarded.push_back(&symbol);
+                    }
+                }
+            }
+            std::ranges::sort(forwarded, {}, &module_export::ordinal);
+            put_varint(raw, forwarded.size());
+            uint64_t ordinal = 0;
+            for (const auto* symbol : forwarded)
+            {
+                put_varint(raw, symbol->ordinal - ordinal);
+                put_text(raw, symbol->forwarder);
+                ordinal = symbol->ordinal;
+            }
+        }
+        return compress_table(raw, "export forwarders");
+    }
+
+    void decode_export_forwarders(const std::span<const std::byte> compressed, const std::span<module_entry> modules)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        if (reader.varint() != modules.size())
+        {
+            throw std::runtime_error("TTD export forwarders do not match the modules");
+        }
+        for (auto& mod : modules)
+        {
+            const auto count = reader.varint();
+            if (count == 0)
+            {
+                continue;
+            }
+            if (!mod.exports || count > mod.exports->size())
+            {
+                throw std::runtime_error("Invalid TTD export forwarders");
+            }
+            auto exports = std::make_shared<std::vector<module_export>>(*mod.exports);
+            uint64_t ordinal = 0;
+            for (uint64_t i = 0; i < count; ++i)
+            {
+                const auto delta = reader.varint();
+                if (delta > UINT64_MAX - ordinal)
+                {
+                    throw std::runtime_error("Invalid TTD export forwarders");
+                }
+                ordinal += delta;
+                const auto symbol = std::ranges::find(*exports, ordinal, &module_export::ordinal);
+                if (symbol == exports->end())
+                {
+                    throw std::runtime_error("TTD export forwarder for an unknown ordinal");
+                }
+                symbol->forwarder = read_text(reader);
+            }
+            mod.exports = std::move(exports);
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD export forwarders");
+        }
+    }
+
     std::vector<std::byte> encode_threads(const thread_table& threads)
     {
         std::vector<std::byte> raw{};
@@ -1079,6 +1269,339 @@ namespace sogen::ttd
             throw std::runtime_error("Invalid TTD threads");
         }
         return threads;
+    }
+
+    std::vector<std::byte> encode_register_snapshots(const std::span<const register_snapshot_entry> entries)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, entries.size());
+        register_snapshot_entry previous{};
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            const auto& entry = entries[i];
+            if (entry.step < previous.step || entry.event_number < previous.event_number || (entry.base != UINT64_MAX && entry.base >= i))
+            {
+                throw std::runtime_error("Invalid TTD register snapshot");
+            }
+            put_varint(raw, entry.step - previous.step);
+            put_varint(raw, entry.event_number - previous.event_number);
+            put_varint(raw, zigzag(entry.offset - (previous.offset + previous.size)));
+            put_varint(raw, entry.size);
+            put_varint(raw, entry.base == UINT64_MAX ? 0 : i - entry.base);
+            previous = entry;
+        }
+        return compress_table(raw, "register snapshots");
+    }
+
+    std::vector<register_snapshot_entry> decode_register_snapshots(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        // Every entry takes at least five bytes.
+        if (count > raw.size() / 5)
+        {
+            throw std::runtime_error("Invalid TTD register snapshots");
+        }
+        std::vector<register_snapshot_entry> entries(static_cast<size_t>(count));
+        register_snapshot_entry previous{};
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            const auto step_delta = reader.varint();
+            const auto event_delta = reader.varint();
+            const auto offset_delta = unzigzag(reader.varint());
+            const auto size = reader.varint();
+            const auto base_distance = reader.varint();
+            if (step_delta > UINT64_MAX - previous.step || event_delta > UINT64_MAX - previous.event_number || base_distance > i)
+            {
+                throw std::runtime_error("Invalid TTD register snapshot");
+            }
+            auto& entry = entries[i];
+            entry = {.step = previous.step + step_delta,
+                     .event_number = previous.event_number + event_delta,
+                     .offset = previous.offset + previous.size + offset_delta,
+                     .size = size,
+                     .base = base_distance ? i - base_distance : UINT64_MAX};
+            previous = entry;
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD register snapshots");
+        }
+        return entries;
+    }
+
+    std::vector<std::byte> encode_mapping_changes(const std::span<const mapping_change> changes)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, changes.size());
+        mapping_change previous{};
+        for (const auto& change : changes)
+        {
+            if (change.step < previous.step || change.event_number < previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD mapping change");
+            }
+            put_varint(raw, change.step - previous.step);
+            put_varint(raw, change.event_number - previous.event_number);
+            put_varint(raw, zigzag(change.address - previous.address));
+            put_varint(raw, change.size);
+            previous = change;
+        }
+        return compress_table(raw, "mapping changes");
+    }
+
+    std::vector<mapping_change> decode_mapping_changes(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        // Every change takes at least four bytes.
+        if (count > raw.size() / 4)
+        {
+            throw std::runtime_error("Invalid TTD mapping changes");
+        }
+        std::vector<mapping_change> changes(static_cast<size_t>(count));
+        mapping_change previous{};
+        for (auto& change : changes)
+        {
+            const auto step_delta = reader.varint();
+            const auto event_delta = reader.varint();
+            if (step_delta > UINT64_MAX - previous.step || event_delta > UINT64_MAX - previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD mapping change");
+            }
+            change.step = previous.step + step_delta;
+            change.event_number = previous.event_number + event_delta;
+            change.address = previous.address + unzigzag(reader.varint());
+            change.size = reader.varint();
+            previous = change;
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD mapping changes");
+        }
+        return changes;
+    }
+
+    std::vector<std::byte> encode_module_machines(const std::span<const module_entry> modules)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, modules.size());
+        for (const auto& mod : modules)
+        {
+            put_varint(raw, mod.machine);
+        }
+        return compress_table(raw, "module machines");
+    }
+
+    void decode_module_machines(const std::span<const std::byte> compressed, const std::span<module_entry> modules)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        if (reader.varint() != modules.size())
+        {
+            throw std::runtime_error("Invalid TTD module machines");
+        }
+        for (auto& mod : modules)
+        {
+            const auto machine = reader.varint();
+            if (machine > UINT16_MAX)
+            {
+                throw std::runtime_error("Invalid TTD module machines");
+            }
+            mod.machine = static_cast<uint16_t>(machine);
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD module machines");
+        }
+    }
+
+    std::vector<std::byte> encode_thread_stacks(const std::span<const thread_stack> stacks)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, stacks.size());
+        thread_stack previous{};
+        for (const auto& stack : stacks)
+        {
+            if (stack.step < previous.step || stack.event_number < previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD thread stack");
+            }
+            put_varint(raw, stack.thread_id);
+            put_varint(raw, stack.step - previous.step);
+            put_varint(raw, stack.event_number - previous.event_number);
+            for (const auto value : {stack.teb, stack.stack_base, stack.stack_limit, stack.teb32, stack.stack32_base, stack.stack32_limit})
+            {
+                put_varint(raw, value);
+            }
+            previous = stack;
+        }
+        return compress_table(raw, "thread stacks");
+    }
+
+    std::vector<thread_stack> decode_thread_stacks(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        // Every entry takes at least nine bytes.
+        if (count > raw.size() / 9)
+        {
+            throw std::runtime_error("Invalid TTD thread stacks");
+        }
+        std::vector<thread_stack> stacks(static_cast<size_t>(count));
+        thread_stack previous{};
+        for (auto& stack : stacks)
+        {
+            const auto id = reader.varint();
+            const auto step_delta = reader.varint();
+            const auto event_delta = reader.varint();
+            if (id > UINT32_MAX || step_delta > UINT64_MAX - previous.step || event_delta > UINT64_MAX - previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD thread stack");
+            }
+            stack.thread_id = static_cast<uint32_t>(id);
+            stack.step = previous.step + step_delta;
+            stack.event_number = previous.event_number + event_delta;
+            for (auto* value : {&stack.teb, &stack.stack_base, &stack.stack_limit, &stack.teb32, &stack.stack32_base, &stack.stack32_limit})
+            {
+                *value = reader.varint();
+            }
+            previous = stack;
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD thread stacks");
+        }
+        return stacks;
+    }
+
+    std::vector<std::byte> encode_memory_regions(const memory_region_table& table)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, table.names.size());
+        for (const auto& name : table.names)
+        {
+            put_text(raw, name);
+        }
+        put_varint(raw, table.regions.size());
+        memory_region previous{};
+        for (const auto& region : table.regions)
+        {
+            if (region.step < previous.step || region.event_number < previous.event_number ||
+                (region.name != UINT32_MAX && region.name >= table.names.size()))
+            {
+                throw std::runtime_error("Invalid TTD memory region");
+            }
+            put_varint(raw, region.step - previous.step);
+            put_varint(raw, region.event_number - previous.event_number);
+            put_varint(raw, zigzag(region.address - previous.address));
+            put_varint(raw, region.size);
+            // The base relative to the address: 0 for free memory, small for the parts of one reservation.
+            put_varint(raw, region.allocation_base ? region.address - region.allocation_base + 1 : 0);
+            for (const auto value : {region.allocation_protection, region.state, region.type, region.protection, region.kind})
+            {
+                put_varint(raw, value);
+            }
+            put_varint(raw, region.name == UINT32_MAX ? 0 : uint64_t{region.name} + 1);
+            previous = region;
+        }
+        return compress_table(raw, "memory regions");
+    }
+
+    memory_region_table decode_memory_regions(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        memory_region_table table{};
+        const auto name_count = reader.varint();
+        if (name_count > raw.size())
+        {
+            throw std::runtime_error("Invalid TTD memory regions");
+        }
+        table.names.resize(static_cast<size_t>(name_count));
+        for (auto& name : table.names)
+        {
+            name = read_text(reader);
+        }
+        const auto count = reader.varint();
+        // Every region takes at least eleven bytes.
+        if (count > raw.size() / 11)
+        {
+            throw std::runtime_error("Invalid TTD memory regions");
+        }
+        table.regions.resize(static_cast<size_t>(count));
+        memory_region previous{};
+        for (auto& region : table.regions)
+        {
+            const auto step_delta = reader.varint();
+            const auto event_delta = reader.varint();
+            if (step_delta > UINT64_MAX - previous.step || event_delta > UINT64_MAX - previous.event_number)
+            {
+                throw std::runtime_error("Invalid TTD memory region");
+            }
+            region.step = previous.step + step_delta;
+            region.event_number = previous.event_number + event_delta;
+            region.address = previous.address + unzigzag(reader.varint());
+            region.size = reader.varint();
+            const auto base_distance = reader.varint();
+            region.allocation_base = base_distance ? region.address - (base_distance - 1) : 0;
+            for (auto* value : {&region.allocation_protection, &region.state, &region.type, &region.protection, &region.kind})
+            {
+                const auto read = reader.varint();
+                if (read > UINT32_MAX)
+                {
+                    throw std::runtime_error("Invalid TTD memory region");
+                }
+                *value = static_cast<uint32_t>(read);
+            }
+            const auto name = reader.varint();
+            if (name > table.names.size())
+            {
+                throw std::runtime_error("Invalid TTD memory region");
+            }
+            region.name = name ? static_cast<uint32_t>(name - 1) : UINT32_MAX;
+            previous = region;
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD memory regions");
+        }
+        return table;
+    }
+
+    std::vector<std::byte> encode_checkpoint_memory_offsets(const std::span<const uint64_t> offsets)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, offsets.size());
+        for (const auto offset : offsets)
+        {
+            put_varint(raw, offset);
+        }
+        return compress_table(raw, "checkpoint memory offsets");
+    }
+
+    std::vector<uint64_t> decode_checkpoint_memory_offsets(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        if (count > raw.size())
+        {
+            throw std::runtime_error("Invalid TTD checkpoint memory offsets");
+        }
+        std::vector<uint64_t> offsets(static_cast<size_t>(count));
+        for (auto& offset : offsets)
+        {
+            offset = reader.varint();
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD checkpoint memory offsets");
+        }
+        return offsets;
     }
 
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)

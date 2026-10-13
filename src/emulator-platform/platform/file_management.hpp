@@ -8,7 +8,13 @@
 #define DEVICE_TYPE              DWORD
 
 #define FILE_DEVICE_DISK         0x00000007
+#define FILE_DEVICE_NAMED_PIPE   0x00000011
+#define FILE_DEVICE_NULL         0x00000015
 #define FILE_DEVICE_CONSOLE      0x00000050
+
+#define FILE_DEVICE_SECURE_OPEN  0x00000100
+
+#define OBJ_INHERIT              0x00000002
 
 #define FILE_SUPERSEDE           0x00000000
 #define FILE_OPEN                0x00000001
@@ -49,6 +55,11 @@
 #define FILE_READ_ATTRIBUTES      0x0080 /* all */
 #define FILE_WRITE_ATTRIBUTES     0x0100 /* all */
 #define FILE_ALL_ACCESS           (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x1ff)
+#define MAXIMUM_ALLOWED           0x02000000
+
+#define FILE_SHARE_READ           0x00000001
+#define FILE_SHARE_WRITE          0x00000002
+#define FILE_SHARE_DELETE         0x00000004
 
 #endif
 

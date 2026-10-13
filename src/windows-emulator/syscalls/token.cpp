@@ -15,9 +15,101 @@ namespace sogen
             constexpr uint32_t token_id = 0x1001;
             constexpr uint32_t token_modified_id = 0x1002;
 
-            constexpr std::array<uint8_t, 12> interactive_sid = {
-                0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x04, 0x00, 0x00, 0x00,
+            // SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED.
+            constexpr uint32_t group_enabled = 0x7;
+            constexpr uint32_t group_logon_id = 0xC0000000;
+            // SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED.
+            constexpr uint32_t group_integrity = 0x60;
+
+            // The binary SID S-1-<authority>-<sub authorities>.
+            std::vector<uint8_t> make_sid(const uint8_t authority, const std::initializer_list<uint32_t> sub_authorities)
+            {
+                std::vector<uint8_t> sid{1, static_cast<uint8_t>(sub_authorities.size()), 0, 0, 0, 0, 0, authority};
+                for (const auto sub_authority : sub_authorities)
+                {
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(&sub_authority);
+                    sid.insert(sid.end(), bytes, bytes + sizeof(sub_authority));
+                }
+                return sid;
+            }
+
+            struct token_group
+            {
+                std::vector<uint8_t> sid{};
+                uint32_t attributes{};
             };
+
+            // The groups of a medium-integrity local user's token, in Windows' order: the account domain's None group
+            // (for an S-1-5-21 user), Everyone, BUILTIN\Users, INTERACTIVE, CONSOLE LOGON, Authenticated Users, This
+            // Organization, Local account, the logon session, LOCAL, NTLM Authentication, and the integrity label.
+            std::vector<token_group> token_groups(const process_context& process)
+            {
+                std::vector<token_group> groups{};
+                const auto& user = process.sid;
+                constexpr uint32_t security_nt_non_unique = 21;
+                if (user.size() >= 12 && user[1] >= 2 && user[7] == 5 && user[8] == security_nt_non_unique && user[9] == 0 &&
+                    user[10] == 0 && user[11] == 0)
+                {
+                    // The user's SID with its RID replaced by DOMAIN_GROUP_RID_USERS (513).
+                    auto none_group = user;
+                    constexpr uint32_t domain_group_rid_users = 513;
+                    memcpy(none_group.data() + none_group.size() - sizeof(uint32_t), &domain_group_rid_users, sizeof(uint32_t));
+                    groups.push_back({.sid = std::move(none_group), .attributes = group_enabled});
+                }
+
+                groups.push_back({.sid = make_sid(1, {0}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {32, 545}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {4}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(2, {1}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {11}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {15}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {113}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {5, 0, token_authentication_id}), .attributes = group_enabled | group_logon_id});
+                groups.push_back({.sid = make_sid(2, {0}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(5, {64, 10}), .attributes = group_enabled});
+                groups.push_back({.sid = make_sid(16, {0x2000}), .attributes = group_integrity});
+                return groups;
+            }
+
+            struct token_privilege
+            {
+                LUID Luid;
+                DWORD Attributes;
+            };
+
+            static_assert(sizeof(token_privilege) == 12);
+
+            constexpr DWORD privilege_enabled = 0x2;
+            constexpr DWORD privilege_removed = 0x4;
+            constexpr NTSTATUS status_not_all_assigned = 0x00000106;
+
+            // The token's privileges (process_context::token_privileges) as LUID_AND_ATTRIBUTES entries.
+            std::vector<token_privilege> held_privileges(const process_context& process)
+            {
+                std::vector<token_privilege> privileges{};
+                privileges.reserve(process.token_privileges.size());
+                for (const auto& [luid, attributes] : process.token_privileges)
+                {
+                    privileges.push_back({.Luid = {.LowPart = luid, .HighPart = 0}, .Attributes = attributes});
+                }
+                return privileges;
+            }
+
+            constexpr std::array<uint8_t, 12> anonymous_sid{1, 1, 0, 0, 0, 0, 0, 5, 7, 0, 0, 0};
+
+            handle resolve_token(const syscall_context& c, const handle token)
+            {
+                if (token == CURRENT_THREAD_TOKEN || token == CURRENT_THREAD_EFFECTIVE_TOKEN)
+                {
+                    const auto impersonation = c.vcpu.active_thread ? c.vcpu.active_thread->impersonation_token : handle{};
+                    if (impersonation != 0 || token == CURRENT_THREAD_TOKEN)
+                    {
+                        return impersonation;
+                    }
+                    return CURRENT_PROCESS_TOKEN;
+                }
+                return token;
+            }
 
             bool sid_matches(const memory_manager& memory, const uint64_t address, const std::span<const uint8_t> expected)
             {
@@ -63,17 +155,30 @@ namespace sogen
 
         TOKEN_TYPE get_token_type(const handle token_handle)
         {
-            return token_handle == DUMMY_IMPERSONATION_TOKEN //
-                       ? TokenImpersonation
-                       : TokenPrimary;
+            const auto impersonation = token_handle == DUMMY_IMPERSONATION_TOKEN || token_handle == ANONYMOUS_IMPERSONATION_TOKEN;
+            return impersonation ? TokenImpersonation : TokenPrimary;
         }
 
-        NTSTATUS handle_NtDuplicateToken(const syscall_context&, const handle existing_token_handle, ACCESS_MASK /*desired_access*/,
+        NTSTATUS handle_NtDuplicateToken(const syscall_context& c, const handle requested_token, ACCESS_MASK /*desired_access*/,
                                          const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>>
                                          /*object_attributes*/,
                                          const BOOLEAN /*effective_only*/, const TOKEN_TYPE type,
                                          const emulator_object<handle> new_token_handle)
         {
+            const auto existing_token_handle = resolve_token(c, requested_token);
+            if (existing_token_handle != CURRENT_PROCESS_TOKEN && existing_token_handle != DUMMY_IMPERSONATION_TOKEN &&
+                existing_token_handle != ANONYMOUS_IMPERSONATION_TOKEN)
+            {
+                return existing_token_handle != 0 ? STATUS_INVALID_HANDLE : STATUS_NO_TOKEN;
+            }
+            if (type != TokenPrimary && type != TokenImpersonation)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            if (existing_token_handle == ANONYMOUS_IMPERSONATION_TOKEN && type == TokenPrimary)
+            {
+                return STATUS_NOT_SUPPORTED;
+            }
             if (get_token_type(existing_token_handle) == type)
             {
                 new_token_handle.write(existing_token_handle);
@@ -90,22 +195,48 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtQueryInformationToken(const syscall_context& c, const handle token_handle,
+        NTSTATUS handle_NtQueryInformationToken(const syscall_context& c, const handle requested_token,
                                                 const TOKEN_INFORMATION_CLASS token_information_class, const uint64_t token_information,
                                                 const ULONG token_information_length, const emulator_object<ULONG> return_length)
         {
+            const auto token_handle = resolve_token(c, requested_token);
+            if (token_handle == 0 && requested_token == CURRENT_THREAD_TOKEN)
+            {
+                return STATUS_NO_TOKEN;
+            }
             if (token_handle != CURRENT_PROCESS_TOKEN && token_handle != CURRENT_THREAD_TOKEN &&
-                token_handle != CURRENT_THREAD_EFFECTIVE_TOKEN && token_handle != DUMMY_IMPERSONATION_TOKEN)
+                token_handle != CURRENT_THREAD_EFFECTIVE_TOKEN && token_handle != DUMMY_IMPERSONATION_TOKEN &&
+                token_handle != ANONYMOUS_IMPERSONATION_TOKEN)
             {
                 return STATUS_NOT_SUPPORTED;
             }
 
             if (token_information_class == TokenAppContainerSid)
             {
-                return STATUS_NOT_SUPPORTED;
+                constexpr auto required_size = sizeof(EmulatorTraits<Emu64>::PVOID);
+                return_length.write_if_valid(required_size);
+                if (token_information_length < required_size)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                emulator_object<EmulatorTraits<Emu64>::PVOID>{c.emu, token_information}.write(0);
+                return STATUS_SUCCESS;
             }
 
-            const auto& sid = c.proc.sid;
+            const auto anonymous = token_handle == ANONYMOUS_IMPERSONATION_TOKEN;
+            const auto sid = anonymous ? std::span<const uint8_t>{anonymous_sid} : std::span<const uint8_t>{c.proc.sid};
+
+            if (anonymous && token_information_class == TokenPrivileges)
+            {
+                constexpr auto required_size = sizeof(ULONG);
+                return_length.write(required_size);
+                if (token_information_length < required_size)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                emulator_object<ULONG>{c.emu, token_information}.write(0);
+                return STATUS_SUCCESS;
+            }
 
             if (token_information_class == TokenUser)
             {
@@ -128,8 +259,25 @@ namespace sogen
 
             if (token_information_class == TokenGroups)
             {
-                constexpr auto group_entry_size = sizeof(SID_AND_ATTRIBUTES64);
-                const auto required_size = sizeof(TOKEN_GROUPS64) + group_entry_size + sid.size() + interactive_sid.size();
+                if (anonymous)
+                {
+                    return_length.write(sizeof(ULONG));
+                    if (token_information_length < sizeof(ULONG))
+                    {
+                        return STATUS_BUFFER_TOO_SMALL;
+                    }
+                    c.emu.write_memory(token_information, ULONG{0});
+                    return STATUS_SUCCESS;
+                }
+
+                // TOKEN_GROUPS: the count, the SID_AND_ATTRIBUTES entries, then the SIDs they point to.
+                const auto groups = token_groups(c.proc);
+                const auto entries_offset = offsetof(TOKEN_GROUPS64, Groups);
+                auto required_size = entries_offset + groups.size() * sizeof(SID_AND_ATTRIBUTES64);
+                for (const auto& group : groups)
+                {
+                    required_size += group.sid.size();
+                }
                 return_length.write(static_cast<ULONG>(required_size));
 
                 if (required_size > token_information_length)
@@ -137,19 +285,32 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                TOKEN_GROUPS64 groups{};
-                groups.GroupCount = 2;
-                groups.Groups[0].Attributes = 0;
-                groups.Groups[0].Sid = token_information + sizeof(TOKEN_GROUPS64) + group_entry_size;
+                c.emu.write_memory(token_information, static_cast<ULONG>(groups.size()));
+                auto sid_address = token_information + entries_offset + groups.size() * sizeof(SID_AND_ATTRIBUTES64);
+                for (size_t i = 0; i < groups.size(); ++i)
+                {
+                    const SID_AND_ATTRIBUTES64 entry{.Sid = sid_address, .Attributes = groups[i].attributes};
+                    c.emu.write_memory(token_information + entries_offset + i * sizeof(SID_AND_ATTRIBUTES64), entry);
+                    c.emu.write_memory(sid_address, groups[i].sid.data(), groups[i].sid.size());
+                    sid_address += groups[i].sid.size();
+                }
+                return STATUS_SUCCESS;
+            }
 
-                SID_AND_ATTRIBUTES64 interactive_group{};
-                interactive_group.Attributes = 0x7; // SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED
-                interactive_group.Sid = groups.Groups[0].Sid + sid.size();
+            if (token_information_class == TokenPrivileges)
+            {
+                const auto privileges = held_privileges(c.proc);
+                const auto privileges_size = privileges.size() * sizeof(token_privilege);
+                const auto required_size = sizeof(DWORD) + privileges_size;
+                return_length.write(static_cast<ULONG>(required_size));
 
-                emulator_object<TOKEN_GROUPS64>{c.emu, token_information}.write(groups);
-                c.emu.write_memory(token_information + sizeof(TOKEN_GROUPS64), interactive_group);
-                c.emu.write_memory(groups.Groups[0].Sid, sid.data(), sid.size());
-                c.emu.write_memory(interactive_group.Sid, interactive_sid);
+                if (required_size > token_information_length)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                c.emu.write_memory(token_information, static_cast<DWORD>(privileges.size()));
+                c.emu.write_memory(token_information + sizeof(DWORD), privileges.data(), privileges_size);
                 return STATUS_SUCCESS;
             }
 
@@ -254,7 +415,8 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                const auto level = get_token_type(token_handle) == TokenImpersonation ? SecurityImpersonation : SecurityAnonymous;
+                const auto level =
+                    !anonymous && get_token_type(token_handle) == TokenImpersonation ? SecurityImpersonation : SecurityAnonymous;
                 emulator_object<SECURITY_IMPERSONATION_LEVEL>{c.emu, token_information}.write(level);
                 return STATUS_SUCCESS;
             }
@@ -376,9 +538,9 @@ namespace sogen
                 stats.AuthenticationId.LowPart = token_authentication_id;
                 stats.ExpirationTime.QuadPart = std::numeric_limits<LONGLONG>::max();
                 stats.TokenType = get_token_type(token_handle);
-                stats.ImpersonationLevel = stats.TokenType == TokenImpersonation ? SecurityImpersonation : SecurityAnonymous;
-                stats.GroupCount = 2;
-                stats.PrivilegeCount = 0;
+                stats.ImpersonationLevel = !anonymous && stats.TokenType == TokenImpersonation ? SecurityImpersonation : SecurityAnonymous;
+                stats.GroupCount = anonymous ? 0 : static_cast<DWORD>(token_groups(c.proc).size());
+                stats.PrivilegeCount = anonymous ? 0 : static_cast<DWORD>(c.proc.token_privileges.size());
                 stats.ModifiedId.LowPart = token_modified_id;
 
                 c.emu.write_memory(token_information, stats);
@@ -398,8 +560,9 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
+                constexpr USHORT token_security_attributes_information_version_v1 = 1;
                 c.emu.write_memory(token_information, TOKEN_SECURITY_ATTRIBUTES_INFORMATION{
-                                                          .Version = 0,
+                                                          .Version = token_security_attributes_information_version_v1,
                                                           .Reserved = {},
                                                           .AttributeCount = 0,
                                                           .Attribute = {},
@@ -473,13 +636,15 @@ namespace sogen
             return STATUS_NOT_SUPPORTED;
         }
 
-        NTSTATUS handle_NtAccessCheck(const syscall_context& c, const uint64_t security_descriptor, const handle client_token,
+        NTSTATUS handle_NtAccessCheck(const syscall_context& c, const uint64_t security_descriptor, const handle requested_token,
                                       const ACCESS_MASK desired_access, const emulator_object<EMU_GENERIC_MAPPING> generic_mapping,
                                       const uint64_t /*privilege_set*/, const emulator_object<ULONG> privilege_set_length,
                                       const emulator_object<ACCESS_MASK> granted_access, const emulator_object<NTSTATUS> access_status)
         {
+            const auto client_token = resolve_token(c, requested_token);
             if (client_token != CURRENT_PROCESS_TOKEN && client_token != CURRENT_THREAD_TOKEN &&
-                client_token != CURRENT_THREAD_EFFECTIVE_TOKEN && client_token != DUMMY_IMPERSONATION_TOKEN)
+                client_token != CURRENT_THREAD_EFFECTIVE_TOKEN && client_token != DUMMY_IMPERSONATION_TOKEN &&
+                client_token != ANONYMOUS_IMPERSONATION_TOKEN)
             {
                 return STATUS_INVALID_HANDLE;
             }
@@ -511,6 +676,13 @@ namespace sogen
             {
                 const auto acl = emulator_object<ACL>{c.emu, dacl_address}.read();
                 auto ace_address = dacl_address + sizeof(ACL);
+                // An ACE applies to the user and to the token's groups (not its integrity label).
+                const auto groups = token_groups(c.proc);
+                const auto applies_to_token = [&](const uint64_t ace_sid) {
+                    return sid_matches(c.emu.memory(), ace_sid, c.proc.sid) || std::ranges::any_of(groups, [&](const token_group& group) {
+                               return group.attributes != group_integrity && sid_matches(c.emu.memory(), ace_sid, group.sid);
+                           });
+                };
                 for (USHORT i = 0; i < acl.AceCount; ++i)
                 {
                     const auto ace = emulator_object<ACCESS_ALLOWED_ACE>{c.emu, ace_address}.read();
@@ -521,8 +693,8 @@ namespace sogen
 
                     const auto ace_mask = map_generic_access(ace.Mask, mapping);
                     const auto ace_sid = ace_address + offsetof(ACCESS_ALLOWED_ACE, SidStart);
-                    const bool applies =
-                        sid_matches(c.emu.memory(), ace_sid, c.proc.sid) || sid_matches(c.emu.memory(), ace_sid, interactive_sid);
+                    const auto anonymous = client_token == ANONYMOUS_IMPERSONATION_TOKEN;
+                    const auto applies = anonymous ? sid_matches(c.emu.memory(), ace_sid, anonymous_sid) : applies_to_token(ace_sid);
                     if (applies && ace.Header.AceType == 1 && (ace_mask & remaining) != 0)
                     {
                         denied = true;
@@ -555,51 +727,22 @@ namespace sogen
                 return STATUS_NOT_SUPPORTED;
             }
 
-            if (number_of_attributes == 2)
+            if ((number_of_attributes != 0) != (attributes.value() != 0))
             {
-                const auto attribute_name_1 = read_unicode_string(c.emu, attributes, 0);
-                const auto attribute_name_2 = read_unicode_string(c.emu, attributes, 1);
-                if (attribute_name_1 == u"WIN://SYSAPPID" && attribute_name_2 == u"WIN://PKG")
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            if (number_of_attributes != 0)
+            {
+                for (ULONG index = 0; index < number_of_attributes; ++index)
                 {
-                    constexpr auto attrs_offset = sizeof(TOKEN_SECURITY_ATTRIBUTES_INFORMATION);
-                    constexpr auto claims_offset = attrs_offset + 2 * sizeof(TOKEN_SECURITY_ATTRIBUTE_V1);
-                    constexpr auto required_size = claims_offset + sizeof(uint64_t);
-
-                    if (return_length.value())
-                    {
-                        return_length.write(required_size);
-                    }
-
-                    if (buffer == 0 || buffer_length < required_size)
-                    {
-                        return STATUS_BUFFER_TOO_SMALL;
-                    }
-
-                    const auto attrs_ptr = buffer + attrs_offset;
-                    const auto claims_ptr = buffer + claims_offset;
-
-                    TOKEN_SECURITY_ATTRIBUTES_INFORMATION info{};
-                    info.Version = 1;
-                    info.Reserved = 0;
-                    info.AttributeCount = 2;
-                    info.Attribute.pAttributeV1 = attrs_ptr;
-
-                    std::array<TOKEN_SECURITY_ATTRIBUTE_V1, 2> attrs{};
-
-                    attrs[0].ValueType = 3; // STRING
-                    attrs[0].ValueCount = 0;
-                    attrs[0].Values = 0;
-
-                    attrs[1].ValueType = 2; // UINT64
-                    attrs[1].ValueCount = 1;
-                    attrs[1].Values = claims_ptr;
-
-                    c.emu.write_memory(buffer, info);
-                    c.emu.write_memory(attrs_ptr, attrs);
-                    c.emu.write_memory(claims_ptr, 0);
-
-                    return STATUS_SUCCESS;
+                    read_unicode_string(c.emu, attributes, index);
                 }
+                if (return_length.value())
+                {
+                    return_length.write(0);
+                }
+                return STATUS_NOT_FOUND;
             }
 
             constexpr auto required_size = sizeof(TOKEN_SECURITY_ATTRIBUTES_INFORMATION);
@@ -614,7 +757,7 @@ namespace sogen
             }
 
             c.emu.write_memory(buffer, TOKEN_SECURITY_ATTRIBUTES_INFORMATION{
-                                           .Version = 0,
+                                           .Version = 1,
                                            .Reserved = {},
                                            .AttributeCount = 0,
                                            .Attribute = {},
@@ -623,9 +766,87 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtAdjustPrivilegesToken()
+        NTSTATUS handle_NtCompareSigningLevels(const syscall_context&, UCHAR, UCHAR)
         {
             return STATUS_NOT_SUPPORTED;
+        }
+
+        // Enables, disables, or removes the token's privileges. Changes to privileges the token does not hold are
+        // skipped with STATUS_NOT_ALL_ASSIGNED; PreviousState receives the old attributes of what changed.
+        NTSTATUS handle_NtAdjustPrivilegesToken(const syscall_context& c, const handle /*token_handle*/, const BOOLEAN disable_all,
+                                                const uint64_t new_state, const ULONG previous_state_length, const uint64_t previous_state,
+                                                const emulator_object<ULONG> return_length)
+        {
+            if (!disable_all && !new_state)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            auto updated = c.proc.token_privileges;
+            std::vector<token_privilege> previous{};
+            bool all_assigned = true;
+
+            const auto change = [&](const uint32_t luid, const DWORD attributes) {
+                const auto held = updated.find(luid);
+                if (held == updated.end())
+                {
+                    all_assigned = false;
+                    return;
+                }
+
+                if (attributes & privilege_removed)
+                {
+                    previous.push_back({.Luid = {.LowPart = luid, .HighPart = 0}, .Attributes = held->second});
+                    updated.erase(held);
+                    return;
+                }
+
+                const auto new_attributes = (held->second & ~privilege_enabled) | (attributes & privilege_enabled);
+                if (new_attributes != held->second)
+                {
+                    previous.push_back({.Luid = {.LowPart = luid, .HighPart = 0}, .Attributes = held->second});
+                    held->second = new_attributes;
+                }
+            };
+
+            if (disable_all)
+            {
+                for (const auto& [luid, attributes] : c.proc.token_privileges)
+                {
+                    change(luid, 0);
+                }
+            }
+            else
+            {
+                const auto count = c.emu.read_memory<DWORD>(new_state);
+                for (DWORD i = 0; i < count; ++i)
+                {
+                    const auto entry = c.emu.read_memory<token_privilege>(new_state + sizeof(DWORD) + i * sizeof(token_privilege));
+                    if (entry.Luid.HighPart != 0)
+                    {
+                        all_assigned = false;
+                        continue;
+                    }
+                    change(entry.Luid.LowPart, entry.Attributes);
+                }
+            }
+
+            // The previous state must fit before anything changes.
+            if (previous_state)
+            {
+                const auto required_size = static_cast<ULONG>(sizeof(DWORD) + previous.size() * sizeof(token_privilege));
+                return_length.write_if_valid(required_size);
+                if (required_size > previous_state_length)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                c.emu.write_memory(previous_state, static_cast<DWORD>(previous.size()));
+                c.emu.write_memory(previous_state + sizeof(DWORD), previous.data(), previous.size() * sizeof(token_privilege));
+            }
+
+            c.proc.token_privileges = std::move(updated);
+            return all_assigned ? STATUS_SUCCESS : status_not_all_assigned;
         }
 
         NTSTATUS handle_NtQuerySecurityPolicy()

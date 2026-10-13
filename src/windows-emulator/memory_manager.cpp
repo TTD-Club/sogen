@@ -5,6 +5,8 @@
 #include "address_utils.hpp"
 #include "memory_permission_ext.hpp"
 
+#include <array>
+#include <cstring>
 #include <vector>
 #include <optional>
 #include <stdexcept>
@@ -101,11 +103,15 @@ namespace sogen
         }
     }
 
-    void memory_manager::update_layout_version()
+    void memory_manager::update_layout_version(const uint64_t address, const uint64_t size)
     {
 #if SOGEN_REFLECTION_LEVEL > 0
         this->layout_version_.fetch_add(1, std::memory_order_relaxed);
 #endif
+        if (this->region_change_callback_ && size)
+        {
+            this->region_change_callback_(address, static_cast<size_t>(size));
+        }
     }
 
     memory_stats memory_manager::compute_memory_stats() const
@@ -177,8 +183,6 @@ namespace sogen
             return;
         }
 
-        std::vector<uint8_t> data{};
-
         for (const auto& reserved_region : this->reserved_regions_)
         {
             if (reserved_region.second.kind == memory_region_kind::mmio)
@@ -188,55 +192,185 @@ namespace sogen
 
             for (const auto& region : reserved_region.second.committed_regions)
             {
-                data.resize(region.second.length);
-
-                this->read_memory(region.first, data.data(), region.second.length);
-
-                buffer.write(data.data(), region.second.length);
+                buffer.write_in_place(region.second.length,
+                                      [&](std::byte* data) { this->read_memory(region.first, data, region.second.length); });
             }
         }
     }
 
     void memory_manager::deserialize_memory_state(utils::buffer_deserializer& buffer, const bool is_snapshot)
     {
-        if (!is_snapshot)
+        if (is_snapshot)
         {
-            assert(this->reserved_regions_.empty());
+            buffer.read_atomic(this->layout_version_);
+            buffer.read(this->default_allocation_address_);
+            buffer.read(this->dep_enabled_);
+            buffer.read_map(this->reserved_regions_);
+            return;
         }
+
+        const auto kept = this->restore_memory_layout(buffer);
+
+        std::vector<std::byte> data{};
+        for (const auto& reserved_region : this->reserved_regions_ | std::views::values)
+        {
+            for (const auto& [address, region] : reserved_region.committed_regions)
+            {
+                data.resize(region.length);
+                buffer.read(data.data(), region.length);
+                this->restore_region_contents(address, region.length, kept.contains(address),
+                                              [&](const uint64_t page) { return restored_page{.data = data.data() + (page - address)}; });
+            }
+        }
+    }
+
+    void memory_manager::deserialize_memory_state(utils::buffer_deserializer& buffer, const restored_page_source& pages)
+    {
+        const auto kept = this->restore_memory_layout(buffer);
+        for (const auto& reserved_region : this->reserved_regions_ | std::views::values)
+        {
+            for (const auto& [address, region] : reserved_region.committed_regions)
+            {
+                this->restore_region_contents(address, region.length, kept.contains(address), pages);
+            }
+        }
+    }
+
+    std::set<uint64_t> memory_manager::restore_memory_layout(utils::buffer_deserializer& buffer)
+    {
+        std::map<uint64_t, std::pair<size_t, memory_permission>> mapped{};
+        for (const auto& reserved_region : this->reserved_regions_ | std::views::values)
+        {
+            for (const auto& [address, region] : reserved_region.committed_regions)
+            {
+                if (reserved_region.kind == memory_region_kind::mmio)
+                {
+                    this->unmap_memory(address, region.length);
+                }
+                else
+                {
+                    mapped.emplace(address, std::pair{region.length, this->get_effective_permissions(region.permissions)});
+                }
+            }
+        }
+        this->reserved_regions_.clear();
 
         buffer.read_atomic(this->layout_version_);
         buffer.read(this->default_allocation_address_);
         buffer.read(this->dep_enabled_);
         buffer.read_map(this->reserved_regions_);
 
-        if (is_snapshot)
+        std::erase_if(this->reserved_regions_, [](const auto& entry) { return entry.second.kind == memory_region_kind::mmio; });
+
+        // Mappings identical to the restored ones stay, and only their changed pages are written: restoring a state
+        // close to the current one then costs a comparison instead of remapping and rewriting all memory.
+        std::set<uint64_t> kept{};
+        for (const auto& reserved_region : this->reserved_regions_ | std::views::values)
         {
-            return;
+            for (const auto& [address, region] : reserved_region.committed_regions)
+            {
+                const auto existing = mapped.find(address);
+                if (existing != mapped.end() && existing->second.first == region.length &&
+                    existing->second.second == this->get_effective_permissions(region.permissions))
+                {
+                    kept.insert(address);
+                }
+            }
+        }
+        for (const auto& [address, region] : mapped)
+        {
+            if (!kept.contains(address))
+            {
+                this->unmap_memory(address, region.first);
+            }
+        }
+        for (const auto& reserved_region : this->reserved_regions_ | std::views::values)
+        {
+            for (const auto& [address, region] : reserved_region.committed_regions)
+            {
+                if (!kept.contains(address))
+                {
+                    this->map_memory(address, region.length, this->get_effective_permissions(region.permissions));
+                }
+            }
         }
 
-        std::vector<uint8_t> data{};
+        return kept;
+    }
 
-        for (auto i = this->reserved_regions_.begin(); i != this->reserved_regions_.end();)
+    void memory_manager::restore_region_contents(const uint64_t address, const size_t length, const bool kept,
+                                                 const restored_page_source& pages)
+    {
+        constexpr size_t page_size = 0x1000;
+        static constexpr std::array<std::byte, page_size> zeros{};
+
+        const auto page_count = (length + page_size - 1) / page_size;
+        std::vector<restored_page> source(page_count);
+        for (size_t i = 0; i < page_count; ++i)
         {
-            auto& reserved_region = i->second;
-            if (reserved_region.kind == memory_region_kind::mmio)
+            source[i] = pages(address + i * page_size);
+        }
+
+        const auto content = [&](const size_t page) { return source[page].data ? source[page].data : zeros.data(); };
+        const auto page_length = [&](const size_t page) { return std::min(page_size, length - page * page_size); };
+        const auto skipped = [&](const size_t page) { return kept && source[page].unchanged; };
+
+        // Each write invalidates the backend's translations of the range, so changed pages are gathered into runs and
+        // written once per run.
+        std::vector<std::byte> current{};
+        std::vector<std::byte> gathered{};
+        for (size_t first = 0; first < page_count;)
+        {
+            if (skipped(first))
             {
-                i = this->reserved_regions_.erase(i);
+                ++first;
                 continue;
             }
-
-            ++i;
-
-            for (const auto& region : reserved_region.committed_regions)
+            auto end = first + 1;
+            while (end < page_count && !skipped(end))
             {
-                data.resize(region.second.length);
-
-                buffer.read(data.data(), region.second.length);
-
-                const auto effective_permission = this->get_effective_permissions(region.second.permissions);
-                this->map_memory(region.first, region.second.length, effective_permission);
-                this->write_memory(region.first, data.data(), region.second.length);
+                ++end;
             }
+
+            const auto run_offset = first * page_size;
+            if (kept)
+            {
+                current.resize(std::min(end * page_size, length) - run_offset);
+                this->read_memory(address + run_offset, current.data(), current.size());
+            }
+            const auto differs = [&](const size_t page) {
+                return !kept || memcmp(content(page), current.data() + (page * page_size - run_offset), page_length(page)) != 0;
+            };
+
+            for (auto page = first; page < end;)
+            {
+                if (!differs(page))
+                {
+                    ++page;
+                    continue;
+                }
+                auto stop = page + 1;
+                bool contiguous = true;
+                while (stop < end && differs(stop))
+                {
+                    contiguous = contiguous && content(stop) == content(stop - 1) + page_size;
+                    ++stop;
+                }
+                const auto run_length = ((stop - page - 1) * page_size) + page_length(stop - 1);
+                const auto* run_data = content(page);
+                if (!contiguous)
+                {
+                    gathered.resize(run_length);
+                    for (auto copied = page; copied < stop; ++copied)
+                    {
+                        std::memcpy(gathered.data() + ((copied - page) * page_size), content(copied), page_length(copied));
+                    }
+                    run_data = gathered.data();
+                }
+                this->write_memory(address + page * page_size, run_data, run_length);
+                page = stop;
+            }
+            first = end;
         }
     }
 
@@ -291,7 +425,7 @@ namespace sogen
 
         merge_regions(committed_regions);
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -319,7 +453,7 @@ namespace sogen
             .permissions = memory_permission::read_write,
         };
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -347,7 +481,7 @@ namespace sogen
             .permissions = permissions,
         };
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -452,6 +586,7 @@ namespace sogen
         // break the pairwise-non-overlap invariant overlaps_reserved_region's fast path depends on,
         // so the surrounding host_reserved coverage is split around the hole instead.
         const uint64_t end = address + size;
+        std::vector<std::pair<uint64_t, uint64_t>> split{};
 
         auto it = this->reserved_regions_.upper_bound(address);
         if (it != this->reserved_regions_.begin())
@@ -473,6 +608,8 @@ namespace sogen
             assert(it->second.committed_regions.empty());
             const bool was_tracked = std::erase(this->host_reserved_addresses_, region_start) != 0;
             it = this->reserved_regions_.erase(it);
+            // The parts around the hole become reservations of their own.
+            split.emplace_back(region_start, region_end - region_start);
 
             if (region_start < address)
             {
@@ -501,6 +638,11 @@ namespace sogen
                 }
                 ++it;
             }
+        }
+
+        for (const auto& [start, length] : split)
+        {
+            this->update_layout_version(start, length);
         }
     }
 
@@ -576,7 +718,7 @@ namespace sogen
             };
         }
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -606,7 +748,7 @@ namespace sogen
             return false;
         }
 
-        if (entry->second.kind == memory_region_kind::host_reserved)
+        if (entry->second.kind == memory_region_kind::host_reserved || entry->second.kind == memory_region_kind::placeholder)
         {
             return false;
         }
@@ -679,7 +821,7 @@ namespace sogen
 
         merge_regions(committed_regions);
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -727,7 +869,7 @@ namespace sogen
             ++i;
         }
 
-        this->update_layout_version();
+        this->update_layout_version(address, size);
 
         return true;
     }
@@ -761,6 +903,95 @@ namespace sogen
         this->memory_->release_guest_address_range(gap_start, gap_end - gap_start);
     }
 
+    bool memory_manager::split_placeholder(const uint64_t address, const size_t size)
+    {
+        const auto entry = this->reserved_regions_.find(address);
+        if (entry == this->reserved_regions_.end() || entry->second.kind != memory_region_kind::placeholder || !size ||
+            size >= entry->second.length || address != page_align_down(address) || size != page_align_up(size))
+        {
+            return false;
+        }
+        const auto remaining_length = entry->second.length - size;
+        reserved_region remaining{.length = remaining_length, .kind = memory_region_kind::placeholder};
+        this->reserved_regions_.emplace(address + size, std::move(remaining));
+        entry->second.length = size;
+        this->update_layout_version(address, remaining_length + size);
+        return true;
+    }
+
+    bool memory_manager::coalesce_placeholders(const uint64_t address, const size_t size)
+    {
+        if (!size || address > MAX_ALLOCATION_END_EXCL || size > MAX_ALLOCATION_END_EXCL - address)
+        {
+            return false;
+        }
+        const auto first = this->reserved_regions_.find(address);
+        auto end = first;
+        auto next_address = address;
+        while (end != this->reserved_regions_.end() && next_address < address + size)
+        {
+            if (end->first != next_address || end->second.kind != memory_region_kind::placeholder ||
+                end->second.length > address + size - next_address)
+            {
+                return false;
+            }
+            next_address += end->second.length;
+            ++end;
+        }
+        if (next_address != address + size || first == end || std::next(first) == end)
+        {
+            return false;
+        }
+        first->second.length = size;
+        this->reserved_regions_.erase(std::next(first), end);
+        this->update_layout_version(address, size);
+        return true;
+    }
+
+    bool memory_manager::replace_placeholder(const uint64_t address, const size_t size, const nt_memory_permission permissions,
+                                             const bool commit)
+    {
+        const auto entry = this->reserved_regions_.find(address);
+        if (entry == this->reserved_regions_.end() || entry->second.kind != memory_region_kind::placeholder || entry->second.length != size)
+        {
+            return false;
+        }
+        entry->second.kind = memory_region_kind::placeholder_backed_allocation;
+        if (commit && !this->commit_memory(address, size, permissions))
+        {
+            entry->second.kind = memory_region_kind::placeholder;
+            return false;
+        }
+        entry->second.initial_permission = permissions.flattened();
+        this->update_layout_version(address, size);
+        return true;
+    }
+
+    bool memory_manager::preserve_placeholder(const uint64_t address, const size_t size)
+    {
+        const auto entry = this->reserved_regions_.find(address);
+        if (entry == this->reserved_regions_.end())
+        {
+            return false;
+        }
+        if (entry->second.kind == memory_region_kind::placeholder)
+        {
+            return this->split_placeholder(address, size);
+        }
+        if (entry->second.kind != memory_region_kind::placeholder_backed_allocation || (size && size != entry->second.length))
+        {
+            return false;
+        }
+        if (!this->decommit_memory(address, entry->second.length))
+        {
+            return false;
+        }
+        entry->second.kind = memory_region_kind::placeholder;
+        entry->second.initial_permission = memory_permission::none;
+        this->update_layout_version(address, entry->second.length);
+        return true;
+    }
+
     bool memory_manager::release_memory(const uint64_t address, size_t size)
     {
         if (!size)
@@ -782,7 +1013,7 @@ namespace sogen
 
             this->reserved_regions_.erase(entry);
             this->release_host_claims(address + entry_length);
-            this->update_layout_version();
+            this->update_layout_version(address, entry_length);
             return true;
         }
 
@@ -867,21 +1098,9 @@ namespace sogen
         }
 
         this->release_host_claims(aligned_end);
-        this->update_layout_version();
+        // The part after the released range becomes its own reservation, with a new allocation base.
+        this->update_layout_version(reserved_start, reserved_end - reserved_start);
         return true;
-    }
-
-    void memory_manager::unmap_all_memory()
-    {
-        for (const auto& reserved_region : this->reserved_regions_)
-        {
-            for (const auto& region : reserved_region.second.committed_regions)
-            {
-                this->unmap_memory(region.first, region.second.length);
-            }
-        }
-
-        this->reserved_regions_.clear();
     }
 
     namespace
@@ -1197,6 +1416,7 @@ namespace sogen
         }
 
         entry->second.mapped_filename = std::move(filename);
+        this->update_layout_version(entry->first, entry->second.length);
     }
 
     memory_manager::reserved_region_map::iterator memory_manager::find_reserved_region(const uint64_t address)

@@ -5,6 +5,7 @@
 #include "process_context.hpp"
 #include "io_completion_wait.hpp"
 #include "syscall_utils.hpp"
+#include "devices/named_pipe.hpp"
 
 namespace sogen
 {
@@ -36,6 +37,40 @@ namespace sogen
             // Write the updated descriptor to GDT index 10 (selector 0x53) of this vCPU's own GDT.
             const uint64_t fs_gdt_offset = gdt_base + 10 * sizeof(uint64_t);
             memory.write_memory(fs_gdt_offset, &descriptor, sizeof(descriptor));
+        }
+
+        void expire_timer(windows_emulator& win_emu, timer& t)
+        {
+            auto& clock = win_emu.clock();
+            if (!t.expire_if_due(clock.steady_now()) || !t.apc_routine)
+            {
+                return;
+            }
+
+            auto* thread = win_emu.process.find_thread_by_id(t.apc_thread_id);
+            if (!thread || thread->is_terminated())
+            {
+                return;
+            }
+
+            // A timer has a single APC object: an expiry while its APC is still queued adds nothing.
+            const auto already_queued = std::ranges::any_of(thread->pending_apcs, [&](const pending_apc& apc) {
+                return apc.apc_routine == t.apc_routine && apc.apc_argument1 == t.apc_context;
+            });
+
+            if (already_queued)
+            {
+                return;
+            }
+
+            // TIMER_APC_ROUTINE(context, low, high) receives the expiry as a FILETIME.
+            const auto time = utils::convert_to_ksystem_time(clock.system_now());
+            thread->pending_apcs.push_back({
+                .apc_routine = t.apc_routine,
+                .apc_argument1 = t.apc_context,
+                .apc_argument2 = time.LowPart,
+                .apc_argument3 = static_cast<uint32_t>(time.High1Time),
+            });
         }
 
         template <typename T>
@@ -75,6 +110,11 @@ namespace sogen
 
             switch (type)
             {
+            case handle_types::device: {
+                const auto* container = c.devices.get(h);
+                const auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
+                return pipe && pipe->signaled ? wait_state::signaled : wait_state::not_signaled;
+            }
             default:
                 break;
 
@@ -147,7 +187,17 @@ namespace sogen
             }
 
             case handle_types::timer: {
-                return wait_state::signaled; // TODO
+                auto* t = c.timers.get(h);
+                if (t)
+                {
+                    expire_timer(win_emu, *t);
+                    if (t->signaled)
+                    {
+                        return wait_state::signaled;
+                    }
+                }
+
+                break;
             }
 
             case handle_types::semaphore: {
@@ -171,7 +221,7 @@ namespace sogen
             }
 
             case handle_types::io_completion: {
-                io_completion_wait::materialize_signaled_wait_packets(c, h);
+                io_completion_wait::materialize_signaled_wait_packets(win_emu, h);
                 const auto* completion = c.io_completions.get(h);
                 if (completion && !completion->queue.empty())
                 {
@@ -202,6 +252,11 @@ namespace sogen
             auto& c = win_emu.process;
             switch (h.value.type)
             {
+            case handle_types::device: {
+                const auto* container = c.devices.get(h);
+                const auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
+                return pipe && pipe->signaled ? std::optional{wait_state::signaled} : std::nullopt;
+            }
             case handle_types::process: {
                 if (h == GUEST_PROCESS_HANDLE)
                 {
@@ -274,8 +329,26 @@ namespace sogen
                 return *acquired ? wait_state::abandoned : wait_state::signaled;
             }
 
-            case handle_types::timer:
-                return wait_state::signaled; // TODO
+            case handle_types::timer: {
+                auto* t = c.timers.get(h);
+                if (!t)
+                {
+                    return std::nullopt;
+                }
+
+                expire_timer(win_emu, *t);
+                if (!t->signaled)
+                {
+                    return std::nullopt;
+                }
+
+                if (!t->notification)
+                {
+                    t->signaled = false;
+                }
+
+                return wait_state::signaled;
+            }
 
             case handle_types::semaphore: {
                 auto* semaphore = c.semaphores.get(h);
@@ -298,7 +371,7 @@ namespace sogen
             }
 
             case handle_types::io_completion: {
-                io_completion_wait::materialize_signaled_wait_packets(c, h);
+                io_completion_wait::materialize_signaled_wait_packets(win_emu, h);
                 const auto* completion = c.io_completions.get(h);
                 if (!completion || completion->queue.empty())
                 {
@@ -441,16 +514,9 @@ namespace sogen
             this->teb64 = this->gs_segment->reserve<TEB64>();
 
             this->teb64->access([&](TEB64& teb_obj) {
-                // Skips GetCurrentNlsCache
-                // This hack can be removed once this is fixed:
-                // https://github.com/momo5502/emulator/issues/128
-                reinterpret_cast<uint8_t*>(&teb_obj)[0x179C] = 1;
-
                 teb_obj.ClientId.UniqueProcess = context.process_id;
                 teb_obj.ClientId.UniqueThread = static_cast<uint64_t>(this->id);
                 teb_obj.DeallocationStack = this->stack_base;
-                // TODO: Proper GuaranteedStack implementation.
-                teb_obj.GuaranteedStackBytes = static_cast<ULONG>(this->stack_size);
                 teb_obj.NtTib.StackLimit = this->stack_base;
                 teb_obj.NtTib.StackBase = this->stack_base + this->stack_size;
                 teb_obj.NtTib.Self = this->teb64->value();
@@ -526,8 +592,6 @@ namespace sogen
 
             // Native 64-bit stack
             teb_obj.DeallocationStack = this->stack_base;
-            // TODO: Proper GuaranteedStack implementation.
-            teb_obj.GuaranteedStackBytes = static_cast<ULONG>(this->stack_size);
             teb_obj.NtTib.StackLimit = this->stack_base;
             teb_obj.NtTib.StackBase = wow64_cpureserved_base;
             teb_obj.NtTib.Self = this->teb64->value();
@@ -584,8 +648,6 @@ namespace sogen
         this->teb32->access([&](TEB32& teb32_obj) {
             // Set NT_TIB32 fields
             teb32_obj.DeallocationStack = static_cast<uint32_t>(nttib32_stack_limit);
-            // TODO: Proper GuaranteedStack implementation.
-            teb32_obj.GuaranteedStackBytes = static_cast<ULONG>(this->wow64_stack_size.value());
             teb32_obj.NtTib.Self = static_cast<uint32_t>(teb32_addr);                // Self pointer to 32-bit TEB
             teb32_obj.NtTib.StackBase = static_cast<uint32_t>(nttib32_stack_base);   // Top of 32-bit stack (High address)
             teb32_obj.NtTib.StackLimit = static_cast<uint32_t>(nttib32_stack_limit); // Bottom of 32-bit stack (Low address)
@@ -701,6 +763,14 @@ namespace sogen
         });
     }
 
+    void expire_timers(windows_emulator& win_emu)
+    {
+        for (auto& t : win_emu.process.timers | std::views::values)
+        {
+            expire_timer(win_emu, t);
+        }
+    }
+
     void emulator_thread::mark_as_ready(const NTSTATUS status)
     {
         this->pending_status = status;
@@ -709,6 +779,7 @@ namespace sogen
         this->await_msg = {};
         this->await_msg_mask = {};
         this->await_io_completion = {};
+        this->await_file_io = {};
         this->await_host_condition = {};
 
         // TODO: Find out if this is correct
@@ -1168,6 +1239,18 @@ namespace sogen
             return complete_if_timed_out(STATUS_TIMEOUT);
         }
 
+        if (this->await_file_io)
+        {
+            const auto status =
+                emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>{*this->memory_ptr, *this->await_file_io}.read().Status;
+            if (status == STATUS_PENDING)
+            {
+                return false;
+            }
+            this->mark_as_ready(status);
+            return true;
+        }
+
         if (this->await_time.has_value())
         {
             return complete_if_timed_out(STATUS_SUCCESS);
@@ -1203,7 +1286,7 @@ namespace sogen
             if (wait.type == io_completion_wait_type::remove_single)
             {
                 io_completion_message message{};
-                if (io_completion_wait::dequeue_io_completion_message(process, wait.io_completion_handle, message))
+                if (io_completion_wait::dequeue_io_completion_message(win_emu, wait.io_completion_handle, message))
                 {
                     emulator_object<emulator_pointer>{*this->memory_ptr, wait.key_context_ptr}.write_if_valid(message.key_context);
                     emulator_object<emulator_pointer>{*this->memory_ptr, wait.apc_context_ptr}.write_if_valid(message.apc_context);
@@ -1226,7 +1309,7 @@ namespace sogen
             if (wait.type == io_completion_wait_type::remove_multiple)
             {
                 const auto removed = io_completion_wait::dequeue_io_completion_entries(
-                    process, wait.io_completion_handle,
+                    win_emu, wait.io_completion_handle,
                     emulator_object<FILE_IO_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>>{*this->memory_ptr, wait.completion_entries_ptr},
                     wait.max_entries);
 
@@ -1257,7 +1340,7 @@ namespace sogen
                                                           this->await_msg->filter_max, true))
             {
                 this->await_msg->message.write(*m);
-                this->current_message_time = m->time;
+                this->record_current_message(*m);
 
                 uint64_t active_handle = 0;
                 uint64_t active_window_ptr = 0;

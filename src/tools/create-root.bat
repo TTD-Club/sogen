@@ -43,6 +43,8 @@ REM (which writes SYSTEM/SECURITY/SOFTWARE/HARDWARE/SAM + NTUSER.DAT into the gi
 CALL "%~dp0grab-registry.bat" "%EMU_REGDIR%"
 
 CALL :collect advapi32.dll
+CALL :collect audioeng.dll
+CALL :collect audiokse.dll
 CALL :collect bcrypt.dll
 CALL :collect bcryptprimitives.dll
 CALL :collect cabinet.dll
@@ -77,6 +79,7 @@ CALL :collect diagnosticdatasettings.dll
 CALL :collect dinput8.dll
 CALL :collect dnsapi.dll
 CALL :collect dpapi.dll
+CALL :collect dsparse.dll
 CALL :collect dsound.dll
 CALL :collect dwmapi.dll
 CALL :collect dxcore.dll
@@ -97,6 +100,8 @@ CALL :collect kdcom.dll
 CALL :collect kernel.appcore.dll
 CALL :collect kernel32.dll
 CALL :collect kernelbase.dll
+CALL :collect_file "%WINDIR%\System32\en-US", KernelBase.dll.mui, %EMU_SYSDIR%\en-us
+CALL :collect_file "%WINDIR%\SysWOW64\en-US", KernelBase.dll.mui, %EMU_SYSDIR_WOW64%\en-us
 CALL :collect ktmw32.dll
 CALL :collect mfperfhelper.dll
 CALL :collect mfplat.dll
@@ -114,6 +119,7 @@ CALL :collect mscoree.dll
 CALL :collect msdmo.dll
 CALL :collect mskeyprotect.dll
 CALL :collect msvcp140.dll
+CALL :collect msvcp140_atomic_wait.dll
 CALL :collect msvcp140d.dll
 CALL :collect msvcp60.dll
 CALL :collect msvcp_win.dll
@@ -162,6 +168,7 @@ CALL :collect slwga.dll
 CALL :collect sppc.dll
 CALL :collect srvcli.dll
 CALL :collect sspicli.dll
+CALL :collect twinapi.appcore.dll
 CALL :collect ucrtbase.dll
 CALL :collect ucrtbased.dll
 CALL :collect uiautomationcore.dll
@@ -212,6 +219,7 @@ CALL :collect_file "%WINDIR%\System32\en-US", user32.dll.mui, %EMU_SYSDIR%\en-us
 CALL :collect_file "%WINDIR%\SysWOW64\en-US", user32.dll.mui, %EMU_SYSDIR_WOW64%\en-us
 
 CALL :collect locale.nls
+CALL :collect l_intl.nls
 CALL :collect c_1252.nls
 CALL :collect c_437.nls
 CALL :collect c_850.nls

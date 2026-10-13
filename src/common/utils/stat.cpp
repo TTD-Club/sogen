@@ -5,12 +5,17 @@
 
 #if defined(_WIN32) && !defined(__MINGW64__)
 #include <corecrt_io.h>
+#include <fcntl.h>
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
 #include <sys/stat.h>
+
+#include <array>
+#include <chrono>
 
 #undef st_atime
 #undef st_mtime
@@ -52,7 +57,7 @@ namespace sogen
         stat->st_rdev = 0;
         stat->st_uid = 0;
         stat->st_gid = 0;
-        stat->st_nlink = 1;
+        stat->st_nlink = file_info.nNumberOfLinks;
 
         auto st_mode = (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? _S_IFDIR | _S_IEXEC : _S_IFREG;
         st_mode |= (file_info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? _S_IREAD : _S_IREAD | _S_IWRITE;
@@ -88,9 +93,17 @@ namespace sogen
             return false;
         }
 
-        auto* const file_handle =
-            CreateFileW(file_name.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        constexpr DWORD share_all = FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE;
+        auto* file_handle =
+            CreateFileW(file_name.c_str(), FILE_READ_ATTRIBUTES, share_all, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+
+        // A reparse point no filter handles (an app execution alias) has no target to stat; Windows reports the
+        // entry itself, as for its attributes.
+        if (file_handle == INVALID_HANDLE_VALUE && GetLastError() == ERROR_CANT_ACCESS_FILE)
+        {
+            file_handle = CreateFileW(file_name.c_str(), FILE_READ_ATTRIBUTES, share_all, nullptr, OPEN_EXISTING,
+                                      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        }
 
         if (file_handle == INVALID_HANDLE_VALUE)
         {
@@ -98,6 +111,28 @@ namespace sogen
         }
 
         const auto result = do_stat(file_handle, stat);
+        CloseHandle(file_handle);
+
+        return result;
+    }
+
+    bool compat_set_file_times(const std::filesystem::path& file_name, const std::optional<LARGE_INTEGER> access_time,
+                               const std::optional<LARGE_INTEGER> write_time)
+    {
+        auto* const file_handle =
+            CreateFileW(file_name.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (file_handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        const auto to_filetime = [](const std::optional<LARGE_INTEGER> time) {
+            return time ? FILETIME{.dwLowDateTime = time->LowPart, .dwHighDateTime = static_cast<DWORD>(time->HighPart)} : FILETIME{};
+        };
+        const auto access = to_filetime(access_time);
+        const auto write = to_filetime(write_time);
+        const auto result = SetFileTime(file_handle, nullptr, access_time ? &access : nullptr, write_time ? &write : nullptr) != FALSE;
         CloseHandle(file_handle);
 
         return result;
@@ -120,7 +155,7 @@ namespace sogen
         dst->st_rdev = 0;
         dst->st_uid = 0;
         dst->st_gid = 0;
-        dst->st_nlink = 1;
+        dst->st_nlink = static_cast<uint32_t>(src->st_nlink);
         dst->st_mode = src->st_mode & (S_IFMT | 0700);
         dst->st_mode |= (src->st_mode & 0700) >> 3;
         dst->st_mode |= (src->st_mode & 0700) >> 6;
@@ -167,5 +202,144 @@ namespace sogen
         return true;
     }
 
+    bool compat_set_file_times(const std::filesystem::path& file_name, const std::optional<LARGE_INTEGER> access_time,
+                               const std::optional<LARGE_INTEGER> write_time)
+    {
+#if defined(__MINGW64__)
+        // No utimensat: only the write time, through the standard library.
+        (void)access_time;
+        if (!write_time)
+        {
+            return true;
+        }
+        const auto since_1601 = std::chrono::duration<int64_t, std::ratio<1, HUNDRED_NANOSECONDS_IN_ONE_SECOND>>{write_time->QuadPart};
+        const auto since_1970 = since_1601 - std::chrono::seconds{EPOCH_DIFFERENCE_1601_TO_1970_SECONDS};
+        const auto system_time =
+            std::chrono::system_clock::time_point{std::chrono::duration_cast<std::chrono::system_clock::duration>(since_1970)};
+        std::error_code ec{};
+        std::filesystem::last_write_time(file_name, std::chrono::clock_cast<std::filesystem::file_time_type::clock>(system_time), ec);
+        return !ec;
+#else
+        const auto to_timespec = [](const std::optional<LARGE_INTEGER> time) {
+            if (!time)
+            {
+                return timespec{.tv_sec = 0, .tv_nsec = UTIME_OMIT};
+            }
+            const auto value = time->QuadPart - WINDOWS_EPOCH_DIFFERENCE;
+            return timespec{.tv_sec = static_cast<time_t>(value / HUNDRED_NANOSECONDS_IN_ONE_SECOND),
+                            .tv_nsec = static_cast<long>((value % HUNDRED_NANOSECONDS_IN_ONE_SECOND) * 100)};
+        };
+        const std::array<timespec, 2> times{to_timespec(access_time), to_timespec(write_time)};
+        return utimensat(AT_FDCWD, file_name.string().c_str(), times.data(), 0) == 0;
 #endif
+    }
+
+#endif
+
+    std::map<std::u16string, compat_host_entry> compat_host_entries(const std::filesystem::path& directory, const std::u16string& pattern)
+    {
+        std::map<std::u16string, compat_host_entry> entries{};
+#if defined(_WIN32) && !defined(__MINGW64__)
+        WIN32_FIND_DATAW data{};
+        auto* const find = FindFirstFileExW((directory / std::filesystem::path(pattern)).c_str(), FindExInfoStandard, &data,
+                                            FindExSearchNameMatch, nullptr, 0);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            return entries;
+        }
+
+        do
+        {
+            compat_host_entry entry{};
+            if (data.cAlternateFileName[0] != L'\0')
+            {
+                entry.short_name = std::filesystem::path{data.cAlternateFileName}.u16string();
+            }
+            // FindFirstFile reports a reparse point's tag in dwReserved0.
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            {
+                entry.reparse_tag = data.dwReserved0;
+            }
+
+            if (!entry.short_name.empty() || entry.reparse_tag)
+            {
+                entries.emplace(std::filesystem::path{data.cFileName}.u16string(), std::move(entry));
+            }
+        } while (FindNextFileW(find, &data));
+
+        FindClose(find);
+#else
+        (void)directory;
+        (void)pattern;
+#endif
+        return entries;
+    }
+
+    std::optional<std::vector<uint8_t>> compat_reparse_data(const std::filesystem::path& path)
+    {
+#if defined(_WIN32) && !defined(__MINGW64__)
+        const auto attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        {
+            return std::nullopt;
+        }
+
+        auto* const handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                         nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return std::nullopt;
+        }
+
+        // FSCTL_GET_REPARSE_POINT (winioctl.h clashes with the platform headers' CTL_CODE).
+        constexpr DWORD fsctl_get_reparse_point = 0x000900A8;
+        std::vector<uint8_t> data(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+        DWORD returned{};
+        const auto read =
+            DeviceIoControl(handle, fsctl_get_reparse_point, nullptr, 0, data.data(), static_cast<DWORD>(data.size()), &returned, nullptr);
+        CloseHandle(handle);
+        if (!read)
+        {
+            return std::nullopt;
+        }
+
+        data.resize(returned);
+        return data;
+#else
+        (void)path;
+        return std::nullopt;
+#endif
+    }
+
+    FILE* compat_open_reparse_point(const std::filesystem::path& path, const bool writable)
+    {
+#if defined(_WIN32) && !defined(__MINGW64__)
+        auto* const handle =
+            CreateFileW(path.c_str(), GENERIC_READ | (writable ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return nullptr;
+        }
+
+        const auto fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | (writable ? _O_RDWR : _O_RDONLY));
+        if (fd == -1)
+        {
+            CloseHandle(handle);
+            return nullptr;
+        }
+
+        auto* const file = _fdopen(fd, writable ? "r+b" : "rb");
+        if (!file)
+        {
+            _close(fd);
+        }
+
+        return file;
+#else
+        (void)path;
+        (void)writable;
+        return nullptr;
+#endif
+    }
 } // namespace sogen

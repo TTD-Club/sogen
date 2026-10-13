@@ -1,10 +1,7 @@
 #include "ttd_trace.hpp"
-#include "snapshot.hpp"
-
-#include <disassembler.hpp>
+#include "snapshot_format.hpp"
 
 #include <utils/compression.hpp>
-#include <utils/finally.hpp>
 
 #include <algorithm>
 #include <array>
@@ -12,13 +9,18 @@
 #include <cctype>
 #include <cstring>
 #include <future>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <ranges>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+
+#define XXH_INLINE_ALL
+#include <common/xxhash.h>
 
 namespace sogen::ttd
 {
@@ -29,59 +31,87 @@ namespace sogen::ttd
         constexpr uint64_t page_size = 4096;
         constexpr size_t cached_chunks = 4;
         constexpr size_t cached_bulk_blocks = bulk_reference_span + 1;
-        constexpr int checkpoint_compression_level = 3;
-        constexpr int code_table_compression_level = 9;
-        constexpr size_t max_instruction_size = 15;
 
-        // The length of an instruction the backend executed without decoding it (size 0: it raises an exception), as
-        // capstone decodes it, or 1 when capstone cannot decode it either. Recording and replay both use this, so the
-        // execute event matches.
-        size_t executed_size(windows_emulator& emu, const uint64_t address, const size_t reported)
+        // "SOGTTD<digit>\0" at the start of every trace file, the digit being the format version.
+        std::optional<uint32_t> version_from_magic(const std::array<char, 8>& magic)
         {
-            if (reported)
+            const std::string_view name(magic.data(), magic.size());
+            if (!name.starts_with("SOGTTD") || magic[7] != '\0' || magic[6] < '1' || magic[6] > '9')
             {
-                return reported;
+                return std::nullopt;
             }
-            auto& cpu = emu.emu();
-            std::array<uint8_t, max_instruction_size> bytes{};
-            size_t readable = 0;
-            while (readable < bytes.size() && cpu.try_read_memory(address + readable, bytes.data() + readable, 1))
-            {
-                ++readable;
-            }
-            const disassembler decoder{};
-            const auto decoded =
-                decoder.disassemble(cpu, cpu.reg<uint16_t>(x86_register::cs), std::span(bytes).first(readable), 1, address);
-            return decoded.empty() ? 1 : static_cast<size_t>(decoded[0].size);
+            return static_cast<uint32_t>(magic[6] - '0');
         }
 
-        // A checkpoint delta's zstd reference is its base state followed by the bulk blocks recorded in between. This
-        // returns that concatenation, or nothing when those blocks are empty and the base state alone is the reference.
-        std::vector<std::byte> extended_reference(const std::span<const std::byte> base, const std::span<const bulk_block> between)
+        // What an instruction does to control flow, from its bytes alone.
+        struct branch_info
         {
-            size_t bulk_size = 0;
-            for (const auto& block : between)
+            bool is_call{};
+            bool is_jump{};
+            bool is_return{};
+            // Through a register or memory operand.
+            bool indirect{};
+        };
+
+        branch_info classify_branch(const std::span<const uint8_t> bytes)
+        {
+            size_t i = 0;
+            // Legacy prefixes (operand/address size, lock, rep/bnd, segments).
+            while (i < bytes.size() &&
+                   (bytes[i] == 0x66 || bytes[i] == 0x67 || bytes[i] == 0xF0 || bytes[i] == 0xF2 || bytes[i] == 0xF3 || bytes[i] == 0x2E ||
+                    bytes[i] == 0x36 || bytes[i] == 0x3E || bytes[i] == 0x26 || bytes[i] == 0x64 || bytes[i] == 0x65))
             {
-                bulk_size += block->size();
+                ++i;
             }
-            if (!bulk_size)
+            // A REX prefix. In 32-bit code 0x40-0x4F are INC/DEC, which are whole one-byte instructions, so a byte that
+            // more of the instruction follows is a prefix in either mode.
+            if (i + 1 < bytes.size() && (bytes[i] & 0xF0) == 0x40)
+            {
+                ++i;
+            }
+            if (i >= bytes.size())
             {
                 return {};
             }
-            std::vector<std::byte> reference{};
-            reference.reserve(base.size() + bulk_size);
-            reference.insert(reference.end(), base.begin(), base.end());
-            for (const auto& block : between)
+            switch (bytes[i])
             {
-                reference.insert(reference.end(), block->begin(), block->end());
+            case 0xE8:
+            case 0x9A:
+                return {.is_call = true};
+            case 0xE9:
+            case 0xEB:
+            case 0xEA:
+                return {.is_jump = true};
+            case 0xC2:
+            case 0xC3:
+            case 0xCA:
+            case 0xCB:
+                return {.is_return = true};
+            case 0xFF: {
+                if (i + 1 >= bytes.size())
+                {
+                    return {};
+                }
+                const auto operation = (bytes[i + 1] >> 3) & 7;
+                if (operation == 2 || operation == 3)
+                {
+                    return {.is_call = true, .indirect = true};
+                }
+                if (operation == 4 || operation == 5)
+                {
+                    return {.is_jump = true, .indirect = true};
+                }
+                return {};
             }
-            return reference;
+            default:
+                return {};
+            }
         }
 
-        void describe_event(std::ostream& stream, const access_event& event)
+        branch_info classify_branch(const access_event& execute)
         {
-            stream << access_kind_name(event.kind) << " step=" << std::hex << event.step << " ip=" << event.ip
-                   << " address=" << event.address << std::dec << " size=" << event.size;
+            const auto size = std::min<size_t>(static_cast<size_t>(execute.size), execute.payload.size());
+            return classify_branch(std::span(execute.payload).first(size));
         }
 
         // Versions 1-4 stored every event as a fixed-size record, followed by full checkpoint snapshots and a
@@ -180,8 +210,6 @@ namespace sogen::ttd
             return std::as_bytes(std::span(values));
         }
 
-        constexpr auto writes_required = "TTD replay scans require a trace recorded with write events";
-
         bool overlaps(uint64_t a, uint64_t as, uint64_t b, uint64_t bs)
         {
             return as && bs && a <= b + std::min(bs - 1, UINT64_MAX - b) && b <= a + std::min(as - 1, UINT64_MAX - a);
@@ -193,29 +221,6 @@ namespace sogen::ttd
         }
 
         constexpr uint64_t max_manifest_size = 1024 * 1024;
-
-        std::vector<std::byte> encode_manifest(const manifest_entries& manifest)
-        {
-            std::vector<std::byte> encoded{};
-            const auto append = [&](const void* data, const size_t size) {
-                const auto* bytes = static_cast<const std::byte*>(data);
-                encoded.insert(encoded.end(), bytes, bytes + size);
-            };
-            for (const auto& [key, value] : manifest)
-            {
-                const auto key_size = static_cast<uint32_t>(key.size());
-                const auto value_size = static_cast<uint32_t>(value.size());
-                append(&key_size, sizeof(key_size));
-                append(&value_size, sizeof(value_size));
-                append(key.data(), key.size());
-                append(value.data(), value.size());
-            }
-            if (encoded.size() > max_manifest_size)
-            {
-                throw std::invalid_argument("TTD manifest exceeds 1 MiB");
-            }
-            return encoded;
-        }
 
         manifest_entries decode_manifest(const std::span<const std::byte> encoded)
         {
@@ -246,539 +251,9 @@ namespace sogen::ttd
         }
     }
 
-    recorder::recorder(windows_emulator& emu, const std::filesystem::path& path, const uint64_t access_mask, manifest_entries manifest)
-        : emu_(emu),
-          path_(path),
-          file_(path, std::ios::binary | std::ios::trunc),
-          manifest_(std::move(manifest))
-    {
-        encode_manifest(manifest_);
-        if (!(access_mask & all_access_kinds))
-        {
-            throw std::invalid_argument("A TTD recording needs at least one access kind");
-        }
-        if (!file_)
-        {
-            throw std::runtime_error("Cannot create TTD trace: " + path.string());
-        }
-        header_.access_mask = access_mask & all_access_kinds;
-        write_object(file_, header_);
-        chunk_events_.reserve(events_per_chunk);
-        recent_page_of_kind_.fill(no_recent_page);
-        tracks_instructions_ = (access_mask & static_cast<uint64_t>(access_kind::execute)) != 0;
-        constexpr auto code_changes = static_cast<uint64_t>(access_kind::execute) | static_cast<uint64_t>(access_kind::write) |
-                                      static_cast<uint64_t>(access_kind::host_write);
-        caches_instructions_ = (access_mask & code_changes) == code_changes;
-
-        // This also makes the initial process/thread state explicit in the snapshot.
-        emu_.setup_process_if_necessary();
-        instruction_ip_ = emu_.emu().read_instruction_pointer();
-        write_checkpoint(emu_.get_executed_instructions());
-
-        auto& cpu = emu_.emu();
-        if (access_mask & static_cast<uint64_t>(access_kind::write))
-        {
-            write_hook_ = scoped_hook(
-                cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
-                    append_data_event(access_kind::write, address, data);
-                }));
-        }
-        if (access_mask & static_cast<uint64_t>(access_kind::read))
-        {
-            read_hook_ = scoped_hook(
-                cpu, cpu.hook_memory_read_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
-                    append_data_event(access_kind::read, address, data);
-                }));
-        }
-        if (access_mask & static_cast<uint64_t>(access_kind::execute))
-        {
-            execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
-                append_event(access_kind::execute, address, executed_size(emu_, address, size));
-            }));
-        }
-        if (access_mask & static_cast<uint64_t>(access_kind::host_write))
-        {
-            host_write_hook_ =
-                scoped_hook(cpu, cpu.hook_host_memory_write([this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
-                    append_data_event(access_kind::host_write, address, data);
-                }));
-        }
-        // Last, so a constructor that throws never leaves a callback behind.
-        if (caches_instructions_)
-        {
-            emu_.memory.set_mapping_change_callback(
-                [this](const uint64_t address, const size_t size) { forget_instructions(address, size); });
-        }
-        ui_ = dynamic_cast<recordable_ui_backend*>(&emu_.ui());
-        if (ui_)
-        {
-            ui_->start_recording([this](const ui_event& event) {
-                ui_inputs_.push_back({.checkpoint = checkpoints_.size() - 1,
-                                      .event_number = header_.event_count,
-                                      .step = emu_.get_executed_instructions(),
-                                      .window = static_cast<uint64_t>(event.window),
-                                      .message = event.message,
-                                      .wparam = event.wParam,
-                                      .lparam = event.lParam});
-            });
-        }
-        syscall_enter_ = syscall_callback(emu_.callbacks.on_syscall_enter, [this](uint32_t) {
-            open_syscall_ = syscall_entry{.step = emu_.get_executed_instructions(), .event_number = header_.event_count};
-        });
-        syscall_exit_ = syscall_callback(emu_.callbacks.on_syscall_exit, [this](const uint32_t id) { close_syscall(id); });
-
-        for (const auto& mod : emu_.mod_manager.modules() | std::views::values)
-        {
-            add_module(mod);
-        }
-        module_load_ = module_callback(emu_.callbacks.on_module_load, [this](const mapped_module& mod) { add_module(mod); });
-        module_unload_ = module_callback(emu_.callbacks.on_module_unload, [this](const mapped_module& mod) {
-            const auto loaded = loaded_modules_.find(mod.image_base);
-            if (loaded == loaded_modules_.end())
-            {
-                return;
-            }
-            auto& entry = modules_[loaded->second];
-            entry.unload_step = emu_.get_executed_instructions();
-            entry.unload_event_number = header_.event_count;
-            loaded_modules_.erase(loaded);
-        });
-    }
-
-    void recorder::add_module(const mapped_module& mod)
-    {
-        auto exports = std::make_shared<std::vector<module_export>>();
-        exports->reserve(mod.exports.size());
-        for (const auto& symbol : mod.exports)
-        {
-            exports->push_back({.rva = symbol.rva, .ordinal = symbol.ordinal, .name = symbol.name});
-        }
-        std::ranges::sort(*exports, {}, [](const module_export& symbol) { return std::tie(symbol.rva, symbol.name); });
-        loaded_modules_[mod.image_base] = modules_.size();
-        modules_.push_back({.base = mod.image_base,
-                            .size = mod.size_of_image,
-                            .load_step = emu_.get_executed_instructions(),
-                            .load_event_number = header_.event_count,
-                            .name = mod.name,
-                            .path = mod.module_path.string(),
-                            .exports = std::move(exports)});
-    }
-
-    void recorder::note_thread(const access_event& event)
-    {
-        const auto* thread = emu_.vcpu(0).active_thread;
-        if (!thread || running_thread_ == thread->id)
-        {
-            return;
-        }
-        running_thread_ = thread->id;
-        // The event is already counted.
-        threads_.switches.push_back({.step = event.step, .event_number = header_.event_count - 1, .thread_id = thread->id});
-        threads_.names[thread->id] = u16_to_u8(thread->name);
-    }
-
-    void recorder::close_syscall(const uint32_t id)
-    {
-        if (!open_syscall_)
-        {
-            return;
-        }
-        auto entry = *open_syscall_;
-        open_syscall_.reset();
-        entry.id = id;
-        entry.event_count = header_.event_count - entry.event_number;
-        entry.result = emu_.emu().reg<uint64_t>(x86_register::rax);
-        if (!syscalls_.names.contains(id))
-        {
-            try
-            {
-                syscalls_.names[id] = emu_.dispatcher.get_syscall_name(id);
-            }
-            catch (const std::out_of_range&)
-            {
-                // An unknown syscall: the emulator stops at it.
-            }
-        }
-        syscalls_.entries.push_back(entry);
-    }
-
-    recorder::~recorder()
-    {
-        try
-        {
-            finish();
-        }
-        catch (const std::exception& e)
-        {
-            emu_.log.error("TTD trace %s was not finalized: %s\n", path_.string().c_str(), e.what());
-        }
-        catch (...)
-        {
-            emu_.log.error("TTD trace %s was not finalized\n", path_.string().c_str());
-        }
-    }
-
-    void recorder::append_event(access_kind kind, uint64_t address, size_t size)
-    {
-        if (!size)
-        {
-            return;
-        }
-        // The backend reports an instruction before running it, with the instruction pointer at its address.
-        instruction_ip_ = address;
-        access_event event{.step = emu_.get_executed_instructions(), .ip = address, .address = address, .size = size, .kind = kind};
-        if (size < inline_data_limit)
-        {
-            const auto cached = caches_instructions_ ? instruction_cache_.find(address) : instruction_cache_.end();
-            if (cached != instruction_cache_.end() && cached->second.size == size)
-            {
-                event.payload = cached->second.bytes;
-            }
-            else
-            {
-                if (!emu_.emu().try_read_memory(address, event.payload.data(), size))
-                {
-                    throw std::runtime_error("Cannot read executed instruction bytes");
-                }
-                if (caches_instructions_)
-                {
-                    instruction_cache_[address] = {.size = size, .bytes = event.payload};
-                    const auto last = last_byte(address, size);
-                    for (auto page = address / page_size; page <= last / page_size; ++page)
-                    {
-                        cached_instructions_by_page_[page].push_back(address);
-                    }
-                }
-            }
-        }
-        push_event(event);
-    }
-
-    void recorder::forget_instructions(const uint64_t address, const uint64_t size)
-    {
-        if (cached_instructions_by_page_.empty() || !size)
-        {
-            return;
-        }
-        const auto last = last_byte(address, size);
-        for (auto page = address / page_size; page <= last / page_size; ++page)
-        {
-            const auto entry = cached_instructions_by_page_.find(page);
-            if (entry == cached_instructions_by_page_.end())
-            {
-                continue;
-            }
-            for (const auto instruction : entry->second)
-            {
-                instruction_cache_.erase(instruction);
-            }
-            cached_instructions_by_page_.erase(entry);
-        }
-    }
-
-    void recorder::append_data_event(access_kind kind, uint64_t address, std::span<const std::byte> data)
-    {
-        if (data.empty())
-        {
-            return;
-        }
-        // A guest access belongs to the instruction the execute hook just reported. Host writes happen outside guest
-        // instructions (syscalls, exception dispatch), where the instruction pointer can differ.
-        const auto ip = kind != access_kind::host_write && tracks_instructions_ ? instruction_ip_ : emu_.emu().read_instruction_pointer();
-        if (kind != access_kind::read)
-        {
-            forget_instructions(address, data.size());
-        }
-        access_event event{.step = emu_.get_executed_instructions(), .ip = ip, .address = address, .size = data.size(), .kind = kind};
-        if (data.size() <= inline_data_limit)
-        {
-            memcpy(event.payload.data(), data.data(), data.size());
-        }
-        else
-        {
-            const uint64_t offset = current_bulk_->size();
-            const uint64_t block = bulk_table_.size();
-            current_bulk_->insert(current_bulk_->end(), data.begin(), data.end());
-            memcpy(event.payload.data(), &offset, sizeof(offset));
-            memcpy(event.payload.data() + sizeof(offset), &block, sizeof(block));
-        }
-        push_event(event);
-    }
-
-    void recorder::push_event(const access_event& event)
-    {
-        chunk_events_.push_back(event);
-        ++header_.event_count;
-        // A thread's first instruction after a switch marks the switch; without execute events, any event does.
-        if (event.kind == access_kind::execute || !tracks_instructions_)
-        {
-            note_thread(event);
-        }
-        const auto first_page = event.address / page_size;
-        const auto last_page = last_byte(event.address, event.size) / page_size;
-        auto& recent_page = recent_page_of_kind_[static_cast<size_t>(event.kind)];
-        if (first_page != last_page || recent_page != first_page)
-        {
-            for (auto page = first_page; page <= last_page; ++page)
-            {
-                chunk_pages_[page] |= static_cast<uint32_t>(event.kind);
-            }
-            recent_page = first_page == last_page ? first_page : no_recent_page;
-        }
-        if (chunk_events_.size() == events_per_chunk)
-        {
-            flush_chunk();
-        }
-    }
-
-    void recorder::flush_chunk()
-    {
-        if (chunk_events_.empty())
-        {
-            return;
-        }
-        // Code ids follow the order of first execution across the whole trace, so they are assigned here; the rest of
-        // the encoding runs on a worker. The chunk's large accesses are the tail of the open bulk block, copied because
-        // the block keeps growing.
-        std::vector<uint64_t> code_ids{};
-        for (const auto& event : chunk_events_)
-        {
-            if (event.kind == access_kind::execute)
-            {
-                code_ids.push_back(code_.id_of(event));
-            }
-        }
-        chunk_bulk_bytes bulk{.block = bulk_table_.size(), .offset = chunk_bulk_start_};
-        if (current_bulk_->size() > chunk_bulk_start_)
-        {
-            bulk.bytes = std::make_shared<const std::vector<std::byte>>(current_bulk_->begin() + static_cast<ptrdiff_t>(chunk_bulk_start_),
-                                                                        current_bulk_->end());
-        }
-        chunk_bulk_start_ = current_bulk_->size();
-
-        const auto index = static_cast<uint32_t>(chunks_.size());
-        chunks_.push_back({.first_event = header_.event_count - chunk_events_.size(),
-                           .event_count = chunk_events_.size(),
-                           .first_step = chunk_events_.front().step,
-                           .last_step = chunk_events_.back().step});
-        for (const auto& [page, kinds] : chunk_pages_)
-        {
-            pages_.push_back({.page = page, .chunk = index, .kinds = kinds});
-        }
-        auto events = std::make_shared<const std::vector<access_event>>(std::move(chunk_events_));
-        chunk_events_ = {};
-        chunk_events_.reserve(events_per_chunk);
-        chunk_pages_.clear();
-        recent_page_of_kind_.fill(no_recent_page);
-        chunk_compressor_.submit_job(index, [events, code_ids = std::move(code_ids), bulk = std::move(bulk)] {
-            return utils::compression::zstd::compress(encode_chunk(*events, code_ids, bulk), chunk_compression_level);
-        });
-        write_compressed(false);
-    }
-
-    void recorder::close_bulk_block()
-    {
-        if (!current_bulk_->empty())
-        {
-            bulk_compressor_.submit(bulk_table_.size(), current_bulk_);
-        }
-        bulk_table_.push_back({});
-        recent_bulk_.push_back(std::move(current_bulk_));
-        if (recent_bulk_.size() > bulk_reference_span)
-        {
-            recent_bulk_.pop_front();
-        }
-        current_bulk_ = std::make_shared<std::vector<std::byte>>();
-        chunk_bulk_start_ = 0;
-        write_compressed(false);
-    }
-
-    void recorder::write_compressed(const bool wait)
-    {
-        for (const auto& [index, compressed] : chunk_compressor_.take_finished(wait))
-        {
-            if (compressed.empty())
-            {
-                throw std::runtime_error("Cannot compress TTD event chunk");
-            }
-            auto& entry = chunks_.at(static_cast<size_t>(index));
-            entry.offset = append_to_file(compressed);
-            entry.size = compressed.size();
-        }
-        for (const auto& [index, compressed] : bulk_compressor_.take_finished(wait))
-        {
-            if (compressed.empty())
-            {
-                throw std::runtime_error("Cannot compress TTD bulk data");
-            }
-            bulk_table_.at(static_cast<size_t>(index)) = {.offset = append_to_file(compressed), .size = compressed.size()};
-        }
-        for (const auto& [index, compressed] : checkpoint_compressor_.take_finished(wait))
-        {
-            if (compressed.empty())
-            {
-                throw std::runtime_error("Cannot compress TTD checkpoint");
-            }
-            auto& entry = checkpoints_.at(static_cast<size_t>(index));
-            entry.offset = append_to_file(compressed);
-            entry.size = compressed.size();
-        }
-    }
-
-    void recorder::write_checkpoint(const uint64_t step)
-    {
-        // A little headroom over the previous state covers ordinary growth without a reallocation.
-        const auto expected_size = base_states_.empty() ? 0 : base_states_.front()->size() + base_states_.front()->size() / 16;
-        auto state = std::make_shared<const std::vector<std::byte>>(snapshot::create_emulator_state(emu_, expected_size));
-        const auto index = static_cast<uint64_t>(checkpoints_.size());
-        if (!index)
-        {
-            checkpoints_.push_back({.step = step});
-            checkpoint_compressor_.submit_job(index,
-                                              [state] { return utils::compression::zstd::compress(*state, checkpoint_compression_level); });
-            base_states_.assign(checkpoint_levels, state);
-            write_compressed(false);
-            return;
-        }
-
-        // Checkpoint i is a delta against i - p, where p is the largest power of checkpoints_per_level dividing i, so
-        // restoring any checkpoint applies fewer than checkpoints_per_level deltas per level.
-        size_t level = 0;
-        uint64_t distance = 1;
-        while (level + 1 < checkpoint_levels && index % (distance * checkpoints_per_level) == 0)
-        {
-            ++level;
-            distance *= checkpoints_per_level;
-        }
-        std::vector<bulk_block> between{};
-        if (distance <= bulk_reference_span)
-        {
-            between.assign(recent_bulk_.end() - static_cast<ptrdiff_t>(distance), recent_bulk_.end());
-        }
-        checkpoints_.push_back({.step = step, .base = index - distance});
-        checkpoint_compressor_.submit_job(index, [state, base = base_states_[level], between = std::move(between)] {
-            const auto extended = extended_reference(*base, between);
-            return utils::compression::zstd::compress_with_reference(*state, extended.empty() ? std::span(*base) : std::span(extended));
-        });
-        std::fill_n(base_states_.begin(), level + 1, state);
-        write_compressed(false);
-    }
-
-    uint64_t recorder::append_to_file(const std::span<const std::byte> bytes)
-    {
-        const auto offset = static_cast<uint64_t>(file_.tellp());
-        file_.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        if (!file_)
-        {
-            throw std::runtime_error("TTD trace write failed");
-        }
-        return offset;
-    }
-
-    void recorder::checkpoint()
-    {
-        if (finished_)
-        {
-            throw std::runtime_error("Cannot checkpoint a finished TTD trace");
-        }
-        const auto step = emu_.get_executed_instructions();
-        if (step <= checkpoints_.back().step)
-        {
-            throw std::runtime_error("TTD checkpoints must have increasing instruction positions");
-        }
-        flush_chunk();
-        close_bulk_block();
-        write_checkpoint(step);
-    }
-
-    void recorder::finish()
-    {
-        if (finished_)
-        {
-            return;
-        }
-        finished_ = true;
-        syscall_enter_.reset();
-        syscall_exit_.reset();
-        module_load_.reset();
-        module_unload_.reset();
-        // Names given after a thread's last switch.
-        for (const auto& thread : emu_.process.threads | std::views::values)
-        {
-            if (threads_.names.contains(thread.id))
-            {
-                threads_.names[thread.id] = u16_to_u8(thread.name);
-            }
-        }
-        write_hook_.remove();
-        read_hook_.remove();
-        execute_hook_.remove();
-        host_write_hook_.remove();
-        if (caches_instructions_)
-        {
-            emu_.memory.set_mapping_change_callback({});
-        }
-        if (ui_)
-        {
-            ui_->stop();
-        }
-        flush_chunk();
-        close_bulk_block();
-        write_compressed(true);
-        base_states_.clear();
-        recent_bulk_.clear();
-        header_.instruction_count = emu_.get_executed_instructions();
-
-        std::ranges::sort(
-            pages_, [](const page_entry& a, const page_entry& b) { return a.page < b.page || (a.page == b.page && a.chunk < b.chunk); });
-        std::vector<page_block> page_blocks{};
-        for (size_t first = 0; first < pages_.size(); first += page_block_entries)
-        {
-            const auto entries = std::span(pages_).subspan(first, std::min<size_t>(page_block_entries, pages_.size() - first));
-            const auto encoded = encode_page_block(entries);
-            page_blocks.push_back({.first_page = entries.front().page,
-                                   .entry_count = entries.size(),
-                                   .offset = append_to_file(encoded),
-                                   .size = encoded.size()});
-        }
-        pages_ = {};
-        const auto code = utils::compression::zstd::compress(bytes_of(code_.entries()), code_table_compression_level);
-        if (code.empty())
-        {
-            throw std::runtime_error("Cannot compress TTD code table");
-        }
-        const auto manifest = encode_manifest(manifest_);
-        const auto syscalls = encode_syscalls(syscalls_);
-        const auto modules = encode_modules(modules_);
-        const auto threads = encode_threads(threads_);
-        const auto exports = encode_exports(modules_);
-        const std::array sections{
-            section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
-            section_entry{
-                .type = section_type::checkpoint_table, .offset = append_to_file(bytes_of(checkpoints_)), .size = checkpoints_.size()},
-            section_entry{.type = section_type::page_index, .offset = append_to_file(bytes_of(page_blocks)), .size = page_blocks.size()},
-            section_entry{.type = section_type::code_table, .offset = append_to_file(code), .size = code.size()},
-            section_entry{.type = section_type::bulk_table, .offset = append_to_file(bytes_of(bulk_table_)), .size = bulk_table_.size()},
-            section_entry{.type = section_type::manifest, .offset = append_to_file(manifest), .size = manifest.size()},
-            section_entry{.type = section_type::ui_inputs, .offset = append_to_file(bytes_of(ui_inputs_)), .size = ui_inputs_.size()},
-            section_entry{.type = section_type::syscalls, .offset = append_to_file(syscalls), .size = syscalls.size()},
-            section_entry{.type = section_type::modules, .offset = append_to_file(modules), .size = modules.size()},
-            section_entry{.type = section_type::threads, .offset = append_to_file(threads), .size = threads.size()},
-            section_entry{.type = section_type::exports, .offset = append_to_file(exports), .size = exports.size()},
-        };
-        header_.section_count = sections.size();
-        header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
-        file_.seekp(0);
-        write_object(file_, header_);
-        file_.flush();
-        if (!file_)
-        {
-            throw std::runtime_error("Cannot finalize TTD trace");
-        }
-    }
-
     trace::trace(const std::filesystem::path& path)
-        : file_(path, std::ios::binary)
+        : file_(path, std::ios::binary),
+          path_(path)
     {
         if (!file_)
         {
@@ -790,16 +265,17 @@ namespace sogen::ttd
         {
             throw std::runtime_error("Truncated TTD trace");
         }
-        const std::string_view name(magic.data(), magic.size());
-        if (!name.starts_with("SOGTTD") || magic[7] != '\0' || magic[6] < '1' || magic[6] > '9')
+        const auto version = version_from_magic(magic);
+        if (!version)
         {
-            throw std::runtime_error("Unsupported TTD trace format");
+            throw std::runtime_error("Not a Sogen TTD trace: " + path.string());
         }
-        version_ = static_cast<uint32_t>(magic[6] - '0');
-        if (version_ == 5 || version_ == 6 || version_ > 8)
+        if (!is_supported_trace_version(*version))
         {
-            throw std::runtime_error("Unsupported TTD trace format");
+            throw std::runtime_error("Unsupported TTD trace format version " + std::to_string(*version) + " (this build reads " +
+                                     std::to_string(oldest_trace_version) + "-4 and 7-" + std::to_string(newest_trace_version) + ")");
         }
+        version_ = *version;
         file_.seekg(0, std::ios::end);
         const auto length = static_cast<uint64_t>(file_.tellg());
         file_.seekg(0);
@@ -811,6 +287,33 @@ namespace sogen::ttd
         {
             read_legacy_layout(length);
         }
+        compute_id();
+    }
+
+    void trace::compute_id()
+    {
+        if (const auto stored = manifest_value(trace_id_key))
+        {
+            id_ = *stored;
+            return;
+        }
+        // Older recordings: a hash of what identifies the file's contents without reading all of it: the header, the
+        // checkpoint table (offsets and sizes differ between any two recordings), and the chunk table.
+        std::vector<std::byte> identity(64);
+        file_.clear();
+        file_.seekg(0);
+        file_.read(reinterpret_cast<char*>(identity.data()), static_cast<std::streamsize>(identity.size()));
+        identity.resize(static_cast<size_t>(file_.gcount()));
+        const auto append = [&](const auto& values) {
+            const auto bytes = std::as_bytes(std::span(values));
+            identity.insert(identity.end(), bytes.begin(), bytes.end());
+        };
+        append(checkpoints_);
+        append(chunks_);
+        std::ostringstream id{};
+        id << 'h' << std::hex << std::setfill('0') << std::setw(16) << XXH64(identity.data(), identity.size(), 0) << std::setw(16)
+           << XXH64(identity.data(), identity.size(), 1);
+        id_ = id.str();
     }
 
     void trace::read_chunked_layout(const uint64_t length)
@@ -842,6 +345,8 @@ namespace sogen::ttd
         }
         // Decoded once the modules they belong to are.
         std::optional<std::vector<std::byte>> exports{};
+        std::optional<std::vector<std::byte>> forwarders{};
+        std::optional<std::vector<std::byte>> machines{};
         for (const auto& section : sections)
         {
             if (section.type == section_type::chunk_table)
@@ -948,8 +453,60 @@ namespace sogen::ttd
                 }
                 syscalls_ = decode_syscalls(read_bytes(section.offset, section.size));
             }
+            else if (section.type == section_type::register_snapshots)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                register_snapshots_ = decode_register_snapshots(read_bytes(section.offset, section.size));
+                for (const auto& entry : register_snapshots_)
+                {
+                    if (!fits(entry.offset, entry.size, 1) ||
+                        (entry.base != UINT64_MAX && register_snapshots_[static_cast<size_t>(entry.base)].base != UINT64_MAX))
+                    {
+                        throw std::runtime_error("Invalid TTD register snapshot entry");
+                    }
+                }
+            }
+            else if (section.type == section_type::mapping_changes)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                mapping_changes_ = decode_mapping_changes(read_bytes(section.offset, section.size));
+                has_mapping_changes_ = true;
+            }
+            else if (section.type == section_type::thread_stacks)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                thread_stacks_ = decode_thread_stacks(read_bytes(section.offset, section.size));
+                has_thread_stacks_ = true;
+            }
+            else if (section.type == section_type::memory_regions)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                memory_regions_ = decode_memory_regions(read_bytes(section.offset, section.size));
+                has_memory_regions_ = true;
+            }
+            else if (section.type == section_type::checkpoint_memory)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                checkpoint_memory_offsets_ = decode_checkpoint_memory_offsets(read_bytes(section.offset, section.size));
+            }
             else if (section.type == section_type::modules || section.type == section_type::threads ||
-                     section.type == section_type::exports)
+                     section.type == section_type::exports || section.type == section_type::export_forwarders ||
+                     section.type == section_type::module_machines)
             {
                 if (!fits(section.offset, section.size, 1))
                 {
@@ -964,15 +521,35 @@ namespace sogen::ttd
                 {
                     threads_ = decode_threads(bytes);
                 }
-                else
+                else if (section.type == section_type::exports)
                 {
                     exports = std::move(bytes);
+                }
+                else if (section.type == section_type::module_machines)
+                {
+                    machines = std::move(bytes);
+                }
+                else
+                {
+                    forwarders = std::move(bytes);
                 }
             }
         }
         if (exports)
         {
             decode_exports(*exports, modules_);
+            if (forwarders)
+            {
+                decode_export_forwarders(*forwarders, modules_);
+            }
+        }
+        if (machines)
+        {
+            decode_module_machines(*machines, modules_);
+        }
+        if (!checkpoint_memory_offsets_.empty() && checkpoint_memory_offsets_.size() != checkpoints_.size())
+        {
+            throw std::runtime_error("Invalid TTD checkpoint memory offsets");
         }
 
         uint64_t next_event = 0;
@@ -1236,6 +813,50 @@ namespace sogen::ttd
         return static_cast<uint32_t>(next - chunks_.begin() - 1);
     }
 
+    namespace
+    {
+        // A least recently used cache of decoded checkpoints, by index, least recent first.
+        template <typename Value>
+        using checkpoint_cache = std::vector<std::pair<uint64_t, std::shared_ptr<const Value>>>;
+
+        // The cached value of checkpoint `index`, made the most recent; null when it is not cached.
+        template <typename Value>
+        std::shared_ptr<const Value> cached_checkpoint(checkpoint_cache<Value>& cache, const uint64_t index)
+        {
+            const auto found = std::ranges::find(cache, index, &std::pair<uint64_t, std::shared_ptr<const Value>>::first);
+            if (found == cache.end())
+            {
+                return nullptr;
+            }
+            std::rotate(found, std::next(found), cache.end());
+            return cache.back().second;
+        }
+
+        // Drops the least recent entries beyond `size`.
+        template <typename Value>
+        void trim_checkpoints(checkpoint_cache<Value>& cache, const size_t size)
+        {
+            if (cache.size() > size)
+            {
+                cache.erase(cache.begin(), cache.begin() + static_cast<ptrdiff_t>(cache.size() - size));
+            }
+        }
+
+        template <typename Value>
+        void cache_checkpoint(checkpoint_cache<Value>& cache, const uint64_t index, std::shared_ptr<const Value> value, const size_t size)
+        {
+            cache.emplace_back(index, std::move(value));
+            trim_checkpoints(cache, size);
+        }
+    }
+
+    void trace::set_checkpoint_cache_size(const size_t count)
+    {
+        checkpoint_cache_size_ = std::max<size_t>(count, 1);
+        trim_checkpoints(state_cache_, checkpoint_cache_size_);
+        trim_checkpoints(checkpoint_memory_cache_, checkpoint_cache_size_);
+    }
+
     std::shared_ptr<const std::vector<std::byte>> trace::checkpoint_state_at(const uint64_t index)
     {
         if (!this->chunked())
@@ -1243,18 +864,24 @@ namespace sogen::ttd
             const auto& entry = checkpoints_.at(static_cast<size_t>(index));
             return std::make_shared<const std::vector<std::byte>>(snapshot::get_emulator_state(read_bytes(entry.offset, entry.size)));
         }
-        if (state_cache_ && state_cache_->first == index)
+        if (auto cached = cached_checkpoint(state_cache_, index))
         {
-            return state_cache_->second;
+            return cached;
         }
 
+        // The chain of deltas back to a full state, or to the nearest state in the cache.
         std::vector<uint64_t> chain{index};
-        while (checkpoints_.at(static_cast<size_t>(chain.back())).base != no_base_checkpoint &&
-               (!state_cache_ || state_cache_->first != chain.back()))
+        std::shared_ptr<const std::vector<std::byte>> cached_base{};
+        while (checkpoints_.at(static_cast<size_t>(chain.back())).base != no_base_checkpoint)
         {
             chain.push_back(checkpoints_.at(static_cast<size_t>(chain.back())).base);
+            cached_base = cached_checkpoint(state_cache_, chain.back());
+            if (cached_base)
+            {
+                break;
+            }
         }
-        const auto from_cache = state_cache_ && state_cache_->first == chain.back();
+        const auto from_cache = static_cast<bool>(cached_base);
 
         // A delta's reference is its base state followed by the bulk blocks in between. Each restored state is
         // decompressed with room for the next delta's blocks, so they can be appended in place instead of copying the
@@ -1308,7 +935,7 @@ namespace sogen::ttd
         if (from_cache)
         {
             chain.pop_back();
-            const auto& cached = *state_cache_->second;
+            const auto& cached = *cached_base;
             if (!chain.empty())
             {
                 between = blocks_between(chain.back());
@@ -1344,7 +971,7 @@ namespace sogen::ttd
             std::swap(state, next);
         }
         auto restored = std::make_shared<const std::vector<std::byte>>(std::move(state));
-        state_cache_ = std::make_pair(index, restored);
+        cache_checkpoint(state_cache_, index, restored, checkpoint_cache_size_);
         return restored;
     }
 
@@ -1394,13 +1021,16 @@ namespace sogen::ttd
             return symbol_location{.module = mod, .offset = rva};
         }
         const auto& exports = *mod->exports;
-        const auto next = std::ranges::upper_bound(exports, rva, {}, &module_export::rva);
-        if (next == exports.begin())
+        // Forwarded exports point at their forwarder strings, not at code.
+        const auto below = std::ranges::find_if(
+            std::ranges::subrange(exports.begin(), std::ranges::upper_bound(exports, rva, {}, &module_export::rva)) | std::views::reverse,
+            [](const module_export& symbol) { return symbol.forwarder.empty(); });
+        if (below.base() == exports.begin())
         {
             return symbol_location{.module = mod, .offset = rva};
         }
         // Of several names for one address, the first by name, preferring a real name over "#<ordinal>".
-        const auto aliases = std::ranges::equal_range(exports, std::prev(next)->rva, {}, &module_export::rva);
+        const auto aliases = std::ranges::equal_range(exports, below->rva, {}, &module_export::rva);
         const auto named = std::ranges::find_if(aliases, [](const module_export& symbol) { return !symbol.name.starts_with('#'); });
         const auto& symbol = named == aliases.end() ? aliases.front() : *named;
         return symbol_location{.module = mod, .symbol = &symbol, .offset = rva - symbol.rva};
@@ -1436,7 +1066,8 @@ namespace sogen::ttd
             }
             for (const auto& symbol : *mod.exports)
             {
-                if (symbol.name == symbol_name)
+                // A forwarder can name a function by ordinal that also has a name.
+                if (symbol.name == symbol_name || (symbol_name.starts_with('#') && symbol_name.substr(1) == std::to_string(symbol.ordinal)))
                 {
                     found.push_back({.module = &mod, .symbol = &symbol});
                 }
@@ -1445,19 +1076,52 @@ namespace sogen::ttd
         return found;
     }
 
-    std::vector<access_event> trace::calls(const std::string_view name, const uint64_t start, const uint64_t end)
+    std::vector<access_event> trace::calls(const std::string_view name, const uint64_t start, const uint64_t end,
+                                           const operation_control& control)
     {
-        std::vector<access_event> found{};
-        for (const auto& [mod, symbol] : find_exports(name))
+        struct target
         {
-            const auto address = mod->base + symbol->rva;
-            const auto first = std::max(start, mod->load_step);
-            const auto last = mod->unload_step ? std::min(end, *mod->unload_step) : end;
+            uint64_t address{};
+            uint64_t first{};
+            uint64_t last{};
+        };
+
+        std::vector<target> targets{};
+        // A forwarded export runs as its target, in the window where both modules are loaded; forwarders can chain.
+        constexpr size_t max_forwarder_depth = 8;
+        const auto add = [&](const auto& self, const module_symbol& found, uint64_t first, uint64_t last, const size_t depth) -> void {
+            first = std::max(first, found.module->load_step);
+            last = found.module->unload_step ? std::min(last, *found.module->unload_step) : last;
             if (first > last)
             {
-                continue;
+                return;
             }
-            for (const auto& event : accesses(address, 1, first, last, static_cast<uint64_t>(access_kind::execute)))
+            if (found.symbol->forwarder.empty())
+            {
+                targets.push_back({.address = found.module->base + found.symbol->rva, .first = first, .last = last});
+                return;
+            }
+            if (depth < max_forwarder_depth)
+            {
+                for (const auto& forwarded : find_exports(found.symbol->forwarder))
+                {
+                    self(self, forwarded, first, last, depth + 1);
+                }
+            }
+        };
+        for (const auto& symbol : find_exports(name))
+        {
+            add(add, symbol, start, end, 0);
+        }
+
+        std::vector<access_event> found{};
+        // Progress counts targets; each query only checks for interruption.
+        const operation_control check_only{.interrupted = control.interrupted};
+        for (size_t done = 0; done < targets.size(); ++done)
+        {
+            control.report(done, targets.size());
+            const auto& [address, first, last] = targets[done];
+            for (const auto& event : accesses(address, 1, first, last, static_cast<uint64_t>(access_kind::execute), check_only))
             {
                 if (event.address == address)
                 {
@@ -1465,7 +1129,11 @@ namespace sogen::ttd
                 }
             }
         }
-        std::ranges::stable_sort(found, {}, &access_event::step);
+        // Several names (an export and the forwarders to it) can lead to the same function.
+        std::ranges::sort(found, {}, [](const access_event& event) { return std::tie(event.step, event.address); });
+        const auto duplicates =
+            std::ranges::unique(found, {}, [](const access_event& event) { return std::tie(event.step, event.address); });
+        found.erase(duplicates.begin(), duplicates.end());
         return found;
     }
 
@@ -1480,6 +1148,22 @@ namespace sogen::ttd
         return std::prev(next)->thread_id;
     }
 
+    std::vector<std::byte> trace::snapshot_registers(const size_t index)
+    {
+        const auto& entry = register_snapshots_.at(index);
+        const auto base = entry.base == UINT64_MAX ? index : entry.base;
+        if (!register_base_cache_ || register_base_cache_->first != base)
+        {
+            const auto& base_entry = register_snapshots_[static_cast<size_t>(base)];
+            register_base_cache_.emplace(base, utils::compression::zstd::decompress(read_bytes(base_entry.offset, base_entry.size)));
+        }
+        if (base == index)
+        {
+            return register_base_cache_->second;
+        }
+        return utils::compression::zstd::decompress_with_reference(read_bytes(entry.offset, entry.size), register_base_cache_->second);
+    }
+
     uint64_t trace::checkpoint_index(const uint64_t step) const
     {
         const auto entry = std::ranges::lower_bound(checkpoints_, step, {}, &checkpoint_entry::step);
@@ -1490,7 +1174,7 @@ namespace sogen::ttd
         return static_cast<uint64_t>(entry - checkpoints_.begin());
     }
 
-    checkpoint_state trace::checkpoint_for_step(const uint64_t step)
+    uint64_t trace::checkpoint_step_for(const uint64_t step) const
     {
         if (step > metadata_.instruction_count)
         {
@@ -1500,8 +1184,12 @@ namespace sogen::ttd
         {
             throw std::out_of_range("TTD position is before the start of the trace");
         }
-        const auto next = std::ranges::upper_bound(checkpoints_, step, {}, &checkpoint_entry::step);
-        const auto index = static_cast<uint64_t>(next - checkpoints_.begin() - 1);
+        return std::prev(std::ranges::upper_bound(checkpoints_, step, {}, &checkpoint_entry::step))->step;
+    }
+
+    checkpoint_state trace::checkpoint_for_step(const uint64_t step)
+    {
+        const auto index = this->checkpoint_index(this->checkpoint_step_for(step));
         return {.step = checkpoints_[static_cast<size_t>(index)].step, .state = checkpoint_state_at(index)};
     }
 
@@ -1712,7 +1400,8 @@ namespace sogen::ttd
     }
 
     std::vector<access_event> trace::matching_events(const std::span<const number_range> ranges,
-                                                     const std::function<bool(const access_event&)>& matches, const bool with_data)
+                                                     const std::function<bool(const access_event&)>& matches, const bool with_data,
+                                                     const operation_control& control)
     {
         std::vector<access_event> result{};
         const auto collect = [&](std::vector<access_event>& output, const std::span<const access_event> events, const uint64_t first_event,
@@ -1788,6 +1477,7 @@ namespace sogen::ttd
             {
                 std::rethrow_exception(error);
             }
+            control.report(first + batch.size(), ranges.size());
         }
         return result;
     }
@@ -1891,7 +1581,8 @@ namespace sogen::ttd
         return std::nullopt;
     }
 
-    std::vector<access_event> trace::accesses(uint64_t address, uint64_t size, uint64_t first_step, uint64_t last_step, uint64_t kind_mask)
+    std::vector<access_event> trace::accesses(uint64_t address, uint64_t size, uint64_t first_step, uint64_t last_step, uint64_t kind_mask,
+                                              const operation_control& control)
     {
         std::vector<access_event> result{};
         if (!size || first_step > last_step)
@@ -1908,10 +1599,12 @@ namespace sogen::ttd
         if (this->chunked())
         {
             // Execute events carry their bytes from the code table; only data accesses need the chunk's values.
-            return matching_events(ranges, matches, (kind_mask & ~static_cast<uint64_t>(access_kind::execute)) != 0);
+            return matching_events(ranges, matches, (kind_mask & ~static_cast<uint64_t>(access_kind::execute)) != 0, control);
         }
-        for (const auto& range : ranges)
+        for (size_t done = 0; done < ranges.size(); ++done)
         {
+            const auto& range = ranges[done];
+            control.report(done, ranges.size());
             for (auto number = range.begin; number < range.end; ++number)
             {
                 const auto event = event_at(number);
@@ -1968,6 +1661,548 @@ namespace sogen::ttd
         return std::nullopt;
     }
 
+    std::vector<std::optional<uint8_t>> trace::memory_at(const uint64_t position, const uint64_t address, const uint64_t size,
+                                                         const operation_control& control)
+    {
+        if (position > metadata_.instruction_count)
+        {
+            throw std::out_of_range("TTD position is beyond end of trace");
+        }
+        if (!size)
+        {
+            return {};
+        }
+        return checkpoint_memory_offsets_.empty() ? memory_from_accesses(position, address, size, control)
+                                                  : memory_from_checkpoint(position, address, size, control);
+    }
+
+    std::vector<std::optional<uint8_t>> trace::memory_from_checkpoint(const uint64_t position, const uint64_t address, const uint64_t size,
+                                                                      const operation_control& control)
+    {
+        std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
+        const auto last = last_byte(address, size);
+        const auto checkpoint_step = checkpoint_step_for(position);
+        // As in fill_from_checkpoint: the checkpoint's own events came before it, a mapping change numbered like an
+        // event came before that event, and one numbered like the first event after the position counts as before it.
+        const auto after = first_event_after(checkpoint_step);
+        const auto boundary = first_event_after(position);
+
+        // Per byte: whether it is settled, whether it was remapped since the checkpoint and not written after, whether
+        // it needs the accesses (MMIO), and the last mapping change since the checkpoint that covers it.
+        std::vector<bool> settled(value.size());
+        std::vector<bool> fresh(value.size());
+        std::vector<bool> from_accesses(value.size());
+        std::vector<std::optional<uint64_t>> remapped_at(value.size());
+        auto unsettled = value.size();
+
+        for (auto change = std::ranges::lower_bound(mapping_changes_, after, {}, &mapping_change::event_number);
+             change != mapping_changes_.end() && change->event_number <= boundary; ++change)
+        {
+            if (!overlaps(change->address, change->size, address, size))
+            {
+                continue;
+            }
+            const auto change_last = change->address + (change->size - 1);
+            for (auto byte = std::max(change->address, address); byte <= std::min(change_last, last); ++byte)
+            {
+                remapped_at[static_cast<size_t>(byte - address)] = change->event_number;
+            }
+        }
+
+        // The latest write since the checkpoint settles a byte, walking back from the position, so a busy page stops
+        // after a few writes; a byte whose latest write came before a later mapping change of it was lost to that.
+        const auto ranges =
+            candidates(address / page_size, last / page_size,
+                       static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::host_write), after, boundary);
+        uint64_t done = 0;
+        for (const auto& candidate : std::views::reverse(ranges))
+        {
+            if (!unsettled)
+            {
+                break;
+            }
+            control.report(done++, ranges.size());
+            for (auto number = candidate.end; unsettled && number-- > candidate.begin;)
+            {
+                const auto event = event_at(number);
+                if ((event.kind != access_kind::write && event.kind != access_kind::host_write) ||
+                    !overlaps(event.address, event.size, address, size))
+                {
+                    continue;
+                }
+                std::vector<std::byte> data{};
+                for (auto byte = std::max(event.address, address); byte < std::min(event.address + event.size, address + size); ++byte)
+                {
+                    const auto index = static_cast<size_t>(byte - address);
+                    if (settled[index])
+                    {
+                        continue;
+                    }
+                    settled[index] = true;
+                    --unsettled;
+                    if (remapped_at[index] && number < *remapped_at[index])
+                    {
+                        fresh[index] = true;
+                        continue;
+                    }
+                    if (data.empty())
+                    {
+                        data = access_data(event);
+                    }
+                    value[index] = static_cast<uint8_t>(data.at(static_cast<size_t>(byte - event.address)));
+                }
+            }
+        }
+
+        // Bytes remapped since the checkpoint and not written after hold what the mapping left: the emulator's own
+        // writes into new memory (file views, images) are recorded as host writes, so committed memory is zero and the
+        // rest has no contents. Traces without the memory map read them from the accesses.
+        for (size_t index = 0; index < value.size(); ++index)
+        {
+            if (!settled[index] && remapped_at[index])
+            {
+                settled[index] = true;
+                fresh[index] = true;
+                --unsettled;
+            }
+        }
+        if (std::ranges::find(fresh, true) != fresh.end())
+        {
+            if (has_memory_regions_)
+            {
+                constexpr uint32_t mem_commit = 0x1000;
+                constexpr uint32_t mmio_region_kind = 5;
+                std::vector<const memory_region*> covering{};
+                for (const auto& region : memory_regions_.regions)
+                {
+                    if (region.step > position)
+                    {
+                        break;
+                    }
+                    if (overlaps(region.address, region.size, address, size))
+                    {
+                        covering.push_back(&region);
+                    }
+                }
+                for (size_t index = 0; index < value.size(); ++index)
+                {
+                    if (!fresh[index])
+                    {
+                        continue;
+                    }
+                    const auto byte = address + index;
+                    // The latest entry covering a byte describes it (memory_regions_at).
+                    const auto latest = std::ranges::find_if(std::views::reverse(covering), [byte](const memory_region* region) {
+                        return byte - region->address < region->size;
+                    });
+                    if (latest == std::views::reverse(covering).end() || (*latest)->state != mem_commit)
+                    {
+                        continue;
+                    }
+                    if ((*latest)->kind == mmio_region_kind)
+                    {
+                        from_accesses[index] = true;
+                    }
+                    else
+                    {
+                        value[index] = uint8_t{0};
+                    }
+                }
+            }
+            else
+            {
+                for (size_t index = 0; index < value.size(); ++index)
+                {
+                    from_accesses[index] = from_accesses[index] || fresh[index];
+                }
+            }
+        }
+        if (unsettled)
+        {
+            const auto memory = checkpoint_memory_at(checkpoint_index(checkpoint_step));
+            auto range = memory->ranges.upper_bound(address);
+            if (range != memory->ranges.begin())
+            {
+                --range;
+            }
+            for (; range != memory->ranges.end() && range->first <= last; ++range)
+            {
+                const auto& [length, offset] = range->second;
+                if (!length)
+                {
+                    continue;
+                }
+                const auto range_last = range->first + (length - 1);
+                for (auto byte = std::max(range->first, address); byte <= std::min(range_last, last); ++byte)
+                {
+                    const auto index = static_cast<size_t>(byte - address);
+                    if (settled[index])
+                    {
+                        continue;
+                    }
+                    if (offset == checkpoint_memory::no_contents)
+                    {
+                        from_accesses[index] = true;
+                    }
+                    else
+                    {
+                        value[index] = static_cast<uint8_t>((*memory->state)[offset + static_cast<size_t>(byte - range->first)]);
+                    }
+                }
+            }
+        }
+
+        // Bytes the checkpoint and the writes don't settle come from the accesses, over the span that holds them.
+        std::optional<size_t> first_unsettled{};
+        size_t last_unsettled{};
+        for (size_t index = 0; index < value.size(); ++index)
+        {
+            if (from_accesses[index])
+            {
+                first_unsettled = first_unsettled.value_or(index);
+                last_unsettled = index;
+            }
+        }
+        if (first_unsettled)
+        {
+            const auto shown = memory_from_accesses(position, address + *first_unsettled, last_unsettled - *first_unsettled + 1, {});
+            for (auto index = *first_unsettled; index <= last_unsettled; ++index)
+            {
+                if (from_accesses[index])
+                {
+                    value[index] = shown[index - *first_unsettled];
+                }
+            }
+        }
+        return value;
+    }
+
+    std::vector<std::optional<uint8_t>> trace::memory_from_accesses(const uint64_t position, const uint64_t address, const uint64_t size,
+                                                                    const operation_control& control)
+    {
+        std::vector<std::optional<uint8_t>> value(static_cast<size_t>(size));
+        // Per byte: whether an access settled it, and whether the latest access up to the position was found (an older
+        // one says less).
+        std::vector<bool> settled(value.size());
+        std::vector<bool> seen_before(value.size());
+        auto unsettled = value.size();
+        auto unseen_before = value.size();
+        const auto boundary = first_event_after(position);
+        const auto event_bytes = [&](const access_event& event) {
+            if (event.kind != access_kind::execute)
+            {
+                return access_data(event);
+            }
+            const auto* bytes = reinterpret_cast<const std::byte*>(event.payload.data());
+            return std::vector<std::byte>(bytes, bytes + event.size);
+        };
+        const auto last = last_byte(address, size);
+        const auto before = candidates(address / page_size, last / page_size, all_access_kinds, 0, boundary);
+        const auto after = candidates(address / page_size, last / page_size, all_access_kinds, boundary, metadata_.event_count);
+        const auto total = before.size() + after.size();
+        uint64_t done = 0;
+
+        // The latest access up to the position shows a byte, unless its memory was mapped or unmapped since.
+        for (const auto& range : std::views::reverse(before))
+        {
+            control.report(done++, total);
+            for (auto number = range.end; unseen_before && number-- > range.begin;)
+            {
+                const auto event = event_at(number);
+                if (!overlaps(event.address, event.size, address, size))
+                {
+                    continue;
+                }
+                std::vector<std::byte> data{};
+                for (auto byte = std::max(event.address, address); byte < std::min(event.address + event.size, address + size); ++byte)
+                {
+                    const auto index = static_cast<size_t>(byte - address);
+                    if (seen_before[index])
+                    {
+                        continue;
+                    }
+                    seen_before[index] = true;
+                    --unseen_before;
+                    if (remapped(byte, number, boundary))
+                    {
+                        continue;
+                    }
+                    if (data.empty())
+                    {
+                        data = event_bytes(event);
+                    }
+                    value[index] = static_cast<uint8_t>(data.at(static_cast<size_t>(byte - event.address)));
+                    settled[index] = true;
+                    --unsettled;
+                }
+            }
+        }
+
+        // Other bytes still hold what the first later access reads or executes, unless something changed them before.
+        for (const auto& range : after)
+        {
+            if (!unsettled)
+            {
+                break;
+            }
+            control.report(done++, total);
+            for (auto number = range.begin; unsettled && number < range.end; ++number)
+            {
+                const auto event = event_at(number);
+                if (!overlaps(event.address, event.size, address, size))
+                {
+                    continue;
+                }
+                const auto shows = event.kind == access_kind::read || event.kind == access_kind::execute;
+                std::vector<std::byte> data{};
+                for (auto byte = std::max(event.address, address); byte < std::min(event.address + event.size, address + size); ++byte)
+                {
+                    const auto index = static_cast<size_t>(byte - address);
+                    if (settled[index])
+                    {
+                        continue;
+                    }
+                    settled[index] = true;
+                    --unsettled;
+                    if (!shows || remapped(byte, boundary, number))
+                    {
+                        continue;
+                    }
+                    if (data.empty())
+                    {
+                        data = event_bytes(event);
+                    }
+                    value[index] = static_cast<uint8_t>(data.at(static_cast<size_t>(byte - event.address)));
+                }
+            }
+        }
+
+        // What no access shows is what the checkpoint the position replays from holds, unless remapped since.
+        if (!checkpoint_memory_offsets_.empty() && std::ranges::any_of(value, [](const auto& byte) { return !byte; }))
+        {
+            fill_from_checkpoint(position, address, boundary, value);
+        }
+        return value;
+    }
+
+    namespace
+    {
+        // The fields of a serialized emulator state: each is a check byte (the low byte of its length), then its bytes.
+        struct state_fields
+        {
+            std::span<const std::byte> data{};
+            size_t offset{};
+
+            std::span<const std::byte> field(const uint64_t length)
+            {
+                if (offset >= data.size() || length > data.size() - offset - 1 ||
+                    static_cast<uint8_t>(data[offset]) != static_cast<uint8_t>(length))
+                {
+                    throw std::runtime_error("Invalid TTD checkpoint memory");
+                }
+                const auto bytes = data.subspan(offset + 1, static_cast<size_t>(length));
+                offset += 1 + static_cast<size_t>(length);
+                return bytes;
+            }
+
+            uint64_t u64()
+            {
+                uint64_t value{};
+                memcpy(&value, field(sizeof(value)).data(), sizeof(value));
+                return value;
+            }
+
+            uint8_t u8()
+            {
+                return static_cast<uint8_t>(field(1).front());
+            }
+        };
+
+        // The committed memory in the memory manager's part of a checkpoint state (memory_manager::serialize_memory_state):
+        // its layout version, default allocation address and DEP flag, the reservations (base, kind, mapped file name,
+        // initial protection, length, and committed ranges with their protection), then the contents of the committed
+        // ranges of every reservation but MMIO, in that order. By address: each range's length and its offset in `data`,
+        // SIZE_MAX (trace::checkpoint_memory::no_contents) for MMIO.
+        std::map<uint64_t, std::pair<uint64_t, size_t>> parse_checkpoint_memory(const std::span<const std::byte> data, const size_t offset)
+        {
+            constexpr uint8_t mmio_kind = 5;
+            constexpr size_t no_contents = SIZE_MAX;
+            constexpr uint64_t nt_permission_size = 2;
+            constexpr uint64_t name_char_size = 2;
+
+            state_fields fields{.data = data, .offset = offset};
+            (void)fields.u64();
+            (void)fields.u64();
+            (void)fields.u8();
+
+            struct reservation
+            {
+                uint8_t kind{};
+                std::vector<std::pair<uint64_t, uint64_t>> committed{};
+            };
+
+            std::vector<reservation> reservations(static_cast<size_t>(std::min<uint64_t>(fields.u64(), data.size())));
+            for (auto& reserved : reservations)
+            {
+                (void)fields.u64();
+                reserved.kind = fields.u8();
+                for (auto name_length = fields.u64(); name_length; --name_length)
+                {
+                    (void)fields.field(name_char_size);
+                }
+                (void)fields.u8();
+                (void)fields.u64();
+                for (auto count = fields.u64(); count; --count)
+                {
+                    const auto address = fields.u64();
+                    const auto length = fields.u64();
+                    (void)fields.field(nt_permission_size);
+                    reserved.committed.emplace_back(address, length);
+                }
+            }
+
+            std::map<uint64_t, std::pair<uint64_t, size_t>> ranges{};
+            for (const auto& reserved : reservations)
+            {
+                for (const auto& [address, length] : reserved.committed)
+                {
+                    if (reserved.kind == mmio_kind)
+                    {
+                        ranges.emplace(address, std::pair{length, no_contents});
+                        continue;
+                    }
+                    const auto contents = fields.field(length);
+                    ranges.emplace(address, std::pair{length, static_cast<size_t>(contents.data() - data.data())});
+                }
+            }
+            return ranges;
+        }
+    }
+
+    std::shared_ptr<const trace::checkpoint_memory> trace::checkpoint_memory_at(const uint64_t index)
+    {
+        if (auto cached = cached_checkpoint(checkpoint_memory_cache_, index))
+        {
+            return cached;
+        }
+        auto memory = std::make_shared<checkpoint_memory>();
+        memory->state = checkpoint_state_at(index);
+        memory->ranges =
+            parse_checkpoint_memory(*memory->state, static_cast<size_t>(checkpoint_memory_offsets_.at(static_cast<size_t>(index))));
+        cache_checkpoint<checkpoint_memory>(checkpoint_memory_cache_, index, memory, checkpoint_cache_size_);
+        return memory;
+    }
+
+    void trace::fill_from_checkpoint(const uint64_t position, const uint64_t address, const uint64_t boundary,
+                                     std::vector<std::optional<uint8_t>>& value)
+    {
+        const auto checkpoint_step = checkpoint_step_for(position);
+        const auto memory = checkpoint_memory_at(checkpoint_index(checkpoint_step));
+        // The events of the checkpoint's instructions came before it; a mapping change numbered like the first event
+        // after it may have come either side, so it counts as after.
+        const auto after = first_event_after(checkpoint_step);
+        std::vector<std::pair<uint64_t, uint64_t>> remapped_ranges{};
+        for (auto change = std::ranges::lower_bound(mapping_changes_, after, {}, &mapping_change::event_number);
+             change != mapping_changes_.end() && change->event_number <= boundary; ++change)
+        {
+            if (overlaps(change->address, change->size, address, value.size()))
+            {
+                remapped_ranges.emplace_back(change->address, change->size);
+            }
+        }
+        for (size_t index = 0; index < value.size(); ++index)
+        {
+            if (value[index])
+            {
+                continue;
+            }
+            const auto byte = address + index;
+            auto range = memory->ranges.upper_bound(byte);
+            if (range == memory->ranges.begin() || byte - std::prev(range)->first >= std::prev(range)->second.first ||
+                std::prev(range)->second.second == checkpoint_memory::no_contents)
+            {
+                continue;
+            }
+            --range;
+            const auto remapped_since = std::ranges::any_of(
+                remapped_ranges, [byte](const std::pair<uint64_t, uint64_t>& changed) { return byte - changed.first < changed.second; });
+            if (!remapped_since)
+            {
+                value[index] = static_cast<uint8_t>((*memory->state)[range->second.second + static_cast<size_t>(byte - range->first)]);
+            }
+        }
+    }
+
+    std::vector<memory_region> trace::memory_regions_at(const uint64_t position) const
+    {
+        constexpr uint32_t mem_free = 0x10000;
+        // The ranges as each entry left them, by address; an entry replaces whatever it overlaps.
+        std::map<uint64_t, memory_region> current{};
+        for (const auto& region : memory_regions_.regions)
+        {
+            if (region.step > position)
+            {
+                break;
+            }
+            if (!region.size)
+            {
+                continue;
+            }
+
+            const auto end = region.address + region.size;
+            auto overlap = current.upper_bound(region.address);
+            if (overlap != current.begin() && std::prev(overlap)->first + std::prev(overlap)->second.size > region.address)
+            {
+                --overlap;
+            }
+            while (overlap != current.end() && overlap->first < end)
+            {
+                auto existing = overlap->second;
+                overlap = current.erase(overlap);
+                const auto existing_end = existing.address + existing.size;
+                if (existing.address < region.address)
+                {
+                    auto left = existing;
+                    left.size = region.address - existing.address;
+                    current.emplace(left.address, left);
+                }
+                if (existing_end > end)
+                {
+                    auto right = existing;
+                    right.address = end;
+                    right.size = existing_end - end;
+                    overlap = current.emplace(right.address, right).first;
+                    ++overlap;
+                }
+            }
+            if (region.state != mem_free)
+            {
+                current.emplace(region.address, region);
+            }
+        }
+
+        std::vector<memory_region> regions{};
+        regions.reserve(current.size());
+        for (auto& region : current | std::views::values)
+        {
+            regions.push_back(region);
+        }
+        return regions;
+    }
+
+    bool trace::remapped(const uint64_t address, const uint64_t after_number, const uint64_t through_number) const
+    {
+        const auto first = std::ranges::upper_bound(mapping_changes_, after_number, {}, &mapping_change::event_number);
+        for (auto change = first; change != mapping_changes_.end() && change->event_number <= through_number; ++change)
+        {
+            if (address - change->address < change->size)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     event_reader::event_reader(trace& recorded, const uint64_t first_number)
         : trace_(recorded),
           buffer_first_(first_number),
@@ -1997,335 +2232,6 @@ namespace sogen::ttd
             {
                 return event;
             }
-        }
-    }
-
-    replay_verifier::replay_verifier(windows_emulator& emu, trace& recorded, const uint64_t from_step, const bool strict)
-        : emu_(emu),
-          trace_(recorded),
-          first_number_(recorded.first_event_after(from_step)),
-          reader_(recorded, first_number_),
-          access_mask_(recorded.access_mask()),
-          strict_(strict)
-    {
-        auto& cpu = emu_.emu();
-        if (access_mask_ & static_cast<uint64_t>(access_kind::write))
-        {
-            write_hook_ = scoped_hook(
-                cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
-                    verify(access_kind::write, address, data.size(), data);
-                }));
-        }
-        if (access_mask_ & static_cast<uint64_t>(access_kind::read))
-        {
-            read_hook_ = scoped_hook(
-                cpu, cpu.hook_memory_read_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
-                    verify(access_kind::read, address, data.size(), data);
-                }));
-        }
-        if (access_mask_ & static_cast<uint64_t>(access_kind::execute))
-        {
-            execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
-                verify(access_kind::execute, address, executed_size(emu_, address, size));
-            }));
-        }
-        if (access_mask_ & static_cast<uint64_t>(access_kind::host_write))
-        {
-            host_write_hook_ =
-                scoped_hook(cpu, cpu.hook_host_memory_write([this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
-                    verify(access_kind::host_write, address, data.size(), data);
-                }));
-        }
-        if (!recorded.has_syscalls())
-        {
-            return;
-        }
-        const auto syscalls = recorded.syscalls();
-        const auto first = std::ranges::upper_bound(syscalls, from_step, {}, &syscall_entry::step);
-        syscalls_ = syscalls.subspan(static_cast<size_t>(first - syscalls.begin()));
-        if (access_mask_ & static_cast<uint64_t>(access_kind::host_write))
-        {
-            host_write_before_hook_ = scoped_hook(cpu, cpu.hook_host_memory_write_before([this](cpu_interface&, const uint64_t address,
-                                                                                                const std::span<const std::byte> data) {
-                if (!in_syscall_ || substituting_ || error_)
-                {
-                    return;
-                }
-                previous_bytes_.resize(data.size());
-                if (!emu_.emu().try_read_memory(address, previous_bytes_.data(), previous_bytes_.size()))
-                {
-                    previous_bytes_.clear();
-                }
-            }));
-        }
-        syscall_enter_ = syscall_callback(emu_.callbacks.on_syscall_enter, [this](const uint32_t id) { enter_syscall(id); });
-        syscall_exit_ = syscall_callback(emu_.callbacks.on_syscall_exit, [this](uint32_t) { exit_syscall(); });
-    }
-
-    void replay_verifier::diverge(const std::string& message)
-    {
-        error_ = message;
-        emu_.stop();
-    }
-
-    std::string replay_verifier::syscall_description(const syscall_entry& entry) const
-    {
-        std::ostringstream description;
-        description << "syscall " << trace_.syscall_name(entry.id).value_or("<unknown>") << " (0x" << std::hex << entry.id << ") at step "
-                    << entry.step;
-        return description.str();
-    }
-
-    void replay_verifier::enter_syscall(const uint32_t id)
-    {
-        if (error_)
-        {
-            return;
-        }
-        const auto step = emu_.get_executed_instructions();
-        const auto* expected = next_syscall_ < syscalls_.size() ? &syscalls_[next_syscall_] : nullptr;
-        if (expected && expected->step == step && expected->event_number == next_event_number() && expected->id == id)
-        {
-            in_syscall_ = true;
-            syscall_events_.clear();
-            return;
-        }
-        std::ostringstream message;
-        message << "TTD replay diverged from the recording: dispatched " << syscall_description({.step = step, .id = id}) << ", expected "
-                << (expected ? syscall_description(*expected) : "no further syscall");
-        diverge(message.str());
-    }
-
-    void replay_verifier::exit_syscall()
-    {
-        if (!in_syscall_)
-        {
-            return;
-        }
-        in_syscall_ = false;
-        const auto& expected = syscalls_[next_syscall_++];
-        if (error_)
-        {
-            return;
-        }
-        const auto first_number = next_event_number();
-        std::vector<access_event> recorded{};
-        recorded.reserve(static_cast<size_t>(expected.event_count));
-        for (uint64_t i = 0; i < expected.event_count; ++i)
-        {
-            const auto event = reader_.next(access_mask_);
-            if (!event)
-            {
-                diverge("TTD trace ends within " + syscall_description(expected));
-                return;
-            }
-            recorded.push_back(*event);
-        }
-
-        auto& cpu = emu_.emu();
-        const auto result = cpu.reg<uint64_t>(x86_register::rax);
-        std::optional<size_t> different_event{};
-        for (size_t i = 0; i < std::max(recorded.size(), syscall_events_.size()); ++i)
-        {
-            if (i >= recorded.size() || i >= syscall_events_.size() ||
-                !matches(recorded[i], syscall_events_[i].event, syscall_events_[i].data))
-            {
-                different_event = i;
-                break;
-            }
-        }
-        if (!different_event && result == expected.result)
-        {
-            verified_events_ += recorded.size();
-            return;
-        }
-
-        if (strict_)
-        {
-            std::ostringstream message;
-            message << "TTD replay diverged from the recording at event " << first_number + different_event.value_or(recorded.size())
-                    << " in " << syscall_description(expected) << ": ";
-            if (!different_event)
-            {
-                message << "it returned 0x" << std::hex << result << ", recorded 0x" << expected.result;
-            }
-            else if (const auto i = *different_event;
-                     i < recorded.size() && i < syscall_events_.size() && matches(recorded[i], syscall_events_[i].event, {}, false))
-            {
-                describe_event(message, syscall_events_[i].event);
-                message << " accessed different data";
-            }
-            else
-            {
-                message << "expected ";
-                if (i < recorded.size())
-                {
-                    describe_event(message, recorded[i]);
-                }
-                else
-                {
-                    message << "no further event";
-                }
-                message << ", observed ";
-                if (i < syscall_events_.size())
-                {
-                    describe_event(message, syscall_events_[i].event);
-                }
-                else
-                {
-                    message << "no further event";
-                }
-            }
-            diverge(message.str());
-            return;
-        }
-
-        // The guest gets what the recording gave it: the live host writes are undone, newest first, then the recorded
-        // ones are applied in order. The handler's other events are descriptor table reads, which change nothing.
-        try
-        {
-            substituting_ = true;
-            const auto restore = utils::finally([this] { substituting_ = false; });
-            for (const auto& live : std::views::reverse(syscall_events_))
-            {
-                if (live.event.kind != access_kind::host_write)
-                {
-                    continue;
-                }
-                if (live.previous.size() != live.data.size())
-                {
-                    std::ostringstream message;
-                    message << "TTD replay cannot undo a live host write to " << std::hex << live.event.address << " in "
-                            << syscall_description(expected);
-                    diverge(message.str());
-                    return;
-                }
-                cpu.write_memory(live.event.address, live.previous.data(), live.previous.size());
-            }
-            for (const auto& event : recorded)
-            {
-                if (event.kind == access_kind::host_write)
-                {
-                    const auto data = trace_.access_data(event);
-                    cpu.write_memory(event.address, data.data(), data.size());
-                }
-            }
-            cpu.reg<uint64_t>(x86_register::rax, expected.result);
-        }
-        catch (const std::exception& e)
-        {
-            diverge("TTD replay cannot apply the recorded results of " + syscall_description(expected) + ": " + e.what());
-            return;
-        }
-        ++substituted_inputs_;
-        verified_events_ += recorded.size();
-    }
-
-    bool replay_verifier::matches(const access_event& expected, const access_event& observed, const std::span<const std::byte> data,
-                                  const bool compare_data)
-    {
-        if (expected.kind != observed.kind || expected.step != observed.step || expected.ip != observed.ip ||
-            expected.address != observed.address || expected.size != observed.size)
-        {
-            return false;
-        }
-        if (observed.kind == access_kind::execute)
-        {
-            return !trace_.has_instruction_bytes() || expected.payload == observed.payload;
-        }
-        return !compare_data || !trace_.has_access_data() || std::ranges::equal(trace_.access_data(expected), data);
-    }
-
-    void replay_verifier::verify(const access_kind kind, const uint64_t address, const size_t size, const std::span<const std::byte> data)
-    {
-        if (error_ || !size || substituting_)
-        {
-            return;
-        }
-        access_event observed{.step = emu_.get_executed_instructions(),
-                              .ip = emu_.emu().read_instruction_pointer(),
-                              .address = address,
-                              .size = size,
-                              .kind = kind};
-        if (kind == access_kind::execute && trace_.has_instruction_bytes() && size < inline_data_limit)
-        {
-            emu_.emu().try_read_memory(address, observed.payload.data(), size);
-        }
-        if (in_syscall_)
-        {
-            syscall_events_.push_back({.event = observed,
-                                       .previous = kind == access_kind::host_write ? std::move(previous_bytes_) : std::vector<std::byte>{},
-                                       .data = {data.begin(), data.end()}});
-            previous_bytes_ = {};
-            return;
-        }
-        const auto expected = reader_.next(access_mask_);
-        const auto same_event = expected && expected->kind == observed.kind && expected->step == observed.step &&
-                                expected->ip == observed.ip && expected->address == observed.address && expected->size == observed.size;
-        const auto same_instruction =
-            kind != access_kind::execute || !trace_.has_instruction_bytes() || (same_event && expected->payload == observed.payload);
-        const auto same_data = kind == access_kind::execute || !trace_.has_access_data() ||
-                               (same_event && std::ranges::equal(trace_.access_data(*expected), data));
-        if (same_event && same_instruction && same_data)
-        {
-            ++verified_events_;
-            return;
-        }
-        if (same_event && same_instruction && kind == access_kind::host_write && !strict_)
-        {
-            const auto recorded = trace_.access_data(*expected);
-            substituting_ = true;
-            const auto restore = utils::finally([this] { substituting_ = false; });
-            emu_.emu().write_memory(address, recorded.data(), recorded.size());
-            ++substituted_inputs_;
-            ++verified_events_;
-            return;
-        }
-        if (same_event && same_instruction)
-        {
-            std::ostringstream message;
-            message << "TTD replay diverged from the recording at event " << reader_.last_number() << ": ";
-            describe_event(message, observed);
-            message << " accessed different data";
-            diverge(message.str());
-            return;
-        }
-        std::ostringstream message;
-        message << "TTD replay diverged from the recording";
-        if (expected)
-        {
-            message << " at event " << reader_.last_number() << ": expected ";
-            describe_event(message, *expected);
-        }
-        else
-        {
-            message << " after its last event: expected nothing";
-        }
-        message << ", observed ";
-        describe_event(message, observed);
-        diverge(message.str());
-    }
-
-    void replay_verifier::finish()
-    {
-        syscall_enter_.reset();
-        syscall_exit_.reset();
-        host_write_before_hook_.remove();
-        write_hook_.remove();
-        read_hook_.remove();
-        execute_hook_.remove();
-        host_write_hook_.remove();
-        if (error_)
-        {
-            throw divergence_error(*error_);
-        }
-        const auto position = emu_.get_executed_instructions();
-        if (const auto missed = reader_.next(access_mask_); missed && missed->step <= position)
-        {
-            std::ostringstream message;
-            message << "TTD replay reached position " << std::hex << position << " without recorded event " << std::dec
-                    << reader_.last_number() << " at step " << std::hex << missed->step;
-            throw divergence_error(message.str());
         }
     }
 
@@ -2375,7 +2281,7 @@ namespace sogen::ttd
         }
     }
 
-    std::vector<self_modifying_hit> trace::self_modifying_code()
+    std::vector<self_modifying_hit> trace::self_modifying_code(const operation_control& control)
     {
         using written_bytes = std::array<uint64_t, page_size / 64>;
         std::unordered_map<uint64_t, written_bytes> written{};
@@ -2395,8 +2301,15 @@ namespace sogen::ttd
         std::map<uint64_t, pending_hit> hits{};
         event_reader reader(*this);
         const auto kinds = static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::execute);
+        constexpr uint64_t report_interval = 1 << 20;
+        uint64_t next_report = 0;
         while (const auto event = reader.next(kinds))
         {
+            if (reader.last_number() >= next_report)
+            {
+                control.report(reader.last_number(), metadata_.event_count);
+                next_report = reader.last_number() + report_interval;
+            }
             if (!event->size)
             {
                 continue;
@@ -2446,169 +2359,355 @@ namespace sogen::ttd
         return result;
     }
 
-    replay_selfmod_scanner::replay_selfmod_scanner(windows_emulator& emu, trace& recorded_writes, const uint64_t capture_address,
-                                                   const size_t capture_size, const size_t capture_wave)
-        : emu_(emu),
-          recorded_writes_(recorded_writes),
-          expected_writes_(recorded_writes, recorded_writes.first_event_after(emu.get_executed_instructions())),
-          capture_address_(capture_address),
-          capture_size_(capture_size),
-          capture_wave_(capture_wave)
+    std::optional<uint32_t> trace_file_version(const std::filesystem::path& path)
     {
-        if (!(recorded_writes_.access_mask() & static_cast<uint64_t>(access_kind::write)))
+        std::ifstream file(path, std::ios::binary);
+        std::array<char, 8> magic{};
+        if (!file.read(magic.data(), magic.size()))
         {
-            throw std::runtime_error(writes_required);
+            return std::nullopt;
         }
-        auto& cpu = emu_.emu();
-        emu_.memory.set_mapping_change_callback([this](const uint64_t address, const size_t size) {
+        return version_from_magic(magic);
+    }
+
+    bool is_trace_file(const std::filesystem::path& path)
+    {
+        return trace_file_version(path).has_value();
+    }
+
+    bool is_supported_trace_version(const uint32_t version)
+    {
+        // Versions 5 and 6 were development formats that were never kept.
+        return version >= oldest_trace_version && version <= newest_trace_version && version != 5 && version != 6;
+    }
+
+    std::optional<access_event> trace::execute_at(const uint64_t position)
+    {
+        if (!position || position > metadata_.instruction_count)
+        {
+            return std::nullopt;
+        }
+        // The execute event comes first among an instruction's events.
+        for (auto number = first_event_at_or_after(position); number < metadata_.event_count; ++number)
+        {
+            const auto event = event_at(number);
+            if (event.step != position)
+            {
+                break;
+            }
+            if (event.kind == access_kind::execute)
+            {
+                return event;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<access_event> trace::previous_instruction(const uint64_t step, const uint32_t thread_id)
+    {
+        if (step <= start_position() + 1)
+        {
+            return std::nullopt;
+        }
+        const auto& switches = threads_.switches;
+        if (switches.empty())
+        {
+            return execute_at(step - 1);
+        }
+        // The run of the thread that holds position step - 1 or ends before it: a run starts at a switch and lasts until
+        // the next one.
+        auto next = std::ranges::upper_bound(switches, step - 1, {}, &thread_switch::step);
+        while (next != switches.begin())
+        {
+            const auto run = std::prev(next);
+            if (run->thread_id == thread_id)
+            {
+                const auto last = next == switches.end() ? step - 1 : std::min(step - 1, next->step - 1);
+                return last > start_position() ? execute_at(last) : std::nullopt;
+            }
+            next = run;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<access_event> trace::next_instruction(const uint64_t step, const uint32_t thread_id)
+    {
+        const auto& switches = threads_.switches;
+        if (switches.empty())
+        {
+            return execute_at(step + 1);
+        }
+        auto next = std::ranges::upper_bound(switches, step, {}, &thread_switch::step);
+        const auto running = next == switches.begin() ? std::nullopt : std::optional(std::prev(next)->thread_id);
+        if (running == thread_id && (next == switches.end() || next->step > step + 1))
+        {
+            return execute_at(step + 1);
+        }
+        for (; next != switches.end(); ++next)
+        {
+            if (next->thread_id == thread_id)
+            {
+                return execute_at(next->step);
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<uint64_t> trace::return_of_call(const access_event& call, const uint64_t entry_step, const uint32_t thread_id)
+    {
+        constexpr auto reads_and_writes = static_cast<uint64_t>(access_kind::read) | static_cast<uint64_t>(access_kind::write);
+        if ((access_mask() & reads_and_writes) != reads_and_writes || !has_access_data())
+        {
+            return std::nullopt;
+        }
+        // The call pushed its return address: that stack slot identifies the invocation, also under recursion.
+        const auto return_address = call.ip + call.size;
+        std::optional<access_event> push{};
+        for (auto number = first_event_at_or_after(call.step); number < metadata_.event_count; ++number)
+        {
+            const auto event = event_at(number);
+            if (event.step != call.step)
+            {
+                break;
+            }
+            if (event.kind != access_kind::write || (event.size != 8 && event.size != 4))
+            {
+                continue;
+            }
+            uint64_t pushed{};
+            memcpy(&pushed, event.payload.data(), static_cast<size_t>(event.size));
+            const auto expected = event.size == 8 ? return_address : (return_address & 0xFFFFFFFF);
+            if (pushed == expected)
+            {
+                push = event;
+                break;
+            }
+        }
+        if (!push)
+        {
+            return std::nullopt;
+        }
+        // The invocation returns at the first return instruction that reads the slot. A write to the slot first means the
+        // frame is gone (unwound, or the thread left it another way); reads by other instructions (_ReturnAddress, stack
+        // walks) do not end it.
+        constexpr auto slot_accesses = reads_and_writes | static_cast<uint64_t>(access_kind::host_write);
+        for (auto from = entry_step - 1;;)
+        {
+            const auto access = next_access(push->address, push->size, from, slot_accesses);
+            if (!access || access->kind != access_kind::read)
+            {
+                return std::nullopt;
+            }
+            from = access->step;
+            if (access->address != push->address || access->size != push->size || thread_at(access->step).value_or(thread_id) != thread_id)
+            {
+                continue;
+            }
+            if (const auto instruction = execute_at(access->step); instruction && classify_branch(*instruction).is_return)
+            {
+                return access->step;
+            }
+        }
+    }
+
+    std::vector<call_event> trace::calls_to(const uint64_t address, const uint64_t start, const uint64_t end,
+                                            const operation_control& control)
+    {
+        if (!(access_mask() & static_cast<uint64_t>(access_kind::execute)))
+        {
+            throw std::runtime_error("TTD call queries need a trace recorded with execute events");
+        }
+        std::vector<access_event> entries{};
+        for (const auto& event : accesses(address, 1, start, end, static_cast<uint64_t>(access_kind::execute), control))
+        {
+            if (event.address == address)
+            {
+                entries.push_back(event);
+            }
+        }
+
+        std::vector<call_event> result{};
+        result.reserve(entries.size());
+        for (size_t done = 0; done < entries.size(); ++done)
+        {
+            control.report(done, entries.size());
+            const auto& entry = entries[done];
+            const auto thread_id = thread_at(entry.step).value_or(0);
+            call_event call{.entry_step = entry.step, .target = address, .thread_id = thread_id};
+            if (const auto previous = previous_instruction(entry.step, thread_id))
+            {
+                call.step = previous->step;
+                call.site = previous->ip;
+                call.is_call = classify_branch(*previous).is_call;
+                if (call.is_call)
+                {
+                    call.return_step = return_of_call(*previous, entry.step, thread_id).value_or(UINT64_MAX);
+                }
+            }
+            result.push_back(call);
+        }
+        return result;
+    }
+
+    std::vector<indirect_branch> trace::indirect_branches(const std::span<const std::pair<uint64_t, uint64_t>> ranges, const bool jumps,
+                                                          const operation_control& control)
+    {
+        if (!(access_mask() & static_cast<uint64_t>(access_kind::execute)) || !has_instruction_bytes())
+        {
+            throw std::runtime_error("TTD branch queries need a trace recorded with execute events and their bytes");
+        }
+        const auto in_ranges = [&](const uint64_t ip) {
+            return std::ranges::any_of(ranges, [&](const auto& range) { return range.second && ip - range.first < range.second; });
+        };
+        const auto wanted = [&](const access_event& event) {
+            if (event.kind != access_kind::execute || !in_ranges(event.ip))
+            {
+                return false;
+            }
+            const auto branch = classify_branch(event);
+            return branch.indirect && (branch.is_call || (jumps && branch.is_jump));
+        };
+
+        std::set<std::pair<uint64_t, uint64_t>> chunk_ranges{};
+        for (const auto& [address, size] : ranges)
+        {
             if (!size)
             {
-                return;
+                continue;
             }
-            const auto last = last_byte(address, size);
-            const auto first_page = address / page_size;
-            const auto last_page = last / page_size;
-            for (auto it = writers_.begin(); it != writers_.end();)
+            for (const auto& range : candidates(address / page_size, last_byte(address, size) / page_size,
+                                                static_cast<uint64_t>(access_kind::execute), 0, metadata_.event_count))
             {
-                if (it->first >= first_page && it->first <= last_page)
-                {
-                    page_latest_write_.erase(it->first);
-                    reported_page_writes_.erase(it->first);
-                    it = writers_.erase(it);
-                }
-                else
-                {
-                    ++it;
-                }
+                chunk_ranges.emplace(range.begin, range.end);
             }
-        });
-        write_hook_ = scoped_hook(
-            cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
-                const auto size = data.size();
-                if (error_ || !size)
+        }
+        // Overlapping candidate lists (legacy traces list single events) merge into disjoint ranges.
+        std::vector<number_range> merged{};
+        for (const auto& [begin, end] : chunk_ranges)
+        {
+            if (!merged.empty() && begin < merged.back().end)
+            {
+                merged.back().end = std::max(merged.back().end, end);
+            }
+            else
+            {
+                merged.push_back({.begin = begin, .end = end});
+            }
+        }
+
+        std::vector<access_event> sites{};
+        if (this->chunked())
+        {
+            sites = matching_events(merged, wanted, false, control);
+        }
+        else
+        {
+            for (size_t done = 0; done < merged.size(); ++done)
+            {
+                control.report(done, merged.size());
+                for (auto number = merged[done].begin; number < merged[done].end; ++number)
                 {
-                    return;
-                }
-                const auto expected = expected_writes_.next(static_cast<uint64_t>(access_kind::write));
-                if (!expected)
-                {
-                    error_ = "TTD replay produced an unrecorded memory write";
-                    emu_.stop();
-                    return;
-                }
-                const auto number = expected_writes_.last_number();
-                const auto step = emu_.get_executed_instructions();
-                const auto ip = emu_.emu().read_instruction_pointer();
-                if (expected->step != step || expected->ip != ip || expected->address != address || expected->size != size)
-                {
-                    std::ostringstream message;
-                    message << "TTD replay memory write diverged at event " << number << ": expected step=" << expected->step
-                            << " ip=" << std::hex << expected->ip << " address=" << expected->address << std::dec
-                            << " size=" << expected->size << ", observed step=" << step << " ip=" << std::hex << ip
-                            << " address=" << address << std::dec << " size=" << size;
-                    error_ = message.str();
-                    emu_.stop();
-                    return;
-                }
-                const auto last = last_byte(address, size);
-                for (uint64_t byte = address; byte <= last; ++byte)
-                {
-                    auto [it, inserted] = writers_.try_emplace(byte / page_size);
-                    if (inserted)
+                    if (const auto event = event_at(number); wanted(event))
                     {
-                        it->second.first_number = number;
-                    }
-                    it->second.bytes[(byte % page_size) / 64] |= uint64_t{1} << (byte % 64);
-                    page_latest_write_[byte / page_size] = number + 1;
-                    if (byte == UINT64_MAX)
-                    {
-                        break;
+                        sites.push_back(event);
                     }
                 }
-                last_write_number_ = number;
-                ++verified_writes_;
-            }));
-        execute_hook_ = scoped_hook(cpu, cpu.hook_memory_execution_metadata([this](cpu_interface&, uint64_t address, size_t size) {
-            if (error_ || !size || hits_.size() >= 256)
-            {
-                return;
             }
-            const auto last = last_byte(address, size);
-            for (uint64_t byte = address; byte <= last; ++byte)
+        }
+
+        // A branch that faults reaches the exception dispatcher instead of its target.
+        std::set<uint64_t> dispatchers{};
+        for (const auto& found : find_exports("ntdll.dll!KiUserExceptionDispatcher"))
+        {
+            if (found.symbol->forwarder.empty())
             {
-                const auto page = writers_.find(byte / page_size);
-                if (page != writers_.end() && (page->second.bytes[(byte % page_size) / 64] & (uint64_t{1} << (byte % 64))))
+                dispatchers.insert(found.module->base + found.symbol->rva);
+            }
+        }
+
+        std::map<std::pair<uint64_t, uint64_t>, indirect_branch> found{};
+        for (size_t i = 0; i < sites.size(); ++i)
+        {
+            if (i % 4096 == 0)
+            {
+                control.check();
+            }
+            const auto& site = sites[i];
+            const auto next = next_instruction(site.step, thread_at(site.step).value_or(0));
+            if (!next || dispatchers.contains(next->ip))
+            {
+                continue;
+            }
+            auto [entry, inserted] = found.try_emplace(
+                {site.ip, next->ip},
+                indirect_branch{.site = site.ip, .target = next->ip, .first_step = site.step, .is_call = classify_branch(site).is_call});
+            ++entry->second.hits;
+        }
+        std::vector<indirect_branch> result{};
+        result.reserve(found.size());
+        for (const auto& branch : found | std::views::values)
+        {
+            result.push_back(branch);
+        }
+        return result;
+    }
+
+    std::vector<exception_event> trace::exceptions(const operation_control& control)
+    {
+        constexpr auto needed = static_cast<uint64_t>(access_kind::execute) | static_cast<uint64_t>(access_kind::host_write);
+        if ((access_mask() & needed) != needed || !has_access_data())
+        {
+            throw std::runtime_error("TTD exception queries need a trace recorded with execute and host write events");
+        }
+        // The 64-bit EXCEPTION_RECORD: code, flags, nested record, address, parameter count, then the parameters. The
+        // dispatch writes it in one host write just before the dispatcher runs (also for exceptions in WoW64 code).
+        constexpr uint64_t record_size = 0x98;
+        constexpr uint64_t record_lookback = 64;
+
+        std::vector<exception_event> result{};
+        for (const auto& dispatcher : find_exports("ntdll.dll!KiUserExceptionDispatcher"))
+        {
+            if (!dispatcher.symbol->forwarder.empty())
+            {
+                continue;
+            }
+            const auto address = dispatcher.module->base + dispatcher.symbol->rva;
+            const auto last = dispatcher.module->unload_step.value_or(UINT64_MAX);
+            for (const auto& entry :
+                 accesses(address, 1, dispatcher.module->load_step, last, static_cast<uint64_t>(access_kind::execute), control))
+            {
+                if (entry.address != address)
                 {
-                    const auto reported = reported_page_writes_.find(byte / page_size);
-                    const auto latest = page_latest_write_.at(byte / page_size);
-                    if (reported != reported_page_writes_.end() && reported->second >= latest)
+                    continue;
+                }
+                const auto thread_id = thread_at(entry.step).value_or(0);
+                exception_event exception{.step = entry.step, .thread_id = thread_id};
+                const auto entry_number = first_event_at_or_after(entry.step);
+                const auto first_number = entry_number > record_lookback ? entry_number - record_lookback : 0;
+                for (auto number = entry_number; number > first_number;)
+                {
+                    --number;
+                    const auto event = event_at(number);
+                    if (event.kind != access_kind::host_write || event.size != record_size)
                     {
                         continue;
                     }
-                    const auto first_number = reported == reported_page_writes_.end() ? page->second.first_number : reported->second;
-                    const auto writer_number =
-                        recorded_writes_.latest_write_to_byte(byte / page_size, byte, first_number, last_write_number_);
-                    if (!writer_number)
+                    const auto record = access_data(event);
+                    memcpy(&exception.code, record.data(), sizeof(exception.code));
+                    memcpy(&exception.flags, record.data() + 0x4, sizeof(exception.flags));
+                    memcpy(&exception.address, record.data() + 0x10, sizeof(exception.address));
+                    memcpy(exception.information.data(), record.data() + 0x20, sizeof(exception.information));
+                    // The dispatch happens between instructions: the raising instruction is the thread's last one.
+                    if (const auto raised = previous_instruction(entry.step, thread_id))
                     {
-                        continue;
+                        exception.raise_step = raised->step;
                     }
-                    reported_page_writes_[byte / page_size] = latest;
-                    const auto writer = recorded_writes_.event_at(*writer_number);
-                    const auto hit = self_modifying_hit{.address = address,
-                                                        .size = size,
-                                                        .write_step = writer.step,
-                                                        .write_ip = writer.ip,
-                                                        .execute_step = emu_.get_executed_instructions(),
-                                                        .execute_ip = emu_.emu().read_instruction_pointer(),
-                                                        .executions = 1};
-                    if (!first_hit_)
-                    {
-                        first_hit_ = hit;
-                    }
-                    if (hits_.size() + 1 == capture_wave_ && capture_size_)
-                    {
-                        captured_memory_.resize(capture_size_);
-                        for (size_t offset = 0; offset < capture_size_; offset += page_size)
-                        {
-                            const auto length = std::min<size_t>(page_size, capture_size_ - offset);
-                            if (!emu_.emu().try_read_memory(capture_address_ + offset, captured_memory_.data() + offset, length))
-                            {
-                                std::fill_n(captured_memory_.data() + offset, length, uint8_t{0});
-                                ++missing_capture_pages_;
-                            }
-                        }
-                    }
-                    if (hits_.size() < 256)
-                    {
-                        hits_.push_back(hit);
-                    }
-                    return;
-                }
-                if (byte == UINT64_MAX)
-                {
                     break;
                 }
+                result.push_back(exception);
             }
-        }));
-    }
-
-    replay_selfmod_scanner::~replay_selfmod_scanner()
-    {
-        emu_.memory.set_mapping_change_callback({});
-    }
-
-    void replay_selfmod_scanner::finish()
-    {
-        emu_.memory.set_mapping_change_callback({});
-        write_hook_.remove();
-        execute_hook_.remove();
-        if (error_)
-        {
-            throw std::runtime_error(*error_);
         }
-        if (expected_writes_.next(static_cast<uint64_t>(access_kind::write)))
-        {
-            throw std::runtime_error("TTD replay ended before all recorded writes occurred");
-        }
+        std::ranges::sort(result, {}, &exception_event::step);
+        return result;
     }
 }

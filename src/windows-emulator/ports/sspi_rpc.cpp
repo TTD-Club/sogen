@@ -6,6 +6,7 @@
 
 #include "binary_writer.hpp"
 #include "../windows_emulator.hpp"
+#include "../registry/registry_utils.hpp"
 
 namespace sogen
 {
@@ -28,6 +29,7 @@ namespace sogen
         constexpr uint32_t k_incomplete_message = 0x80090318;
         constexpr uint32_t k_illegal_message = 0x80090326;
         constexpr uint32_t k_invalid_handle = 0x80090301;
+        constexpr auto status_no_such_package = static_cast<NTSTATUS>(0xC00000FE);
 
         struct sspi_rpc_port : rpc_port
         {
@@ -68,6 +70,8 @@ namespace sogen
                 {
                 case 0:
                     return handle_connect_rpc(win_emu, c, writer);
+                case 1:
+                    return handle_disconnect_rpc(win_emu, c, writer);
                 case 3:
                     return handle_call_rpc(win_emu, c, writer);
                 case 4:
@@ -78,12 +82,45 @@ namespace sogen
                     return handle_process_security_context(win_emu, c, writer);
                 case 7:
                     return handle_delete_security_context(win_emu, c, writer);
+                case 15:
+                    return handle_get_user_name(win_emu, c, writer);
                 default:
                     return STATUS_NOT_SUPPORTED;
                 }
             }
 
           private:
+            static NTSTATUS handle_get_user_name(windows_emulator& win_emu, const lpc_request_context& c,
+                                                 utils::aligned_binary_writer& writer)
+            {
+                if (c.send_buffer_length < 0x2c)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const auto format = win_emu.memory.read_memory<uint32_t>(c.send_buffer + 0x28);
+                if ((format & ~0x10000u) != 2)
+                {
+                    writer.write<uint16_t>(0);
+                    writer.write<uint16_t>(0);
+                    writer.write_ndr_pointer(false);
+                    writer.write<uint32_t>(0);
+                    writer.write(STATUS_NOT_SUPPORTED);
+                    return STATUS_SUCCESS;
+                }
+                auto name = registry_utils::get_user_name(win_emu.registry);
+                if ((format & 0x10000) == 0)
+                {
+                    name = registry_utils::get_account_domain(win_emu.registry) + u"\\" + name;
+                }
+                writer.write(static_cast<uint16_t>(name.size() * sizeof(char16_t)));
+                writer.write(static_cast<uint16_t>((name.size() + 1) * sizeof(char16_t)));
+                writer.write_ndr_pointer(true);
+                writer.write_ndr_u16string(name, false);
+                writer.write<uint32_t>(0);
+                writer.write(STATUS_SUCCESS);
+                return STATUS_SUCCESS;
+            }
+
             struct security_handle
             {
                 uint64_t lower{};
@@ -364,9 +401,192 @@ namespace sogen
                 return {request.bytes.data() + buffer.payload_offset, buffer.size};
             }
 
+            // The SPM API message SspirCallRpc carries: a PORT_MESSAGE, then the API number and its status, then the API's
+            // arguments (LSAP_LOOKUP_PACKAGE_ARGS, LSAP_CALL_PACKAGE_ARGS, ...).
+            static constexpr size_t spm_api_offset = 0x28;
+            static constexpr size_t spm_status_offset = 0x2c;
+            static constexpr size_t spm_arguments_offset = 0x30;
+            static constexpr uint32_t spm_lookup_package = 0;
+            static constexpr uint32_t spm_call_package = 1;
+            static constexpr uint32_t spm_enumerate_packages = 4;
+
+            static std::optional<uint32_t> spm_api(const std::span<const uint8_t> request)
+            {
+                uint32_t api{};
+                if (request.size() < 0x20 || !has_port_context(request) || !read_value(request, 0x20 + spm_api_offset, api))
+                {
+                    return std::nullopt;
+                }
+                return api;
+            }
+
+            // Package ids as LsaLookupAuthenticationPackage reports them on Windows 11.
+            static constexpr std::array<std::pair<std::string_view, uint32_t>, 12> authentication_packages{{
+                {"Negotiate", 0},
+                {"NegoExtender", 1},
+                {"Kerberos", 2},
+                {"NTLM", 3},
+                {"TSSSP", 4},
+                {"pku2u", 5},
+                {"CloudAP", 6},
+                {"WDigest", 7},
+                {"Schannel", 8},
+                {"Microsoft Unified Security Protocol Provider", 9},
+                {"MICROSOFT_AUTHENTICATION_PACKAGE_V1_0", 11},
+                {"Default TLS SSP", 12},
+            }};
+
+            static bool is_authentication_package(const uint32_t package)
+            {
+                return std::ranges::any_of(authentication_packages, [&](const auto& entry) { return entry.second == package; });
+            }
+
+            static std::optional<uint32_t> lookup_package(const std::string_view name)
+            {
+                const auto equals_ignoring_case = [](const std::string_view a, const std::string_view b) {
+                    return std::ranges::equal(a, b, [](const char x, const char y) {
+                        return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
+                    });
+                };
+
+                for (const auto& [package_name, id] : authentication_packages)
+                {
+                    if (equals_ignoring_case(name, package_name))
+                    {
+                        return id;
+                    }
+                }
+                return std::nullopt;
+            }
+
+            static NTSTATUS lookup_package_api(std::vector<uint8_t>& message)
+            {
+                uint32_t name_length{};
+                constexpr size_t name_offset = spm_arguments_offset + 8;
+                constexpr size_t max_name_length = 127;
+                if (!read_value(message, spm_arguments_offset + 4, name_length) || name_length > max_name_length ||
+                    name_offset + name_length > message.size())
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                const std::string_view name{reinterpret_cast<const char*>(message.data() + name_offset), name_length};
+                const auto package = lookup_package(name);
+                if (!package)
+                {
+                    return status_no_such_package;
+                }
+
+                std::memcpy(message.data() + spm_arguments_offset, &*package, sizeof(*package));
+                return STATUS_SUCCESS;
+            }
+
+            // LsaCallAuthenticationPackage: only Kerberos' domain extended policies query (whoami's claims check), answered
+            // as for a machine outside a domain, Dynamic Access Control disabled. lsass allocates the return buffer in the
+            // caller, which frees it with LsaFreeReturnBuffer.
+            static NTSTATUS call_package_api(windows_emulator& win_emu, std::vector<uint8_t>& message)
+            {
+                constexpr uint32_t kerberos_package = 2;
+                constexpr uint32_t kerb_query_domain_extended_policies_message = 32;
+                constexpr uint32_t dac_disabled = 1;
+
+                uint32_t package{};
+                uint64_t submit_buffer{};
+                uint32_t submit_length{};
+                if (!read_value(message, spm_arguments_offset, package) ||
+                    !read_value(message, spm_arguments_offset + 0x08, submit_buffer) ||
+                    !read_value(message, spm_arguments_offset + 0x10, submit_length) || message.size() < spm_arguments_offset + 0x28)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                if (!is_authentication_package(package))
+                {
+                    return status_no_such_package;
+                }
+
+                uint32_t message_type{};
+                if (submit_buffer == 0 || submit_length < sizeof(message_type) ||
+                    !win_emu.emu().try_read_memory(submit_buffer, &message_type, sizeof(message_type)))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                if (package != kerberos_package || message_type != kerb_query_domain_extended_policies_message)
+                {
+                    win_emu.log.warn("Unsupported LsaCallAuthenticationPackage message %u to package %u\n", message_type, package);
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                const std::array<uint32_t, 4> response{kerb_query_domain_extended_policies_message, dac_disabled, 0, 0};
+                const auto response_buffer =
+                    win_emu.memory.allocate_memory(page_align_up(sizeof(response)), nt_memory_permission{memory_permission::read_write});
+                if (response_buffer == 0)
+                {
+                    return STATUS_NO_MEMORY;
+                }
+                win_emu.emu().write_memory(response_buffer, response.data(), sizeof(response));
+
+                const uint32_t response_length = sizeof(response);
+                const NTSTATUS protocol_status = STATUS_SUCCESS;
+                std::memcpy(message.data() + spm_arguments_offset + 0x18, &response_buffer, sizeof(response_buffer));
+                std::memcpy(message.data() + spm_arguments_offset + 0x20, &response_length, sizeof(response_length));
+                std::memcpy(message.data() + spm_arguments_offset + 0x24, &protocol_status, sizeof(protocol_status));
+                return STATUS_SUCCESS;
+            }
+
+            // Replies with the request's SPM message, its arguments updated by the API and its status set.
+            static NTSTATUS handle_spm_message_rpc(windows_emulator& win_emu, const std::span<const uint8_t> request,
+                                                   utils::aligned_binary_writer& writer)
+            {
+                uint32_t declared_length{};
+                uint64_t conformant_count{};
+                if (writer.pointer_size() != utils::aligned_binary_writer::pointer_size_64 || writer.offset() != 0x18 ||
+                    !read_value(request, 0x14, declared_length) || !read_value(request, 0x18, conformant_count) ||
+                    declared_length != conformant_count || declared_length < spm_arguments_offset ||
+                    request.size() != 0x20 + static_cast<size_t>(declared_length))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                std::vector<uint8_t> message(request.begin() + 0x20, request.end());
+                uint32_t api{};
+                read_value(message, spm_api_offset, api);
+
+                NTSTATUS status{};
+                switch (api)
+                {
+                case spm_lookup_package:
+                    status = lookup_package_api(message);
+                    break;
+                case spm_call_package:
+                    status = call_package_api(win_emu, message);
+                    break;
+                default:
+                    win_emu.log.warn("Unsupported SSPI SPM API %u\n", api);
+                    status = STATUS_NOT_SUPPORTED;
+                    break;
+                }
+                std::memcpy(message.data() + spm_status_offset, &status, sizeof(status));
+
+                const auto start = writer.offset();
+                writer.write<int32_t>(static_cast<int32_t>(declared_length));
+                writer.write_ndr_pointer(true);
+                writer.write_pointer_sized(declared_length);
+                writer.write(message.data(), message.size(), 1);
+                writer.align_to(8);
+                write_callback_result(writer);
+                return finish_reply(writer, start, 0x68 + static_cast<size_t>(declared_length)) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+            }
+
             NTSTATUS handle_call_rpc(windows_emulator& win_emu, const lpc_request_context& c, utils::aligned_binary_writer& writer)
             {
                 auto request = read_request(win_emu, c);
+                if (const auto api = request ? spm_api(*request) : std::nullopt; api && *api != spm_enumerate_packages)
+                {
+                    return handle_spm_message_rpc(win_emu, *request, writer);
+                }
+
                 uint32_t declared_length{};
                 uint64_t conformant_count{};
                 uint32_t api{};
@@ -773,19 +993,36 @@ namespace sogen
                 }
                 client_name_referent = win_emu.emu().read_memory<uint64_t>(c.send_buffer);
                 mode = win_emu.emu().read_memory<uint32_t>(c.send_buffer + 8);
-                if (client_name_referent != 0 || mode != 2)
+                if (client_name_referent != 0 || (mode != 0 && mode != 2))
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
 
                 writer.write<int32_t>(0);
-                writer.write<int32_t>(1);
+                writer.write<int32_t>(mode == 0 ? 0xd : 1);
                 writer.write<uint32_t>(0);
                 writer.write(k_sspi_context_uuid.data(), k_sspi_context_uuid.size(), 1);
                 writer.align_to(sizeof(uint32_t));
                 writer.write<int32_t>(0);
                 this->connected_ = true;
                 return STATUS_SUCCESS;
+            }
+
+            // LsaDeregisterLogonProcess: the reply closes the context handle (all zeros) and reports success.
+            NTSTATUS handle_disconnect_rpc(windows_emulator& win_emu, const lpc_request_context& c, utils::aligned_binary_writer& writer)
+            {
+                const auto request = read_request(win_emu, c);
+                if (writer.pointer_size() != utils::aligned_binary_writer::pointer_size_64 || writer.offset() != 0x18 || !request ||
+                    !has_port_context(*request))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                this->connected_ = false;
+                const auto start = writer.offset();
+                writer.pad(k_sspi_context_handle.size());
+                writer.write<int32_t>(0);
+                return finish_reply(writer, start, 0x44) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
             }
 
             bool connected_{};

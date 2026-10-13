@@ -182,6 +182,21 @@ namespace sogen
                     ucs.Buffer = ucs.Buffer - obj_address;
                 });
             }
+
+            // The named (non-image) section of that name; image sections carry their module's name instead.
+            std::optional<handle> find_named_section(process_context& process, const std::u16string_view name)
+            {
+                for (auto& [index, section] : process.sections)
+                {
+                    if (!section.is_image() && !section.name.empty() &&
+                        utils::string::equals_ignore_case(std::u16string_view{section.name}, name))
+                    {
+                        return process.sections.make_handle(index);
+                    }
+                }
+
+                return std::nullopt;
+            }
         }
 
         NTSTATUS handle_NtCreateSection(const syscall_context& c, const emulator_object<handle> section_handle,
@@ -204,10 +219,31 @@ namespace sogen
             if (object_attributes)
             {
                 const auto attributes = object_attributes.read();
+                s.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
                 if (attributes.ObjectName)
                 {
                     auto name = read_unicode_string(c.emu, attributes.ObjectName);
                     c.win_emu.callbacks.on_generic_access("Section with name", name);
+
+                    // A section of that name exists: CreateFileMapping (OBJ_OPENIF) opens it.
+                    if (const auto existing = find_named_section(c.proc, name))
+                    {
+                        constexpr ULONG obj_openif = 0x80;
+                        if (!(attributes.Attributes & obj_openif))
+                        {
+                            return STATUS_OBJECT_NAME_COLLISION;
+                        }
+
+                        const auto opened = c.proc.sections.duplicate(*existing);
+                        if (!opened)
+                        {
+                            return STATUS_INVALID_HANDLE;
+                        }
+
+                        section_handle.write(*opened);
+                        return STATUS_OBJECT_NAME_EXISTS;
+                    }
+
                     s.name = std::move(name);
                 }
             }
@@ -321,17 +357,22 @@ namespace sogen
                     return STATUS_OBJECT_NAME_NOT_FOUND;
                 }
 
-                section_handle.write(c.proc.sections.store(section.value()));
+                section->inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
+                section_handle.write(c.proc.sections.store(std::move(*section)));
                 return STATUS_SUCCESS;
             }
 
-            for (auto& [handle, section] : c.proc.sections)
+            // Another reference to the section, so that closing either handle leaves the other open.
+            if (const auto existing = find_named_section(c.proc, filename))
             {
-                if (!section.name.empty() && utils::string::equals_ignore_case(section.name, filename))
+                const auto opened = c.proc.sections.duplicate(*existing);
+                if (!opened)
                 {
-                    section_handle.write(c.proc.sections.make_handle(handle));
-                    return STATUS_SUCCESS;
+                    return STATUS_INVALID_HANDLE;
                 }
+
+                section_handle.write(*opened);
+                return STATUS_SUCCESS;
             }
 
             return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -344,7 +385,7 @@ namespace sogen
                                            const emulator_object<LARGE_INTEGER> section_offset,
                                            const emulator_object<EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T)> view_size,
                                            const SECTION_INHERIT /*inherit_disposition*/, const ULONG /*allocation_type*/,
-                                           const ULONG /*win32_protect*/)
+                                           const ULONG win32_protect)
         {
             if (!c.proc.is_current_process_handle(process_handle))
             {
@@ -489,12 +530,24 @@ namespace sogen
                     view_size.write(backing_size - aligned_offset);
                 }
                 base_address.write(section_entry->backing_address + aligned_offset);
+                ++c.proc.pagefile_view_counts[section_entry->backing_address];
                 return STATUS_SUCCESS;
             }
 
-            // File-backed section: map a fresh copy of the file contents.
+            // File-backed section: map a fresh copy of the file contents, including what open handles wrote and still buffer.
+            const auto host_path = c.win_emu.file_sys.translate(section_entry->file_name);
+            for (const auto& open_file : c.proc.files | std::views::values)
+            {
+                // The paths may differ in case (a handle keeps the path it was opened with).
+                std::error_code ec{};
+                if (open_file.handle && std::filesystem::equivalent(open_file.host_path, host_path, ec))
+                {
+                    fflush(open_file.handle);
+                }
+            }
+
             std::vector<std::byte> file_data{};
-            if (!utils::io::read_file(c.win_emu.file_sys.translate(section_entry->file_name), &file_data))
+            if (!utils::io::read_file(host_path, &file_data))
             {
                 return STATUS_INVALID_PARAMETER;
             }
@@ -507,16 +560,43 @@ namespace sogen
             }
 
             const auto size = static_cast<size_t>(file_data.size() - offset);
+            if (size == 0)
+            {
+                constexpr auto status_mapped_file_size_zero = static_cast<NTSTATUS>(0xC000011E);
+                return status_mapped_file_size_zero;
+            }
+
             const auto aligned_size = static_cast<size_t>(page_align_up(size));
             const auto reserve_only = section_entry->allocation_attributes == SEC_RESERVE;
             const auto address =
                 c.win_emu.memory.allocate_memory(aligned_size, protection, reserve_only, 0, memory_region_kind::file_section_view);
+            if (!address)
+            {
+                return STATUS_NO_MEMORY;
+            }
             c.win_emu.memory.set_region_mapped_filename(address, section_entry->file_name);
 
             if (!reserve_only && !file_data.empty())
             {
                 c.emu.write_memory(address, file_data.data() + offset, size);
             }
+
+            // Every view keeps its file from shrinking; a shared writable one also writes its changes back to the file (a
+            // copy-on-write view keeps them).
+            const auto section_writable = (section_entry->section_page_protection & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
+            const auto copy_on_write = (win32_protect & (PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;
+            process_context::file_section_view view{
+                .file_name = section_entry->file_name, .offset = static_cast<uint64_t>(offset), .length = size};
+            if (section_writable && !copy_on_write && !reserve_only)
+            {
+                constexpr size_t page_size = 0x1000;
+                for (size_t page = 0; page < size; page += page_size)
+                {
+                    view.page_hashes.push_back(process_context::hash_page(
+                        std::span(file_data).subspan(static_cast<size_t>(offset) + page, std::min(page_size, size - page))));
+                }
+            }
+            c.proc.file_section_views[address] = std::move(view);
 
             if (view_size)
             {
@@ -687,8 +767,23 @@ namespace sogen
                 // when the last section handle is closed.
                 if (region_info.kind == memory_region_kind::pagefile_section_view)
                 {
+                    // The last view of a closed section takes its backing with it.
+                    const auto backing = region_info.allocation_base;
+                    if (const auto views = c.proc.pagefile_view_counts.find(backing);
+                        views != c.proc.pagefile_view_counts.end() && --views->second == 0)
+                    {
+                        c.proc.pagefile_view_counts.erase(views);
+                        if (c.proc.closed_pagefile_backings.erase(backing))
+                        {
+                            c.win_emu.memory.release_memory(backing, 0);
+                        }
+                    }
+
                     return STATUS_SUCCESS;
                 }
+
+                c.proc.write_back_file_section_view(c.win_emu, region_info.allocation_base, 0, UINT64_MAX);
+                c.proc.file_section_views.erase(region_info.allocation_base);
 
                 if (c.win_emu.memory.release_memory(region_info.allocation_base, 0))
                 {

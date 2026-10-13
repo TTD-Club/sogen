@@ -7,6 +7,8 @@
 #include <string_view>
 #include <serialization_helper.hpp>
 #include <utils/file_handle.hpp>
+#include <utils/stat.hpp>
+#include <utils/time.hpp>
 #include <platform/synchronisation.hpp>
 #include <platform/win_pefile.hpp>
 #include <platform/window.hpp>
@@ -36,14 +38,89 @@ namespace sogen
     {
         std::u16string name{};
 
+        // Created by NtCreateTimer2 (a KTIMER2): set and cancelled by the classic and the Timer2 calls, where a classic
+        // timer only takes the classic ones.
+        bool extended{};
+
+        // Notification (manual-reset) timers stay signaled until set again; synchronization timers
+        // release one waiter and reset.
+        bool notification{};
+        bool signaled{};
+        std::optional<std::chrono::steady_clock::time_point> due_time{};
+        std::chrono::steady_clock::duration period{};
+
+        // The APC goes to the thread that set the timer, once per expiry.
+        uint64_t apc_routine{};
+        uint64_t apc_context{};
+        uint32_t apc_thread_id{};
+
+        // Signals the timer if its due time has passed and re-arms a periodic timer. Returns whether
+        // it expired.
+        bool expire_if_due(const std::chrono::steady_clock::time_point now)
+        {
+            if (!this->due_time.has_value() || *this->due_time > now)
+            {
+                return false;
+            }
+
+            this->signaled = true;
+
+            if (this->period.count() > 0)
+            {
+                // A periodic timer that fell behind expires once and resumes its schedule; one too far out to
+                // represent never comes due again.
+                const auto missed = (now - *this->due_time) / this->period;
+                const auto until_next = this->period - (now - *this->due_time - this->period * missed);
+                const auto latest = std::chrono::steady_clock::time_point::max();
+                *this->due_time = until_next > latest - now ? latest : now + until_next;
+            }
+            else
+            {
+                this->due_time.reset();
+            }
+
+            return true;
+        }
+
+        void consume_signal()
+        {
+            if (!this->notification)
+            {
+                this->signaled = false;
+            }
+        }
+
+        void cancel()
+        {
+            this->due_time.reset();
+            this->period = {};
+            this->apc_routine = 0;
+        }
+
         void serialize_object(utils::buffer_serializer& buffer) const override
         {
             buffer.write(this->name);
+            buffer.write(this->extended);
+            buffer.write(this->notification);
+            buffer.write(this->signaled);
+            buffer.write_optional(this->due_time);
+            buffer.write(static_cast<int64_t>(this->period.count()));
+            buffer.write(this->apc_routine);
+            buffer.write(this->apc_context);
+            buffer.write(this->apc_thread_id);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
         {
             buffer.read(this->name);
+            buffer.read(this->extended);
+            buffer.read(this->notification);
+            buffer.read(this->signaled);
+            buffer.read_optional(this->due_time);
+            this->period = std::chrono::steady_clock::duration{buffer.read<int64_t>()};
+            buffer.read(this->apc_routine);
+            buffer.read(this->apc_context);
+            buffer.read(this->apc_thread_id);
         }
     };
 
@@ -667,25 +744,36 @@ namespace sogen
         LARGE_INTEGER creation_time{};
         LARGE_INTEGER last_access_time{};
         LARGE_INTEGER last_write_time{};
+        // The 8.3 name, for names that are not 8.3 themselves (empty where the host keeps none).
+        std::u16string short_name{};
+        // The tag of a junction or symbolic link, 0 for other entries.
+        uint32_t reparse_tag{};
+        bool read_only{};
 
         void serialize(utils::buffer_serializer& buffer) const
         {
+            buffer.write(this->read_only);
             buffer.write(this->file_path);
             buffer.write(this->file_size);
             buffer.write(this->is_directory);
             buffer.write(this->creation_time);
             buffer.write(this->last_access_time);
             buffer.write(this->last_write_time);
+            buffer.write(this->short_name);
+            buffer.write(this->reparse_tag);
         }
 
         void deserialize(utils::buffer_deserializer& buffer)
         {
+            buffer.read(this->read_only);
             buffer.read(this->file_path);
             buffer.read(this->file_size);
             buffer.read(this->is_directory);
             buffer.read(this->creation_time);
             buffer.read(this->last_access_time);
             buffer.read(this->last_write_time);
+            buffer.read(this->short_name);
+            buffer.read(this->reparse_tag);
         }
     };
 
@@ -715,8 +803,14 @@ namespace sogen
         std::filesystem::path host_path{};
         std::optional<file_enumeration_state> enumeration_state{};
         ACCESS_MASK access_mask{};
+        // FILE_SHARE_* the open allows others: checked against later opens of the same file.
+        ULONG share_access{FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE};
         uint32_t file_mode{}; // FileModeInformation
         uint8_t drive_number{'c' - 'a' + 1};
+        // The guest name a pending rename (done at close) moves it to, empty for none.
+        std::u16string renamed_to{};
+        // Opened as the host reparse point itself (compat_open_reparse_point), which the host cannot follow.
+        bool host_reparse_point{};
 
         bool is_file() const
         {
@@ -735,8 +829,11 @@ namespace sogen
             buffer.write(this->host_path.u16string());
             buffer.write_optional(this->enumeration_state);
             buffer.write(this->access_mask);
+            buffer.write(this->share_access);
             buffer.write(this->file_mode);
             buffer.write(this->drive_number);
+            buffer.write(this->renamed_to);
+            buffer.write(this->host_reparse_point);
 
             const auto has_handle = static_cast<bool>(this->handle);
             buffer.write(has_handle);
@@ -754,8 +851,11 @@ namespace sogen
             this->host_path = buffer.read<std::u16string>();
             buffer.read_optional(this->enumeration_state);
             buffer.read(this->access_mask);
+            buffer.read(this->share_access);
             buffer.read(this->file_mode);
             buffer.read(this->drive_number);
+            buffer.read(this->renamed_to);
+            buffer.read(this->host_reparse_point);
 
             const auto has_handle = buffer.read<bool>();
 
@@ -763,11 +863,34 @@ namespace sogen
 
             if (has_handle)
             {
+                const auto open = [this](const std::u16string& mode) {
+                    if (this->host_reparse_point)
+                    {
+                        return compat_open_reparse_point(this->host_path, mode.find_first_of(u"+wa") != std::u16string::npos);
+                    }
 #if defined(OS_WINDOWS)
-                FILE* native_file = _wfopen(this->host_path.c_str(), reinterpret_cast<const wchar_t*>(this->open_mode.c_str()));
+                    return _wfopen(this->host_path.c_str(), reinterpret_cast<const wchar_t*>(mode.c_str()));
 #else
-                FILE* native_file = fopen(u16_to_u8(this->host_path.u16string()).c_str(), u16_to_u8(this->open_mode).c_str());
+                    return fopen(u16_to_u8(this->host_path.u16string()).c_str(), u16_to_u8(mode).c_str());
 #endif
+                };
+
+                // Reopening must not truncate the file as its "w" mode would, nor fail because a later part of the run
+                // deleted it (a replay seeking backwards); the handle then sees the host file as it is now.
+                auto reopen_mode = this->open_mode;
+                if (!reopen_mode.empty() && reopen_mode.front() == u'w')
+                {
+                    reopen_mode = u"r+" + reopen_mode.substr(reopen_mode.find(u'+') == std::u16string::npos ? 1 : 2);
+                }
+                FILE* native_file = open(reopen_mode);
+                if (!native_file)
+                {
+                    if (FILE* created = open(u"ab"))
+                    {
+                        fclose(created);
+                    }
+                    native_file = open(reopen_mode);
+                }
 
                 if (native_file)
                 {
@@ -1056,6 +1179,7 @@ namespace sogen
         uint32_t pending_release_count{};
         bool release_pending{};
         std::vector<handle> worker_threads{};
+        std::vector<handle> starting_worker_threads{};
 
         void serialize_object(utils::buffer_serializer& buffer) const override
         {
@@ -1085,6 +1209,7 @@ namespace sogen
             buffer.write(this->pending_release_count);
             buffer.write(this->release_pending);
             buffer.write_vector(this->worker_threads);
+            buffer.write_vector(this->starting_worker_threads);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -1115,6 +1240,7 @@ namespace sogen
             buffer.read(this->pending_release_count);
             buffer.read(this->release_pending);
             buffer.read_vector(this->worker_threads);
+            buffer.read_vector(this->starting_worker_threads);
         }
     };
 

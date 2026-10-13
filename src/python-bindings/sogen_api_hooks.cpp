@@ -107,6 +107,7 @@ namespace sogen::py
         catch (...)
         {
         }
+        this->callback = nb::none();
     }
 
     hook_handle::hook_handle(sogen::x86_64_emulator& emulator, emulator_hook* hook, nb::object owner)
@@ -143,6 +144,16 @@ namespace sogen::py
         this->clear();
         this->win_emu->callbacks.on_module_load.remove(this->module_load_id);
         this->win_emu->callbacks.on_module_unload.remove(this->module_unload_id);
+    }
+
+    int api_hook_registry::traverse(const visitproc visit, void* arg) const
+    {
+        for (const auto& [_, entry] : this->entries)
+        {
+            Py_VISIT(entry.callback.ptr());
+            Py_VISIT(entry.params.ptr());
+        }
+        return 0;
     }
 
     void api_hook_registry::clear()

@@ -3,6 +3,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace sogen::ttd
 {
@@ -89,6 +91,106 @@ namespace sogen::ttd
         // The export directories of the modules in the modules section, encoded as described at encode_exports;
         // size = compressed bytes.
         exports = 11,
+        // The targets of the forwarded exports in the exports section, encoded as described at
+        // encode_export_forwarders; size = compressed bytes.
+        export_forwarders = 12,
+        // The register snapshots (see register_snapshot_entry), encoded as described at encode_register_snapshots;
+        // size = compressed bytes.
+        register_snapshots = 13,
+        // Every mapping and unmapping of guest memory (see mapping_change), encoded as described at
+        // encode_mapping_changes; size = compressed bytes.
+        mapping_changes = 14,
+        // The PE machine of each module in the modules section, encoded as described at encode_module_machines;
+        // size = compressed bytes.
+        module_machines = 15,
+        // The stack of each thread that ran (see thread_stack), encoded as described at encode_thread_stacks;
+        // size = compressed bytes.
+        thread_stacks = 16,
+        // The memory map at the start and its changes (see memory_region), encoded as described at
+        // encode_memory_regions; size = compressed bytes.
+        memory_regions = 17,
+        // Per checkpoint, the offset in its decoded state at which the memory manager's state begins, so a reader can
+        // take memory contents from checkpoints without parsing the rest; encoded as described at
+        // encode_checkpoint_memory_offsets; size = compressed bytes.
+        checkpoint_memory = 18,
+    };
+
+    // What NtQueryVirtualMemory showed for [address, address + size) from position `step` on (after `event_number`
+    // events), until a later entry covers the range again. The entries at the trace's start position with event number
+    // 0 are the memory that existed when recording began (free memory then is not listed); later ones describe a range
+    // whose reservation, commit, protection or mapping changed, free memory included. The values are Windows' own:
+    // MEM_* states and types, PAGE_* protections (PAGE_GUARD included).
+    struct memory_region
+    {
+        uint64_t step{};
+        uint64_t event_number{};
+        uint64_t address{};
+        uint64_t size{};
+        // The reservation's base and its protection when reserved (AllocationProtect); 0 for free memory.
+        uint64_t allocation_base{};
+        uint32_t allocation_protection{};
+        // MEM_COMMIT, MEM_RESERVE or MEM_FREE.
+        uint32_t state{};
+        // MEM_PRIVATE, MEM_MAPPED or MEM_IMAGE; 0 for free memory.
+        uint32_t type{};
+        // The protection of committed memory; 0 otherwise.
+        uint32_t protection{};
+        // Sogen's finer kind: 0 free, 1 private, 2 file view, 3 pagefile-backed view, 4 image, 5 MMIO or host-aliased
+        // memory, 6 reserved for the host.
+        uint32_t kind{};
+        // The mapped file of a file view, as an index into memory_region_table::names; UINT32_MAX for none. Images have
+        // none: the modules section names them (trace::module_at).
+        uint32_t name{UINT32_MAX};
+    };
+
+    struct memory_region_table
+    {
+        std::vector<memory_region> regions{};
+        std::vector<std::string> names{};
+    };
+
+    // A thread's stack as its TEB (NT_TIB StackBase and StackLimit) described it when the thread first ran in the trace:
+    // at its creation, or at the trace's start for a thread that already existed. Sogen commits a thread's whole stack
+    // when it creates it, so these hold for the thread's life unless the guest rewrites its TEB itself (fibers, which
+    // memory_at at the TEB shows).
+    struct thread_stack
+    {
+        uint32_t thread_id{};
+        // The thread's first instruction in the trace, and the number of events recorded before it.
+        uint64_t step{};
+        uint64_t event_number{};
+        uint64_t teb{};
+        // The stack's high end (StackBase) and low end (StackLimit): it holds [stack_limit, stack_base).
+        uint64_t stack_base{};
+        uint64_t stack_limit{};
+        // For a WoW64 thread, its 32-bit TEB and the 32-bit stack; 0 otherwise.
+        uint64_t teb32{};
+        uint64_t stack32_base{};
+        uint64_t stack32_limit{};
+    };
+
+    // Guest memory [address, address + size) was mapped or unmapped at position `step`, after `event_number` events,
+    // so its bytes no longer hold what earlier accesses showed.
+    struct mapping_change
+    {
+        uint64_t step{};
+        uint64_t event_number{};
+        uint64_t address{};
+        uint64_t size{};
+    };
+
+    // The CPU registers (the backend's save_registers, zstd-compressed) at position `step`, after `event_number` events.
+    // The recorder takes one before the first instruction, after anything but a guest instruction changed registers or
+    // memory (syscalls, thread switches, exception dispatch, instruction hooks, host writes), and at least every so many
+    // instructions, so the instructions up to the next snapshot depend only on these registers and the bytes the trace
+    // records for them. A snapshot with a base is a zstd delta against the base's registers; a base has none.
+    struct register_snapshot_entry
+    {
+        uint64_t step{};
+        uint64_t event_number{};
+        uint64_t offset{};
+        uint64_t size{};
+        uint64_t base{UINT64_MAX};
     };
 
     // A syscall instruction the emulator dispatched: its handler ran after `event_number` events had been recorded,
@@ -197,4 +299,5 @@ namespace sogen::ttd
     static_assert(sizeof(page_entry) == 16);
     static_assert(sizeof(page_block) == 32);
     static_assert(sizeof(ui_input_entry) == 56);
+    static_assert(sizeof(register_snapshot_entry) == 40);
 }

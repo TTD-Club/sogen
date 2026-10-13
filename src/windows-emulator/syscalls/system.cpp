@@ -494,7 +494,6 @@ namespace sogen
 
             case SystemFlushInformation:
             case SystemSecureBootPolicyInformation:
-            case SystemCodeIntegrityPolicyInformation:
             case SystemCodeIntegrityPoliciesFullInformation:
             case SystemHypervisorSharedPageInformation:
             case SystemFeatureConfigurationInformation:
@@ -502,6 +501,9 @@ namespace sogen
             case SystemFeatureConfigurationSectionInformation:
             case SystemFirmwareTableInformation:
             case SystemPolicyInformation:
+            // Performance counter providers (HKEY_PERFORMANCE_DATA) skip what fails.
+            case SystemSuperfetchInformation:
+            case SystemMemoryTopologyInformation:
                 return STATUS_NOT_SUPPORTED;
 
             case SystemControlFlowTransition:
@@ -513,6 +515,45 @@ namespace sogen
 
             case SystemModuleInformationEx:
                 return handle_system_module_information_ex(c, system_information, system_information_length, return_length);
+
+            case SystemRegistryQuotaInformation: {
+                // SYSTEM_REGISTRY_QUOTA_INFORMATION (PDH's "Registry Quota" counters, e.g. CPython's test runner). The
+                // registry quota has been unlimited since Windows Vista: the allowed size reports as 4 GiB - 1.
+                struct registry_quota_information
+                {
+                    ULONG RegistryQuotaAllowed;
+                    ULONG RegistryQuotaUsed;
+                    uint64_t PagedPoolSize;
+                };
+
+                return handle_query<registry_quota_information>(c.emu, system_information, system_information_length, return_length,
+                                                                [&](registry_quota_information& info) {
+                                                                    info.RegistryQuotaAllowed = 0xFFFFFFFF;
+                                                                    info.RegistryQuotaUsed = 0x00800000;
+                                                                    info.PagedPoolSize = 0x10000000;
+                                                                });
+            }
+
+            case SystemLeapSecondInformation: {
+                struct system_leap_second_information
+                {
+                    BOOLEAN enabled;
+                    std::array<uint8_t, 3> reserved;
+                    ULONG flags;
+                };
+
+                static_assert(sizeof(system_leap_second_information) == 8);
+                if (return_length)
+                {
+                    return_length.write(sizeof(system_leap_second_information));
+                }
+                if (system_information_length != sizeof(system_leap_second_information))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                c.emu.write_memory(system_information, system_leap_second_information{});
+                return STATUS_SUCCESS;
+            }
 
             case SystemTimeOfDayInformation:
                 return handle_query<SYSTEM_TIMEOFDAY_INFORMATION64>(c.emu, system_information, system_information_length, return_length,
@@ -846,6 +887,32 @@ namespace sogen
                                                                           ci.Length = sizeof(ci);
                                                                           ci.CodeIntegrityOptions = CODEINTEGRITY_OPTION_ENABLED;
                                                                       });
+            }
+
+            case SystemCodeIntegrityPolicyInformation: {
+                struct system_code_integrity_policy_information
+                {
+                    ULONG options;
+                    ULONG hvci_options;
+                    ULONGLONG version;
+                    GUID policy_guid;
+                };
+
+                static_assert(sizeof(system_code_integrity_policy_information) == 32);
+                if (return_length)
+                {
+                    if (!return_length.try_write(sizeof(system_code_integrity_policy_information)))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+                if (system_information_length != sizeof(system_code_integrity_policy_information))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                const system_code_integrity_policy_information information{};
+                return c.emu.try_write_memory(system_information, &information, sizeof(information)) ? STATUS_SUCCESS
+                                                                                                     : STATUS_ACCESS_VIOLATION;
             }
 
             case SystemBootEnvironmentInformation:

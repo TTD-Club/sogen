@@ -5,6 +5,7 @@
 #include <compare>
 #include <cstdint>
 #include <optional>
+#include <memory>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -12,6 +13,13 @@
 
 namespace sogen
 {
+    inline constexpr uint32_t default_guest_process_id = 0x1000;
+
+    namespace utils
+    {
+        class host_pipe;
+    }
+
     struct managed_process
     {
         uint64_t value{};
@@ -72,15 +80,35 @@ namespace sogen
         uint64_t code{};
     };
 
+    struct process_inherited_pipe
+    {
+        uint64_t guest_handle{};
+        uint64_t file_id{};
+        std::shared_ptr<utils::host_pipe> endpoint;
+        std::string name;
+        uint32_t access{};
+        uint32_t pipe_type{};
+        uint32_t read_mode{};
+        uint32_t completion_mode{};
+        uint32_t create_options{};
+        uint32_t completion_notification_flags{};
+        bool inherit{};
+    };
+
     struct process_create_request
     {
         std::string application{};
         std::string argument0{};
+        std::string command_line{};
         std::string working_directory{};
         std::vector<std::string> arguments{};
         std::unordered_map<std::string, std::string> environment{};
-        uint32_t process_id{4};
+        uint32_t process_id{default_guest_process_id};
         uint32_t thread_id{8};
+        uint64_t standard_input{};
+        uint64_t standard_output{};
+        uint64_t standard_error{};
+        std::vector<process_inherited_pipe> inherited_pipes{};
     };
 
     struct process_create_result

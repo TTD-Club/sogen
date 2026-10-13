@@ -59,6 +59,9 @@ namespace sogen
 
         bool is_static{false};
 
+        // The serialized exports and address names, which do not change once the module is mapped.
+        mutable std::shared_ptr<const std::vector<std::byte>> serialized_symbols{};
+
         bool contains(const uint64_t address) const
         {
             return (address - this->image_base) < this->size_of_image;

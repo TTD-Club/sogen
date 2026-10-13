@@ -133,7 +133,7 @@ namespace sogen
                 case k_nsi_get_parameter:
                     return get_parameter(win_emu, c, read_request(win_emu, c, get_offsets(wow64), wow64));
                 case k_nsi_get_all_parameters:
-                    return get_all_parameters(win_emu, c, read_request(win_emu, c, get_offsets(wow64), wow64));
+                    return get_all_parameters(win_emu, c, read_request(win_emu, c, get_all_offsets(wow64), wow64));
                 case k_nsi_enumerate_objects_all_parameters:
                     return enumerate_objects_all_parameters(win_emu, c, read_request(win_emu, c, enumerate_offsets(wow64), wow64), wow64);
                 default:
@@ -155,6 +155,24 @@ namespace sogen
                                            .rw_size = 0x48,
                                            .dynamic_address = 0x50,
                                            .dynamic_size = 0x58};
+            }
+
+            // NsiGetAllParameters has no parameter type after the key: rw, dynamic and static buffers follow it directly
+            // (64-bit: key@0x28, rw@0x38, dynamic@0x48, static@0x58, each with its size 8 bytes later), as the
+            // performance counter providers send it.
+            static nsi_offsets get_all_offsets(const bool wow64)
+            {
+                if (wow64)
+                {
+                    return get_offsets(wow64);
+                }
+
+                return nsi_offsets{.key_address = 0x28,
+                                   .key_size = 0x30,
+                                   .rw_address = 0x38,
+                                   .rw_size = 0x40,
+                                   .dynamic_address = 0x48,
+                                   .dynamic_size = 0x50};
             }
 
             static nsi_offsets enumerate_offsets(const bool wow64)

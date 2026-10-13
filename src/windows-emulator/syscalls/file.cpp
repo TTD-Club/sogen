@@ -26,10 +26,366 @@ namespace sogen
                 uint64_t completion_key;
             };
 
+            std::u16string normalize_named_pipe_path(const std::u16string_view filename)
+            {
+                constexpr std::u16string_view dos_prefix = u"\\??\\Pipe\\";
+                if (utils::string::starts_with_ignore_case(filename, dos_prefix))
+                {
+                    return u"\\Device\\NamedPipe\\" + std::u16string(filename.substr(dos_prefix.size()));
+                }
+                return std::u16string(filename);
+            }
+
             bool has_valid_filename_characters(const std::u16string_view path)
             {
                 constexpr std::u16string_view invalid_characters = u"\"<>|*?";
                 return path.find_first_of(invalid_characters) == std::u16string_view::npos;
+            }
+
+            constexpr ULONG io_reparse_tag_mount_point = 0xA0000003;
+            constexpr ULONG io_reparse_tag_symlink = 0xA000000C;
+            constexpr ULONG symlink_flag_relative = 1;
+            constexpr ULONG file_open_reparse_point = 0x00200000;
+            constexpr auto status_reparse_point_not_resolved = static_cast<NTSTATUS>(0xC0000280);
+            // A reparse point's chain may not be longer (as on Windows).
+            constexpr int max_reparses = 63;
+
+            std::u16string reparse_key(const std::u16string_view path)
+            {
+                return windows_path(path).u16string();
+            }
+
+            ULONG reparse_tag(const std::vector<uint8_t>& data)
+            {
+                ULONG tag{};
+                if (data.size() >= sizeof(tag))
+                {
+                    memcpy(&tag, data.data(), sizeof(tag));
+                }
+                return tag;
+            }
+
+            constexpr ULONG file_attribute_readonly = 0x1;
+            constexpr auto status_cannot_delete = static_cast<NTSTATUS>(0xC0000121);
+
+            // The attributes a host stat shows: a directory, or a file, read-only without write permission.
+            // Files carry FILE_ATTRIBUTE_ARCHIVE, as Windows sets it on files it creates or changes: clearing read-only
+            // then leaves a value that is not 0 (which would mean "keep the attributes").
+            ULONG host_file_attributes(const struct compat_stat& file_stat)
+            {
+                constexpr uint32_t owner_write = 0200;
+                constexpr ULONG file_attribute_archive = 0x20;
+                const auto read_only = (file_stat.st_mode & owner_write) == 0;
+                const auto base = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : file_attribute_archive;
+                return base | (read_only ? file_attribute_readonly : 0);
+            }
+
+            // A file's attributes with FILE_ATTRIBUTE_REPARSE_POINT if it is one (FILE_ATTRIBUTE_NORMAL stands alone).
+            ULONG with_reparse_attribute(const ULONG attributes, const ULONG tag)
+            {
+                constexpr ULONG file_attribute_reparse_point = 0x400;
+                return tag ? ((attributes & ~static_cast<ULONG>(FILE_ATTRIBUTE_NORMAL)) | file_attribute_reparse_point) : attributes;
+            }
+
+            // The tag of the reparse point the guest made at `path`, 0 for none.
+            ULONG emulated_reparse_tag_at(const process_context& process, const std::u16string_view path)
+            {
+                if (process.reparse_points.empty())
+                {
+                    return 0;
+                }
+
+                const auto entry = process.reparse_points.find(reparse_key(path));
+                return entry == process.reparse_points.end() ? 0 : reparse_tag(entry->second);
+            }
+
+            // The REPARSE_DATA_BUFFER of the reparse point at `path`: one the guest made, or in host mode one the host
+            // has (opens through it already follow it on the host). Nothing for other paths.
+            std::optional<std::vector<uint8_t>> reparse_data_at(const syscall_context& c, const std::u16string_view path)
+            {
+                if (const auto entry = c.proc.reparse_points.find(reparse_key(path)); entry != c.proc.reparse_points.end())
+                {
+                    return entry->second;
+                }
+
+                if (!c.win_emu.file_sys.is_host_mode())
+                {
+                    return std::nullopt;
+                }
+
+                return compat_reparse_data(c.win_emu.file_sys.translate(windows_path(path)));
+            }
+
+            // The tag of the reparse point at `path`, 0 for none.
+            ULONG reparse_tag_at(const syscall_context& c, const std::u16string_view path)
+            {
+                if (const auto tag = emulated_reparse_tag_at(c.proc, path); tag || !c.win_emu.file_sys.is_host_mode())
+                {
+                    return tag;
+                }
+
+                const auto data = reparse_data_at(c, path);
+                return data ? reparse_tag(*data) : 0;
+            }
+
+            // Appends the components of `path` (separated by \ or /) to `parts`, resolving "." and ".." (which stops at the
+            // drive, parts[0]).
+            void append_components(std::vector<std::u16string>& parts, const std::u16string_view path)
+            {
+                size_t start = 0;
+                while (start <= path.size())
+                {
+                    const auto end = path.find_first_of(u"\\/", start);
+                    const auto component = path.substr(start, end == std::u16string_view::npos ? std::u16string_view::npos : end - start);
+                    if (component == u"..")
+                    {
+                        if (parts.size() > 1)
+                        {
+                            parts.pop_back();
+                        }
+                    }
+                    else if (!component.empty() && component != u".")
+                    {
+                        parts.emplace_back(component);
+                    }
+
+                    if (end == std::u16string_view::npos)
+                    {
+                        break;
+                    }
+                    start = end + 1;
+                }
+            }
+
+            // An absolute guest path as its drive ("C:") and its components, keeping their case; nothing for other paths.
+            std::optional<std::vector<std::u16string>> split_path(std::u16string_view path)
+            {
+                for (const std::u16string_view prefix : {u"\\??\\", u"\\\\?\\"})
+                {
+                    if (path.starts_with(prefix))
+                    {
+                        path.remove_prefix(prefix.size());
+                        break;
+                    }
+                }
+
+                const auto is_drive_letter = [](const char16_t c) { return (c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z'); };
+                if (path.size() < 2 || path[1] != u':' || !is_drive_letter(path[0]))
+                {
+                    return std::nullopt;
+                }
+
+                std::vector<std::u16string> parts{std::u16string(path.substr(0, 2))};
+                append_components(parts, path.substr(2));
+                return parts;
+            }
+
+            std::u16string join_path(const std::vector<std::u16string>& parts)
+            {
+                std::u16string path = u"\\??\\" + parts.front() + u"\\";
+                for (size_t i = 1; i < parts.size(); ++i)
+                {
+                    path += (i > 1 ? u"\\" : u"") + parts[i];
+                }
+                return path;
+            }
+
+            // Where a junction or symbolic link leads, as components (a relative link resolves against `link_directory`);
+            // nothing for tags opens do not follow.
+            std::optional<std::vector<std::u16string>> reparse_target(const std::vector<uint8_t>& data,
+                                                                      const std::vector<std::u16string>& link_directory)
+            {
+                // REPARSE_DATA_BUFFER: tag, data length, reserved, then the substitute and print name offsets and lengths
+                // (and, for a symbolic link, its flags) before the path buffer.
+                const auto tag = reparse_tag(data);
+                const auto buffer_offset = tag == io_reparse_tag_symlink ? size_t{20} : size_t{16};
+                if ((tag != io_reparse_tag_mount_point && tag != io_reparse_tag_symlink) || data.size() < buffer_offset)
+                {
+                    return std::nullopt;
+                }
+
+                uint16_t substitute_offset{};
+                uint16_t substitute_length{};
+                memcpy(&substitute_offset, data.data() + 8, sizeof(substitute_offset));
+                memcpy(&substitute_length, data.data() + 10, sizeof(substitute_length));
+                ULONG flags{};
+                if (tag == io_reparse_tag_symlink)
+                {
+                    memcpy(&flags, data.data() + 16, sizeof(flags));
+                }
+
+                if (buffer_offset + substitute_offset + substitute_length > data.size() || substitute_length % sizeof(char16_t) != 0)
+                {
+                    return std::nullopt;
+                }
+
+                std::u16string substitute(substitute_length / sizeof(char16_t), u'\0');
+                memcpy(substitute.data(), data.data() + buffer_offset + substitute_offset, substitute_length);
+
+                if (tag == io_reparse_tag_symlink && (flags & symlink_flag_relative))
+                {
+                    auto parts = link_directory;
+                    append_components(parts, substitute);
+                    return parts;
+                }
+
+                return split_path(substitute);
+            }
+
+            // `name` after following the reparse points among its components, all of them or all but the last (an open
+            // with FILE_OPEN_REPARSE_POINT, or a by-name query). Unchanged without reparse points on the way; nothing for
+            // a chain longer than Windows follows.
+            std::optional<std::u16string> resolve_reparse_points(const process_context& process, const std::u16string& name,
+                                                                 const bool follow_last)
+            {
+                if (process.reparse_points.empty())
+                {
+                    return name;
+                }
+
+                auto parts = split_path(name);
+                if (!parts)
+                {
+                    return name;
+                }
+
+                for (int reparses = 0; reparses <= max_reparses; ++reparses)
+                {
+                    auto replaced = false;
+                    std::vector<std::u16string> prefix{parts->front()};
+                    for (size_t i = 1; i < parts->size(); ++i)
+                    {
+                        prefix.push_back((*parts)[i]);
+                        if (i + 1 == parts->size() && !follow_last)
+                        {
+                            break;
+                        }
+
+                        const auto entry = process.reparse_points.find(reparse_key(join_path(prefix)));
+                        if (entry == process.reparse_points.end())
+                        {
+                            continue;
+                        }
+
+                        prefix.pop_back();
+                        auto target = reparse_target(entry->second, prefix);
+                        if (!target)
+                        {
+                            prefix.push_back((*parts)[i]);
+                            continue;
+                        }
+
+                        target->insert(target->end(), parts->begin() + static_cast<ptrdiff_t>(i) + 1, parts->end());
+                        parts = std::move(target);
+                        replaced = true;
+                        break;
+                    }
+
+                    if (!replaced)
+                    {
+                        return reparses == 0 ? name : join_path(*parts);
+                    }
+                }
+
+                return std::nullopt;
+            }
+
+            // What the host knows of an open file or directory: a file through its stream, a directory by its path (left
+            // empty where that fails, as for a volume).
+            bool stat_open_file(const file& f, struct compat_stat& file_stat)
+            {
+                if (f.handle)
+                {
+                    return compat_fstat(f.handle.file_descriptor(), &file_stat);
+                }
+
+                if (!compat_stat(f.host_path, &file_stat))
+                {
+                    constexpr uint32_t writable_directory = S_IFDIR | 0700;
+                    file_stat = {};
+                    file_stat.st_mode = writable_directory;
+                }
+                return true;
+            }
+
+            // A read-only file cannot be deleted (STATUS_CANNOT_DELETE), as on Windows.
+            bool is_read_only_file(const file& f)
+            {
+                struct compat_stat file_stat{};
+                return stat_open_file(f, file_stat) && (host_file_attributes(file_stat) & file_attribute_readonly) != 0;
+            }
+
+            // The access an open holds for sharing purposes (IoCheckShareAccess): reading, writing, and deleting.
+            struct shared_access
+            {
+                bool read{};
+                bool write{};
+                bool remove{};
+
+                bool any() const
+                {
+                    return this->read || this->write || this->remove;
+                }
+            };
+
+            shared_access get_shared_access(const ACCESS_MASK access)
+            {
+                if (access & GENERIC_ALL)
+                {
+                    return {.read = true, .write = true, .remove = true};
+                }
+
+                // The granted maximum is not computed; reading and writing cover what callers asking for it use.
+                const auto maximum = (access & MAXIMUM_ALLOWED) != 0;
+                return {
+                    .read = maximum || (access & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) != 0,
+                    .write = maximum || (access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE)) != 0,
+                    .remove = (access & DELETE) != 0,
+                };
+            }
+
+            std::u16string sharing_key(const std::filesystem::path& host_path)
+            {
+                auto key = host_path.lexically_normal().generic_u16string();
+#ifdef OS_WINDOWS
+                // Windows hosts ignore case, so differently spelled paths name one file.
+                std::ranges::transform(key, key.begin(), [](const char16_t c) { return utils::string::char_to_lower(c); });
+#endif
+                return key;
+            }
+
+            // Whether an open of `host_path` with `access` and `share_access` is compatible with the process's other
+            // opens of that file, the way IoCheckShareAccess decides it.
+            NTSTATUS check_share_access(const process_context& process, const std::filesystem::path& host_path, const ACCESS_MASK access,
+                                        const ULONG share_access)
+            {
+                const auto wanted = get_shared_access(access);
+                if (!wanted.any())
+                {
+                    return STATUS_SUCCESS;
+                }
+
+                const auto key = sharing_key(host_path);
+                for (const auto& open : process.files | std::views::values)
+                {
+                    const auto held = get_shared_access(open.access_mask);
+                    if (!held.any() || open.host_path.empty() || sharing_key(open.host_path) != key)
+                    {
+                        continue;
+                    }
+
+                    const auto refused =
+                        (wanted.read && !(open.share_access & FILE_SHARE_READ)) ||
+                        (wanted.write && !(open.share_access & FILE_SHARE_WRITE)) ||
+                        (wanted.remove && !(open.share_access & FILE_SHARE_DELETE)) || (held.read && !(share_access & FILE_SHARE_READ)) ||
+                        (held.write && !(share_access & FILE_SHARE_WRITE)) || (held.remove && !(share_access & FILE_SHARE_DELETE));
+                    if (refused)
+                    {
+                        return STATUS_SHARING_VIOLATION;
+                    }
+                }
+
+                return STATUS_SUCCESS;
             }
 
             std::u16string resolve_system_root_path(const syscall_context& c, std::u16string filename)
@@ -128,6 +484,17 @@ namespace sogen
             }
         }
 
+        NTSTATUS handle_NtGetCachedSigningLevel(const syscall_context&, handle, emulator_object<ULONG>, emulator_object<UCHAR>, uint64_t,
+                                                emulator_object<ULONG>, emulator_object<ULONG>)
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        NTSTATUS handle_NtSetCachedSigningLevel()
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
+
         NTSTATUS handle_NtSetInformationFile(const syscall_context& c, const handle file_handle,
                                              const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
                                              const uint64_t file_information, const ULONG length, const FILE_INFORMATION_CLASS info_class)
@@ -135,6 +502,12 @@ namespace sogen
             auto* f = c.proc.files.get(file_handle);
             if (!f)
             {
+                // NUL has no position: setting it is ignored (CPython opens os.devnull with mode 'a').
+                if (file_handle == NUL_HANDLE && info_class == FilePositionInformation)
+                {
+                    return length < sizeof(FILE_POSITION_INFORMATION) ? STATUS_INFO_LENGTH_MISMATCH : STATUS_SUCCESS;
+                }
+
                 auto* device = c.proc.devices.get(file_handle);
                 if (device)
                 {
@@ -159,6 +532,20 @@ namespace sogen
                         device->set_completion_notification_flags(c.emu.read_memory<ULONG>(file_information));
                     }
 
+                    // The completion mode decides whether a read of an empty pipe waits (PIPE_WAIT) or returns
+                    // STATUS_PIPE_EMPTY (PIPE_NOWAIT).
+                    if (auto* pipe = device->get_internal_device<named_pipe>(); pipe && info_class == FilePipeInformation)
+                    {
+                        if (length < sizeof(file_pipe_information))
+                        {
+                            return STATUS_INFO_LENGTH_MISMATCH;
+                        }
+
+                        const auto info = c.emu.read_memory<file_pipe_information>(file_information);
+                        pipe->read_mode = info.read_mode;
+                        pipe->completion_mode = info.completion_mode;
+                    }
+
                     return STATUS_SUCCESS;
                 }
 
@@ -167,7 +554,96 @@ namespace sogen
 
             if (info_class == FileBasicInformation)
             {
+                if (length < sizeof(FILE_BASIC_INFORMATION))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                // Access and write times go to the host file (SetFileTime, os.utime). 0 keeps a time, and -1 and -2
+                // switch its automatic updates off and on, so only positive values are times. Creation times are not
+                // kept.
+                const auto info = c.emu.read_memory<FILE_BASIC_INFORMATION>(file_information);
+                const auto time = [](const LARGE_INTEGER value) { return value.QuadPart > 0 ? std::optional(value) : std::nullopt; };
+                const auto access_time = time(info.LastAccessTime);
+                const auto write_time = time(info.LastWriteTime);
+                if ((access_time || write_time) && !f->host_path.empty() && !compat_set_file_times(f->host_path, access_time, write_time))
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+
+                // Of the attributes (0 keeps them), a file's read-only one is kept as the host file's write permission
+                // (SetFileAttributes, os.chmod); others are not kept.
+                if (info.FileAttributes != 0 && !f->host_path.empty())
+                {
+                    constexpr auto write_permissions =
+                        std::filesystem::perms::owner_write | std::filesystem::perms::group_write | std::filesystem::perms::others_write;
+                    std::error_code ec{};
+                    std::filesystem::permissions(f->host_path, write_permissions,
+                                                 (info.FileAttributes & file_attribute_readonly) ? std::filesystem::perm_options::remove
+                                                                                                 : std::filesystem::perm_options::add,
+                                                 ec);
+                    if (ec)
+                    {
+                        return STATUS_ACCESS_DENIED;
+                    }
+                }
+
                 return STATUS_SUCCESS;
+            }
+
+            // FILE_LINK_INFORMATION has the layout of FILE_RENAME_INFORMATION.
+            const auto read_target_name = [&](const FILE_RENAME_INFORMATION& info) -> std::optional<std::u16string> {
+                auto name =
+                    read_string<char16_t>(c.emu, file_information + offsetof(FILE_RENAME_INFORMATION, FileName), info.FileNameLength / 2);
+                if (!info.RootDirectory)
+                {
+                    return name;
+                }
+
+                const auto* root = c.proc.files.get(info.RootDirectory);
+                if (!root)
+                {
+                    return std::nullopt;
+                }
+
+                const auto has_separator = root->name.ends_with(u"\\") || root->name.ends_with(u"/");
+                return root->name + (has_separator ? u"" : u"\\") + name;
+            };
+
+            if (info_class == FileLinkInformation)
+            {
+                if (length < sizeof(FILE_RENAME_INFORMATION))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                const auto info = c.emu.read_memory<FILE_RENAME_INFORMATION>(file_information);
+                const auto link_name = read_target_name(info);
+                if (!link_name)
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+
+                const auto source = c.win_emu.file_sys.translate(f->name);
+                const auto target = c.win_emu.file_sys.translate_for_creation(*link_name, *link_name);
+                std::error_code ec{};
+                if (std::filesystem::is_directory(source, ec))
+                {
+                    return STATUS_FILE_IS_A_DIRECTORY;
+                }
+
+                if (std::filesystem::exists(target, ec))
+                {
+                    if (!info.ReplaceIfExists)
+                    {
+                        return STATUS_OBJECT_NAME_COLLISION;
+                    }
+
+                    std::filesystem::remove(target, ec);
+                }
+
+                std::filesystem::create_hard_link(source, target, ec);
+                return ec ? STATUS_ACCESS_DENIED : STATUS_SUCCESS;
             }
 
             if (info_class == FileRenameInformation)
@@ -178,22 +654,30 @@ namespace sogen
                 }
 
                 const auto info = c.emu.read_memory<FILE_RENAME_INFORMATION>(file_information);
-                auto new_name =
-                    read_string<char16_t>(c.emu, file_information + offsetof(FILE_RENAME_INFORMATION, FileName), info.FileNameLength / 2);
-
-                if (info.RootDirectory)
+                const auto target_name = read_target_name(info);
+                if (!target_name)
                 {
-                    const auto* root = c.proc.files.get(info.RootDirectory);
-                    if (!root)
-                    {
-                        return STATUS_INVALID_HANDLE;
-                    }
-
-                    const auto has_separator = root->name.ends_with(u"\\") || root->name.ends_with(u"/");
-                    new_name = root->name + (has_separator ? u"" : u"\\") + new_name;
+                    return STATUS_INVALID_HANDLE;
                 }
 
+                // The target's directory may lie behind a junction or link.
+                const auto resolved_name = resolve_reparse_points(c.proc, *target_name, false);
+                if (!resolved_name)
+                {
+                    return status_reparse_point_not_resolved;
+                }
+                const auto& new_name = *resolved_name;
+
                 c.win_emu.log.warn("--> File rename requested: %s --> %s\n", u16_to_u8(f->name).c_str(), u16_to_u8(new_name).c_str());
+
+                // A directory cannot move below itself. The rename happens when the handle closes, where a host
+                // failure would go unreported, so this is refused now, as Windows refuses it.
+                const windows_path source_path{f->name};
+                const windows_path target_path{new_name};
+                if (target_path != source_path && target_path.relative_to(source_path).has_value())
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
 
                 std::error_code ec{};
                 bool file_exists = std::filesystem::exists(c.win_emu.file_sys.translate(new_name), ec);
@@ -208,7 +692,18 @@ namespace sogen
                     return STATUS_OBJECT_NAME_EXISTS;
                 }
 
-                f->handle.defer_rename(c.win_emu.file_sys.translate(f->name), c.win_emu.file_sys.translate(new_name));
+                // A directory is not replaced (os.replace onto a directory fails; a file may be replaced by a
+                // directory). A rename onto itself (another spelling of the name) is not a replacement.
+                const auto target_host_path = c.win_emu.file_sys.translate(new_name);
+                if (file_exists && !std::filesystem::equivalent(c.win_emu.file_sys.translate(f->name), target_host_path, ec) &&
+                    std::filesystem::is_directory(target_host_path, ec))
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+
+                f->handle.defer_rename(c.win_emu.file_sys.translate(f->name),
+                                       c.win_emu.file_sys.translate_for_creation(new_name, new_name));
+                f->renamed_to = new_name;
 
                 return STATUS_SUCCESS;
             }
@@ -226,6 +721,10 @@ namespace sogen
                 }
 
                 const auto info = c.emu.read_memory<FILE_DISPOSITION_INFORMATION>(file_information);
+                if (info.DeleteFile && is_read_only_file(*f))
+                {
+                    return status_cannot_delete;
+                }
 
                 f->handle.defer_delete(info.DeleteFile ? c.win_emu.file_sys.translate(f->name) : std::filesystem::path{});
 
@@ -245,6 +744,12 @@ namespace sogen
                 if (wants_delete && !(f->access_mask & DELETE))
                 {
                     return STATUS_ACCESS_DENIED;
+                }
+
+                constexpr ULONG file_disposition_ignore_readonly_attribute = 0x10;
+                if (wants_delete && !(info.Flags & file_disposition_ignore_readonly_attribute) && is_read_only_file(*f))
+                {
+                    return status_cannot_delete;
                 }
 
                 f->handle.defer_delete(wants_delete ? c.win_emu.file_sys.translate(f->name) : std::filesystem::path{});
@@ -296,6 +801,18 @@ namespace sogen
 
                 const auto info = c.emu.read_memory<FILE_END_OF_FILE_INFORMATION>(file_information);
 
+                // A mapped view keeps the file from shrinking under it.
+                constexpr auto status_user_mapped_file = static_cast<NTSTATUS>(0xC0000243);
+                const windows_path file_path{f->name};
+                for (const auto& view : c.proc.file_section_views | std::views::values)
+                {
+                    if (windows_path{view.file_name} == file_path &&
+                        static_cast<uint64_t>(info.EndOfFile.QuadPart) < view.offset + view.length)
+                    {
+                        return status_user_mapped_file;
+                    }
+                }
+
                 if (!f->handle.resize(info.EndOfFile.QuadPart))
                 {
                     return STATUS_INVALID_PARAMETER;
@@ -325,10 +842,24 @@ namespace sogen
             case FileFsDeviceInformation:
                 return handle_query<FILE_FS_DEVICE_INFORMATION>(
                     c.emu, fs_information, length, io_status_block, [&](FILE_FS_DEVICE_INFORMATION& info) {
-                        if (file_handle == STDOUT_HANDLE || file_handle == STDIN_HANDLE || file_handle == CONSOLE_HANDLE)
+                        const auto* device = c.proc.devices.get(file_handle);
+                        const auto device_name = device ? device->get_device_name() : std::u16string_view{};
+                        // GetFileType reports these as FILE_TYPE_PIPE: AFD registers its sockets as named pipe devices.
+                        if ((device && device->get_internal_device<named_pipe>()) || device_name == u"NamedPipe" ||
+                            device_name.starts_with(u"Afd"))
+                        {
+                            info.DeviceType = FILE_DEVICE_NAMED_PIPE;
+                            info.Characteristics = 0;
+                        }
+                        else if (file_handle == STDOUT_HANDLE || file_handle == STDIN_HANDLE || file_handle == CONSOLE_HANDLE)
                         {
                             info.DeviceType = FILE_DEVICE_CONSOLE;
                             info.Characteristics = 0x20000;
+                        }
+                        else if (file_handle == NUL_HANDLE)
+                        {
+                            info.DeviceType = FILE_DEVICE_NULL;
+                            info.Characteristics = FILE_DEVICE_SECURE_OPEN;
                         }
                         else
                         {
@@ -358,7 +889,14 @@ namespace sogen
 
             case FileFsVolumeInformation:
                 return handle_query<FILE_FS_VOLUME_INFORMATION>(c.emu, fs_information, length, io_status_block,
-                                                                [&](FILE_FS_VOLUME_INFORMATION&) {});
+                                                                [&](FILE_FS_VOLUME_INFORMATION& info) {
+                                                                    // The serial FileIdInformation and FileStatBasicInformation report, so
+                                                                    // st_dev matches.
+                                                                    if (const auto* f = c.proc.files.get(file_handle))
+                                                                    {
+                                                                        info.VolumeSerialNumber = f->drive_number;
+                                                                    }
+                                                                });
 
             case FileFsAttributeInformation:
                 return handle_query<_FILE_FS_ATTRIBUTE_INFORMATION>(
@@ -398,14 +936,26 @@ namespace sogen
             std::vector<file_entry> files{};
 
             const auto dir = file_sys.translate(win_path);
-            const auto make_file_entry = [deterministic_time](const std::filesystem::path& file_path,
-                                                              const std::filesystem::path& host_path, const bool is_directory) {
+            // An exact name (the usual lookup of one file, also by its short name) asks the host for that entry only.
+            const auto exact = !file_mask.empty() && file_mask.find_first_of(u"*?<>\"") == std::u16string_view::npos;
+            const auto host_entries = compat_host_entries(dir, exact ? std::u16string(file_mask) : u"*");
+            const auto host_reparse_points = file_sys.is_host_mode();
+            const auto make_file_entry = [deterministic_time, host_reparse_points, &host_entries](const std::filesystem::path& file_path,
+                                                                                                  const std::filesystem::path& host_path,
+                                                                                                  const bool is_directory) {
                 file_entry entry{.file_path = file_path, .is_directory = is_directory};
+                if (const auto host_entry = host_entries.find(file_path.u16string()); host_entry != host_entries.end())
+                {
+                    entry.short_name = host_entry->second.short_name;
+                    // The host's own junctions and links show in host mode (in root mode their targets are host paths).
+                    entry.reparse_tag = host_reparse_points ? host_entry->second.reparse_tag : 0;
+                }
 
                 struct compat_stat file_stat{};
                 if (compat_stat(host_path, &file_stat))
                 {
                     entry.file_size = is_directory ? 0 : static_cast<uint64_t>(file_stat.st_size);
+                    entry.read_only = (host_file_attributes(file_stat) & file_attribute_readonly) != 0;
                     entry.creation_time = get_file_time(deterministic_time, file_stat.st_ctimespec);
                     entry.last_access_time = get_file_time(deterministic_time, file_stat.st_atimespec);
                     entry.last_write_time = get_file_time(deterministic_time, file_stat.st_mtimespec);
@@ -423,12 +973,18 @@ namespace sogen
             std::error_code ec{};
             for (const auto& file : std::filesystem::directory_iterator(dir, ec))
             {
-                if (!file_mask.empty() && !utils::wildcard::match_filename(file.path().filename().u16string(), file_mask))
+                // Some host entries cannot be inspected (app execution aliases in WindowsApps): list them as files.
+                std::error_code entry_ec{};
+                const auto is_directory = file.is_directory(entry_ec);
+                auto entry = make_file_entry(file.path().filename(), file.path(), is_directory && !entry_ec);
+                // A mask matches the name or the 8.3 name (GetLongPathName looks up PROGRA~1).
+                if (!file_mask.empty() && !utils::wildcard::match_filename(entry.file_path.u16string(), file_mask) &&
+                    (entry.short_name.empty() || !utils::wildcard::match_filename(entry.short_name, file_mask)))
                 {
                     continue;
                 }
 
-                files.emplace_back(make_file_entry(file.path().filename(), file.path(), file.is_directory()));
+                files.emplace_back(std::move(entry));
             }
 
             file_sys.access_mapped_entries(win_path, [&](const std::pair<windows_path, std::filesystem::path>& entry) {
@@ -464,6 +1020,16 @@ namespace sogen
 
                 f->enumeration_state.emplace(file_enumeration_state{});
                 f->enumeration_state->files = scan_directory(c.win_emu.file_sys, f->name, mask, c.win_emu.uses_relative_time());
+                if (!c.proc.reparse_points.empty())
+                {
+                    for (auto& entry : f->enumeration_state->files)
+                    {
+                        if (const auto tag = emulated_reparse_tag_at(c.proc, f->name + u"\\" + entry.file_path.u16string()))
+                        {
+                            entry.reparse_tag = tag;
+                        }
+                    }
+                }
             }
 
             auto& enum_state = *f->enumeration_state;
@@ -522,9 +1088,26 @@ namespace sogen
                 info.LastWriteTime = current_file.last_write_time;
                 info.ChangeTime = info.LastWriteTime;
 
-                info.FileAttributes = current_file.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                // As host_file_attributes: directories, or archived files, read-only where the host says so.
+                constexpr ULONG file_attribute_archive = 0x20;
+                const ULONG attributes = (current_file.is_directory ? FILE_ATTRIBUTE_DIRECTORY : file_attribute_archive) |
+                                         (current_file.read_only ? file_attribute_readonly : 0);
+                info.FileAttributes = with_reparse_attribute(attributes, current_file.reparse_tag);
                 info.FileNameLength = static_cast<ULONG>(file_name.size() * 2);
                 info.EndOfFile.QuadPart = current_file.file_size;
+
+                // For a reparse point, the EA size field holds its tag.
+                if constexpr (requires { info.EaSize; })
+                {
+                    info.EaSize = current_file.reparse_tag;
+                }
+
+                if constexpr (requires { info.ShortName; })
+                {
+                    const auto short_length = std::min(current_file.short_name.size(), std::size(info.ShortName));
+                    std::copy_n(current_file.short_name.begin(), short_length, std::begin(info.ShortName));
+                    info.ShortNameLength = static_cast<char>(short_length * sizeof(char16_t));
+                }
 
                 object.set_address(file_information + new_offset);
                 object.write(info);
@@ -641,9 +1224,71 @@ namespace sogen
                 return status;
             };
 
+            if (const auto* container = c.proc.devices.get(file_handle))
+            {
+                if (const auto* pipe = container->get_internal_device<named_pipe>())
+                {
+                    const auto write_information = [&](const auto& information) {
+                        if (length < sizeof(information))
+                        {
+                            return ret(STATUS_INFO_LENGTH_MISMATCH);
+                        }
+                        c.emu.write_memory(file_information, information);
+                        return ret(STATUS_SUCCESS, sizeof(information));
+                    };
+                    switch (info_class)
+                    {
+                    case FileModeInformation:
+                        return write_information(FILE_MODE_INFORMATION{pipe->create_options & FILE_MODE_MASK});
+                    case FileAccessInformation:
+                        return write_information(FILE_ACCESS_INFORMATION{container->granted_access});
+                    case FilePipeInformation:
+                        return write_information(std::array<ULONG, 2>{pipe->read_mode, pipe->completion_mode});
+                    // A pipe has no position: it reads as 0, and setting it is ignored (so SetFilePointerEx succeeds, and
+                    // CPython opens a pipe with open(name, 'w+b')).
+                    case FilePositionInformation:
+                        return write_information(FILE_POSITION_INFORMATION{});
+                    // The end of a pipe is the data waiting to be read, which SetFilePointerEx(FILE_END) seeks past
+                    // (CPython opens a pipe with open(fd, 'a')).
+                    case FileStandardInformation: {
+                        FILE_STANDARD_INFORMATION information{};
+                        information.AllocationSize.QuadPart = static_cast<LONGLONG>(pipe->inbound_quota) + pipe->outbound_quota;
+                        information.EndOfFile.QuadPart = pipe->bytes_available();
+                        information.NumberOfLinks = 1;
+                        return write_information(information);
+                    }
+                    default:
+                        return ret(STATUS_INVALID_INFO_CLASS);
+                    }
+                }
+            }
+
             const auto* f = c.proc.files.get(file_handle);
             if (!f)
             {
+                // NUL is an empty file at position 0 whatever is written to it.
+                if (file_handle == NUL_HANDLE && (info_class == FilePositionInformation || info_class == FileStandardInformation))
+                {
+                    if (info_class == FilePositionInformation)
+                    {
+                        if (length < sizeof(FILE_POSITION_INFORMATION))
+                        {
+                            return ret(STATUS_INFO_LENGTH_MISMATCH);
+                        }
+                        c.emu.write_memory(file_information, FILE_POSITION_INFORMATION{});
+                        return ret(STATUS_SUCCESS, sizeof(FILE_POSITION_INFORMATION));
+                    }
+
+                    if (length < sizeof(FILE_STANDARD_INFORMATION))
+                    {
+                        return ret(STATUS_INFO_LENGTH_MISMATCH);
+                    }
+                    FILE_STANDARD_INFORMATION i{};
+                    i.NumberOfLinks = 1;
+                    c.emu.write_memory(file_information, i);
+                    return ret(STATUS_SUCCESS, sizeof(FILE_STANDARD_INFORMATION));
+                }
+
                 return ret(STATUS_INVALID_HANDLE);
             }
 
@@ -664,7 +1309,13 @@ namespace sogen
                 const emulator_object<FILE_ATTRIBUTE_TAG_INFORMATION> info{c.emu, file_information};
                 FILE_ATTRIBUTE_TAG_INFORMATION i{};
 
-                i.FileAttributes = f->is_directory() ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                struct compat_stat file_stat{};
+                if (!stat_open_file(*f, file_stat))
+                {
+                    return ret(STATUS_INVALID_HANDLE);
+                }
+                i.ReparseTag = reparse_tag_at(c, f->name);
+                i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), i.ReparseTag);
 
                 info.write(i);
 
@@ -702,11 +1353,6 @@ namespace sogen
 
             if (info_class == FileIdInformation)
             {
-                if (!f->handle)
-                {
-                    return ret(STATUS_NOT_SUPPORTED);
-                }
-
                 constexpr auto required_length = sizeof(FILE_ID_INFORMATION);
 
                 if (length < required_length)
@@ -715,7 +1361,7 @@ namespace sogen
                 }
 
                 struct compat_stat file_stat{};
-                if (!compat_fstat(f->handle.file_descriptor(), &file_stat))
+                if (!stat_open_file(*f, file_stat))
                 {
                     return ret(STATUS_INVALID_HANDLE);
                 }
@@ -745,7 +1391,7 @@ namespace sogen
                 }
 
                 struct compat_stat file_stat{};
-                if (f->handle && !compat_fstat(f->handle.file_descriptor(), &file_stat))
+                if (!stat_open_file(*f, file_stat))
                 {
                     return ret(STATUS_INVALID_HANDLE);
                 }
@@ -810,12 +1456,10 @@ namespace sogen
                 }
 
                 struct compat_stat file_stat{};
-                if (f->handle && !compat_fstat(f->handle.file_descriptor(), &file_stat))
+                if (!stat_open_file(*f, file_stat))
                 {
                     return STATUS_INVALID_HANDLE;
                 }
-
-                const bool is_directory = f->handle ? (file_stat.st_mode & S_IFDIR) != 0 : f->is_directory();
 
                 auto address = file_information;
                 if (all_info)
@@ -829,7 +1473,7 @@ namespace sogen
                 i.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 i.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 i.ChangeTime = i.LastWriteTime;
-                i.FileAttributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c, f->name));
 
                 info.write(i);
 
@@ -860,7 +1504,9 @@ namespace sogen
                 const emulator_object<FILE_STANDARD_INFORMATION> info{c.emu, address};
                 FILE_STANDARD_INFORMATION i{};
                 i.Directory = f->is_directory() ? TRUE : FALSE;
-                i.NumberOfLinks = 1;
+                // Hard links (CreateHardLink, os.link) count.
+                struct compat_stat link_stat{};
+                i.NumberOfLinks = stat_open_file(*f, link_stat) && link_stat.st_nlink > 0 ? link_stat.st_nlink : 1;
 
                 if (f->handle)
                 {
@@ -889,7 +1535,7 @@ namespace sogen
                 }
 
                 struct compat_stat file_stat{};
-                if (f->handle && !compat_fstat(f->handle.file_descriptor(), &file_stat))
+                if (!stat_open_file(*f, file_stat))
                 {
                     return STATUS_INVALID_HANDLE;
                 }
@@ -1072,7 +1718,8 @@ namespace sogen
 
             if (info_class == FileNameInformation || info_class == FileNormalizedNameInformation || all_info)
             {
-                const auto relative_path = u"\\" + windows_path(f->name).without_drive().u16string();
+                // In the case the file system keeps, as GetFinalPathNameByHandle reports it.
+                const auto relative_path = c.win_emu.file_sys.true_case(f->name);
                 const auto required_length = static_cast<uint32_t>((relative_path.size() * 2) + offsetof(FILE_NAME_INFORMATION, FileName));
 
                 if (length < sizeof(FILE_NAME_INFORMATION))
@@ -1143,6 +1790,18 @@ namespace sogen
                 return status;
             };
 
+            // Devices have no by-name information; callers such as Python's os.stat fall back to opening them.
+            std::u16string filename_upper = filename;
+            std::ranges::transform(filename_upper, filename_upper.begin(), ::towupper);
+            if (filename_upper == u"\\??\\NUL")
+            {
+                return ret(STATUS_INVALID_INFO_CLASS);
+            }
+            if (filename_upper == u"\\??\\CON" || filename_upper == u"\\??\\CONIN$" || filename_upper == u"\\??\\CONOUT$")
+            {
+                return ret(STATUS_INVALID_PARAMETER);
+            }
+
             if (info_class == FileStatBasicInformation)
             {
                 block.Information = sizeof(EMU_FILE_STAT_BASIC_INFORMATION);
@@ -1152,7 +1811,14 @@ namespace sogen
                     return ret(STATUS_BUFFER_OVERFLOW);
                 }
 
-                const auto filepath = windows_path(filename);
+                // The name itself, not where a link at its end leads (as an open with FILE_OPEN_REPARSE_POINT).
+                const auto resolved = resolve_reparse_points(c.proc, filename, false);
+                if (!resolved)
+                {
+                    return ret(status_reparse_point_not_resolved);
+                }
+
+                const auto filepath = windows_path(*resolved);
                 if (filepath.is_relative())
                 {
                     return ret(STATUS_OBJECT_NAME_NOT_FOUND);
@@ -1173,7 +1839,18 @@ namespace sogen
                 i.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 i.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 i.ChangeTime = i.LastWriteTime;
-                i.FileAttributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                i.ReparseTag = reparse_tag_at(c, *resolved);
+                i.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), i.ReparseTag);
+                i.NumberOfLinks = file_stat.st_nlink > 0 ? file_stat.st_nlink : 1;
+                i.FileId.QuadPart = static_cast<LONGLONG>(file_stat.st_ino);
+                memcpy(&i.FileId128.Identifier[0], &file_stat.st_ino, sizeof(file_stat.st_ino));
+                if (const auto drive = filepath.get_drive())
+                {
+                    i.VolumeSerialNumber.QuadPart = *drive - 'a' + 1;
+                }
+                // Python's os.path.isfile counts only files on disk devices as regular files.
+                i.DeviceType = FILE_DEVICE_DISK;
+                i.DeviceCharacteristics = 0x20020;
 
                 const auto file_size = is_directory ? 0LL : file_stat.st_size;
                 i.EndOfFile.QuadPart = file_size;
@@ -1284,6 +1961,34 @@ namespace sogen
             }
         }
 
+        NTSTATUS handle_pipe_io(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
+                                const uint64_t apc_context, const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                const uint64_t buffer, const ULONG length, const bool reading)
+        {
+            auto* container = c.proc.devices.get(file_handle);
+            auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
+            if (!pipe)
+            {
+                return STATUS_OBJECT_TYPE_MISMATCH;
+            }
+            io_device_context context{c.emu};
+            context.source_handle = file_handle;
+            context.event = make_handle(event);
+            context.apc_routine = apc_routine;
+            context.apc_context = apc_context;
+            context.io_status_block = io_status_block;
+            context.input_buffer = buffer;
+            context.input_buffer_length = length;
+            context.output_buffer = buffer;
+            context.output_buffer_length = length;
+            context.vcpu = &c.vcpu;
+            if (c.proc.is_wow64_process && io_status_block)
+            {
+                context.wow64_io_status_block.set_address(io_status_block.read().Pointer);
+            }
+            return pipe->start_io(c.win_emu, container->prepare_io_context(context), reading);
+        }
+
         NTSTATUS handle_NtReadFile(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
                                    const uint64_t apc_context,
                                    const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer,
@@ -1312,32 +2017,9 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            const auto* container = c.proc.devices.get(file_handle);
-            if (container)
+            if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
             {
-                if (auto* pipe = container->get_internal_device<named_pipe>())
-                {
-                    if (!pipe->write_queue.empty())
-                    {
-                        std::string_view data = pipe->write_queue.front();
-                        const size_t to_copy = std::min<size_t>(data.size(), length);
-
-                        commit_file_data(data.substr(0, to_copy), c.emu, io_status_block, buffer);
-
-                        if (to_copy == data.size())
-                        {
-                            pipe->write_queue.pop_front();
-                        }
-                        else
-                        {
-                            pipe->write_queue.front().erase(0, to_copy);
-                        }
-
-                        return STATUS_SUCCESS;
-                    }
-
-                    return STATUS_PIPE_EMPTY;
-                }
+                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, buffer, length, true);
             }
 
             const auto* f = c.proc.files.get(file_handle);
@@ -1365,6 +2047,7 @@ namespace sogen
                 }
             }
 
+            f->handle.prepare_read();
             const auto bytes_read = fread(temp_buffer.data(), 1, temp_buffer.size(), f->handle);
 
             if (bytes_read > 0)
@@ -1404,7 +2087,7 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
-            if (!io_request_to_cancel || !device->cancel_io(c.win_emu, io_request_to_cancel.value()))
+            if (!device->cancel_io(c.win_emu, io_request_to_cancel.value()))
             {
                 io_status_block.write(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>{.Status = STATUS_NOT_FOUND, .Information = 0});
                 return STATUS_NOT_FOUND;
@@ -1414,8 +2097,8 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtWriteFile(const syscall_context& c, const handle file_handle, const uint64_t /*event*/,
-                                    const uint64_t /*apc_routine*/, const uint64_t /*apc_context*/,
+        NTSTATUS handle_NtWriteFile(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
+                                    const uint64_t apc_context,
                                     const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer,
                                     const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset,
                                     const emulator_object<ULONG> /*key*/)
@@ -1450,25 +2133,9 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            const auto* container = c.proc.devices.get(file_handle);
-            if (container)
+            if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
             {
-                if (auto* pipe = container->get_internal_device<named_pipe>())
-                {
-                    (void)pipe; // For future use: suppressing compiler issues
-                    // TODO c.win_emu.callbacks.on_named_pipe_write(pipe->name, temp_buffer);
-
-                    // TODO pipe->write_queue.push_back(temp_buffer);
-
-                    if (io_status_block)
-                    {
-                        IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
-                        block.Information = static_cast<ULONG>(temp_buffer.size());
-                        io_status_block.write(block);
-                    }
-
-                    return STATUS_SUCCESS;
-                }
+                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, buffer, length, false);
             }
 
             const auto* f = c.proc.files.get(file_handle);
@@ -1504,6 +2171,7 @@ namespace sogen
                 }
             }
 
+            f->handle.prepare_write();
             const auto bytes_written = fwrite(temp_buffer.data(), 1, temp_buffer.size(), f->handle);
 
             if (io_status_block)
@@ -1542,6 +2210,7 @@ namespace sogen
 
             std::string temp_buffer{};
             temp_buffer.resize(length);
+            source->handle.prepare_read();
             const auto bytes_read = fread(temp_buffer.data(), 1, temp_buffer.size(), source->handle);
 
             if (destination_offset)
@@ -1553,6 +2222,7 @@ namespace sogen
                 }
             }
 
+            destination->handle.prepare_write();
             const auto bytes_written = fwrite(temp_buffer.data(), 1, bytes_read, destination->handle);
             (void)fflush(destination->handle);
 
@@ -1689,9 +2359,11 @@ namespace sogen
 
         constexpr std::u16string map_mode(const ACCESS_MASK desired_access, const ULONG create_disposition)
         {
-            const auto wants_write = (desired_access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0;
-            const auto wants_read =
-                (desired_access & (GENERIC_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE)) != 0;
+            // Changing attributes or extended attributes writes no data: such an open reads the stream, so that it works
+            // on a read-only file (os.chmod), as on Windows.
+            const auto wants_write = (desired_access & (GENERIC_WRITE | FILE_WRITE_DATA)) != 0;
+            const auto wants_read = (desired_access & (GENERIC_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE |
+                                                       FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0;
 
             if (desired_access & FILE_APPEND_DATA)
             {
@@ -1768,10 +2440,8 @@ namespace sogen
 
         NTSTATUS handle_named_pipe_create(const syscall_context& c, const emulator_object<handle>& out_handle,
                                           const std::u16string_view filename, const OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>& attributes,
-                                          ACCESS_MASK desired_access)
+                                          ACCESS_MASK desired_access, const ULONG create_options)
         {
-            (void)attributes; // This isn't being consumed atm, suppressing errors
-
             c.win_emu.callbacks.on_generic_access("Creating/opening named pipe", filename);
 
             io_device_creation_data data{};
@@ -1782,8 +2452,37 @@ namespace sogen
 
             if (auto* pipe_device = container.get_internal_device<named_pipe>())
             {
-                pipe_device->name = std::u16string(filename);
-                pipe_device->access = desired_access;
+                pipe_device->name = normalize_named_pipe_path(filename);
+                container.granted_access = desired_access;
+                pipe_device->create_options = create_options;
+                container.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
+
+                // A client connects to a server instance of that name that has no client yet; with every instance busy
+                // the open fails with STATUS_PIPE_NOT_AVAILABLE (ERROR_PIPE_BUSY), without any with NOT_FOUND.
+                auto server_exists = false;
+                for (const auto& [index, existing] : c.proc.devices)
+                {
+                    (void)index;
+                    auto* server = existing.get_internal_device<named_pipe>();
+                    if (!server || !server->server || server->anonymous || windows_path(server->name) != windows_path(pipe_device->name))
+                    {
+                        continue;
+                    }
+
+                    server_exists = true;
+                    if (server->unopened_peer)
+                    {
+                        pipe_device->copy_configuration(*server);
+                        container.granted_access = desired_access;
+                        pipe_device->create_options = create_options;
+                        pipe_device->endpoint = std::move(server->unopened_peer);
+                        break;
+                    }
+                }
+                if (!pipe_device->endpoint && windows_path(pipe_device->name) != windows_path(u"\\Device\\NamedPipe\\"))
+                {
+                    return server_exists ? STATUS_PIPE_NOT_AVAILABLE : STATUS_OBJECT_NAME_NOT_FOUND;
+                }
             }
 
             const auto handle = c.proc.devices.store(std::move(container));
@@ -1792,12 +2491,81 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtCreateFile(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
-                                     const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
-                                     const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
-                                     const emulator_object<LARGE_INTEGER> /*allocation_size*/, ULONG /*file_attributes*/,
-                                     ULONG /*share_access*/, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
-                                     ULONG ea_length)
+        // A host reparse point that is there but cannot be followed: an app execution alias, whose tag no file system
+        // filter handles (std::filesystem::exists fails on it). Junctions and symbolic links are followed by the host, or
+        // dangle, which is a missing file.
+        static bool is_unfollowable_host_reparse_point(const syscall_context& c, const std::u16string& name,
+                                                       const std::filesystem::path& host_path)
+        {
+            std::error_code ec{};
+            if (!std::filesystem::exists(std::filesystem::symlink_status(host_path, ec)))
+            {
+                return false;
+            }
+
+            const auto tag = reparse_tag_at(c, name);
+            return tag != 0 && tag != io_reparse_tag_mount_point && tag != io_reparse_tag_symlink;
+        }
+
+        // Windows opens such a reparse point only as itself (FILE_OPEN_REPARSE_POINT); following it fails with
+        // STATUS_IO_REPARSE_TAG_NOT_HANDLED (ERROR_CANT_ACCESS_FILE), which CPython's stat retries without following.
+        static NTSTATUS open_host_reparse_point(const syscall_context& c, const emulator_object<handle> file_handle, file f,
+                                                const std::filesystem::path& host_path, const ULONG create_disposition,
+                                                const ULONG create_options)
+        {
+            constexpr auto status_io_reparse_tag_not_handled = static_cast<NTSTATUS>(0xC0000279);
+            if (!(create_options & file_open_reparse_point))
+            {
+                return status_io_reparse_tag_not_handled;
+            }
+
+            if (create_options & FILE_DIRECTORY_FILE)
+            {
+                return STATUS_NOT_A_DIRECTORY;
+            }
+
+            if (create_disposition == FILE_CREATE)
+            {
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+
+            if (create_disposition != FILE_OPEN && create_disposition != FILE_OPEN_IF)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            if (const auto status = check_share_access(c.proc, host_path, f.access_mask, f.share_access); status != STATUS_SUCCESS)
+            {
+                return status;
+            }
+
+            c.win_emu.callbacks.on_generic_access("Opening file", f.name);
+
+            auto mode = map_mode(f.access_mask, create_disposition);
+            if (mode.empty())
+            {
+                mode = u"rb";
+            }
+
+            auto* native_file = compat_open_reparse_point(host_path, mode != u"rb");
+            if (!native_file)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            f.handle = native_file;
+            f.open_mode = std::move(mode);
+            f.host_path = host_path;
+            f.host_reparse_point = true;
+
+            file_handle.write(c.proc.files.store(std::move(f)));
+            return STATUS_SUCCESS;
+        }
+
+        static NTSTATUS create_file(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
+                                    const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                    const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, ULONG share_access,
+                                    ULONG create_disposition, ULONG create_options, uint64_t ea_buffer, ULONG ea_length)
         {
             constexpr ULONG file_opened = 1;
 
@@ -1808,6 +2576,13 @@ namespace sogen
 
             const auto attributes = object_attributes.read();
             auto filename = read_unicode_string(c.emu, attributes.ObjectName);
+
+            // \DosDevices\ is another name of \??\ (WaitNamedPipe opens \DosDevices\pipe\).
+            if (constexpr std::u16string_view dos_devices = u"\\DosDevices\\";
+                utils::string::starts_with_ignore_case(std::u16string_view{filename}, dos_devices))
+            {
+                filename = u"\\??\\" + filename.substr(dos_devices.size());
+            }
 
             // Check for console device paths
             // Convert to uppercase for case-insensitive comparison
@@ -1821,7 +2596,7 @@ namespace sogen
                 handle root_handle{};
                 root_handle.bits = attributes.RootDirectory;
                 const auto* root_container = c.proc.devices.get(root_handle);
-                const auto* root_pipe = root_container ? root_container->get_internal_device<named_pipe>() : nullptr;
+                auto* root_pipe = root_container ? root_container->get_internal_device<named_pipe>() : nullptr;
                 if (root_pipe)
                 {
                     c.win_emu.callbacks.on_generic_access("Opening anonymous pipe", root_pipe->name);
@@ -1829,15 +2604,15 @@ namespace sogen
                     io_device_creation_data data{};
                     io_device_container container{u"NamedPipe", c.win_emu, data};
                     auto* pipe_device = container.get_internal_device<named_pipe>();
-                    pipe_device->name = root_pipe->name;
-                    pipe_device->access = desired_access;
-                    pipe_device->pipe_type = root_pipe->pipe_type;
-                    pipe_device->read_mode = root_pipe->read_mode;
-                    pipe_device->completion_mode = root_pipe->completion_mode;
-                    pipe_device->max_instances = root_pipe->max_instances;
-                    pipe_device->inbound_quota = root_pipe->inbound_quota;
-                    pipe_device->outbound_quota = root_pipe->outbound_quota;
-                    pipe_device->default_timeout = root_pipe->default_timeout;
+                    if (!root_pipe->unopened_peer)
+                    {
+                        return STATUS_PIPE_NOT_AVAILABLE;
+                    }
+                    pipe_device->copy_configuration(*root_pipe);
+                    container.granted_access = desired_access;
+                    pipe_device->create_options = create_options;
+                    container.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
+                    pipe_device->endpoint = std::move(root_pipe->unopened_peer);
 
                     file_handle.write(c.proc.devices.store(std::move(container)));
 
@@ -1876,7 +2651,7 @@ namespace sogen
 
             if (is_named_pipe_path(filename))
             {
-                return handle_named_pipe_create(c, file_handle, filename, attributes, desired_access);
+                return handle_named_pipe_create(c, file_handle, filename, attributes, desired_access, create_options);
             }
 
             auto printer = utils::finally([&] {
@@ -1891,9 +2666,20 @@ namespace sogen
                     .length = ea_length,
                 };
 
-                io_device_container container{std::u16string(*io_device_name), c.win_emu, data};
+                // A device that cannot serve the request (a socket of an address family the host lacks, such as
+                // Bluetooth) fails the open, as on Windows, instead of the emulation.
+                std::optional<io_device_container> container{};
+                try
+                {
+                    container.emplace(std::u16string(*io_device_name), c.win_emu, data);
+                }
+                catch (const std::exception& e)
+                {
+                    c.win_emu.log.warn("Opening device %s failed: %s\n", u16_to_u8(*io_device_name).c_str(), e.what());
+                    return STATUS_NOT_SUPPORTED;
+                }
 
-                const auto handle = c.proc.devices.store(std::move(container));
+                const auto handle = c.proc.devices.store(std::move(*container));
                 file_handle.write(handle);
 
                 return STATUS_SUCCESS;
@@ -1915,6 +2701,8 @@ namespace sogen
 
             file f{};
             f.access_mask = desired_access;
+            f.share_access = share_access;
+            f.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
             f.file_mode = create_options & FILE_MODE_MASK;
             f.name = std::move(filename);
 
@@ -1934,6 +2722,17 @@ namespace sogen
 
             std::error_code ec{};
 
+            // Junctions and symbolic links on the way lead elsewhere; the last component itself is opened, not followed,
+            // with FILE_OPEN_REPARSE_POINT. The handle names where it led (GetFinalPathNameByHandle).
+            if (auto resolved = resolve_reparse_points(c.proc, f.name, !(create_options & file_open_reparse_point)))
+            {
+                f.name = std::move(*resolved);
+            }
+            else
+            {
+                return status_reparse_point_not_resolved;
+            }
+
             const windows_path path = f.name;
 
             if (!path.is_absolute())
@@ -1945,6 +2744,21 @@ namespace sogen
 
             const auto host_path = c.win_emu.file_sys.translate(path);
             const bool file_exists = std::filesystem::exists(host_path, ec);
+
+            if (!file_exists && is_unfollowable_host_reparse_point(c, f.name, host_path))
+            {
+                return open_host_reparse_point(c, file_handle, std::move(f), host_path, create_disposition, create_options);
+            }
+
+            // Opening an existing file or directory must agree with the share modes of its other opens (deleting a
+            // file another handle holds without FILE_SHARE_DELETE fails, as it does on Windows).
+            if (file_exists && create_disposition != FILE_CREATE)
+            {
+                if (const auto status = check_share_access(c.proc, host_path, desired_access, share_access); status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+            }
 
             if (file_exists && std::filesystem::is_directory(host_path, ec))
             {
@@ -1979,7 +2793,7 @@ namespace sogen
 
                 if (file_exists)
                 {
-                    return STATUS_NOT_A_DIRECTORY;
+                    return create_disposition == FILE_CREATE ? STATUS_OBJECT_NAME_COLLISION : STATUS_NOT_A_DIRECTORY;
                 }
 
                 if (create_disposition != FILE_CREATE && create_disposition != FILE_OPEN_IF)
@@ -1992,7 +2806,7 @@ namespace sogen
                     return STATUS_OBJECT_PATH_NOT_FOUND;
                 }
 
-                create_directory(host_path, ec);
+                create_directory(c.win_emu.file_sys.translate_for_creation(path, f.name), ec);
 
                 if (ec)
                 {
@@ -2019,9 +2833,19 @@ namespace sogen
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
 
-            if (create_disposition == FILE_OPEN_IF && !file_exists)
+            // A new file is created here, under the name the guest spelled (see translate_for_creation); opening it
+            // below then finds it whatever the mode.
+            const auto creates = create_disposition == FILE_CREATE || create_disposition == FILE_OPEN_IF ||
+                                 create_disposition == FILE_SUPERSEDE || create_disposition == FILE_OVERWRITE_IF;
+            if (creates && !file_exists)
             {
-                std::ofstream touch(host_path, std::ios::binary | std::ios::app);
+                // A missing parent, or one that is a file, is a path that does not exist.
+                if (!std::filesystem::is_directory(host_path.parent_path(), ec))
+                {
+                    return STATUS_OBJECT_PATH_NOT_FOUND;
+                }
+
+                std::ofstream touch(c.win_emu.file_sys.translate_for_creation(path, f.name), std::ios::binary | std::ios::app);
                 if (!touch)
                 {
                     return STATUS_ACCESS_DENIED;
@@ -2032,12 +2856,6 @@ namespace sogen
 
             if (mode.empty() && create_disposition == FILE_CREATE)
             {
-                std::ofstream touch(host_path, std::ios::binary | std::ios::app);
-                if (!touch)
-                {
-                    return STATUS_ACCESS_DENIED;
-                }
-
                 mode = u"rb";
             }
 
@@ -2070,6 +2888,17 @@ namespace sogen
             file_handle.write(handle);
 
             return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtCreateFile(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
+                                     const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                     const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                     const emulator_object<LARGE_INTEGER> /*allocation_size*/, ULONG /*file_attributes*/,
+                                     ULONG share_access, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
+                                     ULONG ea_length)
+        {
+            return create_file(c, file_handle, desired_access, object_attributes, io_status_block, share_access, create_disposition,
+                               create_options, ea_buffer, ea_length);
         }
 
         NTSTATUS handle_NtQueryFullAttributesFile(const syscall_context& c,
@@ -2106,6 +2935,16 @@ namespace sogen
 
             c.win_emu.callbacks.on_generic_access("Querying file attributes", filename);
 
+            // A link at the end of the name is described itself, not followed.
+            if (auto resolved = resolve_reparse_points(c.proc, filename, false))
+            {
+                filename = std::move(*resolved);
+            }
+            else
+            {
+                return status_reparse_point_not_resolved;
+            }
+
             const windows_path filepath(filename);
             if (!has_valid_filename_characters(filepath.u16string()))
             {
@@ -2132,7 +2971,7 @@ namespace sogen
                 info.AllocationSize.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
                 info.EndOfFile.QuadPart = static_cast<LONGLONG>(file_stat.st_size);
                 info.ChangeTime = info.LastWriteTime;
-                info.FileAttributes = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                info.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c, filename));
             });
 
             return STATUS_SUCCESS;
@@ -2172,6 +3011,16 @@ namespace sogen
 
             c.win_emu.callbacks.on_generic_access("Querying file attributes", filename);
 
+            // A link at the end of the name is described itself, not followed.
+            if (auto resolved = resolve_reparse_points(c.proc, filename, false))
+            {
+                filename = std::move(*resolved);
+            }
+            else
+            {
+                return status_reparse_point_not_resolved;
+            }
+
             const windows_path filepath(filename);
             if (!has_valid_filename_characters(filepath.u16string()))
             {
@@ -2196,7 +3045,7 @@ namespace sogen
                 info.LastAccessTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_atimespec);
                 info.LastWriteTime = get_file_time(c.win_emu.uses_relative_time(), file_stat.st_mtimespec);
                 info.ChangeTime = info.LastWriteTime;
-                info.FileAttributes = (file_stat.st_mode & S_IFDIR) != 0 ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+                info.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c, filename));
             });
 
             return STATUS_SUCCESS;
@@ -2326,7 +3175,6 @@ namespace sogen
 
             (void)share_access;
             (void)create_disposition;
-            (void)create_options;
 
             const auto attributes = object_attributes.read();
             const auto filename = read_unicode_string(c.emu, attributes.ObjectName);
@@ -2344,20 +3192,51 @@ namespace sogen
             const auto& pipe_name = anonymous_pipe ? root_pipe->name : filename;
             c.win_emu.callbacks.on_generic_access("Creating named pipe", pipe_name);
 
+            // The first instance of a name sets how many it may have (unlimited: -1); one more fails (ERROR_PIPE_BUSY).
+            if (!anonymous_pipe)
+            {
+                const windows_path wanted = normalize_named_pipe_path(pipe_name);
+                ULONG instances = 0;
+                std::optional<ULONG> limit{};
+                for (const auto& entry : c.proc.devices | std::views::values)
+                {
+                    const auto* server = entry.get_internal_device<named_pipe>();
+                    if (server && server->server && !server->anonymous && windows_path(server->name) == wanted)
+                    {
+                        ++instances;
+                        limit = limit.value_or(server->max_instances);
+                    }
+                }
+
+                constexpr auto status_instance_not_available = static_cast<NTSTATUS>(0xC00000AB);
+                if (limit && *limit != std::numeric_limits<ULONG>::max() && instances >= *limit)
+                {
+                    return status_instance_not_available;
+                }
+            }
+
             io_device_creation_data data{};
             io_device_container container{u"NamedPipe", c.win_emu, data};
 
             if (auto* pipe_device = container.get_internal_device<named_pipe>())
             {
-                pipe_device->name = pipe_name;
-                pipe_device->access = desired_access;
+                pipe_device->name = normalize_named_pipe_path(pipe_name);
+                pipe_device->server = true;
+                pipe_device->anonymous = anonymous_pipe;
+                container.granted_access = desired_access;
                 pipe_device->pipe_type = named_pipe_type;
                 pipe_device->read_mode = read_mode;
                 pipe_device->completion_mode = completion_mode;
                 pipe_device->max_instances = maximum_instances;
                 pipe_device->inbound_quota = inbound_quota;
                 pipe_device->outbound_quota = outbound_quota;
+                pipe_device->create_options = create_options;
+                container.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
                 pipe_device->default_timeout = default_timeout.read();
+                auto endpoints =
+                    utils::host_pipe::create_pair(named_pipe_type != 0, std::max<ULONG>({inbound_quota, outbound_quota, 4096}));
+                pipe_device->endpoint = std::move(endpoints.first);
+                pipe_device->unopened_peer = std::move(endpoints.second);
             }
             else
             {
@@ -2375,6 +3254,92 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        // FSCTL_SET/GET/DELETE_REPARSE_POINT on a file or directory handle (opened with FILE_OPEN_REPARSE_POINT for a link
+        // itself); nothing for other controls.
+        static std::optional<NTSTATUS> reparse_point_control(const syscall_context& c, const file& f,
+                                                             const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                                             const ULONG fs_control_code, const emulator_pointer input_buffer,
+                                                             const ULONG input_buffer_length, const emulator_pointer output_buffer,
+                                                             const ULONG output_buffer_length)
+        {
+            constexpr ULONG fsctl_set_reparse_point = 0x900A4;
+            constexpr ULONG fsctl_get_reparse_point = 0x900A8;
+            constexpr ULONG fsctl_delete_reparse_point = 0x900AC;
+            constexpr auto status_io_reparse_data_invalid = static_cast<NTSTATUS>(0xC0000278);
+            constexpr auto status_directory_not_empty = static_cast<NTSTATUS>(0xC0000101);
+            constexpr auto status_not_a_directory = static_cast<NTSTATUS>(0xC0000103);
+            // Tag, data length, reserved.
+            constexpr ULONG header_size = 8;
+
+            const auto complete = [&](const NTSTATUS status, const uint64_t information) {
+                if (io_status_block)
+                {
+                    io_status_block.write({.Status = status, .Information = information});
+                }
+                return status;
+            };
+
+            const auto key = reparse_key(f.name);
+            switch (fs_control_code)
+            {
+            case fsctl_set_reparse_point: {
+                if (input_buffer_length < header_size)
+                {
+                    return complete(status_io_reparse_data_invalid, 0);
+                }
+
+                std::vector<uint8_t> data(input_buffer_length);
+                c.emu.read_memory(input_buffer, data.data(), data.size());
+                uint16_t data_length{};
+                memcpy(&data_length, data.data() + 4, sizeof(data_length));
+                if (header_size + data_length > data.size())
+                {
+                    return complete(status_io_reparse_data_invalid, 0);
+                }
+                data.resize(header_size + data_length);
+
+                // A junction replaces an empty directory.
+                if (reparse_tag(data) == io_reparse_tag_mount_point && !c.proc.reparse_points.contains(key))
+                {
+                    if (!f.is_directory())
+                    {
+                        return complete(status_not_a_directory, 0);
+                    }
+
+                    std::error_code ec{};
+                    if (!std::filesystem::is_empty(f.host_path, ec))
+                    {
+                        return complete(status_directory_not_empty, 0);
+                    }
+                }
+
+                c.proc.reparse_points[key] = std::move(data);
+                return complete(STATUS_SUCCESS, 0);
+            }
+            case fsctl_get_reparse_point: {
+                const auto found = reparse_data_at(c, f.name);
+                if (!found)
+                {
+                    return complete(STATUS_NOT_A_REPARSE_POINT, 0);
+                }
+
+                const auto& data = *found;
+                if (output_buffer_length < header_size)
+                {
+                    return complete(STATUS_BUFFER_TOO_SMALL, 0);
+                }
+
+                const auto size = std::min<size_t>(data.size(), output_buffer_length);
+                c.emu.write_memory(output_buffer, data.data(), size);
+                return complete(size < data.size() ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS, size);
+            }
+            case fsctl_delete_reparse_point:
+                return complete(c.proc.reparse_points.erase(key) ? STATUS_SUCCESS : STATUS_NOT_A_REPARSE_POINT, 0);
+            default:
+                return std::nullopt;
+            }
+        }
+
         NTSTATUS handle_NtFsControlFile(const syscall_context& c, const handle file_handle, const handle event,
                                         const emulator_pointer apc_routine, const emulator_pointer apc_context,
                                         const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
@@ -2384,13 +3349,17 @@ namespace sogen
             auto* device = c.proc.devices.get(file_handle);
             if (!device)
             {
-                constexpr ULONG FSCTL_GET_REPARSE_POINT = 0x900A8;
-                if (fs_control_code == FSCTL_GET_REPARSE_POINT && c.proc.files.get(file_handle))
+                if (const auto* f = c.proc.files.get(file_handle))
                 {
-                    // The target is a regular file or directory, not a reparse point. Returning
-                    // STATUS_INVALID_HANDLE here makes callers (e.g. path canonicalization) treat
-                    // the buffer as populated; Windows reports STATUS_NOT_A_REPARSE_POINT instead.
-                    return STATUS_NOT_A_REPARSE_POINT;
+                    if (const auto status = reparse_point_control(c, *f, io_status_block, fs_control_code, input_buffer,
+                                                                  input_buffer_length, output_buffer, output_buffer_length))
+                    {
+                        if (auto* e = c.proc.events.get(event); e && NT_SUCCESS(*status))
+                        {
+                            e->signaled = true;
+                        }
+                        return *status;
+                    }
                 }
 
                 c.win_emu.log.warn("NtFsControlFile on non-device handle (control code 0x%X)\n", static_cast<uint32_t>(fs_control_code));

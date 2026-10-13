@@ -2,6 +2,7 @@
 #include "../emulator_utils.hpp"
 #include "../io_completion_wait.hpp"
 #include "../syscall_utils.hpp"
+#include "../devices/named_pipe.hpp"
 
 namespace sogen
 {
@@ -12,6 +13,54 @@ namespace sogen
         NTSTATUS handle_NtReleaseMutant(const syscall_context& c, handle mutant_handle, emulator_object<LONG> previous_count);
         NTSTATUS handle_NtReleaseSemaphore(const syscall_context& c, handle semaphore_handle, ULONG release_count,
                                            emulator_object<LONG> previous_count);
+
+        namespace
+        {
+            struct closing_file
+            {
+                std::u16string name{};
+                std::filesystem::path host_path{};
+                std::u16string renamed_to{};
+            };
+
+            // A file or directory that is gone after its last handle closed was deleted or renamed: its reparse point, and
+            // any below it, go too, or move to the new name.
+            void update_reparse_points_after_close(process_context& process, const closing_file& closing)
+            {
+                std::error_code ec{};
+                if (std::filesystem::exists(std::filesystem::symlink_status(closing.host_path, ec)))
+                {
+                    return;
+                }
+
+                const auto old_key = windows_path(closing.name).u16string();
+                const auto new_key = closing.renamed_to.empty() ? std::u16string{} : windows_path(closing.renamed_to).u16string();
+                std::vector<std::pair<std::u16string, std::vector<uint8_t>>> moved{};
+                for (auto entry = process.reparse_points.begin(); entry != process.reparse_points.end();)
+                {
+                    const auto& key = entry->first;
+                    if (key != old_key && !key.starts_with(old_key + u"\\"))
+                    {
+                        ++entry;
+                        continue;
+                    }
+
+                    if (!new_key.empty())
+                    {
+                        moved.emplace_back(new_key + key.substr(old_key.size()), std::move(entry->second));
+                    }
+                    entry = process.reparse_points.erase(entry);
+                }
+
+                for (auto& [key, data] : moved)
+                {
+                    process.reparse_points[std::move(key)] = std::move(data);
+                }
+            }
+        }
+
+        constexpr ULONG duplicate_close_source = 1;
+        constexpr ULONG duplicate_same_access = 2;
 
         NTSTATUS handle_NtClose(const syscall_context& c, const handle h)
         {
@@ -27,6 +76,13 @@ namespace sogen
             if (value.is_pseudo || h == GUEST_PROCESS_HANDLE)
             {
                 return STATUS_SUCCESS;
+            }
+
+            auto* handle_store = c.proc.get_handle_store(h);
+            const auto* object = handle_store ? handle_store->get_object(h) : nullptr;
+            if (object && object->protect_from_close)
+            {
+                return STATUS_HANDLE_NOT_CLOSABLE;
             }
 
             if (value.type == handle_types::wait_completion_packet)
@@ -52,6 +108,10 @@ namespace sogen
                 auto* device = c.proc.devices.get(h);
                 if (device && device->ref_count == 1)
                 {
+                    if (device->is_last_file_reference() && device->get_internal_device<named_pipe>())
+                    {
+                        device->cancel_io(c.win_emu, 0);
+                    }
                     device->release_references(c.proc);
                 }
             }
@@ -61,6 +121,7 @@ namespace sogen
                 const auto* port = c.proc.ports.get(h);
                 if (port && port->ref_count == 1)
                 {
+                    port->get_internal_port()->release_sections(c.win_emu);
                     const auto port_key = static_cast<uint32_t>(h.bits & 0xFFFFFFFF);
                     if (const auto views = c.proc.pending_alpc_reply_views.find(port_key); views != c.proc.pending_alpc_reply_views.end())
                     {
@@ -104,10 +165,30 @@ namespace sogen
                 }
             }
 
-            auto* handle_store = c.proc.get_handle_store(h);
+            // The last handle of a file runs its pending delete or rename; reparse points there go or move along.
+            std::optional<closing_file> closing{};
+            if (value.type == handle_types::file && !c.proc.reparse_points.empty())
+            {
+                const auto* f = c.proc.files.get(h);
+                if (f && f->ref_count == 1)
+                {
+                    closing = closing_file{.name = f->name, .host_path = f->host_path, .renamed_to = f->renamed_to};
+                }
+            }
+
             if (handle_store && handle_store->erase(h))
             {
-                if (section_backing_address != 0)
+                if (closing)
+                {
+                    update_reparse_points_after_close(c.proc, *closing);
+                }
+
+                // Mapped views keep the section's pages: the backing goes with the last of them.
+                if (section_backing_address != 0 && c.proc.pagefile_view_counts.contains(section_backing_address))
+                {
+                    c.proc.closed_pagefile_backings[section_backing_address] = true;
+                }
+                else if (section_backing_address != 0)
                 {
                     c.win_emu.memory.release_memory(section_backing_address, 0);
                 }
@@ -119,8 +200,10 @@ namespace sogen
 
         NTSTATUS handle_NtDuplicateObject(const syscall_context& c, const handle source_process_handle, const handle source_handle,
                                           const handle target_process_handle, const emulator_object<handle> target_handle,
-                                          const ACCESS_MASK /*desired_access*/, const ULONG /*handle_attributes*/, const ULONG /*options*/)
+                                          const ACCESS_MASK desired_access, const ULONG handle_attributes, const ULONG options)
         {
+            constexpr ULONG duplicate_same_attributes = 0x4;
+
             if (!c.proc.is_current_process_handle(source_process_handle) || !c.proc.is_current_process_handle(target_process_handle))
             {
                 return STATUS_NOT_SUPPORTED;
@@ -135,6 +218,20 @@ namespace sogen
             }
 
             auto* store = c.proc.get_handle_store(resolved_source_handle);
+            if (const auto* source = c.proc.devices.get(resolved_source_handle))
+            {
+                if (source->get_internal_device<named_pipe>())
+                {
+                    auto duplicate = source->duplicate((options & duplicate_same_access) ? source->granted_access : desired_access,
+                                                       (handle_attributes & OBJ_INHERIT) != 0);
+                    target_handle.write(c.proc.devices.store(std::move(duplicate)));
+                    if (options & duplicate_close_source)
+                    {
+                        return handle_NtClose(c, resolved_source_handle);
+                    }
+                    return STATUS_SUCCESS;
+                }
+            }
             if (!store)
             {
                 return STATUS_NOT_SUPPORTED;
@@ -144,6 +241,20 @@ namespace sogen
             if (!new_handle)
             {
                 return STATUS_INVALID_HANDLE;
+            }
+
+            // Duplicates share their source's object, and so its flags.
+            auto* object = store->get_object(*new_handle);
+            const auto source_inherits = object && object->inherit;
+            if (options & duplicate_close_source)
+            {
+                (void)handle_NtClose(c, resolved_source_handle);
+            }
+
+            // The new handle is inheritable as asked, or as the source was with DUPLICATE_SAME_ATTRIBUTES.
+            if (object)
+            {
+                object->inherit = (options & duplicate_same_attributes) ? source_inherits : (handle_attributes & OBJ_INHERIT) != 0;
             }
 
             target_handle.write(*new_handle);
@@ -224,7 +335,10 @@ namespace sogen
                         return STATUS_INVALID_HANDLE;
                     }
 
-                    device_path = windows_path(file->name).to_device_path();
+                    // \Device\HarddiskVolume<n>, then the path in the case the file system keeps (GetFinalPathNameByHandle).
+                    const auto volume_path = windows_path(file->name).to_device_path();
+                    const auto volume_end = volume_path.find(u'\\', std::u16string_view{u"\\Device\\"}.size());
+                    device_path = volume_path.substr(0, volume_end) + c.win_emu.file_sys.true_case(file->name);
                     break;
                 }
                 case handle_types::device: {
@@ -457,11 +571,13 @@ namespace sogen
 
             if (object_information_class == ObjectHandleFlagInformation)
             {
-                return handle_query<OBJECT_HANDLE_FLAG_INFORMATION>(c.emu, object_information, object_information_length, return_length,
-                                                                    [&](OBJECT_HANDLE_FLAG_INFORMATION& info) {
-                                                                        info.Inherit = 0;
-                                                                        info.ProtectFromClose = 0;
-                                                                    });
+                return handle_query<OBJECT_HANDLE_FLAG_INFORMATION>(
+                    c.emu, object_information, object_information_length, return_length, [&](OBJECT_HANDLE_FLAG_INFORMATION& info) {
+                        auto* store = c.proc.get_handle_store(effective_handle);
+                        const auto* object = store ? store->get_object(effective_handle) : nullptr;
+                        info.Inherit = object && object->inherit;
+                        info.ProtectFromClose = object && object->protect_from_close;
+                    });
             }
 
             c.win_emu.log.error("Unsupported object info class: %X\n", object_information_class);
@@ -545,6 +661,14 @@ namespace sogen
 
             switch (h.value.type)
             {
+            case handle_types::device: {
+                const auto* container = c.proc.devices.get(h);
+                if (!container)
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+                return container->get_internal_device<named_pipe>() ? STATUS_SUCCESS : STATUS_OBJECT_TYPE_MISMATCH;
+            }
             case handle_types::process:
                 // The synthetic Steam process never signals, so a liveness wait times out ("alive").
                 return (h == STEAM_PROCESS_HANDLE || c.proc.processes.get(h)) ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
@@ -856,22 +980,22 @@ namespace sogen
             }
 
             const auto effective_handle = c.proc.resolve_object_pseudo_handle(handle, c.vcpu.active_thread);
-            if (!c.proc.get_handle_store(effective_handle))
+            auto* store = c.proc.get_handle_store(effective_handle);
+            auto* object = store ? store->get_object(effective_handle) : nullptr;
+            if (object == nullptr)
             {
                 return STATUS_INVALID_HANDLE;
             }
 
-            // Validate the buffer, then drop the flags: NtQueryObject reports both
-            // as 0 because neither is tracked per handle. Failing instead breaks
-            // callers that only set them defensively -- winhttp aborts session
-            // creation with ERROR_NOT_SUPPORTED and returns a NULL session.
             const emulator_object<OBJECT_HANDLE_FLAG_INFORMATION> info{c.emu, object_information};
-            (void)info.read();
+            const auto flags = info.read();
+            object->inherit = flags.Inherit != 0;
+            object->protect_from_close = flags.ProtectFromClose != 0;
 
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtQuerySecurityObject(const syscall_context& c, const handle /*h*/, const SECURITY_INFORMATION security_information,
+        NTSTATUS handle_NtQuerySecurityObject(const syscall_context& c, const handle, const SECURITY_INFORMATION security_information,
                                               const emulator_pointer security_descriptor, const ULONG length,
                                               const emulator_object<ULONG> length_needed)
         {
@@ -881,13 +1005,8 @@ namespace sogen
                 return STATUS_INVALID_PARAMETER;
             }
 
-            // Owner SID: S-1-5-32-544 (Administrators)
-            // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-            const uint8_t owner_sid[] = {0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00};
-
-            // Group SID: S-1-5-18 (Local System)
-            // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-            const uint8_t group_sid[] = {0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00};
+            const auto& owner_sid = c.proc.sid;
+            const auto& group_sid = c.proc.sid;
 
             // DACL structure
             // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
@@ -910,12 +1029,12 @@ namespace sogen
 
             if (security_information & OWNER_SECURITY_INFORMATION)
             {
-                total_size += sizeof(owner_sid);
+                total_size += static_cast<ULONG>(owner_sid.size());
             }
 
             if (security_information & GROUP_SECURITY_INFORMATION)
             {
-                total_size += sizeof(group_sid);
+                total_size += static_cast<ULONG>(group_sid.size());
             }
 
             if (security_information & DACL_SECURITY_INFORMATION)
@@ -949,15 +1068,15 @@ namespace sogen
             if (security_information & OWNER_SECURITY_INFORMATION)
             {
                 sd.Owner = current_offset;
-                c.emu.write_memory(security_descriptor + current_offset, owner_sid);
-                current_offset += sizeof(owner_sid);
+                c.emu.write_memory(security_descriptor + current_offset, owner_sid.data(), owner_sid.size());
+                current_offset += static_cast<ULONG>(owner_sid.size());
             }
 
             if (security_information & GROUP_SECURITY_INFORMATION)
             {
                 sd.Group = current_offset;
-                c.emu.write_memory(security_descriptor + current_offset, group_sid);
-                current_offset += sizeof(group_sid);
+                c.emu.write_memory(security_descriptor + current_offset, group_sid.data(), group_sid.size());
+                current_offset += static_cast<ULONG>(group_sid.size());
             }
 
             if (security_information & DACL_SECURITY_INFORMATION)

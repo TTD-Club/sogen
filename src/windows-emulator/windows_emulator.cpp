@@ -14,6 +14,7 @@
 
 #include "network/static_socket_factory.hpp"
 #include "memory_permission_ext.hpp"
+#include "worker_factory_support.hpp"
 
 namespace sogen
 {
@@ -350,13 +351,51 @@ namespace sogen
         {
             for (const auto& thread_entry : process.threads)
             {
-                if (thread_entry.second.await_host_condition)
+                if (thread_entry.second.await_host_condition || thread_entry.second.await_file_io)
                 {
                     return true;
                 }
             }
 
             return false;
+        }
+
+        // The earliest time after `now` at which a waiting thread, a waitable timer, or a window timer becomes due, if
+        // any does. Deadlines already past are left out: whatever they could wake would not be idle.
+        std::optional<std::chrono::steady_clock::time_point> next_deadline(const process_context& process,
+                                                                           const std::chrono::steady_clock::time_point now)
+        {
+            std::optional<std::chrono::steady_clock::time_point> deadline{};
+            const auto consider = [&](const std::optional<std::chrono::steady_clock::time_point>& time) {
+                if (time.has_value() && *time > now && (!deadline || *time < *deadline))
+                {
+                    deadline = *time;
+                }
+            };
+
+            for (const auto& thread : process.threads | std::views::values)
+            {
+                if (thread.is_terminated())
+                {
+                    continue;
+                }
+                consider(thread.await_time);
+                if (thread.await_io_completion)
+                {
+                    consider(thread.await_io_completion->timeout);
+                }
+                for (const auto& timer : thread.user_timers | std::views::values)
+                {
+                    consider(timer.due_time);
+                }
+            }
+
+            for (const auto& timer : process.timers | std::views::values)
+            {
+                consider(timer.due_time);
+            }
+
+            return deadline;
         }
 
         vcpu_context* find_vcpu_running_thread(windows_emulator& win_emu, const emulator_thread& thread);
@@ -406,6 +445,8 @@ namespace sogen
             {
                 dev.work(win_emu);
             }
+
+            worker_factory_support::start_workers_for_queued_work(win_emu);
         }
 
         emulator_thread* get_thread_by_id(process_context& process, const uint32_t id)
@@ -717,6 +758,8 @@ namespace sogen
     windows_emulator::windows_emulator(std::unique_ptr<x86_64_emulator> emu, const emulator_settings& settings,
                                        emulator_callbacks callbacks, emulator_interfaces interfaces)
         : emu_(std::move(emu)),
+          use_native_timestamp_counter_(!interfaces.clock && !settings.use_relative_time &&
+                                        this->emu_->supports_native_timestamp_counter()),
           clock_(get_clock(interfaces, this->executed_instructions_, this->idle_ticks_, settings.use_relative_time)),
           dns_lookup_(get_dns_lookup(interfaces)),
           socket_factory_(get_socket_factory(interfaces)),
@@ -855,8 +898,14 @@ namespace sogen
 
         const auto needed_switch = vcpu.switch_thread.exchange(false);
 
-        while (!switch_to_next_thread(*this, vcpu))
+        while (true)
         {
+            expire_timers(*this);
+            if (switch_to_next_thread(*this, vcpu))
+            {
+                break;
+            }
+
             if (this->vcpu_count_ > 1 && vcpu.active_thread)
             {
                 // Nothing runnable for this vCPU: detach the stale thread so another
@@ -866,6 +915,20 @@ namespace sogen
             }
 
             const auto host_wait_pending = has_pending_host_wait(this->process);
+
+            // Under relative time, idling skips to the next deadline (at most a time slice ahead), so that waits and
+            // timers wake in the order of their due times. The relative clock ticks once per millisecond.
+            uint64_t idle_advance = MAX_INSTRUCTIONS_PER_TIME_SLICE;
+            if (this->use_relative_time_)
+            {
+                const auto now = this->clock_->steady_now();
+                if (const auto deadline = next_deadline(this->process, now))
+                {
+                    // One tick past it: timed-out waits compare strictly.
+                    const auto until = std::chrono::ceil<std::chrono::milliseconds>(*deadline - now).count();
+                    idle_advance = std::clamp<uint64_t>(static_cast<uint64_t>(until) + 1, 1, MAX_INSTRUCTIONS_PER_TIME_SLICE);
+                }
+            }
 
             // Idle: nothing is ready. Release the kernel lock while pumping UI events
             // and sleeping so other threads (UI delivery, vCPU workers) can run.
@@ -879,7 +942,7 @@ namespace sogen
 
             if (this->use_relative_time_)
             {
-                this->idle_ticks_ += MAX_INSTRUCTIONS_PER_TIME_SLICE;
+                this->idle_ticks_ += idle_advance;
             }
             else if (host_wait_pending)
             {
@@ -949,7 +1012,7 @@ namespace sogen
         return switch_to_thread(*this, vcpu, *thread, true);
     }
 
-    void windows_emulator::on_instruction_execution(vcpu_context& vcpu, const uint64_t address)
+    void windows_emulator::on_instruction_execution(vcpu_context& vcpu, const uint64_t address, const size_t size)
     {
         auto& thread = vcpu.thread();
 
@@ -967,14 +1030,16 @@ namespace sogen
 
         ++this->executed_instructions_;
         thread.previous_ip = thread.current_ip;
-        thread.current_ip = vcpu.cpu.read_instruction_pointer();
+        // The backend reports instructions with the instruction pointer at their address.
+        thread.current_ip = address;
 
-        if (!this->uses_section_first_execution_hooks())
+        if (!this->uses_section_first_execution_hooks() && address - this->executed_section_start_ >= this->executed_section_size_)
         {
             this->track_section_first_execution(address);
         }
 
         this->callbacks.on_instruction(address);
+        this->callbacks.on_instruction_executed(address, size);
     }
 
     bool windows_emulator::uses_section_first_execution_hooks() const
@@ -1005,6 +1070,9 @@ namespace sogen
 
             if (section.first_execute.has_value())
             {
+                // Instructions in this section need no tracking until modules change.
+                this->executed_section_start_ = section.region.start;
+                this->executed_section_size_ = section.region.length;
                 return;
             }
 
@@ -1025,6 +1093,7 @@ namespace sogen
 
     void windows_emulator::clear_section_first_execution_hooks()
     {
+        this->forget_executed_section();
         for (const auto& hooks : this->section_first_execution_hooks_ | std::views::values)
         {
             for (auto* hook : hooks)
@@ -1089,6 +1158,7 @@ namespace sogen
     void windows_emulator::setup_hooks()
     {
         this->callbacks.on_module_load.add([this](mapped_module& mod) {
+            this->forget_executed_section();
             for (size_t i = 0; i < mod.sections.size(); ++i)
             {
                 this->install_section_first_execution_hook(mod, i);
@@ -1096,6 +1166,7 @@ namespace sogen
         });
 
         this->callbacks.on_module_unload.add([this](mapped_module& mod) {
+            this->forget_executed_section();
             const auto hooks = this->section_first_execution_hooks_.extract(mod.image_base);
             if (hooks)
             {
@@ -1127,6 +1198,11 @@ namespace sogen
             auto& acting = vcpu.cpu;
             this->callbacks.on_rdtscp();
 
+            if (this->use_native_timestamp_counter_)
+            {
+                return instruction_hook_continuation::run_instruction;
+            }
+
             const auto ticks = this->clock_->timestamp_counter();
             acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
             acting.reg(x86_register::rdx, static_cast<uint32_t>(ticks >> 32));
@@ -1144,6 +1220,11 @@ namespace sogen
             const scoped_dispatch dispatch(*this, vcpu);
             auto& acting = vcpu.cpu;
             this->callbacks.on_rdtsc();
+
+            if (this->use_native_timestamp_counter_)
+            {
+                return instruction_hook_continuation::run_instruction;
+            }
 
             const auto ticks = this->clock_->timestamp_counter();
             acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
@@ -1279,12 +1360,22 @@ namespace sogen
 
         if (this->uses_instruction_precision())
         {
-            this->emu().hook_memory_execution([&](cpu_interface& cpu, const uint64_t address) {
+            const auto on_instruction = [&](cpu_interface& cpu, const uint64_t address, const size_t size) {
                 const std::scoped_lock lock(this->kernel_lock_);
                 auto& vcpu = this->vcpu(cpu.index());
                 const scoped_dispatch dispatch(*this, vcpu);
-                this->on_instruction_execution(vcpu, address); //
-            });
+                this->on_instruction_execution(vcpu, address, size); //
+            };
+            // The metadata hook also gives instruction sizes to on_instruction_executed; backends without one report 0.
+            try
+            {
+                this->emu().hook_memory_execution_metadata(on_instruction);
+            }
+            catch (const std::runtime_error&)
+            {
+                this->emu().hook_memory_execution(
+                    [on_instruction](cpu_interface& cpu, const uint64_t address) { on_instruction(cpu, address, 0); });
+            }
         }
         else if (!this->emu().is_stop_thread_safe())
         {
@@ -1466,12 +1557,19 @@ namespace sogen
             vcpu.cpu.start(count);
             lock.lock();
 
-            if (!vcpu.switch_thread && !vcpu.cpu.has_violation())
+            // A run that continues past the budget would switch threads before its next instruction, either because the
+            // last instruction requested it or because the next instruction's hook ends the time slice. The switch is
+            // done here too, and the budget checked at the top of the loop, so that a run stopping at a position leaves
+            // the same state as one passing through it.
+            if (use_count && this->executed_instructions_ >= target_instructions && this->uses_instruction_precision() &&
+                !vcpu.switch_thread && (vcpu.thread().executed_instructions + 1) % MAX_INSTRUCTIONS_PER_TIME_SLICE == 0)
             {
-                break;
+                ++vcpu.thread().executed_instructions;
+                vcpu.thread().apc_alertable = false;
+                vcpu.switch_thread = true;
             }
 
-            if (use_count && this->executed_instructions_ >= target_instructions)
+            if (!vcpu.switch_thread && !vcpu.cpu.has_violation())
             {
                 break;
             }
@@ -1814,6 +1912,31 @@ namespace sogen
 
     void windows_emulator::serialize(utils::buffer_serializer& buffer) const
     {
+        this->serialize_state(buffer, true);
+    }
+
+    void windows_emulator::serialize(utils::buffer_serializer& buffer, size_t& memory_offset) const
+    {
+        this->serialize_state(buffer, true, &memory_offset);
+    }
+
+    void windows_emulator::serialize_without_memory_contents(utils::buffer_serializer& buffer) const
+    {
+        this->serialize_state(buffer, false);
+    }
+
+    void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
+    {
+        this->deserialize_state(buffer, [&] { this->memory.deserialize_memory_state(buffer, false); });
+    }
+
+    void windows_emulator::deserialize_without_memory_contents(utils::buffer_deserializer& buffer, const restored_page_source& pages)
+    {
+        this->deserialize_state(buffer, [&] { this->memory.deserialize_memory_state(buffer, pages); });
+    }
+
+    void windows_emulator::serialize_state(utils::buffer_serializer& buffer, const bool memory_contents, size_t* memory_offset) const
+    {
         buffer.write(this->application_settings_);
         buffer.write(this->setup_completed_);
         buffer.write(this->executed_instructions_);
@@ -1826,13 +1949,17 @@ namespace sogen
 
         // Backend snapshot mode is not used here; Unicorn's in-place snapshot path is broken.
         this->emu().serialize_state(buffer, false);
-        this->memory.serialize_memory_state(buffer, false);
+        if (memory_offset)
+        {
+            *memory_offset = buffer.get_buffer().size();
+        }
+        this->memory.serialize_memory_state(buffer, !memory_contents);
         this->mod_manager.serialize(buffer);
         this->dispatcher.serialize(buffer);
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
     }
 
-    void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
+    void windows_emulator::deserialize_state(utils::buffer_deserializer& buffer, const std::function<void()>& restore_memory)
     {
         this->register_factories(buffer);
 
@@ -1854,7 +1981,6 @@ namespace sogen
         this->registry.deserialize_runtime_state(buffer);
 
         this->process.prepare_for_state_restore(*this);
-        this->memory.unmap_all_memory();
         this->clear_section_first_execution_hooks();
         this->ui().reset();
         this->audio().stop();
@@ -1862,7 +1988,7 @@ namespace sogen
 
         // Match raw serialize() above; do not use backend snapshot mode here.
         this->emu().deserialize_state(buffer, false);
-        this->memory.deserialize_memory_state(buffer, false);
+        restore_memory();
         this->mod_manager.deserialize(buffer);
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
@@ -1913,7 +2039,6 @@ namespace sogen
         this->registry.deserialize_runtime_state(buffer);
 
         this->process.prepare_for_state_restore(*this);
-        this->memory.unmap_all_memory();
         this->clear_section_first_execution_hooks();
         this->ui().reset();
         this->audio().stop();

@@ -4,6 +4,7 @@
 
 #include <windows_emulator.hpp>
 #include <emulator_process_target.hpp>
+#include <inherited_pipes.hpp>
 #include <backend_selection.hpp>
 #include <win_x86_64_gdb_stub_handler.hpp>
 #include <minidump_loader.hpp>
@@ -736,6 +737,7 @@ namespace sogen
             if (options.managed_process)
             {
                 win_emu->setup_process_if_necessary();
+                install_inherited_pipes(*win_emu, options.managed_process->request(), options.managed_process->take_inherited_pipes());
                 managed_target = std::make_unique<emulator_process_target>(*win_emu);
                 if (!options.managed_process->wait_for_resume(*managed_target))
                 {
@@ -967,6 +969,12 @@ namespace sogen
             return success;
         }
 
+// GCC 13 reports the value-initialized analysis_options' std::set members as maybe used uninitialized once CLI11's
+// option setup is inlined into run_main.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
         int run_main(int argc, char** argv)
         {
 #ifndef _WIN32
@@ -1176,6 +1184,9 @@ namespace sogen
 
             return 1;
         }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     }
 
     int windows_main(const int argc, char** argv)

@@ -2,10 +2,18 @@
 #include "snapshot.hpp"
 #include "ttd_build_info.hpp"
 
+#include <address_utils.hpp>
+#include <utils/finally.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #define XXH_INLINE_ALL
@@ -283,8 +291,12 @@ namespace sogen::ttd
     namespace
     {
         // Runs the emulator to `position` with one start() per checkpoint interval, as the recording ran: window input
-        // is pumped at each boundary. Returns whether it got there.
-        bool run_intervals(windows_emulator& win_emu, trace& recorded, const uint64_t position)
+        // is pumped at each boundary. Also stops at `keyframe_stops` (sorted) and calls `at_keyframe` there. Returns
+        // whether it got there. With `control`, it also stops at every keyframe_interval to check it and report
+        // progress; the replay does not depend on where start() calls end (keyframe stops split them the same way).
+        bool run_intervals(windows_emulator& win_emu, trace& recorded, const uint64_t position,
+                           const std::span<const uint64_t> keyframe_stops = {}, const std::function<void()>& at_keyframe = {},
+                           const operation_control& control = {})
         {
             const auto run_to = [&](const uint64_t target) {
                 const auto before = win_emu.get_executed_instructions();
@@ -294,23 +306,82 @@ namespace sogen::ttd
                 }
                 return win_emu.get_executed_instructions() == target;
             };
+
+            const auto from = win_emu.get_executed_instructions();
+            const auto controlled = control.interrupted || control.progress;
+            const auto report = [&] { control.report(win_emu.get_executed_instructions() - from, position > from ? position - from : 0); };
+            std::vector<uint64_t> stops{};
             for (const auto& checkpoint : recorded.checkpoints())
             {
-                if (checkpoint.step >= position)
+                stops.push_back(checkpoint.step);
+            }
+            stops.insert(stops.end(), keyframe_stops.begin(), keyframe_stops.end());
+            if (controlled)
+            {
+                for (auto stop = (from / keyframe_interval + 1) * keyframe_interval; stop < position; stop += keyframe_interval)
                 {
-                    break;
+                    stops.push_back(stop);
                 }
-                if (checkpoint.step > win_emu.get_executed_instructions() && !run_to(checkpoint.step))
+                report();
+            }
+            std::erase_if(stops, [&](const uint64_t stop) { return stop <= from || stop >= position; });
+            std::ranges::sort(stops);
+            stops.erase(std::ranges::unique(stops).begin(), stops.end());
+
+            for (const auto stop : stops)
+            {
+                if (!run_to(stop))
                 {
                     return false;
+                }
+                if (std::ranges::binary_search(keyframe_stops, stop))
+                {
+                    at_keyframe();
+                }
+                if (controlled)
+                {
+                    report();
                 }
             }
             return run_to(position);
         }
 
-        // Replays from `from`, where the emulator holds the recorded state, to `position`.
+        // Where a replay from `from` to `position` keeps keyframes: with `every_interval`, at every checkpoint and
+        // keyframe_interval on the way (to prepare a trace); otherwise only at the last keyframe_interval before
+        // `position`, so that moving back from there is cheap while a single seek stays about as fast as without.
+        std::vector<uint64_t> keyframe_stops(const trace& recorded, const uint64_t from, const uint64_t position, const bool every_interval)
+        {
+            std::vector<uint64_t> stops{};
+            if (!every_interval)
+            {
+                if (const auto last = (position - 1) / keyframe_interval * keyframe_interval; position && last > from)
+                {
+                    stops.push_back(last);
+                }
+                return stops;
+            }
+            for (auto stop = (from / keyframe_interval + 1) * keyframe_interval; stop < position; stop += keyframe_interval)
+            {
+                stops.push_back(stop);
+            }
+            for (const auto& checkpoint : recorded.checkpoints())
+            {
+                if (checkpoint.step > from && checkpoint.step < position)
+                {
+                    stops.push_back(checkpoint.step);
+                }
+            }
+            std::ranges::sort(stops);
+            stops.erase(std::ranges::unique(stops).begin(), stops.end());
+            return stops;
+        }
+
+        // Replays from `from`, where the emulator holds the recorded state, to `position`. With `keyframes`, keeps states
+        // on the way (see keyframe_stops) and finally notes what the emulator holds (keyframe_store::note_state);
+        // `exact_start` tells that the state at `from` was reached without substituting inputs.
         seek_result replay_range(windows_emulator& win_emu, trace& recorded, const uint64_t from, const uint64_t position,
-                                 const bool strict, const bool from_checkpoint)
+                                 const bool strict, const bool from_checkpoint, keyframe_store* keyframes = nullptr,
+                                 const bool exact_start = true, const bool every_interval = false, const operation_control& control = {})
         {
             try
             {
@@ -325,13 +396,68 @@ namespace sogen::ttd
                 {
                     ui.emplace(win_emu, recorded.ui_inputs(), ui_replay::after_events{verifier.next_event_number()}, clock);
                 }
-                run_intervals(win_emu, recorded, position);
+                // Keyframes captured on the way read only the memory the replay changed since the previous one.
+                std::vector<uint64_t> written_pages{};
+                std::vector<std::pair<uint64_t, uint64_t>> remapped{};
+                auto baseline = from;
+                const auto incremental = keyframes && verifier.observes_all_writes();
+                if (incremental)
+                {
+                    verifier.observe_writes([&](const uint64_t address, const size_t size) {
+                        for (auto page = page_align_down(address); page < address + size; page += 0x1000)
+                        {
+                            if (written_pages.empty() || written_pages.back() != page)
+                            {
+                                written_pages.push_back(page);
+                            }
+                        }
+                    });
+                    win_emu.memory.set_mapping_change_callback(
+                        [&](const uint64_t address, const size_t size) { remapped.emplace_back(address, size); });
+                }
+                const auto stop_tracking = utils::finally([&] {
+                    if (incremental)
+                    {
+                        win_emu.memory.set_mapping_change_callback({});
+                    }
+                });
+                const auto sort_written_pages = [&] {
+                    std::ranges::sort(written_pages);
+                    written_pages.erase(std::ranges::unique(written_pages).begin(), written_pages.end());
+                };
+                const auto at_stop = [&] {
+                    if (verifier.diverged())
+                    {
+                        return;
+                    }
+                    const auto exact = exact_start && !verifier.substituted_inputs();
+                    if (incremental)
+                    {
+                        sort_written_pages();
+                        keyframes->capture(win_emu, exact, baseline, written_pages, remapped);
+                    }
+                    else
+                    {
+                        keyframes->capture(win_emu, exact);
+                    }
+                    baseline = win_emu.get_executed_instructions();
+                    written_pages.clear();
+                    remapped.clear();
+                };
+
+                const auto stops = keyframes ? keyframe_stops(recorded, from, position, every_interval) : std::vector<uint64_t>{};
+                run_intervals(win_emu, recorded, position, stops, at_stop, control);
                 verifier.finish();
                 if (const auto reached = win_emu.get_executed_instructions(); reached != position)
                 {
                     std::ostringstream message;
                     message << "TTD replay reached position " << std::hex << reached << " instead of " << position;
                     throw divergence_error(message.str());
+                }
+                if (incremental)
+                {
+                    sort_written_pages();
+                    keyframes->note_state(win_emu, baseline, std::move(written_pages), std::move(remapped));
                 }
                 return {
                     .checkpoint = from, .verified_events = verifier.verified_events(), .substituted_inputs = verifier.substituted_inputs()};
@@ -343,16 +469,122 @@ namespace sogen::ttd
         }
     }
 
-    seek_result seek(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict)
+    seek_result seek(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict,
+                     const operation_control& control)
     {
         require_deterministic(win_emu);
         check_manifest(win_emu, recorded);
-        const auto checkpoint = recorded.checkpoint_for_step(position);
-        snapshot::load_emulator_state(win_emu, *checkpoint.state);
-        return replay_range(win_emu, recorded, checkpoint.step, position, strict, true);
+        auto& store = keyframes(recorded);
+        const auto checkpoint_step = recorded.checkpoint_step_for(position);
+        auto from = checkpoint_step;
+        auto exact = true;
+        // A strict seek must check every input from the checkpoint on, so it starts only from exact keyframes.
+        if (const auto keyframe = store.restore_latest(win_emu, checkpoint_step, position, strict))
+        {
+            std::tie(from, exact) = *keyframe;
+        }
+        else
+        {
+            snapshot::load_emulator_state(win_emu, *recorded.checkpoint_for_step(position).state);
+        }
+        return replay_range(win_emu, recorded, from, position, strict, from == checkpoint_step, &store, exact, false, control);
     }
 
-    seek_result run_to(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict)
+    void prepare_keyframes(trace& recorded, const std::span<windows_emulator* const> emulators, const operation_control& control)
+    {
+        for (auto* emulator : emulators)
+        {
+            require_deterministic(*emulator);
+            check_manifest(*emulator, recorded);
+        }
+
+        const auto end = recorded.metadata().instruction_count;
+        std::vector<uint64_t> starts{recorded.start_position()};
+        for (const auto& checkpoint : recorded.checkpoints())
+        {
+            if (checkpoint.step > starts.back() && checkpoint.step < end)
+            {
+                starts.push_back(checkpoint.step);
+            }
+        }
+
+        // Each emulator replays a contiguous run of checkpoint intervals, so it decodes one checkpoint and then keeps
+        // going forward. Every emulator needs its own reader: a trace is not safe to use from several threads.
+        const auto workers = std::min(emulators.size(), starts.size());
+        std::vector<std::exception_ptr> failures(workers);
+        std::vector<std::thread> threads{};
+        // The workers stop at every keyframe anyway; there they add their progress and look for a cancellation, which
+        // only the calling thread decides (`control` is not called from the workers).
+        std::atomic<uint64_t> replayed{};
+        std::atomic<bool> cancelled{};
+        std::atomic<size_t> finished{};
+        for (size_t worker = 0; worker < workers; ++worker)
+        {
+            const auto first = starts[worker * starts.size() / workers];
+            const auto next = (worker + 1) * starts.size() / workers;
+            const auto last = next < starts.size() ? starts[next] : end;
+            threads.emplace_back([&, emulator = emulators[worker], worker, first, last] {
+                uint64_t reported = 0;
+                const operation_control worker_control{
+                    .interrupted = [&] { return cancelled.load(); },
+                    .progress =
+                        [&](const uint64_t done, uint64_t) {
+                            replayed += done - reported;
+                            reported = done;
+                        },
+                };
+                try
+                {
+                    trace reader(recorded.path());
+                    share_keyframes(reader, recorded);
+                    snapshot::load_emulator_state(*emulator, *reader.checkpoint_for_step(first).state);
+                    auto& store = keyframes(reader);
+                    store.capture(*emulator, true);
+                    replay_range(*emulator, reader, first, last, false, true, &store, true, true, worker_control);
+                }
+                catch (...)
+                {
+                    failures[worker] = std::current_exception();
+                }
+                ++finished;
+            });
+        }
+        const auto total = end - recorded.start_position();
+        while ((control.interrupted || control.progress) && finished < workers)
+        {
+            if (!cancelled)
+            {
+                try
+                {
+                    control.report(replayed, total);
+                }
+                catch (const operation_cancelled&)
+                {
+                    cancelled = true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        for (auto& thread : threads)
+        {
+            thread.join();
+        }
+        if (cancelled)
+        {
+            throw operation_cancelled();
+        }
+        for (const auto& failure : failures)
+        {
+            if (failure)
+            {
+                std::rethrow_exception(failure);
+            }
+        }
+        control.report(total, total);
+    }
+
+    seek_result run_to(windows_emulator& win_emu, trace& recorded, const uint64_t position, const bool strict,
+                       const operation_control& control)
     {
         require_deterministic(win_emu);
         check_manifest(win_emu, recorded);
@@ -369,11 +601,11 @@ namespace sogen::ttd
         {
             throw std::out_of_range("TTD position is beyond end of trace");
         }
-        return replay_range(win_emu, recorded, from, position, strict, false);
+        return replay_range(win_emu, recorded, from, position, strict, false, nullptr, true, false, control);
     }
 
     seek_result replay_to_end(windows_emulator& win_emu, trace& recorded, const std::function<void()>& attach, const bool strict,
-                              const bool restore)
+                              const bool restore, const operation_control& control)
     {
         require_deterministic(win_emu);
         const auto start = recorded.start_position();
@@ -398,7 +630,7 @@ namespace sogen::ttd
         {
             replay_verifier verifier(win_emu, recorded, start, strict);
             const ui_replay ui(win_emu, recorded.ui_inputs(), 0, [&verifier] { return verifier.next_event_number(); });
-            const auto reached = run_intervals(win_emu, recorded, end);
+            const auto reached = run_intervals(win_emu, recorded, end, {}, {}, control);
             verifier.finish();
             if (!reached)
             {

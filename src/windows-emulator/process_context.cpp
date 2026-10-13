@@ -1,5 +1,6 @@
 #include "std_include.hpp"
 #include "process_context.hpp"
+#include "code_page.hpp"
 
 #include "emulator_utils.hpp"
 #include "registry/registry_utils.hpp"
@@ -207,7 +208,8 @@ namespace sogen
 
         utils::unordered_insensitive_u16string_map<std::u16string> get_environment_variables(registry_manager& registry,
                                                                                              const windows_version_manager& version,
-                                                                                             const application_settings& app_settings)
+                                                                                             const application_settings& app_settings,
+                                                                                             const bool is_wow64_process)
         {
             utils::unordered_insensitive_u16string_map<std::u16string> env_map;
             std::unordered_set<std::u16string_view> keys_to_expand;
@@ -264,6 +266,40 @@ namespace sogen
             env_map[u"TMP"] = user_profile + u"\\AppData\\Local\\Temp";
             env_map[u"TEMP"] = user_profile + u"\\AppData\\Local\\Temp";
             env_map[u"USERPROFILE"] = user_profile;
+
+            // What CreateEnvironmentBlock adds for a user, from where Windows keeps it. A 32-bit process sees the x86
+            // directories as ProgramFiles and CommonProgramFiles.
+            const auto read_current_version = [&](const std::string_view name, std::u16string fallback) {
+                auto value =
+                    registry_utils::read_registry_string(registry, R"(\Registry\Machine\Software\Microsoft\Windows\CurrentVersion)", name);
+                return value && !value->empty() ? std::move(*value) : std::move(fallback);
+            };
+            const auto program_files = read_current_version("ProgramFilesDir", system_drive + u"\\Program Files");
+            const auto program_files_x86 = read_current_version("ProgramFilesDir (x86)", system_drive + u"\\Program Files (x86)");
+            const auto common_files = read_current_version("CommonFilesDir", program_files + u"\\Common Files");
+            const auto common_files_x86 = read_current_version("CommonFilesDir (x86)", program_files_x86 + u"\\Common Files");
+            env_map[u"ProgramFiles"] = is_wow64_process ? program_files_x86 : program_files;
+            env_map[u"ProgramFiles(x86)"] = program_files_x86;
+            env_map[u"ProgramW6432"] = read_current_version("ProgramW6432Dir", program_files);
+            env_map[u"CommonProgramFiles"] = is_wow64_process ? common_files_x86 : common_files;
+            env_map[u"CommonProgramFiles(x86)"] = common_files_x86;
+            env_map[u"CommonProgramW6432"] = read_current_version("CommonW6432Dir", common_files);
+
+            const auto read_profile_list = [&](const std::string_view name, const std::u16string_view fallback) {
+                const auto value = registry_utils::read_registry_string(
+                    registry, R"(\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\ProfileList)", name);
+                return expand_environment_string(value && !value->empty() ? *value : std::u16string(fallback), env_map);
+            };
+            env_map[u"ProgramData"] = read_profile_list("ProgramData", system_drive + u"\\ProgramData");
+            env_map[u"ALLUSERSPROFILE"] = env_map[u"ProgramData"];
+            env_map[u"PUBLIC"] = read_profile_list("Public", system_drive + u"\\Users\\Public");
+
+            env_map[u"APPDATA"] = user_profile + u"\\AppData\\Roaming";
+            env_map[u"LOCALAPPDATA"] = user_profile + u"\\AppData\\Local";
+            env_map[u"HOMEDRIVE"] = user_profile.size() >= 2 && user_profile[1] == u':' ? user_profile.substr(0, 2) : system_drive;
+            env_map[u"HOMEPATH"] = user_profile.size() >= 2 && user_profile[1] == u':' ? user_profile.substr(2) : user_profile;
+            env_map[u"USERDOMAIN"] = env_map[u"COMPUTERNAME"];
+            env_map[u"LOGONSERVER"] = u"\\\\" + env_map[u"COMPUTERNAME"];
 
             for (const auto& [key, value] : app_settings.environment)
             {
@@ -346,7 +382,7 @@ namespace sogen
 
             proc_params.Environment = allocator.copy_string(u"=::=::\\");
 
-            const auto env_map = get_environment_variables(win_emu.registry, version, app_settings);
+            const auto env_map = get_environment_variables(win_emu.registry, version, app_settings, this->is_wow64_process);
             for (const auto& [name, value] : env_map)
             {
                 std::u16string entry;
@@ -361,17 +397,31 @@ namespace sogen
             const auto application_str = app_settings.application.u16string();
 
             const auto& argument0 = app_settings.argument0.empty() ? application_str : app_settings.argument0;
-            std::u16string command_line{};
-            append_command_line_argument(command_line, argument0);
-
-            for (const auto& arg : app_settings.arguments)
+            auto command_line = app_settings.command_line.value_or(std::u16string{});
+            if (!app_settings.command_line)
             {
-                command_line.push_back(u' ');
-                append_command_line_argument(command_line, arg);
+                append_command_line_argument(command_line, argument0);
+                for (const auto& arg : app_settings.arguments)
+                {
+                    command_line.push_back(u' ');
+                    append_command_line_argument(command_line, arg);
+                }
             }
 
             allocator.make_unicode_string(proc_params.CommandLine, command_line);
-            allocator.make_unicode_string(proc_params.CurrentDirectory.DosPath, app_settings.working_directory.u16string() + u"\\", 1024);
+            // The current directory as Windows shows it: an upper case drive letter, components in the case the file
+            // system keeps (windows_path lowercases them), ending in a separator.
+            auto current_directory = app_settings.working_directory.u16string();
+            if (const auto drive = app_settings.working_directory.get_drive())
+            {
+                current_directory = std::u16string(1, static_cast<char16_t>(std::toupper(static_cast<unsigned char>(*drive)))) + u":" +
+                                    win_emu.file_sys.true_case(current_directory);
+            }
+            if (!current_directory.ends_with(u'\\'))
+            {
+                current_directory.push_back(u'\\');
+            }
+            allocator.make_unicode_string(proc_params.CurrentDirectory.DosPath, current_directory, 1024);
             allocator.make_unicode_string(proc_params.ImagePathName, application_str);
 
             const auto total_length = allocator.get_next_address() - this->process_params64.value();
@@ -406,6 +456,10 @@ namespace sogen
             // p.AnsiCodePageData = allocator.reserve<CPTABLEINFO>().value();
             // p.OemCodePageData = allocator.reserve<CPTABLEINFO>().value();
             p.UnicodeCaseTableData = allocator.reserve<NLSTABLEINFO>().value();
+
+            // Non-zero (Windows 11 sets 0x6A5): kernelbase then loads the Unicode casing table (NtGetNlsSectionPtr
+            // section 14, l_intl.nls) that LCMapString and CompareString use beyond ASCII.
+            p.UseCaseMapping = 0x6A5;
         });
 
         if (this->is_wow64_process)
@@ -499,6 +553,7 @@ namespace sogen
                 // Initialize NLS tables for 32-bit processes
                 // These need to be in 32-bit addressable space
                 p32.UnicodeCaseTableData = static_cast<uint32_t>(allocator.reserve<NLSTABLEINFO>().value());
+                p32.UseCaseMapping = 0x6A5;
 
                 // TODO: Initialize other PEB32 fields as needed
             });
@@ -572,6 +627,7 @@ namespace sogen
         this->default_register_set = emu.save_registers();
 
         this->user_handles.setup(is_wow64_process);
+        initialize_user_code_page_tables(win_emu);
 
         auto [mh, monitor_obj] = this->user_handles.allocate_object<USER_MONITOR>(handle_types::monitor);
         this->default_monitor_handle = mh;
@@ -725,6 +781,11 @@ namespace sogen
         buffer.write(this->raw_keyboard_target);
         buffer.write_map(this->raw_inputs);
         buffer.write(this->next_raw_input_token);
+        buffer.write_map(this->token_privileges);
+        buffer.write_map(this->file_section_views);
+        buffer.write_map(this->pagefile_view_counts);
+        buffer.write_map(this->closed_pagefile_backings);
+        buffer.write_map(this->reparse_points);
         buffer.write_atomic(this->audio_render_event);
 
         buffer.write(this->user_handles);
@@ -829,6 +890,11 @@ namespace sogen
         buffer.read(this->raw_keyboard_target);
         buffer.read_map(this->raw_inputs);
         buffer.read(this->next_raw_input_token);
+        buffer.read_map(this->token_privileges);
+        buffer.read_map(this->file_section_views);
+        buffer.read_map(this->pagefile_view_counts);
+        buffer.read_map(this->closed_pagefile_backings);
+        buffer.read_map(this->reparse_points);
         buffer.read_atomic(this->audio_render_event);
 
         buffer.read(this->user_handles);
@@ -1066,6 +1132,95 @@ namespace sogen
         default:
             return nullptr;
         }
+    }
+
+    uint64_t process_context::hash_page(const std::span<const std::byte> page)
+    {
+        // FNV-1a: stable across hosts, so serialized hashes stay valid.
+        uint64_t hash = 0xCBF29CE484222325;
+        for (const auto value : page)
+        {
+            hash ^= static_cast<uint8_t>(value);
+            hash *= 0x100000001B3;
+        }
+        return hash;
+    }
+
+    void process_context::write_back_file_section_view(windows_emulator& win_emu, const uint64_t base, const uint64_t start,
+                                                       const uint64_t end)
+    {
+        const auto entry = this->file_section_views.find(base);
+        if (entry == this->file_section_views.end())
+        {
+            return;
+        }
+
+        constexpr uint64_t page_size = 0x1000;
+        auto& view = entry->second;
+        std::fstream file{};
+        std::vector<std::byte> page(page_size);
+        for (size_t index = 0; index < view.page_hashes.size(); ++index)
+        {
+            const auto page_start = base + index * page_size;
+            const auto length = std::min<uint64_t>(page_size, view.length - index * page_size);
+            if (page_start + length <= start || page_start >= end)
+            {
+                continue;
+            }
+
+            const auto bytes = std::span(page).first(static_cast<size_t>(length));
+            if (!win_emu.memory.try_read_memory(page_start, bytes.data(), bytes.size()) || hash_page(bytes) == view.page_hashes[index])
+            {
+                continue;
+            }
+
+            if (!file.is_open())
+            {
+                file.open(win_emu.file_sys.translate(windows_path{view.file_name}), std::ios::in | std::ios::out | std::ios::binary);
+                if (!file)
+                {
+                    return;
+                }
+            }
+
+            file.seekp(static_cast<std::streamoff>(view.offset + index * page_size));
+            file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            view.page_hashes[index] = hash_page(bytes);
+        }
+    }
+
+    uint32_t process_context::count_handles() const
+    {
+        // Every open handle holds a reference on its object (some objects also hold internal ones).
+        uint64_t count = 0;
+        const auto add = [&](const auto& store) {
+            for (const auto& object : store | std::views::values)
+            {
+                count += object.ref_count;
+            }
+        };
+
+        add(this->processes);
+        add(this->managed_threads);
+        add(this->threads);
+        add(this->events);
+        add(this->files);
+        add(this->devices);
+        add(this->semaphores);
+        add(this->io_completions);
+        add(this->wait_completion_packets);
+        add(this->worker_factories);
+        add(this->jobs);
+        add(this->registry_keys);
+        add(this->mutants);
+        add(this->timers);
+        add(this->desktops);
+        add(this->ports);
+        add(this->sections);
+        add(this->private_namespaces);
+        add(this->deferred_window_position_batches);
+
+        return static_cast<uint32_t>(std::min<uint64_t>(count, UINT32_MAX));
     }
 
     emulator_thread* process_context::find_thread_by_id(const uint32_t thread_id)

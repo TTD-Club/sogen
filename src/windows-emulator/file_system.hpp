@@ -27,6 +27,12 @@ namespace sogen
             return !is_escaping_relative_path(relative_path);
         }
 
+        // Host mode: guest paths are host paths (apart from mappings), with no emulation root.
+        bool is_host_mode() const
+        {
+            return this->root_.empty();
+        }
+
         std::set<char> list_drives() const
         {
             std::set<char> drives{};
@@ -62,6 +68,25 @@ namespace sogen
             return drives;
         }
 
+        uint8_t drive_type(const char drive) const
+        {
+            const auto drives = this->list_drives();
+            if (std::ranges::find(drives, drive) == drives.end())
+            {
+                constexpr uint8_t no_root_directory = 1;
+                return no_root_directory;
+            }
+#ifdef OS_WINDOWS
+            if (this->root_.empty())
+            {
+                const std::array<wchar_t, 4> path{static_cast<wchar_t>(drive), L':', L'\\', L'\0'};
+                return static_cast<uint8_t>(GetDriveTypeW(path.data()));
+            }
+#endif
+            constexpr uint8_t fixed_drive_type = 3;
+            return fixed_drive_type;
+        }
+
         std::filesystem::path translate(const windows_path& win_path) const
         {
             if (!win_path.is_absolute())
@@ -84,13 +109,120 @@ namespace sogen
 #ifdef OS_WINDOWS
             if (this->root_.empty())
             {
-                return win_path.u16string();
+                return keep_trailing_spaces_and_dots(win_path.u16string());
             }
 #endif
 
             // Emulation-root translation, confined to the drive root.
             const std::array<char, 2> root_drive{win_path.get_drive().value_or('c'), 0};
             return confine(this->root_ / root_drive.data(), this->root_ / win_path.to_portable_path());
+        }
+
+        // The host path at which to create `win_path`, a new entry the guest named `spelled`. Windows keeps the case a
+        // name was created with, while windows_path (and so translate) lowercases every component. Where the host
+        // file system ignores case (Windows hosts), the new entry takes the guest's spelling of its last component and
+        // later lookups through translate still find it. Case-sensitive hosts keep the lowercase name every lookup uses.
+        std::filesystem::path translate_for_creation(const windows_path& win_path, [[maybe_unused]] const std::u16string_view spelled) const
+        {
+            auto host_path = this->translate(win_path);
+#ifdef OS_WINDOWS
+            auto leaf = spelled;
+            while (!leaf.empty() && (leaf.back() == u'\\' || leaf.back() == u'/'))
+            {
+                leaf.remove_suffix(1);
+            }
+            if (const auto separator = leaf.find_last_of(u"\\/"); separator != std::u16string_view::npos)
+            {
+                leaf = leaf.substr(separator + 1);
+            }
+            if (!leaf.empty() && windows_path(std::u16string(leaf)).u16string() == win_path.leaf() &&
+                host_path.filename().u16string() == win_path.leaf())
+            {
+                host_path.replace_filename(std::filesystem::path(std::u16string(leaf)));
+            }
+#endif
+            return host_path;
+        }
+
+        // The part of a guest path after its drive ("\Users\x"), its components in the case the file system keeps for
+        // them, as Windows reports names (GetFinalPathNameByHandle). On Windows hosts that is the host's case of each
+        // existing component (the guest's spelling of components the host lacks or reaches through a link); elsewhere
+        // the guest's spelling.
+        std::u16string true_case(std::u16string_view spelled) const
+        {
+            for (const std::u16string_view prefix : {u"\\??\\", u"\\\\?\\"})
+            {
+                if (spelled.starts_with(prefix))
+                {
+                    spelled.remove_prefix(prefix.size());
+                    break;
+                }
+            }
+            std::u16string drive{};
+            if (spelled.size() >= 2 && spelled[1] == u':')
+            {
+                drive = spelled.substr(0, 2);
+                spelled.remove_prefix(2);
+            }
+
+            std::vector<std::u16string> parts{};
+            size_t start = 0;
+            while (start <= spelled.size())
+            {
+                const auto end = spelled.find_first_of(u"\\/", start);
+                const auto part = spelled.substr(start, end == std::u16string_view::npos ? std::u16string_view::npos : end - start);
+                if (part == u"..")
+                {
+                    if (!parts.empty())
+                    {
+                        parts.pop_back();
+                    }
+                }
+                else if (!part.empty() && part != u".")
+                {
+                    parts.emplace_back(part);
+                }
+                if (end == std::u16string_view::npos)
+                {
+                    break;
+                }
+                start = end + 1;
+            }
+
+#ifdef OS_WINDOWS
+            if (!drive.empty() && !parts.empty())
+            {
+                // The host's spelling of the trailing components that name the same entries.
+                std::error_code ec{};
+                const auto canonical =
+                    std::filesystem::canonical(this->translate(windows_path{drive + u"\\" + std::u16string(spelled)}), ec);
+                if (!ec)
+                {
+                    std::vector<std::u16string> host_parts{};
+                    for (const auto& component : canonical.relative_path())
+                    {
+                        host_parts.emplace_back(component.u16string());
+                    }
+
+                    auto host = host_parts.rbegin();
+                    for (auto part = parts.rbegin(); part != parts.rend() && host != host_parts.rend(); ++part, ++host)
+                    {
+                        if (!utils::string::equals_ignore_case(std::u16string_view{*part}, std::u16string_view{*host}))
+                        {
+                            break;
+                        }
+                        *part = *host;
+                    }
+                }
+            }
+#endif
+
+            std::u16string result{};
+            for (const auto& part : parts)
+            {
+                result += u"\\" + part;
+            }
+            return result.empty() ? u"\\" : result;
         }
 
         template <typename F>
@@ -120,10 +252,36 @@ namespace sogen
         {
             if (is_subpath(base.lexically_normal(), candidate.lexically_normal()))
             {
-                return weakly_canonical(candidate);
+                // weakly_canonical resolves "dir " to "dir" even in the \\?\ form, so such names skip it.
+                auto kept = keep_trailing_spaces_and_dots(candidate);
+                return kept.native() != candidate.native() ? std::move(kept) : weakly_canonical(candidate);
             }
 
             return base;
+        }
+
+        // Windows strips trailing spaces and dots from every component of a host path that is not in the \\?\ form,
+        // so "dir " would open "dir". Guest NT paths keep them (only Win32 path conversion strips them, in the guest),
+        // so a host path with such a component takes the \\?\ form.
+        static std::filesystem::path keep_trailing_spaces_and_dots(std::filesystem::path path)
+        {
+#ifdef OS_WINDOWS
+            const auto& native = path.native();
+            if (!path.is_absolute() || native.starts_with(LR"(\\)"))
+            {
+                return path;
+            }
+
+            for (const auto& component : path.relative_path())
+            {
+                const auto& name = component.native();
+                if (name != L"." && name != L".." && !name.empty() && (name.back() == L' ' || name.back() == L'.'))
+                {
+                    return {LR"(\\?\)" + path.lexically_normal().make_preferred().native()};
+                }
+            }
+#endif
+            return path;
         }
 
         // If a mapped directory is an ancestor of `win_path`, resolve the remaining path against the mapped

@@ -154,4 +154,21 @@ namespace sogen::py
     {
         set(name, nb::none());
     }
+
+    int callback_registry::traverse(const visitproc visit, void* arg) const
+    {
+        for (const auto& slot : callback_slots)
+        {
+            Py_VISIT((this->*slot.member).ptr());
+        }
+        return 0;
+    }
+
+    void callback_registry::clear_all()
+    {
+        for (const auto& slot : callback_slots)
+        {
+            this->*slot.member = nb::none();
+        }
+    }
 }

@@ -90,16 +90,17 @@ namespace sogen
 
         std::unique_ptr<i_socket> socket_wrapper::accept(address& address)
         {
-            sockaddr addr{};
-            socklen_t addrlen = sizeof(sockaddr);
-            const auto s = ::accept(this->socket_.get_socket(), &addr, &addrlen);
+            // Room for any peer: a sockaddr is too small for an IPv6 one (the accept fails with WSAEFAULT).
+            sockaddr_storage addr{};
+            socklen_t addrlen = sizeof(addr);
+            const auto s = ::accept(this->socket_.get_socket(), reinterpret_cast<sockaddr*>(&addr), &addrlen);
 
             if (s == INVALID_SOCKET)
             {
                 return nullptr;
             }
 
-            address.set_address(&addr, addrlen);
+            address.set_address(reinterpret_cast<const sockaddr*>(&addr), addrlen);
 
             return std::make_unique<socket_wrapper>(s);
         }

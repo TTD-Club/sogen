@@ -28,6 +28,8 @@ namespace sogen::py
             sogen::x86_64_emulator* emu{};
             emulator_hook* hook{};
             std::function<void()> remover{};
+            // The hook calls this through a borrowed handle, so that the garbage collector sees the only reference.
+            nb::object callback = nb::none();
 
             hook_state() = default;
             hook_state(sogen::x86_64_emulator& emulator, emulator_hook* hook);
@@ -131,6 +133,7 @@ namespace sogen::py
         explicit api_hook_registry(windows_emulator& emulator);
         ~api_hook_registry();
 
+        int traverse(visitproc visit, void* arg) const;
         void clear();
         void del_item(const std::string& key);
         void set_item(const std::string& key, nb::object callback);
@@ -156,7 +159,10 @@ namespace sogen::py
 
         explicit hook_registry(windows_emulator& emulator);
 
-        hook_handle make_hook(emulator_hook* hook);
+        int traverse(visitproc visit, void* arg) const;
+        void clear();
+
+        hook_handle make_hook(emulator_hook* hook, nb::object callback);
 
         hook_handle memory_execution(nb::object callback);
         hook_handle memory_execution_at(uint64_t address, nb::object callback);
@@ -202,6 +208,8 @@ namespace sogen::py
         // clears the slot. Throws on unknown name or non-callable value.
         void set(std::string_view name, nb::object callable);
         void clear(std::string_view name);
+        int traverse(visitproc visit, void* arg) const;
+        void clear_all();
 
         // Resolves a slot name to the corresponding nb::object member, or returns
         // nullptr if the name is unknown. Used by both `set` and the property
@@ -242,6 +250,9 @@ namespace sogen::py
         sogen_windows_emulator& operator=(sogen_windows_emulator&&) noexcept;
 
         windows_emulator& native() const;
+
+        int traverse(visitproc visit, void* arg) const;
+        void clear_python_references() const;
 
         void start(size_t count = 0) const;
         void stop() const;

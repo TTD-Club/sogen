@@ -24,11 +24,18 @@ namespace sogen
     class memory_manager;
     class linux_memory_manager;
 
+    namespace ttd
+    {
+        // The TTD CPU view's standalone CPU, which maps pages itself (it has no process memory to manage).
+        class view_engine;
+    }
+
     class memory_interface
     {
       public:
         friend memory_manager;
         friend linux_memory_manager;
+        friend ttd::view_engine;
 
         virtual ~memory_interface() = default;
 

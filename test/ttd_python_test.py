@@ -6,6 +6,7 @@ directory. SAMPLE is a host path (host mode), or a guest path when EMULATOR_ARGS
 
 import gc
 import pathlib
+import random
 import re
 import shutil
 import subprocess
@@ -114,6 +115,93 @@ def main() -> None:
             assert "ran since" in str(error), error
         else:
             raise AssertionError("run_to went on after the emulator ran")
+
+        # cpu_at: the registers at a position from the nearest register snapshot and a replay on a standalone CPU. They
+        # equal a full replay's everywhere but right before a thread switch, where cpu_at already has the next
+        # thread's registers. memory_at and read_memory: the bytes at a position from the recorded accesses.
+        assert trace.has_register_snapshots
+        mirror = ttd_format.Trace(cli_trace)
+        snapshot_positions = [entry[0] for entry in mirror.register_snapshots]
+        assert snapshot_positions[0] == 0 and snapshot_positions[-1] == trace.instruction_count, snapshot_positions[:3]
+        assert snapshot_positions == sorted(snapshot_positions) and mirror.mapping_changes, len(mirror.mapping_changes)
+        assert all(base is None or mirror.register_snapshots[base][4] is None for *_, base in mirror.register_snapshots)
+        names = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                 "rip", "rflags"]
+        before_switch = {switch.position - 1 for switch in trace.thread_switches}
+        rng = random.Random(4)
+        positions = {store.position - 1, store.position, load.position, trace.instruction_count}
+        for syscall in trace.syscalls[:15]:
+            positions.update(syscall.position + delta for delta in (-1, 0, 1))
+        for switch in trace.thread_switches[1:8]:
+            positions.update({switch.position, switch.position + 1})
+        positions.update(rng.randrange(1, trace.instruction_count + 1) for _ in range(25))
+        compared = 0
+        for position in sorted(p for p in positions - before_switch if 0 < p <= trace.instruction_count):
+            view = trace.cpu_at(position)
+            assert view.position == position and view.replayed_instructions < 30000, view
+            replay.seek(position)
+            for name in names:
+                register = getattr(sogen.Register, name)
+                assert view.read_register(register) == emulator.read_register(register), (position, name)
+            rsp = view.read_register(sogen.Register.rsp)
+            for index, byte in enumerate(trace.memory_at(position, rsp, 64)):
+                assert byte is None or byte == emulator.read_memory(rsp + index, 1)[0], (position, hex(rsp + index))
+            compared += 1
+        assert compared > 40, compared
+        for position in sorted(before_switch)[:5]:
+            trace.cpu_at(position)
+        assert len(trace.cpu_at(store.position).read_register_bytes(sogen.Register.xmm0)) == 16
+        # The global's old value comes from the image, and no access shows it before the store changes it: the checkpoint
+        # memory does.
+        assert trace.memory_at(store.position - 1, address, 8) == list(OLD_VALUE.to_bytes(8, "little"))
+        assert trace.read_memory(store.position, address, 8) == NEW_VALUE.to_bytes(8, "little")
+        assert trace.read_memory(load.position - 1, address, 8) == NEW_VALUE.to_bytes(8, "little")
+        assert trace.memory_at(store.position, 0x10, 4) == [None] * 4
+        try:
+            trace.read_memory(store.position, 0x10, 4)
+        except ValueError as error:
+            assert "0x10" in str(error), error
+        else:
+            raise AssertionError("read_memory returned bytes no access shows")
+        try:
+            trace.cpu_at(trace.instruction_count + 1)
+        except IndexError:
+            pass
+        else:
+            raise AssertionError("cpu_at went beyond the end of the trace")
+
+        # Keyframes: seeks keep states on the way that later seeks restore, and prepare_seeks keeps them over the whole
+        # trace on several emulators at once. Every state reached from a keyframe equals the one a full replay from the
+        # checkpoint reaches (a second reader with no keyframe budget), including after a fork and in strict seeks.
+        plain = ttd.Trace(cli_trace)
+        plain.keyframe_budget = 0
+        plain_replay = ttd.Replay(plain, ttd.create_emulator(sample, **settings))
+        keyed = ttd.Trace(cli_trace)
+        keyed_replay = ttd.Replay(keyed, keyed_emulator := ttd.create_emulator(sample, **settings))
+        positions = [load.position, load.position - 30000, load.position - 1, store.position, keyed.instruction_count]
+        for position in positions:
+            keyed_replay.seek(position)
+            plain_replay.seek(position)
+            assert keyed_emulator.serialize_state() == plain_replay.emulator.serialize_state(), position
+        assert plain.keyframe_count == 0 and 0 < keyed.keyframe_count <= len(positions), keyed.keyframe_count
+        keyed.prepare_seeks([ttd.create_emulator(sample, **settings) for _ in range(3)])
+        assert keyed.keyframe_count > len(keyed.checkpoints) and keyed.keyframe_memory > 0, keyed.keyframe_count
+        rng = random.Random(1)
+        for position in [rng.randrange(1, keyed.instruction_count + 1) for _ in range(8)] + [store.position - 1]:
+            result = keyed_replay.seek(position)
+            plain_replay.seek(position)
+            assert 0 < position - result.checkpoint < 25000 or position == result.checkpoint, (position, result.checkpoint)
+            assert keyed_emulator.serialize_state() == plain_replay.emulator.serialize_state(), position
+        keyed_emulator.write_memory(address, FORKED_VALUE.to_bytes(8, "little"))
+        keyed_emulator.start(1000)
+        for strict_replay in (keyed_replay, ttd.Replay(keyed, keyed_emulator, strict=True)):
+            strict_replay.seek(load.position)
+            plain_replay.seek(load.position)
+            assert read_u64(keyed_emulator, address) == NEW_VALUE
+            assert keyed_emulator.serialize_state() == plain_replay.emulator.serialize_state()
+        del plain_replay, keyed_replay, strict_replay
+        plain.close()
+        keyed.close()
 
         # The manifest says how a trace was recorded; tools/ttd_format.py reads the same entries.
         manifest = trace.manifest
@@ -290,6 +378,22 @@ def main() -> None:
         assert trace.symbol(calls[0].address + 1, calls[0].position).lower() == "kernel32.dll!virtualquery+0x1"
         assert trace.symbol(store.ip, store.position).lower().startswith(sample_name)
         assert trace.symbol(0x10, store.position) is None and trace.find_exports("kernel32!NoSuchExport") == []
+
+        # Forwarded exports name their targets, API sets resolved, and their calls are the target's.
+        assert [{e.ordinal: e.forwarder for e in m.exports if e.forwarder} for m in modules] == [
+            m.get("forwarders", {}) for m in mirror_trace.modules]
+        forwarded = [e for m in modules for e in m.exports if e.forwarder]
+        assert len(forwarded) > 100 and all("!" in e.forwarder for e in forwarded), forwarded[:5]
+        assert sum(e.forwarder.startswith(("api-", "ext-")) for e in forwarded) < len(forwarded) // 10, forwarded[:5]
+        (kernel32, heap_alloc), = trace.find_exports("kernel32!HeapAlloc")
+        assert heap_alloc.forwarder == "ntdll.dll!RtlAllocateHeap", heap_alloc
+        # Before kernel32 loads, ntdll's function runs but kernel32's name for it does not exist yet.
+        positions = lambda name, start=0: [(c.position, c.address) for c in trace.calls(name, start=start)]
+        allocations = positions("ntdll!RtlAllocateHeap", kernel32.load_position)
+        assert allocations and positions("kernel32!HeapAlloc") == allocations
+        assert positions("HeapAlloc") == positions("RtlAllocateHeap", kernel32.load_position) == allocations
+        assert not (trace.symbol(kernel32.base + heap_alloc.rva, allocations[0][0]) or "").lower().endswith("!heapalloc")
+        assert [(m.name, e.name) for m, e in trace.find_exports(f"kernel32!#{heap_alloc.ordinal}")] == [(kernel32.name, "HeapAlloc")]
 
         # Live input that changes a syscall's outcome: ttd-input.txt exists while recording and is gone for the replay,
         # so NtQueryAttributesFile fails and writes nothing. A strict replay names the syscall; others undo its live

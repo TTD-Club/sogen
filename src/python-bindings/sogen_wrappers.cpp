@@ -12,9 +12,29 @@ namespace sogen::py
     {
     }
 
-    hook_handle hook_registry::make_hook(emulator_hook* hook)
+    int hook_registry::traverse(const visitproc visit, void* arg) const
+    {
+        for (const auto& hook : this->active_hooks)
+        {
+            Py_VISIT(hook.shared_state->callback.ptr());
+        }
+        return this->apis->traverse(visit, arg);
+    }
+
+    void hook_registry::clear()
+    {
+        for (const auto& hook : this->active_hooks)
+        {
+            hook.remove();
+        }
+        this->active_hooks.clear();
+        this->apis->clear();
+    }
+
+    hook_handle hook_registry::make_hook(emulator_hook* hook, nb::object callback)
     {
         hook_handle stored{this->emu->emu(), hook, nb::none()};
+        stored.shared_state->callback = std::move(callback);
         this->active_hooks.emplace_back(stored);
 
         auto exposed = stored;
@@ -24,78 +44,78 @@ namespace sogen::py
 
     hook_handle hook_registry::memory_execution(nb::object callback)
     {
-        auto* hook = this->emu->emu().hook_memory_execution([cb = std::move(callback)](cpu_interface&, uint64_t address) {
+        auto* hook = this->emu->emu().hook_memory_execution([cb = nb::handle(callback)](cpu_interface&, uint64_t address) {
             nb::gil_scoped_acquire gil{};
             cb(address);
         });
-        return make_hook(hook);
+        return make_hook(hook, std::move(callback));
     }
 
     hook_handle hook_registry::memory_execution_at(uint64_t address, nb::object callback)
     {
-        auto* hook = this->emu->emu().hook_memory_execution(address, [cb = std::move(callback)](cpu_interface&, uint64_t addr) {
+        auto* hook = this->emu->emu().hook_memory_execution(address, [cb = nb::handle(callback)](cpu_interface&, uint64_t addr) {
             nb::gil_scoped_acquire gil{};
             cb(addr);
         });
-        return make_hook(hook);
+        return make_hook(hook, std::move(callback));
     }
 
     hook_handle hook_registry::memory_read(uint64_t address, uint64_t size, nb::object callback)
     {
         auto* hook = this->emu->emu().hook_memory_read(
-            address, size, [cb = std::move(callback)](cpu_interface&, uint64_t addr, const void* data, size_t length) {
+            address, size, [cb = nb::handle(callback)](cpu_interface&, uint64_t addr, const void* data, size_t length) {
                 nb::gil_scoped_acquire gil{};
                 cb(addr, nb::bytes(static_cast<const char*>(data), static_cast<nb::ssize_t>(length)));
             });
-        return make_hook(hook);
+        return make_hook(hook, std::move(callback));
     }
 
     hook_handle hook_registry::memory_write(uint64_t address, uint64_t size, nb::object callback)
     {
         auto* hook = this->emu->emu().hook_memory_write(
-            address, size, [cb = std::move(callback)](cpu_interface&, uint64_t addr, const void* data, size_t length) {
+            address, size, [cb = nb::handle(callback)](cpu_interface&, uint64_t addr, const void* data, size_t length) {
                 nb::gil_scoped_acquire gil{};
                 cb(addr, nb::bytes(static_cast<const char*>(data), static_cast<nb::ssize_t>(length)));
             });
-        return make_hook(hook);
+        return make_hook(hook, std::move(callback));
     }
 
     hook_handle hook_registry::instruction(x86_hookable_instructions instruction_type, nb::object callback)
     {
-        auto* hook = this->emu->emu().hook_instruction(instruction_type, [cb = std::move(callback)](cpu_interface&, uint64_t data) {
+        auto* hook = this->emu->emu().hook_instruction(instruction_type, [cb = nb::handle(callback)](cpu_interface&, uint64_t data) {
             nb::gil_scoped_acquire gil{};
             return coerce_instruction_continuation(cb(data));
         });
-        return make_hook(hook);
+        return make_hook(hook, std::move(callback));
     }
 
     hook_handle hook_registry::interrupt(nb::object callback)
     {
-        auto* hook = this->emu->emu().hook_interrupt([cb = std::move(callback)](cpu_interface&, int interrupt) {
+        auto* hook = this->emu->emu().hook_interrupt([cb = nb::handle(callback)](cpu_interface&, int interrupt) {
             nb::gil_scoped_acquire gil{};
             cb(interrupt);
         });
-        return make_hook(hook);
+        return make_hook(hook, std::move(callback));
     }
 
     hook_handle hook_registry::memory_violation(nb::object callback)
     {
         auto* hook =
-            this->emu->emu().hook_memory_violation([cb = std::move(callback)](cpu_interface&, uint64_t address, size_t size,
-                                                                              memory_operation operation, memory_violation_type type) {
+            this->emu->emu().hook_memory_violation([cb = nb::handle(callback)](cpu_interface&, uint64_t address, size_t size,
+                                                                               memory_operation operation, memory_violation_type type) {
                 nb::gil_scoped_acquire gil{};
                 return coerce_memory_violation_continuation(cb(address, size, operation, type));
             });
-        return make_hook(hook);
+        return make_hook(hook, std::move(callback));
     }
 
     hook_handle hook_registry::basic_block(nb::object callback)
     {
-        auto* hook = this->emu->emu().hook_basic_block([cb = std::move(callback)](cpu_interface&, const sogen::basic_block& block) {
+        auto* hook = this->emu->emu().hook_basic_block([cb = nb::handle(callback)](cpu_interface&, const sogen::basic_block& block) {
             nb::gil_scoped_acquire gil{};
             cb(block);
         });
-        return make_hook(hook);
+        return make_hook(hook, std::move(callback));
     }
 
     // ----- sogen_process_context -----
@@ -157,6 +177,30 @@ namespace sogen::py
     windows_emulator& sogen_windows_emulator::native() const
     {
         return *this->emu;
+    }
+
+    int sogen_windows_emulator::traverse(const visitproc visit, void* arg) const
+    {
+        if (this->callbacks)
+        {
+            if (const auto result = this->callbacks->traverse(visit, arg))
+            {
+                return result;
+            }
+        }
+        return this->hooks ? this->hooks->traverse(visit, arg) : 0;
+    }
+
+    void sogen_windows_emulator::clear_python_references() const
+    {
+        if (this->callbacks)
+        {
+            this->callbacks->clear_all();
+        }
+        if (this->hooks)
+        {
+            this->hooks->clear();
+        }
     }
 
     void sogen_windows_emulator::start(const size_t count) const

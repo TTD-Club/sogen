@@ -102,15 +102,23 @@ namespace sogen
             buffer.write(mod.size_of_heap_reserve);
             buffer.write(mod.size_of_heap_commit);
 
-            buffer.write_vector(mod.exports);
-            buffer.write_map(mod.address_names);
+            if (!mod.serialized_symbols)
+            {
+                buffer_serializer symbols{};
+                symbols.write_vector(mod.exports);
+                symbols.write_map(mod.address_names);
+                mod.serialized_symbols = std::make_shared<const std::vector<std::byte>>(symbols.move_buffer());
+            }
+            buffer.append_serialized(*mod.serialized_symbols);
 
             buffer.write_vector(mod.sections);
 
             buffer.write(mod.is_static);
         }
 
-        static void deserialize(buffer_deserializer& buffer, mapped_module& mod)
+        // Takes the symbols of the module previously mapped at the same base when they serialized identically, which
+        // makes restoring a state with the modules already loaded cheap.
+        static void deserialize(buffer_deserializer& buffer, mapped_module& mod, module_manager::module_map& previous)
         {
             buffer.read(mod.name);
             buffer.read(mod.path);
@@ -128,8 +136,22 @@ namespace sogen
             buffer.read(mod.size_of_heap_reserve);
             buffer.read(mod.size_of_heap_commit);
 
-            buffer.read_vector(mod.exports);
-            buffer.read_map(mod.address_names);
+            const auto earlier = previous.find(mod.image_base);
+            if (earlier != previous.end() && earlier->second.serialized_symbols &&
+                buffer.skip_serialized(*earlier->second.serialized_symbols))
+            {
+                mod.exports = std::move(earlier->second.exports);
+                mod.address_names = std::move(earlier->second.address_names);
+                mod.serialized_symbols = std::move(earlier->second.serialized_symbols);
+            }
+            else
+            {
+                const auto symbols_offset = buffer.get_offset();
+                buffer.read_vector(mod.exports);
+                buffer.read_map(mod.address_names);
+                const auto symbols = buffer.read_since(symbols_offset);
+                mod.serialized_symbols = std::make_shared<const std::vector<std::byte>>(symbols.begin(), symbols.end());
+            }
 
             buffer.read_vector(mod.sections);
 
@@ -595,7 +617,16 @@ namespace sogen
 
     void module_manager::deserialize(utils::buffer_deserializer& buffer)
     {
-        buffer.read_map(this->modules_);
+        auto previous = std::move(this->modules_);
+        this->modules_.clear();
+        const auto module_count = buffer.read<uint64_t>();
+        for (uint64_t i = 0; i < module_count; ++i)
+        {
+            const auto base = buffer.read<uint64_t>();
+            mapped_module mod{};
+            utils::deserialize(buffer, mod, previous);
+            this->modules_.emplace(base, std::move(mod));
+        }
         buffer.read_map(this->modules_load_count);
         this->last_module_cache_ = this->modules_.end();
 
