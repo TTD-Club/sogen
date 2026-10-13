@@ -50,9 +50,8 @@ def main() -> None:
         assert (write_step, write_ip) in query("execute", write_ip, 1)
         assert (read_step, read_ip) in query("execute", read_ip, 1)
 
-        def seek(position: int) -> tuple[int, int]:
-            output = run("--ttd-replay", trace, "--ttd-seek", hex(position), "--ttd-read", hex(address), *emulator_args,
-                         sample)
+        def seek(position: int, read: int = address) -> tuple[int, int]:
+            output = run("--ttd-replay", trace, "--ttd-seek", hex(position), "--ttd-read", hex(read), *emulator_args, sample)
             rip = int(re.search(r"TTD position [0-9a-f]+:0 RIP ([0-9a-f]+)", output).group(1), 16)
             value = int(re.search(r"TTD memory [0-9a-f]+ = ([0-9a-f]+)", output).group(1), 16)
             return rip, value
@@ -80,6 +79,18 @@ def main() -> None:
         # Replaying each checkpoint interval from the previous checkpoint must reach exactly the recorded state.
         verified = run("--ttd-replay", trace, "--ttd-verify-checkpoints", *emulator_args, sample)
         assert verified.count(" matches ") == checkpoint_count, verified
+
+        # RDRAND and RDSEED do not give the guest host randomness: their results differ from each other, and a replay
+        # gets the recorded ones.
+        random = int(re.search(r"ttd-random ([0-9A-Fa-f]+)", recording).group(1), 16)
+        random_writes = run("--ttd-query", trace, "--ttd-access", "write", "--ttd-address", hex(random), "--ttd-size", "32")
+        stored = [(int(step, 16), int.from_bytes(bytes.fromhex(data), "little")) for step, data in
+                  re.findall(r"^([0-9a-f]+):0 ip=[0-9a-f]+ address=[0-9a-f]+ size=8 data=([0-9a-f]+)$", random_writes, re.M)]
+        assert len(stored) == 4, random_writes
+        values = [value for _, value in stored]
+        assert len(set(values)) == len(values) and values[2] >> 16 == 0x89AB, [hex(value) for value in values]
+        for index, (step, value) in enumerate(stored):
+            assert seek(step, random + 8 * index)[1] == value, (index, hex(value))
 
         store_chunk = next(index for index, (_, _, first, last, _, _) in enumerate(recorded.chunks) if first <= write_step <= last)
         chunk_events = recorded.chunk_events(store_chunk)

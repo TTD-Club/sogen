@@ -52,6 +52,90 @@ namespace sogen::ttd
             return decoded.empty() ? 1 : static_cast<size_t>(decoded[0].size);
         }
 
+        uint64_t mix_position(uint64_t position)
+        {
+            position += 0x9E3779B97F4A7C15;
+            position = (position ^ (position >> 30)) * 0xBF58476D1CE4E5B9;
+            position = (position ^ (position >> 27)) * 0x94D049BB133111EB;
+            return position ^ (position >> 31);
+        }
+
+        // TTD's CPUID hides RDRAND (cpuid_override), yet the backend runs RDRAND and RDSEED for a guest that executes
+        // them anyway, and Unicorn's helper returns host randomness outside MSVC builds (a constant in them). Recordings
+        // and replays run them here instead, before the backend does: the result derives from the position, with the
+        // flags of a successful call. Both only exist with a register operand (0F C7 /6 and /7); with a LOCK or REP
+        // prefix the backend raises #UD.
+        void run_random_instruction(windows_emulator& emu, const uint64_t address, const std::span<const uint8_t> instruction)
+        {
+            constexpr std::array<uint8_t, 6> segment_prefixes{0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65};
+            size_t offset = 0;
+            size_t operand_size = 4;
+            for (; offset < instruction.size(); ++offset)
+            {
+                if (instruction[offset] == 0x66)
+                {
+                    operand_size = 2;
+                }
+                else if (std::ranges::find(segment_prefixes, instruction[offset]) == segment_prefixes.end())
+                {
+                    break;
+                }
+            }
+            uint8_t rex = 0;
+            if (offset < instruction.size() && (instruction[offset] & 0xF0) == 0x40)
+            {
+                rex = instruction[offset++];
+            }
+            if (instruction.size() - offset != 3 || instruction[offset] != 0x0F || instruction[offset + 1] != 0xC7)
+            {
+                return;
+            }
+            const auto modrm = instruction[offset + 2];
+            const auto operation = (modrm >> 3) & 7;
+            if ((modrm >> 6) != 3 || (operation != 6 && operation != 7))
+            {
+                return;
+            }
+
+            constexpr std::array registers{x86_register::rax, x86_register::rcx, x86_register::rdx, x86_register::rbx,
+                                           x86_register::rsp, x86_register::rbp, x86_register::rsi, x86_register::rdi,
+                                           x86_register::r8,  x86_register::r9,  x86_register::r10, x86_register::r11,
+                                           x86_register::r12, x86_register::r13, x86_register::r14, x86_register::r15};
+            const auto destination = registers[(modrm & 7) | ((rex & 1) << 3)];
+            if (rex & 8)
+            {
+                operand_size = 8;
+            }
+
+            auto& cpu = emu.emu();
+            const auto value = mix_position(emu.get_executed_instructions());
+            auto result = value;
+            if (operand_size == 4)
+            {
+                result = static_cast<uint32_t>(value);
+            }
+            else if (operand_size == 2)
+            {
+                result = (cpu.reg<uint64_t>(destination) & ~0xFFFFULL) | (value & 0xFFFF);
+            }
+            cpu.reg<uint64_t>(destination, result);
+
+            constexpr uint32_t carry_flag = 0x1;
+            constexpr uint32_t status_flags = 0x8D5;
+            cpu.reg<uint32_t>(x86_register::eflags, (cpu.reg<uint32_t>(x86_register::eflags) & ~status_flags) | carry_flag);
+            cpu.reg<uint64_t>(x86_register::rip, address + instruction.size());
+        }
+
+        void run_random_instruction(windows_emulator& emu, const uint64_t address, const size_t size)
+        {
+            std::array<uint8_t, max_instruction_size> instruction{};
+            const auto length = std::min(size, instruction.size());
+            if (emu.emu().try_read_memory(address, instruction.data(), length))
+            {
+                run_random_instruction(emu, address, std::span(instruction).first(length));
+            }
+        }
+
         template <typename T>
         std::optional<PEDirectory_t2> read_export_directory(const memory_manager& memory, const uint64_t base, const uint64_t offset)
         {
@@ -275,24 +359,28 @@ namespace sogen::ttd
                     append_data_event(access_kind::read, address, data);
                 }));
         }
-        if (access_mask & static_cast<uint64_t>(access_kind::execute))
+        // Without execute events, instructions are still looked at for RDRAND and RDSEED.
+        const auto record_execute = [this](const uint64_t address, const size_t size) {
+            const auto length = executed_size(emu_, address, size);
+            if (!tracks_instructions_)
+            {
+                run_random_instruction(emu_, address, length);
+                return;
+            }
+            const auto instruction = append_event(access_kind::execute, address, length);
+            run_random_instruction(emu_, address, std::span(instruction).first(std::min(length, instruction.size())));
+        };
+        // With instruction precision the emulator already handles every instruction; its callback saves the backend a
+        // second hook call per instruction.
+        if (emu_.uses_instruction_precision())
         {
-            const auto record_execute = [this](const uint64_t address, const size_t size) {
-                append_event(access_kind::execute, address, executed_size(emu_, address, size));
-            };
-            // With instruction precision the emulator already handles every instruction; its callback saves the backend
-            // a second hook call per instruction.
-            if (emu_.uses_instruction_precision())
-            {
-                instruction_callback_ = instruction_callback(emu_.callbacks.on_instruction_executed, record_execute);
-            }
-            else
-            {
-                execute_hook_ = scoped_hook(
-                    cpu, cpu.hook_memory_execution_metadata([record_execute](cpu_interface&, const uint64_t address, const size_t size) {
-                        record_execute(address, size);
-                    }));
-            }
+            instruction_callback_ = instruction_callback(emu_.callbacks.on_instruction_executed, record_execute);
+        }
+        else
+        {
+            execute_hook_ = scoped_hook(
+                cpu, cpu.hook_memory_execution_metadata(
+                         [record_execute](cpu_interface&, const uint64_t address, const size_t size) { record_execute(address, size); }));
         }
         if (access_mask & static_cast<uint64_t>(access_kind::host_write))
         {
@@ -515,11 +603,11 @@ namespace sogen::ttd
         }
     }
 
-    void recorder::append_event(access_kind kind, uint64_t address, size_t size)
+    std::array<uint8_t, inline_data_limit> recorder::append_event(access_kind kind, uint64_t address, size_t size)
     {
         if (!size)
         {
-            return;
+            return {};
         }
         // The backend reports an instruction before running it, with the instruction pointer at its address.
         instruction_ip_ = address;
@@ -582,6 +670,7 @@ namespace sogen::ttd
             chunk_code_ids_.push_back(code_.id_of(event));
         }
         push_event(event);
+        return event.payload;
     }
 
     void recorder::forget_instructions(const uint64_t address, const uint64_t size)
@@ -1033,23 +1122,29 @@ namespace sogen::ttd
                     verify(access_kind::read, address, data.size(), data);
                 }));
         }
-        if (access_mask_ & static_cast<uint64_t>(access_kind::execute))
+        // As in the recorder, also without execute events.
+        const auto verify_execute = [this](const uint64_t address, const size_t size) {
+            const auto length = executed_size(emu_, address, size);
+            if (access_mask_ & static_cast<uint64_t>(access_kind::execute))
+            {
+                verify(access_kind::execute, address, length);
+            }
+            if (!error_)
+            {
+                const auto instruction = instruction_bytes(address, length);
+                run_random_instruction(emu_, address, std::span(instruction).first(std::min(length, instruction.size())));
+            }
+        };
+        // As in the recorder: with instruction precision, the emulator's own per-instruction callback.
+        if (emu_.uses_instruction_precision())
         {
-            const auto verify_execute = [this](const uint64_t address, const size_t size) {
-                verify(access_kind::execute, address, executed_size(emu_, address, size));
-            };
-            // As in the recorder: with instruction precision, the emulator's own per-instruction callback.
-            if (emu_.uses_instruction_precision())
-            {
-                instruction_callback_ = instruction_callback(emu_.callbacks.on_instruction_executed, verify_execute);
-            }
-            else
-            {
-                execute_hook_ = scoped_hook(
-                    cpu, cpu.hook_memory_execution_metadata([verify_execute](cpu_interface&, const uint64_t address, const size_t size) {
-                        verify_execute(address, size);
-                    }));
-            }
+            instruction_callback_ = instruction_callback(emu_.callbacks.on_instruction_executed, verify_execute);
+        }
+        else
+        {
+            execute_hook_ = scoped_hook(
+                cpu, cpu.hook_memory_execution_metadata(
+                         [verify_execute](cpu_interface&, const uint64_t address, const size_t size) { verify_execute(address, size); }));
         }
         if (access_mask_ & static_cast<uint64_t>(access_kind::host_write))
         {

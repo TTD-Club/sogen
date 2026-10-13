@@ -27,7 +27,8 @@ namespace sogen::ttd
 
     // The CPUID results Sogen's tools report instead of executing CPUID. A recording depends on them, so every tool that
     // records or replays a trace reports the same ones, with RDRAND hidden: Unicorn serves it from the host's random
-    // source outside MSVC builds, which a replay cannot repeat.
+    // source outside MSVC builds, which a replay cannot repeat. Guests that execute RDRAND or RDSEED anyway get values
+    // the recorder and the replay verifier derive from the position.
     std::optional<cpuid_result> cpuid_override(uint32_t leaf, bool hide_rdrand);
 
     // Hooks CPUID with the overrides (RDRAND hidden) on an emulator that nothing else hooks CPUID on, for recording or

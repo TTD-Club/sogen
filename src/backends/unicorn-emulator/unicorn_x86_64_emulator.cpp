@@ -321,6 +321,10 @@ namespace sogen::unicorn
             {
                 auto result_size = size;
                 ++this->register_generation_;
+                if (reg == UC_X86_REG_RIP || reg == UC_X86_REG_EIP || reg == UC_X86_REG_IP)
+                {
+                    this->violation_ip_ = std::nullopt;
+                }
                 uce(uc_reg_write2(*this, reg, value, &result_size));
 
                 if (size < result_size)
@@ -855,6 +859,7 @@ namespace sogen::unicorn
 
                 this->touch_memory();
                 ++this->register_generation_;
+                this->violation_ip_ = std::nullopt;
                 const uc_context_serializer serializer(this->uc_, is_snapshot);
                 serializer.deserialize(buffer);
             }
@@ -889,6 +894,7 @@ namespace sogen::unicorn
             {
                 utils::buffer_deserializer buffer{register_data};
                 ++this->register_generation_;
+                this->violation_ip_ = std::nullopt;
                 const uc_context_serializer serializer(this->uc_, false);
                 serializer.deserialize(buffer);
             }

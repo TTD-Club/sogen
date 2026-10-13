@@ -1,8 +1,8 @@
 // Fixture for test/ttd_step_test.py: one store and one load of a known global, one syscall that writes its output
-// into a known global, code written at runtime and then executed, a ud2 that raises an exception, a string that
-// only exists transiently, the attributes of an input file the tests create and delete (live host input), and a
-// window that briefly waits for WM_APP (test/ttd_python_test.py injects one). The addresses are printed so the tests
-// can locate the matching trace events.
+// into a known global, code written at runtime and then executed, a ud2 that raises an exception, RDRAND and RDSEED
+// results kept in a known global, a string that only exists transiently, the attributes of an input file the tests
+// create and delete (live host input), and a window that briefly waits for WM_APP (test/ttd_python_test.py injects
+// one). The addresses are printed so the tests can locate the matching trace events.
 
 #include <array>
 #include <cstdint>
@@ -23,6 +23,40 @@ namespace
 
     // mov eax, 42; ret
     constexpr std::array<uint8_t, 6> generated_code{0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};
+
+    // CPUID hides RDRAND under TTD, but a guest may execute it and RDSEED anyway. Each one returns its result in
+    // EAX/RAX, or 0 when CF reports a failure.
+    // rdrand eax; jc +2; xor eax, eax; ret
+    constexpr std::array<uint8_t, 8> rdrand_eax{0x0F, 0xC7, 0xF0, 0x72, 0x02, 0x31, 0xC0, 0xC3};
+    // rdseed ecx; jc +2; xor ecx, ecx; mov eax, ecx; ret
+    constexpr std::array<uint8_t, 10> rdseed_ecx{0x0F, 0xC7, 0xF9, 0x72, 0x02, 0x31, 0xC9, 0x89, 0xC8, 0xC3};
+    // mov eax, 0x89ABCDEF; rdrand ax; ret (the upper half of EAX must stay)
+    constexpr std::array<uint8_t, 10> rdrand_ax{0xB8, 0xEF, 0xCD, 0xAB, 0x89, 0x66, 0x0F, 0xC7, 0xF0, 0xC3};
+#ifdef _WIN64
+    // rdrand r9; jc +3; xor r9d, r9d; mov rax, r9; ret
+    constexpr std::array<uint8_t, 13> rdrand_r9{0x49, 0x0F, 0xC7, 0xF1, 0x72, 0x03, 0x45, 0x31, 0xC9, 0x4C, 0x89, 0xC8, 0xC3};
+#endif
+
+    std::array<volatile uint64_t, 4> ttd_random{};
+
+    template <size_t Size>
+    uint64_t run_generated(uint8_t* code, const std::array<uint8_t, Size>& bytes)
+    {
+        memcpy(code, bytes.data(), bytes.size());
+        return reinterpret_cast<uint64_t (*)()>(code)();
+    }
+
+    // The results stay in ttd_random for the tests, which compare them across the recording and its replays.
+    bool run_random_instructions(uint8_t* code)
+    {
+        ttd_random[0] = static_cast<uint32_t>(run_generated(code, rdrand_eax));
+        ttd_random[1] = static_cast<uint32_t>(run_generated(code, rdseed_ecx));
+        ttd_random[2] = static_cast<uint32_t>(run_generated(code, rdrand_ax));
+#ifdef _WIN64
+        ttd_random[3] = run_generated(code, rdrand_r9);
+#endif
+        return ttd_random[0] && ttd_random[1] && (ttd_random[2] >> 16) == 0x89AB;
+    }
 
     constexpr std::string_view transient_text = "SOGEN_TTD_TRANSIENT_STRING_FOR_RECOVERY";
     std::array<volatile char, transient_text.size() + 1> transient{};
@@ -112,7 +146,8 @@ int main()
 {
     auto* code = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     auto* illegal = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!code || !illegal)
+    auto* random_code = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!code || !illegal || !random_code)
     {
         return 4;
     }
@@ -122,6 +157,8 @@ int main()
     printf("ttd-code %p\n", static_cast<void*>(code));
     printf("ttd-ud2 %p\n", static_cast<void*>(illegal));
     printf("ttd-input %p\n", static_cast<void*>(const_cast<DWORD*>(&ttd_input_attributes)));
+    printf("ttd-random %p\n", static_cast<void*>(const_cast<uint64_t*>(ttd_random.data())));
+    printf("ttd-random-code %p\n", static_cast<void*>(random_code));
     std::array<int, 4> cpu_info{};
     __cpuid(cpu_info.data(), 1);
     printf("ttd-rdrand %d\n", (cpu_info[2] >> 30) & 1);
@@ -147,6 +184,11 @@ int main()
     if (!raises_illegal_instruction(illegal))
     {
         return 5;
+    }
+
+    if (!run_random_instructions(random_code))
+    {
+        return 6;
     }
 
     for (size_t i = 0; i < transient_text.size(); ++i)

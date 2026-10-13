@@ -240,7 +240,7 @@ namespace sogen::ttd
         scoped_hook host_write_hook_{};
         bool finished_{};
 
-        void append_event(access_kind kind, uint64_t address, size_t size);
+        std::array<uint8_t, inline_data_limit> append_event(access_kind kind, uint64_t address, size_t size);
         void append_data_event(access_kind kind, uint64_t address, std::span<const std::byte> data);
         void push_event(const access_event& event);
         void flush_chunk();

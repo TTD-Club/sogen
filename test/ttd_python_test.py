@@ -134,6 +134,11 @@ def main() -> None:
             positions.update(syscall.position + delta for delta in (-1, 0, 1))
         for switch in trace.thread_switches[1:8]:
             positions.update({switch.position, switch.position + 1})
+        random_code = int(re.search(r"ttd-random-code ([0-9A-Fa-f]+)", recording).group(1), 16)
+        random_instructions = [event.position for event in trace.accesses(random_code, 0x1000, kinds=ttd.EXECUTE)
+                               if bytes(event.data[-3:-1]) == b"\x0f\xc7"]
+        assert len(random_instructions) == 4, random_instructions
+        positions.update(position + delta for position in random_instructions for delta in (-1, 0, 1))
         positions.update(rng.randrange(1, trace.instruction_count + 1) for _ in range(25))
         compared = 0
         for position in sorted(p for p in positions - before_switch if 0 < p <= trace.instruction_count):
