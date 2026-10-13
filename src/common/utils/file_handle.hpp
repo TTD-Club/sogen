@@ -245,8 +245,18 @@ namespace sogen
 
                 if (this->deferred_rename_ && !this->deferred_delete_)
                 {
+                    const auto& [old_filepath, new_filepath] = *this->deferred_rename_;
                     std::error_code ec{};
-                    std::filesystem::rename(this->deferred_rename_->old_filepath, this->deferred_rename_->new_filepath, ec);
+#ifndef OS_WINDOWS
+                    // Windows lets a directory replace a file; POSIX rename refuses (ENOTDIR).
+                    const auto target = std::filesystem::symlink_status(new_filepath, ec);
+                    if (std::filesystem::is_directory(old_filepath, ec) && std::filesystem::exists(target) &&
+                        !std::filesystem::is_directory(target))
+                    {
+                        std::filesystem::remove(new_filepath, ec);
+                    }
+#endif
+                    std::filesystem::rename(old_filepath, new_filepath, ec);
                     this->deferred_rename_ = {};
                 }
 
