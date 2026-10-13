@@ -7,6 +7,7 @@
 #include <string_view>
 #include <serialization_helper.hpp>
 #include <utils/file_handle.hpp>
+#include <utils/stat.hpp>
 #include <platform/synchronisation.hpp>
 #include <platform/win_pefile.hpp>
 #include <platform/window.hpp>
@@ -783,6 +784,8 @@ namespace sogen
         uint8_t drive_number{'c' - 'a' + 1};
         // The guest name a pending rename (done at close) moves it to, empty for none.
         std::u16string renamed_to{};
+        // Opened as the host reparse point itself (compat_open_reparse_point), which the host cannot follow.
+        bool host_reparse_point{};
 
         bool is_file() const
         {
@@ -805,6 +808,7 @@ namespace sogen
             buffer.write(this->file_mode);
             buffer.write(this->drive_number);
             buffer.write(this->renamed_to);
+            buffer.write(this->host_reparse_point);
 
             const auto has_handle = static_cast<bool>(this->handle);
             buffer.write(has_handle);
@@ -826,6 +830,7 @@ namespace sogen
             buffer.read(this->file_mode);
             buffer.read(this->drive_number);
             buffer.read(this->renamed_to);
+            buffer.read(this->host_reparse_point);
 
             const auto has_handle = buffer.read<bool>();
 
@@ -834,6 +839,10 @@ namespace sogen
             if (has_handle)
             {
                 const auto open = [this](const std::u16string& mode) {
+                    if (this->host_reparse_point)
+                    {
+                        return compat_open_reparse_point(this->host_path, mode.find_first_of(u"+wa") != std::u16string::npos);
+                    }
 #if defined(OS_WINDOWS)
                     return _wfopen(this->host_path.c_str(), reinterpret_cast<const wchar_t*>(mode.c_str()));
 #else

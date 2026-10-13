@@ -2,6 +2,7 @@
 
 #include <platform/platform.hpp>
 
+#include <cstdio>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -46,6 +47,10 @@ namespace sogen
 
     // The REPARSE_DATA_BUFFER of a host reparse point (Windows hosts only), nothing for other entries.
     std::optional<std::vector<uint8_t>> compat_reparse_data(const std::filesystem::path& path);
+
+    // Opens a host reparse point itself rather than what it leads to, for reparse points the host cannot follow (an
+    // app execution alias). Windows hosts only; nullptr elsewhere.
+    FILE* compat_open_reparse_point(const std::filesystem::path& path, bool writable);
 
     LARGE_INTEGER convert_timespec_to_filetime(timespec timespec);
 } // namespace sogen

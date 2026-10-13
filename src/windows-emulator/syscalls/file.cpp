@@ -2546,6 +2546,77 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        // A host reparse point that is there but cannot be followed: an app execution alias, whose tag no file system
+        // filter handles (std::filesystem::exists fails on it). Junctions and symbolic links are followed by the host, or
+        // dangle, which is a missing file.
+        static bool is_unfollowable_host_reparse_point(const syscall_context& c, const std::u16string& name,
+                                                       const std::filesystem::path& host_path)
+        {
+            std::error_code ec{};
+            if (!std::filesystem::exists(std::filesystem::symlink_status(host_path, ec)))
+            {
+                return false;
+            }
+
+            const auto tag = reparse_tag_at(c, name);
+            return tag != 0 && tag != io_reparse_tag_mount_point && tag != io_reparse_tag_symlink;
+        }
+
+        // Windows opens such a reparse point only as itself (FILE_OPEN_REPARSE_POINT); following it fails with
+        // STATUS_IO_REPARSE_TAG_NOT_HANDLED (ERROR_CANT_ACCESS_FILE), which CPython's stat retries without following.
+        static NTSTATUS open_host_reparse_point(const syscall_context& c, const emulator_object<handle> file_handle, file f,
+                                                const std::filesystem::path& host_path, const ULONG create_disposition,
+                                                const ULONG create_options)
+        {
+            constexpr auto status_io_reparse_tag_not_handled = static_cast<NTSTATUS>(0xC0000279);
+            if (!(create_options & file_open_reparse_point))
+            {
+                return status_io_reparse_tag_not_handled;
+            }
+
+            if (create_options & FILE_DIRECTORY_FILE)
+            {
+                return STATUS_NOT_A_DIRECTORY;
+            }
+
+            if (create_disposition == FILE_CREATE)
+            {
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+
+            if (create_disposition != FILE_OPEN && create_disposition != FILE_OPEN_IF)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            if (const auto status = check_share_access(c.proc, host_path, f.access_mask, f.share_access); status != STATUS_SUCCESS)
+            {
+                return status;
+            }
+
+            c.win_emu.callbacks.on_generic_access("Opening file", f.name);
+
+            auto mode = map_mode(f.access_mask, create_disposition);
+            if (mode.empty())
+            {
+                mode = u"rb";
+            }
+
+            auto* native_file = compat_open_reparse_point(host_path, mode != u"rb");
+            if (!native_file)
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+
+            f.handle = native_file;
+            f.open_mode = std::move(mode);
+            f.host_path = host_path;
+            f.host_reparse_point = true;
+
+            file_handle.write(c.proc.files.store(std::move(f)));
+            return STATUS_SUCCESS;
+        }
+
         static NTSTATUS create_file(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
                                     const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
                                     const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, ULONG share_access,
@@ -2731,6 +2802,11 @@ namespace sogen
 
             const auto host_path = c.win_emu.file_sys.translate(path);
             const bool file_exists = std::filesystem::exists(host_path, ec);
+
+            if (!file_exists && is_unfollowable_host_reparse_point(c, f.name, host_path))
+            {
+                return open_host_reparse_point(c, file_handle, std::move(f), host_path, create_disposition, create_options);
+            }
 
             // Opening an existing file or directory must agree with the share modes of its other opens (deleting a
             // file another handle holds without FILE_SHARE_DELETE fails, as it does on Windows).

@@ -5,6 +5,7 @@
 
 #if defined(_WIN32) && !defined(__MINGW64__)
 #include <corecrt_io.h>
+#include <fcntl.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -92,9 +93,17 @@ namespace sogen
             return false;
         }
 
-        auto* const file_handle =
-            CreateFileW(file_name.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        constexpr DWORD share_all = FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE;
+        auto* file_handle =
+            CreateFileW(file_name.c_str(), FILE_READ_ATTRIBUTES, share_all, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+
+        // A reparse point no filter handles (an app execution alias) has no target to stat; Windows reports the
+        // entry itself, as for its attributes.
+        if (file_handle == INVALID_HANDLE_VALUE && GetLastError() == ERROR_CANT_ACCESS_FILE)
+        {
+            file_handle = CreateFileW(file_name.c_str(), FILE_READ_ATTRIBUTES, share_all, nullptr, OPEN_EXISTING,
+                                      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        }
 
         if (file_handle == INVALID_HANDLE_VALUE)
         {
@@ -299,6 +308,38 @@ namespace sogen
 #else
         (void)path;
         return std::nullopt;
+#endif
+    }
+
+    FILE* compat_open_reparse_point(const std::filesystem::path& path, const bool writable)
+    {
+#if defined(_WIN32) && !defined(__MINGW64__)
+        auto* const handle =
+            CreateFileW(path.c_str(), GENERIC_READ | (writable ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return nullptr;
+        }
+
+        const auto fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | (writable ? _O_RDWR : _O_RDONLY));
+        if (fd == -1)
+        {
+            CloseHandle(handle);
+            return nullptr;
+        }
+
+        auto* const file = _fdopen(fd, writable ? "r+b" : "rb");
+        if (!file)
+        {
+            _close(fd);
+        }
+
+        return file;
+#else
+        (void)path;
+        (void)writable;
+        return nullptr;
 #endif
     }
 } // namespace sogen

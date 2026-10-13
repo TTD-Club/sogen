@@ -893,6 +893,72 @@ namespace
         return true;
     }
 
+    // An app execution alias (IO_REPARSE_TAG_APPEXECLINK) opens only as itself; following it fails with
+    // ERROR_CANT_ACCESS_FILE. Skipped where the user has no aliases (an emulation root).
+    bool test_app_execution_alias()
+    {
+        std::array<wchar_t, MAX_PATH> local_app_data{};
+        if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data.data(), static_cast<DWORD>(local_app_data.size())))
+        {
+            return true;
+        }
+
+        const std::wstring directory = std::wstring(local_app_data.data()) + L"\\Microsoft\\WindowsApps\\";
+        WIN32_FIND_DATAW entry{};
+        auto* const find = FindFirstFileW((directory + L"*.exe").c_str(), &entry);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            return true;
+        }
+
+        std::wstring alias{};
+        do
+        {
+            if ((entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && entry.dwReserved0 == IO_REPARSE_TAG_APPEXECLINK)
+            {
+                alias = directory + entry.cFileName;
+                break;
+            }
+        } while (FindNextFileW(find, &entry));
+        FindClose(find);
+
+        if (alias.empty())
+        {
+            return true;
+        }
+
+        auto* const followed = CreateFileW(alias.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        const auto follow_error = GetLastError();
+        if (followed != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(followed);
+        }
+
+        auto* const handle = CreateFileW(alias.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            printf("Opening the alias itself failed (%lu)\n", GetLastError());
+            return false;
+        }
+
+        FILE_ATTRIBUTE_TAG_INFO tag_info{};
+        const auto got_tag = GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag_info, sizeof(tag_info));
+        CloseHandle(handle);
+
+        const auto attributes = GetFileAttributesW(alias.c_str());
+        if (followed != INVALID_HANDLE_VALUE || follow_error != ERROR_CANT_ACCESS_FILE || !got_tag ||
+            tag_info.ReparseTag != IO_REPARSE_TAG_APPEXECLINK || attributes == INVALID_FILE_ATTRIBUTES ||
+            !(attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        {
+            printf("Alias: follow error %lu, tag %d %lX, attributes %lX\n", follow_error, got_tag, tag_info.ReparseTag, attributes);
+            return false;
+        }
+
+        return true;
+    }
+
     // Reads right after a write, and writes right after a read, continue at the file position.
     bool test_read_after_write()
     {
@@ -3927,6 +3993,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_file_mappings, "File Mappings")
     RUN_TEST(test_environment_and_names, "Environment and Names")
     RUN_TEST(test_reparse_points, "Reparse Points")
+    RUN_TEST(test_app_execution_alias, "App Execution Alias")
     RUN_TEST(test_system_info, "System Info")
     RUN_TEST(test_monitor_info, "Monitor Info")
     RUN_TEST(test_time_zone, "Time Zone")
