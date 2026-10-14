@@ -378,8 +378,15 @@ namespace
             LsaCallAuthenticationPackage(lsa, package, &request, sizeof(request), &response, &response_length, &protocol_status);
         const auto* policies = static_cast<const extended_policies*>(response);
         constexpr ULONG dac_disabled = 1;
+#ifdef _WIN64
         const auto ok = status == 0 && protocol_status == 0 && response_length == sizeof(extended_policies) && policies &&
                         policies->message_type == 32 && policies->flags == dac_disabled;
+#else
+        // Kerberos refuses the request's 32-bit layout from a WOW64 client.
+        constexpr auto status_invalid_parameter = static_cast<NTSTATUS>(0xC000000D);
+        const auto ok = status == 0 && protocol_status == status_invalid_parameter && response_length == 0 && !policies;
+        (void)dac_disabled;
+#endif
         if (response)
         {
             LsaFreeReturnBuffer(response);
