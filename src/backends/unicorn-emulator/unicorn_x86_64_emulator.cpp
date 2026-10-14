@@ -214,8 +214,10 @@ namespace sogen::unicorn
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
 #endif
+                // 2 GB of translated code on 64-bit hosts. A 32-bit host has 2 GB of address space in all, and two
+                // emulators (a restored copy next to its source) must fit in it.
                 constexpr auto is_64_bit = sizeof(void*) >= 8;
-                uce(uc_ctl_set_tcg_buffer_size(this->uc_, (is_64_bit ? 2 : 1) << 30 /* 2 gb */));
+                uce(uc_ctl_set_tcg_buffer_size(this->uc_, is_64_bit ? (2u << 30) : (256u << 20)));
 
 #ifndef OS_WINDOWS
 #pragma GCC diagnostic pop
