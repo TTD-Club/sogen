@@ -745,7 +745,14 @@ namespace sogen
                 max = std::max(import_thunk, max);
             }
 
-            c.win_emu->emu().hook_memory_write(min, max - min,
+            // Import slots are pointer-sized for the image: 4 bytes in 32-bit images. The watched range ends after the
+            // last slot.
+            const auto slot_size = c.win_emu->mod_manager.executable->machine == static_cast<uint16_t>(PEMachineType::I386)
+                                       ? sizeof(uint32_t)
+                                       : sizeof(uint64_t);
+            const auto watched_size = max - min + slot_size;
+
+            c.win_emu->emu().hook_memory_write(min, watched_size,
                                                [&c](cpu_interface&, const uint64_t address, const void* value, size_t size) {
                                                    const auto& watched_module = *c.win_emu->mod_manager.executable;
 
@@ -769,33 +776,35 @@ namespace sogen
                                                    });
                                                });
 
-            c.win_emu->emu().hook_memory_read(min, max - min, [&c](cpu_interface&, const uint64_t address, const void*, size_t) {
-                const auto rip = c.win_emu->emu().read_instruction_pointer();
-                const auto& watched_module = *c.win_emu->mod_manager.executable;
-                const auto accessor_module = get_module_if_interesting(c.win_emu->mod_manager, c.settings->modules, rip);
+            c.win_emu->emu().hook_memory_read(
+                min, watched_size, [&c, slot_size](cpu_interface&, const uint64_t address, const void*, size_t) {
+                    const auto rip = c.win_emu->emu().read_instruction_pointer();
+                    const auto& watched_module = *c.win_emu->mod_manager.executable;
+                    const auto accessor_module = get_module_if_interesting(c.win_emu->mod_manager, c.settings->modules, rip);
 
-                if (!accessor_module.has_value())
-                {
-                    return;
-                }
+                    if (!accessor_module.has_value())
+                    {
+                        return;
+                    }
 
-                const auto sym = watched_module.imports.find(address);
-                if (sym == watched_module.imports.end())
-                {
-                    return;
-                }
+                    const auto sym = watched_module.imports.find(address);
+                    if (sym == watched_module.imports.end())
+                    {
+                        return;
+                    }
 
-                accessed_import access{};
-                access.address = c.win_emu->emu().read_memory<uint64_t>(address);
-                access.access_context = c.make_execution_context();
-                access.import_name = sym->second.name;
-                access.import_module = watched_module.imported_modules.at(sym->second.module_index);
+                    accessed_import access{};
+                    access.address = slot_size == sizeof(uint32_t) ? c.win_emu->emu().read_memory<uint32_t>(address)
+                                                                   : c.win_emu->emu().read_memory<uint64_t>(address);
+                    access.access_context = c.make_execution_context();
+                    access.import_name = sym->second.name;
+                    access.import_module = watched_module.imported_modules.at(sym->second.module_index);
 
-                const auto& t = c.win_emu->current_thread();
-                access.access_inst_count = t.executed_instructions;
+                    const auto& t = c.win_emu->current_thread();
+                    access.access_inst_count = t.executed_instructions;
 
-                c.accessed_imports.push_back(std::move(access));
-            });
+                    c.accessed_imports.push_back(std::move(access));
+                });
         }
     }
 
