@@ -554,8 +554,8 @@ namespace sogen
                 }
 
                 const std::array<uint32_t, 4> response{kerb_query_domain_extended_policies_message, dac_disabled, 0, 0};
-                const auto response_buffer =
-                    win_emu.memory.allocate_memory(page_align_up(sizeof(response)), nt_memory_permission{memory_permission::read_write});
+                const auto response_buffer = win_emu.memory.allocate_memory(static_cast<size_t>(page_align_up(sizeof(response))),
+                                                                            nt_memory_permission{memory_permission::read_write});
                 if (response_buffer == 0)
                 {
                     return STATUS_NO_MEMORY;

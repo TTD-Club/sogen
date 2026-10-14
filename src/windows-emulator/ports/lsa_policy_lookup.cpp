@@ -416,7 +416,7 @@ namespace sogen
                     return std::nullopt;
                 }
 
-                std::u16string value(count, u'\0');
+                std::u16string value(static_cast<size_t>(count), u'\0');
                 win_emu.emu().read_memory(c.send_buffer + characters_offset, value.data(), length);
                 return value;
             }

@@ -14,7 +14,7 @@ namespace sogen::ttd
 {
     namespace
     {
-        constexpr uint64_t page_size = 0x1000;
+        constexpr size_t page_size = 0x1000;
 
         std::string describe(const std::string_view what, const access_kind kind, const uint64_t address, const size_t size)
         {
@@ -151,7 +151,8 @@ namespace sogen::ttd
                 for (auto i = cursor > 8 ? cursor - 8 : 0; i < std::min(cursor + 2, events.size()); ++i)
                 {
                     context += "\n  " + std::string(i == cursor ? "> " : "  ") +
-                               describe("", events[i].kind, events[i].address, events[i].size) + " step=" + std::to_string(events[i].step);
+                               describe("", events[i].kind, events[i].address, static_cast<size_t>(events[i].size)) +
+                               " step=" + std::to_string(events[i].step);
                 }
                 throw divergence_error(*this->divergence_ + " replaying to position " + std::to_string(position) + context);
             }
@@ -241,14 +242,14 @@ namespace sogen::ttd
                     return;
                 }
                 const auto* bytes = reinterpret_cast<const std::byte*>(event.payload.data());
-                for (uint64_t i = 0; i < event.size; ++i)
+                for (size_t i = 0; i < event.size; ++i)
                 {
                     const auto address = event.address + i;
                     if (pages[page_index] != address / page_size)
                     {
                         page_index = static_cast<size_t>(std::ranges::lower_bound(pages, address / page_size) - pages.begin());
                     }
-                    const auto offset = page_index * page_size + address % page_size;
+                    const auto offset = page_index * page_size + static_cast<size_t>(address % page_size);
                     contents[offset] = bytes[i];
                     known[offset] = true;
                 }
@@ -305,14 +306,14 @@ namespace sogen::ttd
                     continue;
                 }
                 const auto* bytes = reinterpret_cast<const std::byte*>(event.payload.data());
-                for (uint64_t k = 0; k < event.size; ++k)
+                for (size_t k = 0; k < event.size; ++k)
                 {
                     const auto address = event.address + k;
                     if (pages[page_index] != address / page_size)
                     {
                         page_index = static_cast<size_t>(std::ranges::lower_bound(pages, address / page_size) - pages.begin());
                     }
-                    auto& value = contents[page_index * page_size + address % page_size];
+                    auto& value = contents[page_index * page_size + static_cast<size_t>(address % page_size)];
                     if (event.kind == access_kind::read && value != bytes[k])
                     {
                         this->inject_[i] = true;
