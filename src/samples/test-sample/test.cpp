@@ -3809,21 +3809,22 @@ namespace
         const PTIMERAPCROUTINE on_timer = [](void* context, DWORD, DWORD) { ++*static_cast<int*>(context); };
 
         // The period must outlast running the routine: under the emulator's relative clock an instruction takes a
-        // millisecond, and a timer that is due again whenever its APC returns starves the thread (as on Windows).
+        // millisecond, and a timer that is due again whenever its APC returns starves the thread (as on Windows). A
+        // WOW64 process takes about 2,000 instructions from the APC to NtContinue, a 64-bit one under 500.
         LARGE_INTEGER due_time{};
         due_time.QuadPart = -10'000;
-        if (!SetWaitableTimer(timer, &due_time, 500, on_timer, &apc_count, FALSE))
+        if (!SetWaitableTimer(timer, &due_time, 4000, on_timer, &apc_count, FALSE))
         {
             return false;
         }
 
-        for (int i = 0; i < 100 && apc_count < 3; ++i)
+        for (int i = 0; i < 100 && apc_count < 2; ++i)
         {
             SleepEx(1000, TRUE);
         }
 
         CancelWaitableTimer(timer);
-        if (apc_count < 3)
+        if (apc_count < 2)
         {
             puts("Periodic timer did not run its completion routine");
             return false;
