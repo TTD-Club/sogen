@@ -1141,6 +1141,42 @@ namespace
         return true;
     }
 
+    // A rename that changes only the case of a name needs no MOVEFILE_REPLACE_EXISTING, and the name takes the new case.
+    bool test_case_only_rename()
+    {
+        const auto base = scratch_directory() + L"CaseRename" + std::to_wstring(GetCurrentProcessId());
+        const auto file = base + L"\\name.txt";
+        const auto renamed = base + L"\\NAME.txt";
+        const auto cleanup = sogen::utils::finally([&] {
+            DeleteFileW(renamed.c_str());
+            RemoveDirectoryW(base.c_str());
+        });
+
+        if (!CreateDirectoryW(base.c_str(), nullptr))
+        {
+            return false;
+        }
+        CloseHandle(CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr));
+
+        if (!MoveFileExW(file.c_str(), renamed.c_str(), 0))
+        {
+            printf("Case-only rename failed: %lu\n", GetLastError());
+            return false;
+        }
+
+        auto* const handle = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        std::array<wchar_t, MAX_PATH> final_name{};
+        const auto length = GetFinalPathNameByHandleW(handle, final_name.data(), static_cast<DWORD>(final_name.size()), 0);
+        CloseHandle(handle);
+        if (length == 0 || !std::wstring_view(final_name.data(), length).ends_with(L"\\NAME.txt"))
+        {
+            printf("Final name after rename: %ls\n", final_name.data());
+            return false;
+        }
+
+        return true;
+    }
+
     // A directory is not replaced (moving a file onto it fails and leaves both), while a directory may replace a file.
     bool test_replace_refusals()
     {
@@ -4142,6 +4178,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_drives_and_volumes, "Drives and Volumes")
     RUN_TEST(test_replace_refusals, "Replace Refusals")
     RUN_TEST(test_read_only_and_final_names, "Read-Only and Final Names")
+    RUN_TEST(test_case_only_rename, "Case-Only Rename")
     RUN_TEST(test_read_after_write, "Read After Write")
     RUN_TEST(test_file_mappings, "File Mappings")
     RUN_TEST(test_environment_and_names, "Environment and Names")

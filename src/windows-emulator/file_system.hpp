@@ -115,17 +115,26 @@ namespace sogen
 
             // Emulation-root translation, confined to the drive root.
             const std::array<char, 2> root_drive{win_path.get_drive().value_or('c'), 0};
-            return confine(this->root_ / root_drive.data(), this->root_ / win_path.to_portable_path());
+            const auto drive_root = this->root_ / root_drive.data();
+            return resolve_case(drive_root, confine(drive_root, this->root_ / win_path.to_portable_path()));
         }
 
         // The host path at which to create `win_path`, a new entry the guest named `spelled`. Windows keeps the case a
-        // name was created with, while windows_path (and so translate) lowercases every component. Where the host
-        // file system ignores case (Windows hosts), the new entry takes the guest's spelling of its last component and
-        // later lookups through translate still find it. Case-sensitive hosts keep the lowercase name every lookup uses.
-        std::filesystem::path translate_for_creation(const windows_path& win_path, [[maybe_unused]] const std::u16string_view spelled) const
+        // name was created with, while windows_path (and so translate) lowercases every component. The new entry takes
+        // the guest's spelling of its last component, and later lookups through translate still find it: Windows hosts
+        // ignore case, and elsewhere translate matches components ignoring case. An existing entry keeps its name, unless
+        // it is being `renamed` (a rename that changes only the case of a name).
+        std::filesystem::path translate_for_creation(const windows_path& win_path, const std::u16string_view spelled,
+                                                     [[maybe_unused]] const bool renamed = false) const
         {
             auto host_path = this->translate(win_path);
-#ifdef OS_WINDOWS
+#ifndef OS_WINDOWS
+            std::error_code ec{};
+            if (!renamed && exists(symlink_status(host_path, ec)))
+            {
+                return host_path;
+            }
+#endif
             auto leaf = spelled;
             while (!leaf.empty() && (leaf.back() == u'\\' || leaf.back() == u'/'))
             {
@@ -136,18 +145,17 @@ namespace sogen
                 leaf = leaf.substr(separator + 1);
             }
             if (!leaf.empty() && windows_path(std::u16string(leaf)).u16string() == win_path.leaf() &&
-                host_path.filename().u16string() == win_path.leaf())
+                utils::string::equals_ignore_case(std::u16string_view{host_path.filename().u16string()},
+                                                  std::u16string_view{win_path.leaf()}))
             {
                 host_path.replace_filename(std::filesystem::path(std::u16string(leaf)));
             }
-#endif
             return host_path;
         }
 
         // The part of a guest path after its drive ("\Users\x"), its components in the case the file system keeps for
-        // them, as Windows reports names (GetFinalPathNameByHandle). On Windows hosts that is the host's case of each
-        // existing component (the guest's spelling of components the host lacks or reaches through a link); elsewhere
-        // the guest's spelling.
+        // them, as Windows reports names (GetFinalPathNameByHandle): the host's case of each existing component (the
+        // guest's spelling of components the host lacks or reaches through a link).
         std::u16string true_case(std::u16string_view spelled) const
         {
             for (const std::u16string_view prefix : {u"\\??\\", u"\\\\?\\"})
@@ -189,7 +197,6 @@ namespace sogen
                 start = end + 1;
             }
 
-#ifdef OS_WINDOWS
             if (!drive.empty() && !parts.empty())
             {
                 // The host's spelling of the trailing components that name the same entries.
@@ -215,7 +222,6 @@ namespace sogen
                     }
                 }
             }
-#endif
 
             std::u16string result{};
             for (const auto& part : parts)
@@ -308,7 +314,67 @@ namespace sogen
                 return std::nullopt;
             }
 
-            return confine(*best_dest, *best_dest / best_remainder.to_portable_path());
+            return resolve_case(*best_dest, confine(*best_dest, *best_dest / best_remainder.to_portable_path()));
+        }
+
+        // Guest names ignore case, but translated paths are lowercase and the host may keep entries in another case (one
+        // the guest created, see translate_for_creation, or a mapped host directory). On case-sensitive hosts each
+        // component of `path` below `base` that does not exist as spelled takes the name of an entry of its directory
+        // that matches it ignoring case. Components that match nothing are kept, and so is everything after them.
+        static std::filesystem::path resolve_case([[maybe_unused]] const std::filesystem::path& base, std::filesystem::path path)
+        {
+#ifdef OS_WINDOWS
+            return path;
+#else
+            std::error_code ec{};
+            if (exists(symlink_status(path, ec)))
+            {
+                return path;
+            }
+
+            const auto relative = path.lexically_relative(base);
+            if (is_escaping_relative_path(relative) || relative == ".")
+            {
+                return path;
+            }
+
+            auto resolved = base;
+            auto component = relative.begin();
+            for (; component != relative.end(); ++component)
+            {
+                auto next = resolved / *component;
+                if (!exists(symlink_status(next, ec)))
+                {
+                    const auto wanted = component->u16string();
+                    std::optional<std::filesystem::path> match{};
+                    for (std::filesystem::directory_iterator entry(resolved, ec), end{}; !ec && entry != end; entry.increment(ec))
+                    {
+                        if (utils::string::equals_ignore_case(std::u16string_view{entry->path().filename().u16string()},
+                                                              std::u16string_view{wanted}))
+                        {
+                            match = entry->path();
+                            break;
+                        }
+                    }
+
+                    if (!match)
+                    {
+                        break;
+                    }
+
+                    next = std::move(*match);
+                }
+
+                resolved = std::move(next);
+            }
+
+            for (; component != relative.end(); ++component)
+            {
+                resolved /= *component;
+            }
+
+            return resolved;
+#endif
         }
 
         std::filesystem::path root_{};

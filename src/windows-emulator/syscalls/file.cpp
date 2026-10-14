@@ -680,29 +680,32 @@ namespace sogen
                 }
 
                 std::error_code ec{};
-                bool file_exists = std::filesystem::exists(c.win_emu.file_sys.translate(new_name), ec);
+                const auto source_host_path = c.win_emu.file_sys.translate(f->name);
+                const auto target_host_path = c.win_emu.file_sys.translate(new_name);
+                const bool file_exists = std::filesystem::exists(target_host_path, ec);
 
                 if (ec)
                 {
                     return STATUS_ACCESS_DENIED;
                 }
 
-                if (!info.ReplaceIfExists && file_exists)
+                // A rename onto itself (another spelling of the name) changes only the case of the name. It replaces
+                // nothing, so it needs no ReplaceIfExists.
+                const auto onto_itself = target_path == source_path;
+                if (!info.ReplaceIfExists && file_exists && !onto_itself)
                 {
                     return STATUS_OBJECT_NAME_EXISTS;
                 }
 
                 // A directory is not replaced (os.replace onto a directory fails; a file may be replaced by a
-                // directory). A rename onto itself (another spelling of the name) is not a replacement.
-                const auto target_host_path = c.win_emu.file_sys.translate(new_name);
-                if (file_exists && !std::filesystem::equivalent(c.win_emu.file_sys.translate(f->name), target_host_path, ec) &&
+                // directory).
+                if (file_exists && !onto_itself && !std::filesystem::equivalent(source_host_path, target_host_path, ec) &&
                     std::filesystem::is_directory(target_host_path, ec))
                 {
                     return STATUS_ACCESS_DENIED;
                 }
 
-                f->handle.defer_rename(c.win_emu.file_sys.translate(f->name),
-                                       c.win_emu.file_sys.translate_for_creation(new_name, new_name));
+                f->handle.defer_rename(source_host_path, c.win_emu.file_sys.translate_for_creation(new_name, new_name, onto_itself));
                 f->renamed_to = new_name;
 
                 return STATUS_SUCCESS;
@@ -2764,7 +2767,7 @@ namespace sogen
 
             f.drive_number = path.get_drive().value() - 'a' + 1;
 
-            const auto host_path = c.win_emu.file_sys.translate(path);
+            auto host_path = c.win_emu.file_sys.translate(path);
             const bool file_exists = std::filesystem::exists(host_path, ec);
 
             if (!file_exists && is_unfollowable_host_reparse_point(c, f.name, host_path))
@@ -2828,7 +2831,8 @@ namespace sogen
                     return STATUS_OBJECT_PATH_NOT_FOUND;
                 }
 
-                create_directory(c.win_emu.file_sys.translate_for_creation(path, f.name), ec);
+                host_path = c.win_emu.file_sys.translate_for_creation(path, f.name);
+                create_directory(host_path, ec);
 
                 if (ec)
                 {
@@ -2867,7 +2871,8 @@ namespace sogen
                     return STATUS_OBJECT_PATH_NOT_FOUND;
                 }
 
-                std::ofstream touch(c.win_emu.file_sys.translate_for_creation(path, f.name), std::ios::binary | std::ios::app);
+                host_path = c.win_emu.file_sys.translate_for_creation(path, f.name);
+                std::ofstream touch(host_path, std::ios::binary | std::ios::app);
                 if (!touch)
                 {
                     return STATUS_ACCESS_DENIED;
