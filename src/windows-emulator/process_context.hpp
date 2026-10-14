@@ -515,6 +515,13 @@ namespace sogen
             uint16_t scan_code{};         // keyboard scan code
             uint32_t key_message{};       // corresponding WM_KEY* or WM_SYSKEY* message
             bool key_extended{};          // true when the key's scan code has an E0 prefix (lParam bit 24)
+
+            friend void serialize(utils::buffer_serializer& buffer, const raw_input_payload& value)
+            {
+                buffer.write_zero_padded(value, &raw_input_payload::keyboard, &raw_input_payload::dx, &raw_input_payload::dy,
+                                         &raw_input_payload::mouse_buttons, &raw_input_payload::mouse_button_data, &raw_input_payload::vkey,
+                                         &raw_input_payload::scan_code, &raw_input_payload::key_message, &raw_input_payload::key_extended);
+            }
         };
 
         std::map<uint32_t, raw_input_payload> raw_inputs{};

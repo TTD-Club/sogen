@@ -13,6 +13,8 @@
 #include <platform/win_pefile.hpp>
 #include <platform/window.hpp>
 
+#include "platform_serialization.hpp"
+
 namespace sogen
 {
 
@@ -171,6 +173,11 @@ namespace sogen
     };
 
     static_assert(sizeof(accelerator_table_entry) == 6);
+
+    inline void serialize(utils::buffer_serializer& buffer, const accelerator_table_entry& value)
+    {
+        buffer.write_zero_padded(value, &accelerator_table_entry::flags, &accelerator_table_entry::key, &accelerator_table_entry::command);
+    }
 
     template <typename GuestType>
     struct user_object : ref_counted_object

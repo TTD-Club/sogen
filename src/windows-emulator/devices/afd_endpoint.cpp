@@ -27,7 +27,14 @@ namespace sogen
             int address_family;
             int type;
             int protocol;
+
             // ...
+
+            friend void serialize(utils::buffer_serializer& buffer, const afd_creation_data& value)
+            {
+                buffer.write_zero_padded(value, &afd_creation_data::unk1, &afd_creation_data::afd_open_packet_xx, &afd_creation_data::unk2,
+                                         &afd_creation_data::address_family, &afd_creation_data::type, &afd_creation_data::protocol);
+            }
         };
 
         struct win_sockaddr

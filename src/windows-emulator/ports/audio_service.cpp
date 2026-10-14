@@ -157,6 +157,12 @@ namespace sogen
             audio_format host_format{};
             uint32_t average_bytes_per_second{};
             uint16_t block_align{};
+
+            friend void serialize(utils::buffer_serializer& buffer, const stream_audio_format& value)
+            {
+                buffer.write_zero_padded(value, &stream_audio_format::wave_format, &stream_audio_format::host_format,
+                                         &stream_audio_format::average_bytes_per_second, &stream_audio_format::block_align);
+            }
         };
 
         std::optional<stream_audio_format> read_stream_audio_format(windows_emulator& win_emu, const lpc_request_context& c,

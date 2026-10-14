@@ -153,6 +153,11 @@ namespace sogen
         }
     };
 
+    inline void serialize(utils::buffer_serializer& buffer, const lpc_port_message& value)
+    {
+        buffer.write_zero_padded(value, &lpc_port_message::native, &lpc_port_message::is_wow64);
+    }
+
     struct lpc_message_context
     {
         emulator_object<PORT_MESSAGE64> send_message;

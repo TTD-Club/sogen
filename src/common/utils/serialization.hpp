@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <concepts>
 #include <cstdint>
 #include <type_traits>
@@ -167,6 +168,11 @@ namespace sogen
                 }
                 else if constexpr (is_trivially_copyable)
                 {
+                    // Padding bytes hold whatever the host left there, which would make equal states serialize
+                    // differently. A type with padding (or bool members) gets a serialize() that uses write_zero_padded.
+                    static_assert(std::has_unique_object_representations_v<T> || std::is_floating_point_v<T> || std::is_same_v<T, bool>,
+                                  "Type may have padding: serialize it with write_zero_padded");
+
                     union
                     {
                         const T* type_{};
@@ -182,6 +188,22 @@ namespace sogen
                     static_assert(is_trivially_copyable, "Key must be trivially copyable or implement serializable!");
                     std::abort();
                 }
+            }
+
+            // Writes the bytes of `object` as write() writes a trivially copyable type, but with every byte outside
+            // `members` zero: its padding then serializes the same way each time.
+            template <typename T, typename... Members>
+            void write_zero_padded(const T& object, Members T::*... members)
+            {
+                static_assert(std::is_trivially_copyable_v<T>);
+                std::array<std::byte, sizeof(T)> bytes{};
+                const auto* base = reinterpret_cast<const std::byte*>(&object);
+                const auto copy_member = [&](const auto& member) {
+                    const auto* start = reinterpret_cast<const std::byte*>(&member);
+                    std::memcpy(bytes.data() + (start - base), start, sizeof(member));
+                };
+                (copy_member(object.*members), ...);
+                this->write(bytes.data(), bytes.size());
             }
 
             template <typename T>
