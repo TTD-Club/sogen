@@ -668,7 +668,7 @@ namespace sogen
                 }
                 const auto& new_name = *resolved_name;
 
-                c.win_emu.log.warn("--> File rename requested: %s --> %s\n", u16_to_u8(f->name).c_str(), u16_to_u8(new_name).c_str());
+                c.win_emu.callbacks.on_generic_access("File rename requested", f->name + u" --> " + new_name);
 
                 // A directory cannot move below itself. The rename happens when the handle closes, where a host
                 // failure would go unreported, so this is refused now, as Windows refuses it.
