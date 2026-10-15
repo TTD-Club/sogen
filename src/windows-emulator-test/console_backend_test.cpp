@@ -242,7 +242,8 @@ namespace sogen::test
     {
         console_text_request request{.unicode = 1};
         EXPECT_EQ(STATUS_INVALID_PARAMETER, this->invoke_text(0x01000006, request, 3));
-        EXPECT_EQ(STATUS_INVALID_PARAMETER, this->invoke_text(0x01000006, request, 2, false, STDIN_HANDLE));
+        // An input handle is the wrong kind of handle (ERROR_INVALID_HANDLE on Windows).
+        EXPECT_EQ(STATUS_INVALID_HANDLE, this->invoke_text(0x01000006, request, 2, false, STDIN_HANDLE));
         EXPECT_EQ(0u, request.bytes_written);
     }
 
@@ -272,7 +273,7 @@ namespace sogen::test
     TEST_F(ConsoleProtocolTest, FontRequestsRejectInputHandlesAndInvalidSizes)
     {
         console_font_request font{};
-        EXPECT_EQ(STATUS_INVALID_PARAMETER, this->invoke(0x03000004, font, STDIN_HANDLE));
+        EXPECT_EQ(STATUS_INVALID_HANDLE, this->invoke(0x03000004, font, STDIN_HANDLE));
         font.width = -1;
         EXPECT_EQ(STATUS_INVALID_PARAMETER, this->invoke(0x0300002C, font));
         uint32_t truncated{};

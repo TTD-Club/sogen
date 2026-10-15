@@ -3042,6 +3042,66 @@ namespace
         return WriteConsoleA(output, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) && written == text.size();
     }
 
+    // Input buffer flushes, scrolling and cursor shape (timeout, choice, pause and cls use them), and an input call on an
+    // output handle or the reverse failing with ERROR_INVALID_HANDLE.
+    bool test_console_buffers()
+    {
+        auto* const input =
+            CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        auto* const output =
+            CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        const auto close_handles = sogen::utils::finally([&] {
+            CloseHandle(input);
+            CloseHandle(output);
+        });
+        DWORD mode{};
+        if (input == INVALID_HANDLE_VALUE || output == INVALID_HANDLE_VALUE || !GetConsoleMode(input, &mode))
+        {
+            return true;
+        }
+
+        const auto fails_as_wrong_handle = [](const BOOL result) { return !result && GetLastError() == ERROR_INVALID_HANDLE; };
+
+        constexpr SMALL_RECT scrolled{.Left = 0, .Top = 0, .Right = 79, .Bottom = 24};
+        CHAR_INFO fill{};
+        fill.Char.UnicodeChar = L' ';
+        fill.Attributes = 7;
+        if (!FlushConsoleInputBuffer(input) || !fails_as_wrong_handle(FlushConsoleInputBuffer(output)) ||
+            !ScrollConsoleScreenBufferW(output, &scrolled, nullptr, COORD{.X = 0, .Y = -25}, &fill) ||
+            !fails_as_wrong_handle(ScrollConsoleScreenBufferW(input, &scrolled, nullptr, COORD{.X = 0, .Y = -25}, &fill)))
+        {
+            puts("Flushing or scrolling the console failed");
+            return false;
+        }
+
+        CONSOLE_CURSOR_INFO original{};
+        CONSOLE_CURSOR_INFO cursor{};
+        constexpr CONSOLE_CURSOR_INFO hidden{.dwSize = 50, .bVisible = FALSE};
+        constexpr CONSOLE_CURSOR_INFO too_small{.dwSize = 0, .bVisible = TRUE};
+        const auto cursor_ok = GetConsoleCursorInfo(output, &original) && SetConsoleCursorInfo(output, &hidden) &&
+                               GetConsoleCursorInfo(output, &cursor) && cursor.dwSize == 50 && !cursor.bVisible &&
+                               !SetConsoleCursorInfo(output, &too_small) && GetLastError() == ERROR_INVALID_PARAMETER &&
+                               fails_as_wrong_handle(GetConsoleCursorInfo(input, &cursor));
+        SetConsoleCursorInfo(output, &original);
+        if (!cursor_ok)
+        {
+            puts("Console cursor information is wrong");
+            return false;
+        }
+
+        DWORD count{};
+        DWORD written{};
+        if (!fails_as_wrong_handle(GetNumberOfConsoleInputEvents(output, &count)) ||
+            !fails_as_wrong_handle(WriteConsoleW(input, L"x", 1, &written, nullptr)) ||
+            !fails_as_wrong_handle(SetConsoleTextAttribute(input, 7)))
+        {
+            puts("A console call on the wrong kind of handle did not fail as on Windows");
+            return false;
+        }
+
+        return true;
+    }
+
     bool test_anonymous_pipe()
     {
         HANDLE read_end{};
@@ -4151,6 +4211,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_dir_io, "Dir I/O")
     RUN_TEST(test_apis, "APIs")
     RUN_TEST(test_console_write, "Console Write")
+    RUN_TEST(test_console_buffers, "Console Buffers")
     RUN_TEST(test_oem_conversion, "OEM Conversion")
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
     RUN_TEST(test_pipe_data, "Pipe Data")

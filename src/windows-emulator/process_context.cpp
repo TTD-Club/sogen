@@ -473,9 +473,9 @@ namespace sogen
                 params32.Flags = RTL_USER_PROCESS_PARAMETERS_IMAGE_KEY_MISSING | RTL_USER_PROCESS_PARAMETERS_APP_MANIFEST_PRESENT |
                                  RTL_USER_PROCESS_PARAMETERS_NORMALIZED;
 
-                params32.ConsoleHandle = static_cast<uint32_t>(CONSOLE_HANDLE.h);
-                params32.StandardOutput = static_cast<uint32_t>(STDOUT_HANDLE.h);
-                params32.StandardInput = static_cast<uint32_t>(STDIN_HANDLE.h);
+                params32.ConsoleHandle = static_cast<uint32_t>(CONSOLE_HANDLE_WOW64.bits);
+                params32.StandardOutput = static_cast<uint32_t>(STDOUT_HANDLE_WOW64.bits);
+                params32.StandardInput = static_cast<uint32_t>(STDIN_HANDLE_WOW64.bits);
                 params32.StandardError = params32.StandardOutput;
 
                 this->process_params64.access([&](const RTL_USER_PROCESS_PARAMETERS64& params64) {
@@ -494,11 +494,15 @@ namespace sogen
                     // Copy other fields
                     params32.CurrentDirectory.Handle = static_cast<uint32_t>(params64.CurrentDirectory.Handle);
                     params32.ShowWindowFlags = params64.ShowWindowFlags;
-                    params32.ConsoleHandle = static_cast<uint32_t>(params64.ConsoleHandle);
+                    // Console handles as 32-bit code can use them (see CONSOLE_HANDLE_WOW64).
+                    const auto console_handle32 = [](const uint64_t value) {
+                        return static_cast<uint32_t>(console_handle_for(make_handle(value), true).bits);
+                    };
+                    params32.ConsoleHandle = console_handle32(params64.ConsoleHandle);
                     params32.ConsoleFlags = params64.ConsoleFlags;
-                    params32.StandardInput = static_cast<uint32_t>(params64.StandardInput);
-                    params32.StandardOutput = static_cast<uint32_t>(params64.StandardOutput);
-                    params32.StandardError = static_cast<uint32_t>(params64.StandardError);
+                    params32.StandardInput = console_handle32(params64.StandardInput);
+                    params32.StandardOutput = console_handle32(params64.StandardOutput);
+                    params32.StandardError = console_handle32(params64.StandardError);
                     params32.StartingX = params64.StartingX;
                     params32.StartingY = params64.StartingY;
                     params32.CountX = params64.CountX;

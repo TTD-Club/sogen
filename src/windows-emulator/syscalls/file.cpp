@@ -2657,7 +2657,7 @@ namespace sogen
                 filename_upper == u"\\??\\CON" || filename_upper == u"\\DEVICE\\CONSOLE" || filename_upper == u"CON")
             {
                 c.win_emu.callbacks.on_generic_access("Opening console output", filename);
-                file_handle.write(STDOUT_HANDLE);
+                file_handle.write(console_handle_for(STDOUT_HANDLE, c.proc.is_wow64_process));
                 return STATUS_SUCCESS;
             }
 
@@ -2665,7 +2665,7 @@ namespace sogen
             if (filename_upper == u"\\??\\CONIN$" || filename_upper == u"\\DEVICE\\CONIN$" || filename_upper == u"CONIN$")
             {
                 c.win_emu.callbacks.on_generic_access("Opening console input", filename);
-                file_handle.write(STDIN_HANDLE);
+                file_handle.write(console_handle_for(STDIN_HANDLE, c.proc.is_wow64_process));
                 return STATUS_SUCCESS;
             }
 
@@ -2715,7 +2715,9 @@ namespace sogen
 
             handle root_handle{};
             root_handle.bits = attributes.RootDirectory;
-            if (root_handle.value.is_pseudo && (filename == u"\\Reference" || filename == u"\\Connect"))
+            // Opens below the console connection: a pseudo handle, or its WOW64 alias, which the opener gets back.
+            if ((root_handle.value.is_pseudo || canonical_console_handle(root_handle) == CONSOLE_HANDLE) &&
+                (filename == u"\\Reference" || filename == u"\\Connect"))
             {
                 file_handle.write(root_handle);
                 return STATUS_SUCCESS;
@@ -2723,7 +2725,7 @@ namespace sogen
 
             if (filename == u"\\??\\CONOUT$")
             {
-                file_handle.write(STDOUT_HANDLE);
+                file_handle.write(console_handle_for(STDOUT_HANDLE, c.proc.is_wow64_process));
                 return STATUS_SUCCESS;
             }
 

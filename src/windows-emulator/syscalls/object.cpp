@@ -213,7 +213,7 @@ namespace sogen
 
             if (resolved_source_handle.value.is_pseudo)
             {
-                target_handle.write(resolved_source_handle);
+                target_handle.write(console_handle_for(resolved_source_handle, c.proc.is_wow64_process));
                 return STATUS_SUCCESS;
             }
 
@@ -602,7 +602,7 @@ namespace sogen
 
         std::optional<handle> resolve_wait32_handle(const syscall_context& c, const uint32_t raw_handle)
         {
-            const auto decoded = make_handle(static_cast<uint64_t>(raw_handle));
+            const auto decoded = canonical_console_handle(make_handle(static_cast<uint64_t>(raw_handle)));
             if (decoded.value.type != handle_types::reserved)
             {
                 return decoded;
@@ -639,7 +639,7 @@ namespace sogen
         // same recovery the wait32 path does. WoW64 and some callers hand us handles without type bits.
         handle resolve_wait_handle(const syscall_context& c, const handle h)
         {
-            const auto resolved = c.proc.resolve_object_pseudo_handle(h, c.vcpu.active_thread);
+            const auto resolved = c.proc.resolve_object_pseudo_handle(canonical_console_handle(h), c.vcpu.active_thread);
             if (resolved.value.type != handle_types::reserved || resolved.value.is_pseudo)
             {
                 return resolved;

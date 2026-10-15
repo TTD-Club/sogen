@@ -652,6 +652,62 @@ namespace sogen
     constexpr auto STDIN_HANDLE = make_pseudo_handle(0x3, handle_types::file);
     constexpr auto NUL_HANDLE = make_pseudo_handle(0x4, handle_types::file);
 
+    // A pseudo handle is negative as a 32-bit value, and 32-bit (WOW64) kernelbase refuses such a console handle, so
+    // WOW64 processes get these aliases of the console handles instead: the pseudo bit cleared and the system bit, which
+    // no other handle uses, set. Syscalls take an alias as the handle it stands for (see canonical_console_handle).
+    constexpr handle make_wow64_console_alias(const uint32_t id)
+    {
+        handle_value value{};
+        value.id = id;
+        value.type = handle_types::file;
+        value.is_system = true;
+        value.is_pseudo = false;
+        return {value};
+    }
+
+    constexpr auto CONSOLE_HANDLE_WOW64 = make_wow64_console_alias(0x1);
+    constexpr auto STDOUT_HANDLE_WOW64 = make_wow64_console_alias(0x2);
+    constexpr auto STDIN_HANDLE_WOW64 = make_wow64_console_alias(0x3);
+
+    inline handle canonical_console_handle(const handle h)
+    {
+        if (h == CONSOLE_HANDLE_WOW64)
+        {
+            return CONSOLE_HANDLE;
+        }
+        if (h == STDOUT_HANDLE_WOW64)
+        {
+            return STDOUT_HANDLE;
+        }
+        if (h == STDIN_HANDLE_WOW64)
+        {
+            return STDIN_HANDLE;
+        }
+        return h;
+    }
+
+    // The console handle a process of the given kind is given for `h`.
+    inline handle console_handle_for(const handle h, const bool wow64)
+    {
+        if (!wow64)
+        {
+            return h;
+        }
+        if (h == CONSOLE_HANDLE)
+        {
+            return CONSOLE_HANDLE_WOW64;
+        }
+        if (h == STDOUT_HANDLE)
+        {
+            return STDOUT_HANDLE_WOW64;
+        }
+        if (h == STDIN_HANDLE)
+        {
+            return STDIN_HANDLE_WOW64;
+        }
+        return h;
+    }
+
     constexpr auto DUMMY_IMPERSONATION_TOKEN = make_pseudo_handle(0x1, handle_types::token);
     constexpr auto ANONYMOUS_IMPERSONATION_TOKEN = make_pseudo_handle(0x2, handle_types::token);
 

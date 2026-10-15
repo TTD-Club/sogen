@@ -58,4 +58,22 @@ namespace sogen::test
             EXPECT_EQ(STATUS_SUCCESS, query_console(emu, console, FileAlignmentInformation).status);
         }
     }
+
+    // WOW64 processes get console handles that are positive as 32-bit values (32-bit kernelbase refuses others), which
+    // syscalls take as the console pseudo handles, also when WOW64 sign-extends them.
+    TEST(ConsoleInformationTest, Wow64ConsoleAliasesStandForTheConsoleHandles)
+    {
+        for (const auto& console : {CONSOLE_HANDLE, STDOUT_HANDLE, STDIN_HANDLE})
+        {
+            const auto alias = console_handle_for(console, true);
+            EXPECT_GT(static_cast<int32_t>(static_cast<uint32_t>(alias.bits)), 0);
+            EXPECT_EQ(console, canonical_console_handle(alias));
+            const auto sign_extended = make_handle(static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(alias.bits))));
+            EXPECT_EQ(console, canonical_console_handle(sign_extended));
+            EXPECT_EQ(console, console_handle_for(console, false));
+        }
+
+        const auto other = make_handle(0x1234, handle_types::file, false);
+        EXPECT_EQ(other, canonical_console_handle(other));
+    }
 }
