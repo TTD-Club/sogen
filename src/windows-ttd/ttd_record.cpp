@@ -399,13 +399,13 @@ namespace sogen::ttd
         // The memory map at the start; its changes follow from the callback below.
         note_memory_regions(0, MAX_ALLOCATION_END_EXCL, true);
         // Last, so a constructor that throws never leaves a callback behind.
-        emu_.memory.set_mapping_change_callback([this](const uint64_t address, const size_t size) {
+        emu_.memory.set_mapping_change_callback([this](const uint64_t address, const uint64_t size) {
             mapping_changes_.push_back(
                 {.step = emu_.get_executed_instructions(), .event_number = header_.event_count, .address = address, .size = size});
             forget_instructions(address, size);
         });
         emu_.memory.set_region_change_callback(
-            [this](const uint64_t address, const size_t size) { note_memory_regions(address, size, false); });
+            [this](const uint64_t address, const uint64_t size) { note_memory_regions(address, size, false); });
         ui_ = dynamic_cast<recordable_ui_backend*>(&emu_.ui());
         if (ui_)
         {
@@ -1543,7 +1543,7 @@ namespace sogen::ttd
             throw std::runtime_error(writes_required);
         }
         auto& cpu = emu_.emu();
-        emu_.memory.set_mapping_change_callback([this](const uint64_t address, const size_t size) {
+        emu_.memory.set_mapping_change_callback([this](const uint64_t address, const uint64_t size) {
             if (!size)
             {
                 return;

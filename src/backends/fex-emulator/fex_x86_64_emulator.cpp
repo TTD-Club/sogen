@@ -1779,7 +1779,7 @@ namespace sogen::fex
             return ranges;
         }
 
-        std::vector<host_reserved_range> reserved_host_ranges_in(uint64_t address, size_t size) const override
+        std::vector<host_reserved_range> reserved_host_ranges_in(uint64_t address, uint64_t size) const override
         {
             // mach_vm_region's start-address parameter lets the kernel skip straight to the first region
             // at or above the window, so this visits only regions actually inside it (usually none),
@@ -1825,7 +1825,7 @@ namespace sogen::fex
             return read_host_mappings_android(0, guest_address_space_end);
         }
 
-        std::vector<host_reserved_range> reserved_host_ranges_in(const uint64_t address, const size_t size) const override
+        std::vector<host_reserved_range> reserved_host_ranges_in(const uint64_t address, const uint64_t size) const override
         {
             return read_host_mappings_android(address, address + size);
         }
@@ -1882,7 +1882,7 @@ namespace sogen::fex
         }
 
 #if defined(__APPLE__) || defined(__ANDROID__)
-        void reserve_guest_address_range(uint64_t address, size_t size) override
+        void reserve_guest_address_range(uint64_t address, uint64_t size) override
         {
 #ifdef __APPLE__
             const uint64_t start = host_page_align_down_apple(address);

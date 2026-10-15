@@ -157,7 +157,7 @@ namespace sogen
                                              uint64_t memory_information, uint64_t memory_information_length,
                                              emulator_object<uint64_t> return_length);
         NTSTATUS handle_NtProtectVirtualMemory(const syscall_context& c, handle process_handle, emulator_object<uint64_t> base_address,
-                                               emulator_object<uint32_t> bytes_to_protect, uint32_t protection,
+                                               emulator_object<uint64_t> bytes_to_protect, uint32_t protection,
                                                emulator_object<uint32_t> old_protection);
         NTSTATUS handle_NtAllocateVirtualMemoryEx(const syscall_context& c, handle process_handle, emulator_object<uint64_t> base_address,
                                                   emulator_object<uint64_t> bytes_to_allocate, uint32_t allocation_type,

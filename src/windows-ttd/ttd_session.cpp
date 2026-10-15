@@ -413,7 +413,7 @@ namespace sogen::ttd
                         }
                     });
                     win_emu.memory.set_mapping_change_callback(
-                        [&](const uint64_t address, const size_t size) { remapped.emplace_back(address, size); });
+                        [&](const uint64_t address, const uint64_t size) { remapped.emplace_back(address, size); });
                 }
                 const auto stop_tracking = utils::finally([&] {
                     if (incremental)

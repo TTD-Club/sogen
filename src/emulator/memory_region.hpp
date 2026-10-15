@@ -9,7 +9,7 @@ namespace sogen
     struct basic_memory_region
     {
         uint64_t start{};
-        size_t length{}; // uint64_t?
+        uint64_t length{};
         PermissionType permissions{};
     };
 
