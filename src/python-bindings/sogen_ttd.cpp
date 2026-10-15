@@ -832,6 +832,16 @@ namespace sogen::py
                     "The registers at position, replayed from the nearest register snapshot without an emulated process "
                     "(verified against the recording; DivergenceError otherwise). Needs a trace with register snapshots")
                 .def(
+                    "cpu_at_many",
+                    [](const ttd_trace& self, const std::vector<uint64_t>& positions) {
+                        auto& native = self.native();
+                        const nb::gil_scoped_release release{};
+                        return ttd::cpu_views_at(native, positions);
+                    },
+                    nb::arg("positions"),
+                    "cpu_at for each of positions, in their order, replaying each register snapshot interval once for all "
+                    "the positions in it (both ends of every call to a function cost one replay per interval)")
+                .def(
                     "memory_at",
                     [](const ttd_trace& self, const uint64_t position, const uint64_t address, const uint64_t size) {
                         auto& native = self.native();
@@ -913,13 +923,13 @@ namespace sogen::py
                 .def_prop_ro("replayed_instructions", &ttd::cpu_view::replayed_instructions,
                              "Instructions replayed from the register snapshot to the position")
                 .def(
-                    "read_register", [](ttd::cpu_view& self, const x86_register reg) { return self.cpu().reg<uint64_t>(reg); },
+                    "read_register", [](const ttd::cpu_view& self, const x86_register reg) { return self.read_register(reg); },
                     nb::arg("register"), "The low 64 bits of a register")
                 .def(
                     "read_register_bytes",
-                    [](ttd::cpu_view& self, const x86_register reg) {
+                    [](const ttd::cpu_view& self, const x86_register reg) {
                         std::array<std::byte, 64> value{};
-                        const auto size = self.cpu().read_register(reg, value.data(), value.size());
+                        const auto size = self.read_register(reg, value.data(), value.size());
                         return to_bytes(std::span(value).first(size));
                     },
                     nb::arg("register"), "A register's full value, little-endian (16 bytes for xmm registers)")

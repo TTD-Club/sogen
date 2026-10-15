@@ -3,7 +3,9 @@
 #include <unicorn_x86_64_emulator.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <sstream>
@@ -104,6 +106,16 @@ namespace sogen::ttd
         std::vector<std::byte> replay(const std::span<const access_event> events, const std::optional<access_event>& following,
                                       const std::vector<std::byte>& registers, const uint64_t position)
         {
+            const auto executes = static_cast<uint64_t>(std::ranges::count(events, access_kind::execute, &access_event::kind));
+            return std::move(this->replay(events, following, registers, std::span{&executes, 1}, position).front());
+        }
+
+        // Like the replay above, but returns the registers after each count of instructions in `stops` (ascending; none
+        // beyond the events), running the events once. `position` is the last stop's, for messages.
+        std::vector<std::vector<std::byte>> replay(const std::span<const access_event> events, const std::optional<access_event>& following,
+                                                   const std::vector<std::byte>& registers, const std::span<const uint64_t> stops,
+                                                   const uint64_t position)
+        {
             this->used_ = true;
             this->prepare_memory(events, following);
             auto& cpu = *this->cpu_;
@@ -118,29 +130,80 @@ namespace sogen::ttd
             // The backend's instruction count stops the CPU where its state is complete (a stop from a hook can leave the
             // flags uncomputed). A restarted instruction counts twice, so the rest runs again until every one ran.
             std::vector<size_t> instructions_from(events.size() + 1);
+            std::vector<size_t> execute_events{};
             for (auto i = events.size(); i-- > 0;)
             {
                 instructions_from[i] = instructions_from[i + 1] + (events[i].kind == access_kind::execute ? 1 : 0);
             }
-            while (!this->divergence_)
+            for (size_t i = 0; i < events.size(); ++i)
             {
-                // An instruction abandoned just before the count ran out has to run again.
-                if (!instructions_from[this->cursor_] && following && this->running_ &&
-                    cpu.read_instruction_pointer() != following->address &&
-                    cpu.read_instruction_pointer() == events[*this->running_].address)
+                if (events[i].kind == access_kind::execute)
                 {
-                    this->cursor_ = *this->running_;
+                    execute_events.push_back(i);
                 }
-                if (!instructions_from[this->cursor_])
+            }
+
+            std::vector<std::vector<std::byte>> results{};
+            results.reserve(stops.size());
+            constexpr size_t max_restarts = 64;
+            size_t furthest = 0;
+            size_t restarts = 0;
+            for (const auto stop : stops)
+            {
+                // The stop comes before the events of instruction `stop` + 1, which is `next`.
+                const auto end = stop < execute_events.size() ? execute_events[static_cast<size_t>(stop)] : events.size();
+                const access_event* next = following ? &*following : nullptr;
+                if (stop < execute_events.size())
+                {
+                    next = &events[end];
+                }
+                while (!this->divergence_ && this->cursor_ <= end)
+                {
+                    auto remaining = instructions_from[this->cursor_] - instructions_from[end];
+                    // An instruction abandoned just before the count ran out has to run again.
+                    if (!remaining && next && this->running_ && cpu.read_instruction_pointer() != next->address &&
+                        cpu.read_instruction_pointer() == events[*this->running_].address)
+                    {
+                        this->cursor_ = *this->running_;
+                        remaining = instructions_from[this->cursor_] - instructions_from[end];
+                    }
+                    if (!remaining)
+                    {
+                        break;
+                    }
+                    const auto before = this->cursor_;
+                    cpu.start(remaining);
+                    if (this->cursor_ == before)
+                    {
+                        break;
+                    }
+                    // Translations from earlier replays can make the backend abandon an instruction every time it runs
+                    // (it takes one of its stores for a change to translated code). That shows as a divergence, which a
+                    // fresh engine settles (see replay_snapshot_interval).
+                    if (this->cursor_ > furthest)
+                    {
+                        furthest = this->cursor_;
+                        restarts = 0;
+                    }
+                    else if (++restarts > max_restarts)
+                    {
+                        this->divergence_ = describe("TTD replay keeps restarting the instruction at", access_kind::execute,
+                                                     cpu.read_instruction_pointer(), 0);
+                        break;
+                    }
+                }
+
+                if (this->divergence_)
                 {
                     break;
                 }
-                const auto before = this->cursor_;
-                cpu.start(instructions_from[this->cursor_]);
-                if (this->cursor_ == before)
+                if (this->cursor_ != end)
                 {
-                    break;
+                    this->events_ = {};
+                    throw divergence_error("TTD replay to position " + std::to_string(position) + " stopped after " +
+                                           std::to_string(this->cursor_) + " of " + std::to_string(end) + " recorded events");
                 }
+                results.push_back(cpu.save_registers());
             }
             this->events_ = {};
 
@@ -156,12 +219,7 @@ namespace sogen::ttd
                 }
                 throw divergence_error(*this->divergence_ + " replaying to position " + std::to_string(position) + context);
             }
-            if (this->cursor_ != events.size())
-            {
-                throw divergence_error("TTD replay to position " + std::to_string(position) + " stopped after " +
-                                       std::to_string(this->cursor_) + " of " + std::to_string(events.size()) + " recorded events");
-            }
-            return cpu.save_registers();
+            return results;
         }
 
       private:
@@ -348,73 +406,188 @@ namespace sogen::ttd
         }
     };
 
-    cpu_view::cpu_view(trace& recorded, const uint64_t position)
-        : position_(position)
+    namespace
     {
-        if (position > recorded.metadata().instruction_count)
+        // The index of the latest register snapshot at or before `position`.
+        size_t snapshot_index_at(const trace& recorded, const std::span<const register_snapshot_entry> snapshots, const uint64_t position)
         {
-            throw std::out_of_range("TTD position is beyond end of trace");
+            if (position > recorded.metadata().instruction_count)
+            {
+                throw std::out_of_range("TTD position is beyond end of trace");
+            }
+            if (snapshots.empty())
+            {
+                throw std::runtime_error("This TTD trace has no register snapshots");
+            }
+            const auto next = std::ranges::upper_bound(snapshots, position, {}, &register_snapshot_entry::step);
+            if (next == snapshots.begin())
+            {
+                throw std::out_of_range("No TTD register snapshot at or before this position");
+            }
+            return static_cast<size_t>(next - snapshots.begin() - 1);
         }
+
+        // The registers after each count of instructions in `stops` (ascending) after register snapshot `index`, running
+        // that snapshot's interval once, to position `last`, the last stop.
+        std::vector<std::vector<std::byte>> replay_snapshot_interval(trace& recorded, const size_t index,
+                                                                     const std::span<const uint64_t> stops, const uint64_t last)
+        {
+            const auto& snapshot = recorded.register_snapshots()[index];
+            const auto registers = recorded.snapshot_registers(index);
+            if (last == snapshot.step)
+            {
+                return std::vector<std::vector<std::byte>>(stops.size(), registers);
+            }
+
+            // The events of the instructions after the snapshot, up to and including instruction `last`, and the
+            // instruction after it, which the CPU decodes before it stops.
+            std::vector<access_event> events{};
+            std::optional<access_event> following{};
+            event_reader reader(recorded, snapshot.event_number);
+            while (const auto event = reader.next())
+            {
+                if (event->kind == access_kind::execute && event->step > last)
+                {
+                    following = event;
+                    break;
+                }
+                if (event->kind == access_kind::host_write || event->size > inline_data_limit)
+                {
+                    throw std::runtime_error("TTD register snapshot interval contains a host write");
+                }
+                events.push_back(*event);
+            }
+
+            auto& engine = recorded.view_engine_slot();
+            if (!engine)
+            {
+                engine = std::make_shared<view_engine>();
+            }
+            const auto reused = engine->used();
+            try
+            {
+                return engine->replay(events, following, registers, stops, last);
+            }
+            catch (const divergence_error&)
+            {
+                // Code an engine translated in earlier replays can make the backend take a store for self-modifying code
+                // and rerun the instruction without reporting its stores again. A fresh engine settles whether the replay
+                // really diverges.
+                if (!reused)
+                {
+                    throw;
+                }
+                engine = std::make_shared<view_engine>();
+                return engine->replay(events, following, registers, stops, last);
+            }
+        }
+    }
+
+    namespace
+    {
+        uint64_t next_cpu_view_id()
+        {
+            static std::atomic<uint64_t> next_id{1};
+            return next_id.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // The CPU of this thread that read_register decodes views on, holding the registers of view `id`.
+        x86_64_emulator& decoding_cpu(const uint64_t id, const std::vector<std::byte>& registers)
+        {
+            thread_local std::unique_ptr<x86_64_emulator> cpu{};
+            thread_local uint64_t loaded{};
+            if (!cpu)
+            {
+                cpu = unicorn::create_x86_64_emulator();
+            }
+            if (loaded != id)
+            {
+                loaded = 0;
+                cpu->restore_registers(registers);
+                cpu->reg<uint64_t>(x86_register::rflags, cpu->reg<uint64_t>(x86_register::rflags));
+                loaded = id;
+            }
+            return *cpu;
+        }
+    }
+
+    cpu_view::cpu_view(trace& recorded, const uint64_t position)
+        : position_(position),
+          id_(next_cpu_view_id())
+    {
+        const auto index = snapshot_index_at(recorded, recorded.register_snapshots(), position);
+        replayed_instructions_ = position - recorded.register_snapshots()[index].step;
+        registers_ = std::move(replay_snapshot_interval(recorded, index, std::span{&replayed_instructions_, 1}, position).front());
+    }
+
+    cpu_view::cpu_view(const uint64_t position, const uint64_t replayed_instructions, std::vector<std::byte> registers)
+        : registers_(std::move(registers)),
+          position_(position),
+          replayed_instructions_(replayed_instructions),
+          id_(next_cpu_view_id())
+    {
+    }
+
+    uint64_t cpu_view::read_register(const x86_register reg) const
+    {
+        uint64_t value{};
+        this->read_register(reg, &value, sizeof(value));
+        return value;
+    }
+
+    size_t cpu_view::read_register(const x86_register reg, void* value, const size_t size) const
+    {
+        auto& cpu = this->cpu_ ? *this->cpu_ : decoding_cpu(this->id_, this->registers_);
+        return cpu.read_register(reg, value, size);
+    }
+
+    x86_64_emulator& cpu_view::cpu()
+    {
+        if (!this->cpu_)
+        {
+            this->cpu_ = cpu_with_registers(this->registers_);
+        }
+        return *this->cpu_;
+    }
+
+    std::vector<cpu_view> cpu_views_at(trace& recorded, const std::span<const uint64_t> positions)
+    {
         const auto snapshots = recorded.register_snapshots();
-        if (snapshots.empty())
+        std::vector<size_t> order(positions.size());
+        std::iota(order.begin(), order.end(), size_t{0});
+        std::ranges::stable_sort(order, {}, [&](const size_t i) { return positions[i]; });
+
+        std::vector<std::optional<cpu_view>> views(positions.size());
+        for (size_t first = 0; first < order.size();)
         {
-            throw std::runtime_error("This TTD trace has no register snapshots");
-        }
-        const auto next = std::ranges::upper_bound(snapshots, position, {}, &register_snapshot_entry::step);
-        if (next == snapshots.begin())
-        {
-            throw std::out_of_range("No TTD register snapshot at or before this position");
-        }
-        const auto index = static_cast<size_t>(next - snapshots.begin() - 1);
-        const auto& snapshot = snapshots[index];
-        replayed_instructions_ = position - snapshot.step;
-        auto registers = recorded.snapshot_registers(index);
-        if (!replayed_instructions_)
-        {
-            cpu_ = cpu_with_registers(registers);
-            return;
+            const auto index = snapshot_index_at(recorded, snapshots, positions[order[first]]);
+            const auto step = snapshots[index].step;
+            auto last = first + 1;
+            while (last < order.size() && snapshot_index_at(recorded, snapshots, positions[order[last]]) == index)
+            {
+                ++last;
+            }
+
+            std::vector<uint64_t> stops{};
+            stops.reserve(last - first);
+            for (auto k = first; k < last; ++k)
+            {
+                stops.push_back(positions[order[k]] - step);
+            }
+            auto registers = replay_snapshot_interval(recorded, index, stops, positions[order[last - 1]]);
+            for (auto k = first; k < last; ++k)
+            {
+                views[order[k]].emplace(positions[order[k]], stops[k - first], std::move(registers[k - first]));
+            }
+            first = last;
         }
 
-        // The events of the instructions after the snapshot, up to and including instruction `position`, and the
-        // instruction after it, which the CPU decodes before it stops.
-        std::vector<access_event> events{};
-        std::optional<access_event> following{};
-        event_reader reader(recorded, snapshot.event_number);
-        while (const auto event = reader.next())
+        std::vector<cpu_view> result{};
+        result.reserve(views.size());
+        for (auto& view : views)
         {
-            if (event->kind == access_kind::execute && event->step > position)
-            {
-                following = event;
-                break;
-            }
-            if (event->kind == access_kind::host_write || event->size > inline_data_limit)
-            {
-                throw std::runtime_error("TTD register snapshot interval contains a host write");
-            }
-            events.push_back(*event);
+            result.push_back(std::move(*view));
         }
-
-        auto& engine = recorded.view_engine_slot();
-        if (!engine)
-        {
-            engine = std::make_shared<view_engine>();
-        }
-        const auto reused = engine->used();
-        try
-        {
-            cpu_ = cpu_with_registers(engine->replay(events, following, registers, position));
-        }
-        catch (const divergence_error&)
-        {
-            // Code an engine translated in earlier replays can make the backend take a store for self-modifying code and
-            // rerun the instruction without reporting its stores again. A fresh engine settles whether the replay really
-            // diverges.
-            if (!reused)
-            {
-                throw;
-            }
-            engine = std::make_shared<view_engine>();
-            cpu_ = cpu_with_registers(engine->replay(events, following, registers, position));
-        }
+        return result;
     }
 }

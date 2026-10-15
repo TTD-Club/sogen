@@ -75,6 +75,9 @@ with ttd.Trace("sample.sogttd") as trace:
     xmm0 = cpu.read_register_bytes(sogen.Register.xmm0)
     stack = trace.memory_at(store.position, rsp, 64)  # each byte from the nearest access showing it; None if none does
     data = trace.read_memory(store.position, rsp, 8)  # bytes, or ValueError when a byte is unknown
+    # Many positions at once (CpuViews in the order given): each snapshot interval replays once for all its positions,
+    # e.g. arguments and return values of every call: [p for c in calls for p in (c.entry_position, c.return_position)].
+    cpus = trace.cpu_at_many([call.entry_position for call in trace.calls_to(module.base + export.rva)])
 
     # Replay: every recorded event is verified on the way; ttd.DivergenceError (a RuntimeError) names the first
     # divergence. Syscalls whose live writes or result differ (a network answer, a missing file) and host writes with
@@ -140,7 +143,7 @@ recorded window input.
 | Target | Headers | Needs | Provides |
 | --- | --- | --- | --- |
 | `windows-ttd-reader` | `ttd_trace.hpp`, `ttd_format.hpp`, `ttd_chunk.hpp` | `emulator-common` (zstd) | `ttd::trace` and every query that does not replay: accesses, `memory_at`, calls, `calls_to`, `indirect_branches`, `exceptions`, modules, threads, syscalls, ids |
-| `windows-ttd-view` | `ttd_view.hpp` | the reader, `emulator`, `unicorn-emulator` | `ttd::cpu_view` (`Trace.cpu_at`): registers at a position on a standalone Unicorn CPU |
+| `windows-ttd-view` | `ttd_view.hpp` | the reader, `emulator`, `unicorn-emulator` | `ttd::cpu_view` (`Trace.cpu_at`): registers at a position on a standalone Unicorn CPU; `ttd::cpu_views_at` (`Trace.cpu_at_many`) for many positions, one replay per snapshot interval |
 | `windows-ttd` | `ttd_record.hpp`, `ttd_session.hpp`, scans | both, `windows-emulator` | recording, replay (`seek`, `run_to`, `replay_to_end`), keyframes, replay scans |
 
 `ttd::keyframes(trace)` and `ttd::share_keyframes(reader, other)` are free functions of `windows-ttd`

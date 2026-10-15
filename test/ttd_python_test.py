@@ -155,6 +155,20 @@ def main() -> None:
         assert compared > 40, compared
         for position in sorted(before_switch)[:5]:
             trace.cpu_at(position)
+        # cpu_at_many: one replay per snapshot interval for every position in it, in the order given (duplicates
+        # included), each view equal to cpu_at's.
+        batch = [p for p in positions if 0 < p <= trace.instruction_count] + sorted(before_switch)[:5]
+        batch += batch[:3]
+        rng.shuffle(batch)
+        views = trace.cpu_at_many(batch)
+        assert [view.position for view in views] == batch
+        for position, view in zip(batch, views):
+            single = trace.cpu_at(position)
+            assert view.replayed_instructions == single.replayed_instructions, position
+            for name in names:
+                register = getattr(sogen.Register, name)
+                assert view.read_register(register) == single.read_register(register), (position, name)
+        assert trace.cpu_at_many([]) == []
         assert len(trace.cpu_at(store.position).read_register_bytes(sogen.Register.xmm0)) == 16
         # The global's old value comes from the image, and no access shows it before the store changes it: the checkpoint
         # memory does.
