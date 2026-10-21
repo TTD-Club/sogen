@@ -5,16 +5,20 @@
 #include "process_manager.hpp"
 
 #include <stop_reason.hpp>
+#include <utils/finally.hpp>
 #include <utils/function.hpp>
 
 #include "syscall_dispatcher.hpp"
 #include "process_context.hpp"
 #include "kernel_lock.hpp"
+#include "scheduler_clock.hpp"
 #include "logger.hpp"
 #include "file_system.hpp"
+#include "filesystem/mount_spec.hpp"
 #include "memory_manager.hpp"
 #include "module/module_manager.hpp"
 #include "network/dns_lookup.hpp"
+#include "network/socket_activity.hpp"
 #include "network/socket_factory.hpp"
 #include "version/windows_version_manager.hpp"
 #include <platform/audio_backend.hpp>
@@ -50,6 +54,7 @@ namespace sogen
         opt_func<void(std::string_view type, std::u16string_view name)> on_generic_access{};
         opt_func<void(std::string_view description)> on_generic_activity{};
         opt_func<void(std::string_view description)> on_suspicious_activity{};
+        opt_func<void(network::socket_activity activity, const network::address& address)> on_socket_activity{};
         utils::callback_list<void(std::string_view message)> on_debug_string{};
         utils::callback_list<void(const mapped_module& mod, const mapped_section& section, uint64_t address)> on_section_first_execution{};
         opt_func<void(uint64_t address)> on_instruction{};
@@ -115,6 +120,14 @@ namespace sogen
         bool use_relative_time{false};
         bool use_instruction_precision{true};
 
+        // Timing fidelity vs. speed. With interception on (the default, used by the analyzer) rdtsc reads
+        // and KUSER_SHARED_DATA accesses trap so the emulated clock stays exact and deterministic. Turning
+        // them off (as the sandbox does) lets the guest read the host TSC natively and KUSD from a plain
+        // mapped page, removing those VM exits. The cost is exact/reproducible timing, and KUSD's time
+        // fields then only advance in steps of the interrupt thread's 20 ms period.
+        bool intercept_rdtsc{true};
+        bool intercept_kusd{true};
+
         std::filesystem::path emulation_root{};
         std::filesystem::path registry_directory{"./registry"};
 
@@ -125,9 +138,12 @@ namespace sogen
         bool load_registry{true};
 
         std::unordered_map<uint16_t, uint16_t> port_mappings{};
-        std::unordered_map<windows_path, std::filesystem::path> path_mappings{};
+        filesystem_mode root_mode{default_root_mode};
+        std::vector<mount_spec> mounts{};
 
         fake_environment_config fake_env{};
+
+        network::network_mode network{network::network_mode::offline};
     };
 
     struct emulator_interfaces
@@ -170,7 +186,8 @@ namespace sogen
 
         std::unique_ptr<x86_64_emulator> emu_{};
         bool use_native_timestamp_counter_{};
-        std::unique_ptr<utils::clock> clock_{};
+        std::unique_ptr<scheduler_clock> clock_{};
+        network::network_mode network_mode_{};
         std::unique_ptr<network::dns_lookup> dns_lookup_{};
         std::unique_ptr<network::socket_factory> socket_factory_{};
         std::unique_ptr<ui_backend> ui_backend_{};
@@ -220,9 +237,19 @@ namespace sogen
             return *this->clock_;
         }
 
+        [[nodiscard]] scheduler_clock& scheduling_clock()
+        {
+            return *this->clock_;
+        }
+
         const utils::clock& clock() const
         {
             return *this->clock_;
+        }
+
+        network::network_mode network_mode() const
+        {
+            return this->network_mode_;
         }
 
         network::dns_lookup& dns_lookup()
@@ -291,6 +318,13 @@ namespace sogen
         }
 
         void handle_ui_event(const ui_event& event);
+        void apply_cursor_capture();
+
+        // Input held for low-level hooks: the next hook the given thread has to run, marked as running.
+        std::optional<std::pair<process_context::low_level_input, user_low_level_hook>> begin_low_level_hook(emulator_thread& thread);
+        void finish_low_level_hook(emulator_thread& thread, bool swallow);
+        bool has_low_level_hook_work(uint32_t thread_id);
+        emulator_thread* drain_low_level_input();
         void deliver_raw_input(const process_context::raw_input_payload& payload, hwnd explicit_target);
         void deliver_raw_mouse_input(int32_t dx, int32_t dy, uint16_t button_flags, uint16_t button_data = 0);
         void deliver_raw_keyboard_input(uint16_t vkey, uint16_t scan_code, uint32_t message, bool extended);
@@ -388,11 +422,17 @@ namespace sogen
         // Prints BEL contention stats when SOGEN_LOCK_PROFILE is set (see kernel_lock).
         void dump_lock_profile();
 
-        // Signal a guest event from a host-owned thread (e.g. the audio render thread). The handle is resolved
-        // under the kernel lock, so it cannot race a concurrent close on an emulator thread; a handle the guest
-        // has already closed is simply ignored. Returns false without signaling if the lock is busy -- callers
-        // here drive periodic work and can retry, and blocking would stall them behind long kernel operations.
-        bool try_signal_guest_event(handle event_handle);
+        // Signal a guest event from a host-owned thread (e.g. the audio render thread). The request is queued and
+        // applied by the scheduler under the kernel lock, so it cannot race a concurrent close on an emulator
+        // thread; a handle the guest has already closed is simply ignored. Taking the kernel lock here instead
+        // would either stall the caller behind long kernel operations or drop the signal while it is busy.
+        // Requests count as separate wakes: a new one is only delivered once the guest consumed the previous
+        // one, so signals queued while the lock was busy don't coalesce in the event. At most maximum_pending
+        // wakes are kept, for clients that stop waiting.
+        void request_guest_event_signal(handle event_handle, uint32_t maximum_pending);
+        void apply_pending_guest_event_signals();
+
+        void wake_idle_vcpu();
 
         uint64_t get_executed_instructions() const
         {
@@ -494,15 +534,60 @@ namespace sogen
         bool perform_thread_switch(vcpu_context& vcpu);
         bool activate_thread(vcpu_context& vcpu, uint32_t id);
 
+        // Runs f with the kernel lock released, for host calls that can block for a long time (e.g. a GPU present)
+        // and would otherwise stall every other vCPU. f must not touch any emulator or guest state. Requires the
+        // kernel lock, which is held again when this returns. Other vCPUs dispatch meanwhile, so the dispatch
+        // marker is set aside for that time.
+        template <typename F>
+        decltype(auto) run_without_kernel_lock(F&& f)
+        {
+            this->kernel_lock_.assert_held();
+            auto* dispatch_vcpu = std::exchange(this->dispatch_vcpu_, nullptr);
+            this->kernel_lock_.unlock();
+            const auto _ = utils::finally([this, dispatch_vcpu] {
+                this->kernel_lock_.lock();
+                this->dispatch_vcpu_ = dispatch_vcpu;
+            });
+            return f();
+        }
+
+        // Swaps the registers of the outgoing thread on a vCPU for the incoming one. With more than one vCPU the
+        // hypercalls run with the kernel lock released: they only touch this vCPU, but cost tens of microseconds and
+        // would otherwise serialize every other vCPU behind each thread switch. Both threads are marked as in transit
+        // meanwhile. Requires the kernel lock, and incoming must already be the vCPU's active thread.
+        void transfer_thread_registers(vcpu_context& vcpu, emulator_thread* outgoing, emulator_thread& incoming);
+
+        // Blocks until no vCPU is transferring the thread's registers. Requires the kernel lock, which it releases
+        // while waiting.
+        void wait_for_register_transfer(const emulator_thread& thread);
+
       private:
+        void set_foreground_window(hwnd window);
+        void deliver_ui_event(const ui_event& event);
+        std::pair<int32_t, int32_t> cursor_after_pointer_event(const ui_event& event) const;
+        std::pair<emulator_thread*, const user_low_level_hook*> find_low_level_hook(uint64_t handle);
+        void wake_thread(emulator_thread& thread);
+
         bool use_relative_time_{false}; // TODO: Get rid of that
         bool instruction_precision_{true};
+        bool intercept_rdtsc_{true};
+        bool intercept_kusd_{true};
         uint32_t vcpu_count_{1};
         std::atomic_bool should_stop{false};
 
         // The emulator kernel lock: held by all code touching shared kernel state,
         // released while guest code executes (docs/multi-vcpu-design.md, section 7).
         kernel_lock kernel_lock_{};
+        std::mutex idle_wakeup_mutex_{};
+        std::condition_variable idle_wakeup_cv_{};
+        uint32_t pending_idle_wakeups_{};
+        std::atomic<uint32_t> idle_vcpus_{0};
+
+        void credit_idle_wakeup();
+        bool wait_for_idle_wakeup(std::chrono::milliseconds timeout);
+
+        std::mutex pending_event_signals_mutex_{};
+        std::map<uint64_t, uint32_t> pending_event_signals_{};
 
         // The vCPU currently running a handler under the kernel lock; drives
         // current_thread(). See scoped_dispatch.

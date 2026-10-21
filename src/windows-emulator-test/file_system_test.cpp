@@ -2,45 +2,321 @@
 
 #include <fstream>
 
+#include <emulator_utils.hpp>
 #include <file_system.hpp>
+#include <filesystem/guest_file.hpp>
+
+#include <fstream>
+#include <random>
 
 namespace sogen::test
 {
-    TEST(FileSystemTest, PathTraversalIsNotPossible)
+    namespace
     {
-        const auto current_dir = std::filesystem::current_path();
+        void write_host_file(const std::filesystem::path& path, const std::string_view contents)
+        {
+            std::ofstream stream(path, std::ios::binary);
+            stream.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        }
 
-        const file_system fs{current_dir};
+        std::string read_host_file(const std::filesystem::path& path)
+        {
+            std::ifstream stream(path, std::ios::binary);
+            return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+        }
 
-        EXPECT_EQ(current_dir / "a", fs.translate(windows_path('a', {u"..", u"..", u"..", u"..", u"a.txt"})));
-        EXPECT_EQ(current_dir / "a", fs.translate(windows_path('a', {u"b", u"..", u"..", u"b", u"..", u"a.txt"})));
-        EXPECT_EQ(current_dir / "a", fs.translate(windows_path('a', {u"..", u"b"})));
+        std::string read_guest_file(const guest_file& file, const size_t size)
+        {
+            std::string contents(size, '\0');
+            contents.resize(file.read(std::as_writable_bytes(std::span(contents))));
+            return contents;
+        }
+
+        class FileSystemTest : public testing::Test
+        {
+          protected:
+            void SetUp() override
+            {
+                this->root = std::filesystem::temp_directory_path() /
+                             ("sogen-file-system-test-" + std::to_string(std::random_device{}()) + std::to_string(std::random_device{}()));
+                std::filesystem::create_directories(this->root / "c" / "windows");
+                std::filesystem::create_directories(this->root / "a");
+                std::filesystem::create_directories(this->root / "mapped" / "deep");
+                std::filesystem::create_directories(this->root / "other");
+                this->root = std::filesystem::canonical(this->root);
+
+                write_host_file(this->root / "c" / "x.txt", "root");
+                write_host_file(this->root / "mapped" / "x.txt", "mapped");
+                write_host_file(this->root / "other" / "y.txt", "other");
+                write_host_file(this->root / "single.txt", "single");
+            }
+
+            void TearDown() override
+            {
+                std::error_code ec{};
+                std::filesystem::remove_all(this->root, ec);
+            }
+
+            std::filesystem::path root{};
+        };
     }
 
-    TEST(FileSystemTest, DirectoryMappingMountsSubtree)
+    TEST_F(FileSystemTest, ParentComponentsResolveInGuestSpace)
     {
-        const auto current_dir = std::filesystem::current_path();
+        file_system fs{this->root};
+        fs.map(windows_path{'c', {u"mnt"}}, this->root / "mapped");
 
-        file_system fs{current_dir};
-        fs.map(windows_path('c', {u"mnt"}), current_dir);
+        EXPECT_EQ(this->root / "a" / "a.txt", fs.translate(windows_path{'a', {u"..", u"..", u"..", u"a.txt"}}));
+        EXPECT_EQ(this->root / "a" / "a.txt", fs.translate(windows_path{'a', {u"b", u"..", u"..", u"b", u"..", u"a.txt"}}));
+        EXPECT_EQ(this->root / "c" / "x.txt", fs.translate(windows_path{'c', {u"mnt", u"..", u"x.txt"}}));
+        EXPECT_EQ(this->root / "c" / "x.txt", fs.translate(windows_path{'c', {u"mnt", u"..", u"..", u"x.txt"}}));
+    }
 
-        // A file under the mounted directory resolves to the same file under the host directory.
-        EXPECT_EQ(current_dir / "sub" / "a.txt", fs.translate(windows_path('c', {u"mnt", u"sub", u"a.txt"})));
+    TEST_F(FileSystemTest, DeepestMountWins)
+    {
+        file_system fs{this->root};
+        fs.map(windows_path{'c', {u"mnt"}}, this->root / "mapped");
+        fs.map(windows_path{'c', {u"mnt", u"deep"}}, this->root / "other");
+        fs.map(windows_path{'c', {u"mnt", u"exact.txt"}}, this->root / "single.txt");
 
-        // ".." cannot escape the mount; it is confined to the mounted directory.
-        EXPECT_EQ(current_dir, fs.translate(windows_path('c', {u"mnt", u"..", u"..", u"etc"})));
+        EXPECT_EQ(this->root / "mapped" / "sub" / "a.txt", fs.translate(windows_path{'c', {u"mnt", u"sub", u"a.txt"}}));
+        EXPECT_EQ(this->root / "other" / "y.txt", fs.translate(windows_path{'c', {u"mnt", u"deep", u"y.txt"}}));
+        EXPECT_EQ(this->root / "single.txt", fs.translate(windows_path{'c', {u"mnt", u"exact.txt"}}));
 
-        // The deepest matching mount wins.
-        fs.map(windows_path('c', {u"mnt", u"deep"}), current_dir / "other");
-        EXPECT_EQ(current_dir / "other" / "x.txt", fs.translate(windows_path('c', {u"mnt", u"deep", u"x.txt"})));
+        const auto result = fs.open(windows_path{'c', {u"mnt", u"exact.txt"}}, u"rb");
+        ASSERT_TRUE(result.file);
+        EXPECT_EQ(6, result.file->size());
+    }
 
-        // An exact file mapping still takes precedence over the directory mount.
-        fs.map(windows_path('c', {u"mnt", u"exact.txt"}), current_dir / "elsewhere.txt");
-        EXPECT_EQ(current_dir / "elsewhere.txt", fs.translate(windows_path('c', {u"mnt", u"exact.txt"})));
+    TEST_F(FileSystemTest, UnknownDrivesDoNotResolve)
+    {
+        file_system fs{this->root};
+
+        EXPECT_TRUE(fs.translate(windows_path{'z', {u"x.txt"}}).empty());
+        EXPECT_FALSE(fs.stat(windows_path{'z', {}}));
+
+        const auto result = fs.open(windows_path{'z', {u"x.txt"}}, u"wb");
+        EXPECT_FALSE(result.file);
+        EXPECT_EQ(STATUS_OBJECT_PATH_NOT_FOUND, result.status);
+        EXPECT_FALSE(std::filesystem::exists(this->root / "z"));
+    }
+
+    TEST_F(FileSystemTest, DrivesComeFromMounts)
+    {
+        file_system fs{this->root};
+        EXPECT_EQ((std::set<char>{'a', 'c'}), fs.list_drives());
+
+        fs.map(windows_path{'d', {}}, this->root / "other");
+        EXPECT_EQ((std::set<char>{'a', 'c', 'd'}), fs.list_drives());
+        EXPECT_EQ(this->root / "other" / "y.txt", fs.translate(windows_path{'d', {u"y.txt"}}));
+    }
+
+    TEST_F(FileSystemTest, ListingIncludesChildMounts)
+    {
+        file_system fs{this->root};
+        fs.map(windows_path{'c', {u"mnt"}}, this->root / "mapped");
+        fs.map(windows_path{'c', {u"windows"}}, this->root / "single.txt");
+        fs.map(windows_path{'c', {u"missing"}}, this->root / "does-not-exist");
+
+        std::map<std::u16string, bool> entries{};
+        for (const auto& entry : fs.list_directory(windows_path{'c', {}}))
+        {
+            EXPECT_FALSE(entries.contains(entry.name));
+            entries[entry.name] = entry.is_directory;
+        }
+
+        EXPECT_EQ((std::map<std::u16string, bool>{{u"mnt", true}, {u"windows", false}, {u"x.txt", false}}), entries);
+    }
+
+    TEST_F(FileSystemTest, RenameAcrossMountsCopiesFile)
+    {
+        file_system fs{this->root, filesystem_mode::read_write};
+        fs.map(windows_path{'c', {u"mnt"}}, this->root / "mapped", filesystem_mode::read_write);
+
+        EXPECT_EQ(STATUS_SUCCESS, fs.rename(windows_path{'c', {u"mnt", u"x.txt"}}, windows_path{'c', {u"moved.txt"}}));
+        EXPECT_FALSE(std::filesystem::exists(this->root / "mapped" / "x.txt"));
+        EXPECT_EQ("mapped", read_host_file(this->root / "c" / "moved.txt"));
+
+        EXPECT_EQ(STATUS_NOT_SAME_DEVICE, fs.rename(windows_path{'c', {u"moved.txt"}}, windows_path{'a', {u"moved.txt"}}));
+        EXPECT_EQ(STATUS_NOT_SAME_DEVICE, fs.rename(windows_path{'c', {u"mnt", u"deep"}}, windows_path{'c', {u"deep"}}));
+    }
+
+    TEST_F(FileSystemTest, DirectoryMountPointsCannotBeRemovedOrRenamed)
+    {
+        file_system fs{this->root, filesystem_mode::read_write};
+        fs.map(windows_path{'c', {u"mnt"}}, this->root / "mapped", filesystem_mode::read_write);
+
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.remove(windows_path{'c', {u"mnt"}}));
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.remove(windows_path{'c', {}}));
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.rename(windows_path{'c', {u"mnt"}}, windows_path{'c', {u"renamed"}}));
+        EXPECT_TRUE(std::filesystem::exists(this->root / "mapped" / "x.txt"));
+    }
+
+    TEST_F(FileSystemTest, FileMountsCanBeRemovedAndRenamed)
+    {
+        file_system fs{this->root, filesystem_mode::read_write};
+        fs.map(windows_path{'c', {u"single.txt"}}, this->root / "single.txt", filesystem_mode::read_write);
+        fs.map(windows_path{'c', {u"other.txt"}}, this->root / "other" / "y.txt", filesystem_mode::read_write);
+
+        EXPECT_EQ(STATUS_SUCCESS, fs.rename(windows_path{'c', {u"x.txt"}}, windows_path{'c', {u"single.txt"}}));
+        EXPECT_FALSE(std::filesystem::exists(this->root / "c" / "x.txt"));
+        EXPECT_EQ("root", read_host_file(this->root / "single.txt"));
+
+        EXPECT_EQ(STATUS_SUCCESS, fs.rename(windows_path{'c', {u"other.txt"}}, windows_path{'c', {u"moved.txt"}}));
+        EXPECT_FALSE(std::filesystem::exists(this->root / "other" / "y.txt"));
+        EXPECT_EQ("other", read_host_file(this->root / "c" / "moved.txt"));
+
+        EXPECT_EQ(STATUS_SUCCESS, fs.remove(windows_path{'c', {u"single.txt"}}));
+        EXPECT_FALSE(std::filesystem::exists(this->root / "single.txt"));
+    }
+
+    TEST_F(FileSystemTest, ReadOnlyMountsRejectWrites)
+    {
+        file_system fs{this->root, filesystem_mode::read_only};
+        fs.map(windows_path{'c', {u"mnt"}}, this->root / "mapped", filesystem_mode::read_write);
+
+        const windows_path existing{'c', {u"x.txt"}};
+        const windows_path missing{'c', {u"new.txt"}};
+
+        EXPECT_FALSE(fs.is_writable(existing));
+        EXPECT_TRUE(fs.open(existing, u"rb").file);
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.open(existing, u"r+b").status);
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.open(existing, u"ab").status);
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.open(missing, u"wb").status);
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.create_directory(windows_path{'c', {u"dir"}}));
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.remove(existing));
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.rename(existing, missing));
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.rename(windows_path{'c', {u"mnt", u"x.txt"}}, missing));
+        EXPECT_EQ(STATUS_ACCESS_DENIED, fs.rename(existing, windows_path{'c', {u"mnt", u"moved.txt"}}));
+
+        EXPECT_FALSE(std::filesystem::exists(this->root / "c" / "new.txt"));
+        EXPECT_FALSE(std::filesystem::exists(this->root / "c" / "dir"));
+        EXPECT_EQ("root", read_host_file(this->root / "c" / "x.txt"));
+        EXPECT_EQ("mapped", read_host_file(this->root / "mapped" / "x.txt"));
+
+        const windows_path writable{'c', {u"mnt", u"new.txt"}};
+        EXPECT_TRUE(fs.is_writable(writable));
+        EXPECT_TRUE(fs.open(writable, u"wb").file);
+        EXPECT_EQ(STATUS_SUCCESS, fs.create_directory(windows_path{'c', {u"mnt", u"dir"}}));
+        EXPECT_EQ(STATUS_SUCCESS, fs.remove(writable));
+    }
+
+    TEST_F(FileSystemTest, ExplicitMountReplacesRootDrive)
+    {
+        file_system fs{this->root, filesystem_mode::read_only};
+        fs.map(windows_path{'c', {}}, this->root / "mapped", filesystem_mode::read_write);
+
+        EXPECT_EQ(this->root / "mapped" / "x.txt", fs.translate(windows_path{'c', {u"x.txt"}}));
+        EXPECT_TRUE(fs.is_writable(windows_path{'c', {u"x.txt"}}));
+        EXPECT_FALSE(fs.is_writable(windows_path{'a', {u"x.txt"}}));
+    }
+
+    TEST_F(FileSystemTest, HandlesReportWriteAccess)
+    {
+        file_system fs{this->root, filesystem_mode::read_write};
+        const windows_path path{'c', {u"x.txt"}};
+
+        const guest_file reader{fs, path, u"rb", fs.open(path, u"rb").file};
+        const guest_file writer{fs, path, u"r+b", fs.open(path, u"r+b").file};
+        const guest_file directory{fs, windows_path{'c', {}}};
+
+        EXPECT_FALSE(reader.is_writable());
+        EXPECT_TRUE(writer.is_writable());
+        EXPECT_FALSE(directory.is_writable());
+    }
+
+    TEST_F(FileSystemTest, DeferredOperationsRunOnClose)
+    {
+        file_system fs{this->root, filesystem_mode::read_write};
+        const windows_path source{'c', {u"x.txt"}};
+        const windows_path target{'c', {u"renamed.txt"}};
+
+        {
+            guest_file file{fs, source, u"rb", fs.open(source, u"rb").file};
+            file.defer_rename(target);
+        }
+
+        EXPECT_FALSE(std::filesystem::exists(this->root / "c" / "x.txt"));
+        EXPECT_EQ("root", read_host_file(this->root / "c" / "renamed.txt"));
+
+        {
+            guest_file file{fs, target, u"rb", fs.open(target, u"rb").file};
+            file.set_delete_on_close(true);
+        }
+
+        EXPECT_FALSE(std::filesystem::exists(this->root / "c" / "renamed.txt"));
+    }
+
+    TEST_F(FileSystemTest, SnapshotRestoreKeepsWrittenContents)
+    {
+        file_system fs{this->root, filesystem_mode::read_write};
+        const windows_path path{'c', {u"new.bin"}};
+        constexpr std::string_view contents = "snapshot";
+
+        guest_file file{fs, path, u"w+b", fs.open(path, u"w+b").file};
+        ASSERT_TRUE(file);
+        ASSERT_EQ(contents.size(), file.write(std::as_bytes(std::span(contents))));
+        ASSERT_TRUE(file.flush());
+        ASSERT_TRUE(file.seek_to(4));
+
+        utils::buffer_serializer serializer{};
+        serializer.write(file);
+
+        utils::buffer_deserializer deserializer{serializer};
+        deserializer.register_factory<file_system_wrapper>([&] { return file_system_wrapper{fs}; });
+
+        guest_file restored{};
+        deserializer.read(restored);
+
+        ASSERT_TRUE(restored);
+        EXPECT_EQ(4, restored.tell());
+        EXPECT_EQ("shot", read_guest_file(restored, 16));
+        EXPECT_EQ(contents, read_host_file(this->root / "c" / "new.bin"));
+    }
+
+    TEST_F(FileSystemTest, SnapshotRestoreRequiresWritableMountForPendingWrites)
+    {
+        file_system saved_fs{this->root, filesystem_mode::read_write};
+        file_system read_only_fs{this->root, filesystem_mode::read_only};
+        const windows_path path{'c', {u"x.txt"}};
+
+        const auto get_restore_error = [](const guest_file& file, file_system& fs) -> std::string {
+            utils::buffer_serializer serializer{};
+            serializer.write(file);
+
+            utils::buffer_deserializer deserializer{serializer};
+            deserializer.register_factory<file_system_wrapper>([&] { return file_system_wrapper{fs}; });
+
+            try
+            {
+                guest_file restored{};
+                deserializer.read(restored);
+                return {};
+            }
+            catch (const std::runtime_error& e)
+            {
+                return e.what();
+            }
+        };
+
+        const guest_file reader{saved_fs, path, u"rb", saved_fs.open(path, u"rb").file};
+        EXPECT_EQ("", get_restore_error(reader, read_only_fs));
+
+        const guest_file writer{saved_fs, path, u"r+b", saved_fs.open(path, u"r+b").file};
+        EXPECT_NE(std::string::npos, get_restore_error(writer, read_only_fs).find("with a writable handle"));
+
+        guest_file deleter{saved_fs, path, u"rb", saved_fs.open(path, u"rb").file};
+        deleter.set_delete_on_close(true);
+        EXPECT_NE(std::string::npos, get_restore_error(deleter, read_only_fs).find("with delete-on-close set"));
+        deleter.set_delete_on_close(false);
+
+        guest_file renamer{saved_fs, path, u"rb", saved_fs.open(path, u"rb").file};
+        renamer.defer_rename(windows_path{'c', {u"renamed.txt"}});
+        EXPECT_NE(std::string::npos, get_restore_error(renamer, read_only_fs).find("with a pending rename"));
     }
 
     // Guest names ignore case: entries the host keeps in another case are found, and new entries take the guest's case.
-    TEST(FileSystemTest, NamesKeepTheirCase)
+    TEST(FileSystemCaseTest, NamesKeepTheirCase)
     {
         const auto root =
             std::filesystem::temp_directory_path() / ("sogen-case-" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
@@ -48,7 +324,7 @@ namespace sogen::test
         std::filesystem::create_directories(root / "c" / "MixedDir");
         std::ofstream(root / "c" / "MixedDir" / "File.TXT").put('x');
 
-        const file_system fs{root};
+        file_system fs{root, filesystem_mode::read_write};
         const auto found = fs.translate(windows_path('c', {u"mixeddir", u"file.txt"}));
         EXPECT_TRUE(std::filesystem::exists(found));
         EXPECT_EQ(std::filesystem::canonical(found).filename(), "File.TXT");
@@ -63,6 +339,21 @@ namespace sogen::test
         EXPECT_TRUE(std::filesystem::equivalent(existing, root / "c" / "MixedDir" / "File.TXT"));
         const auto renamed = fs.translate_for_creation(windows_path('c', {u"mixeddir", u"file.txt"}), u"C:\\mixeddir\\FILE.txt", true);
         EXPECT_EQ(renamed.filename(), "FILE.txt");
+
+        const auto names = [&] {
+            std::set<std::filesystem::path> result{};
+            for (const auto& entry : std::filesystem::directory_iterator(root / "c" / "MixedDir"))
+            {
+                result.insert(entry.path().filename());
+            }
+            return result;
+        };
+
+        EXPECT_TRUE(fs.open(windows_path('c', {u"mixeddir", u"created.txt"}), u"ab", u"C:\\mixeddir\\Created.txt").file);
+        EXPECT_EQ(STATUS_SUCCESS, fs.create_directory(windows_path('c', {u"mixeddir", u"subdir"}), u"SubDir"));
+        EXPECT_EQ(STATUS_SUCCESS,
+                  fs.rename(windows_path('c', {u"mixeddir", u"file.txt"}), windows_path('c', {u"mixeddir", u"file.txt"}), u"FILE.txt"));
+        EXPECT_EQ(names(), (std::set<std::filesystem::path>{"Created.txt", "SubDir", "FILE.txt"}));
 
         std::filesystem::remove_all(root);
     }

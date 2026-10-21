@@ -126,3 +126,14 @@ cmake --preset=vs2022
 ```bash
 analyzer.exe C:\example.exe
 ```
+
+By default, the guest has no access to the host network. Guest sockets use an in-process loopback, DNS queries resolve to no addresses, and the Steam bridge is disabled. To give the guest access to the host network, add `--network live`:
+
+```bash
+analyzer.exe --network live C:\example.exe
+```
+
+The guest file system is read-only by default, and guest writes fail with `STATUS_ACCESS_DENIED`. Use
+`--root-mode rw` to let the guest change the emulation root, or the host drives when no root is set. Use
+`--mount HOST:GUEST[:MODE]` to add a host file or directory at a guest path, for example
+`--mount .\out:C:\out:rw`. See [docs/filesystem.md](docs/filesystem.md) for the details of mounts and modes.

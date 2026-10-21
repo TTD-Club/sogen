@@ -10,11 +10,11 @@ namespace sogen
 {
     namespace
     {
-        std::optional<SDL_AudioFormat> to_sdl_format(const audio_format& format)
+        SDL_AudioFormat to_sdl_format(const audio_format& format)
         {
             if (format.is_float)
             {
-                return format.bits_per_sample == 32 ? std::optional{SDL_AUDIO_F32} : std::nullopt;
+                return format.bits_per_sample == 32 ? SDL_AUDIO_F32 : SDL_AUDIO_UNKNOWN;
             }
 
             switch (format.bits_per_sample)
@@ -26,7 +26,7 @@ namespace sogen
             case 32:
                 return SDL_AUDIO_S32;
             default:
-                return std::nullopt;
+                return SDL_AUDIO_UNKNOWN;
             }
         }
 
@@ -54,7 +54,7 @@ namespace sogen
                 this->close_stream();
 
                 const auto sdl_format = to_sdl_format(format);
-                if (!sdl_format || format.channels == 0 || format.sample_rate == 0)
+                if (sdl_format == SDL_AUDIO_UNKNOWN || format.channels == 0 || format.sample_rate == 0)
                 {
                     return false;
                 }
@@ -68,7 +68,8 @@ namespace sogen
                     }
                 }
 
-                const SDL_AudioSpec spec{*sdl_format, static_cast<int>(format.channels), static_cast<int>(format.sample_rate)};
+                const SDL_AudioSpec spec{
+                    .format = sdl_format, .channels = static_cast<int>(format.channels), .freq = static_cast<int>(format.sample_rate)};
                 this->stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
                 if (!this->stream_)
                 {

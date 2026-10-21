@@ -56,8 +56,12 @@ namespace sogen
         }
 #endif
 
+        // Not an aggregate: GCC 15+ reports the set members as uninitialized once
+        // the value-initialization of the base is inlined.
         struct analysis_options : analysis_settings
         {
+            analysis_options() = default;
+
             mutable bool use_gdb{false};
             std::string gdb_host{"127.0.0.1"};
             uint16_t gdb_port{28960};
@@ -78,6 +82,7 @@ namespace sogen
             std::string report_format{"jsonl"};
             std::string whp_execution_hook_mode{"auto"};
             std::optional<backend_type> backend{};
+            network::network_mode network{network::network_mode::offline};
             bool disable_instruction_precision{false};
             uint32_t vcpu_count{1};
             std::filesystem::path registry_path{get_current_binary_dir() / "registry"};
@@ -87,7 +92,8 @@ namespace sogen
             uint16_t managed_process_port{};
             std::string managed_process_token{};
             managed_process_connection* managed_process{};
-            std::unordered_map<windows_path, std::filesystem::path> path_mappings{};
+            filesystem_mode root_mode{default_root_mode};
+            std::vector<mount_spec> mounts{};
             utils::unordered_insensitive_u16string_map<std::u16string> environment{};
             // The text after the application on the analyzer's own command line, quotes and escapes as typed, which the
             // guest's command line ends with (see raw_application_arguments).
@@ -212,6 +218,8 @@ namespace sogen
                                                                   const std::string& token)
         {
             std::vector<std::string> arguments{"--managed-process-port", std::to_string(port), "--managed-process-token", token};
+            arguments.emplace_back("--network");
+            arguments.emplace_back(network::to_string(options.network));
 
             const auto add_path = [&](const std::string_view option, const std::filesystem::path& path) {
                 if (!path.empty())
@@ -227,11 +235,12 @@ namespace sogen
                 arguments.emplace_back("--reg-file");
                 arguments.push_back(registry_file.string());
             }
-            for (const auto& [source, target] : options.path_mappings)
+            arguments.emplace_back("--root-mode");
+            arguments.emplace_back(to_string(options.root_mode));
+            for (const auto& mount : options.mounts)
             {
-                arguments.emplace_back("--path");
-                arguments.push_back(u16_to_u8(source.u16string()));
-                arguments.push_back(target.string());
+                arguments.emplace_back("--mount");
+                arguments.push_back(render_mount_spec(mount));
             }
 
             return arguments;
@@ -690,7 +699,9 @@ namespace sogen
                 .use_instruction_precision = !options.disable_instruction_precision,
                 .emulation_root = options.emulation_root,
                 .registry_directory = options.registry_path,
-                .path_mappings = options.path_mappings,
+                .root_mode = options.root_mode,
+                .mounts = options.mounts,
+                .network = options.network,
             };
         }
 
@@ -851,6 +862,10 @@ namespace sogen
             }
             const auto win_emu = setup_emulator(options, args, emulator_interfaces{.ui = std::move(ui), .processes = manager.get()});
             ttd::prepare_replay(*win_emu, options.ttd);
+            if (options.network == network::network_mode::live)
+            {
+                win_emu->log.warn("Network mode is live: the guest can use the host network\n");
+            }
             apply_registry_files(*win_emu, options);
 #ifndef OS_EMSCRIPTEN
             std::unique_ptr<emulator_process_target> managed_target{};
@@ -1174,6 +1189,11 @@ namespace sogen
             app.add_option("--vcpus", options.vcpu_count, "Number of virtual CPUs (requires a backend with multi-vCPU support)")
                 ->capture_default_str();
 
+            std::string network_name{network::to_string(network::network_mode::offline)};
+            app.add_option("--network", network_name, "Guest network access: offline (no host network) or live")
+                ->capture_default_str()
+                ->check(CLI::IsMember({"offline", "live"}));
+
             std::string backend_name{};
             app.add_option("--backend", backend_name, "Select CPU backend: unicorn, icicle, whp, kvm or fex (overrides env)")
                 ->check(CLI::IsMember({"unicorn", "icicle", "whp", "kvm", "fex"}));
@@ -1185,7 +1205,19 @@ namespace sogen
             app.add_option("-i,--ignore", ignored_functions, "Comma-separated list of functions to ignore")->allow_extra_args(false);
 
             std::vector<std::pair<std::string, std::string>> path_mappings{};
-            app.add_option("-p,--path", path_mappings, "Map a Windows path to a host path")->type_name("SRC DST")->allow_extra_args(false);
+            app.add_option("-p,--path", path_mappings, "Map a Windows path to a host path, same as --mount DST:SRC")
+                ->type_name("SRC DST")
+                ->allow_extra_args(false);
+
+            std::vector<std::string> mounts{};
+            app.add_option("--mount", mounts, "Mount a host path into the guest file system (MODE is ro or rw)")
+                ->type_name("HOST:GUEST[:MODE]")
+                ->allow_extra_args(false);
+
+            std::string root_mode{to_string(default_root_mode)};
+            app.add_option("--root-mode", root_mode, "Access mode of the emulation root drives")
+                ->capture_default_str()
+                ->check(CLI::IsMember({"ro", "rw"}));
 
             std::vector<std::pair<std::string, std::string>> environment{};
             app.add_option("--env", environment, "Set an environment variable")->type_name("NAME VALUE")->allow_extra_args(false);
@@ -1225,6 +1257,8 @@ namespace sogen
                     throw std::runtime_error("GDB debugging requires --vcpus 1");
                 }
 
+                options.network = network::parse_network_mode(network_name);
+
                 if (!backend_name.empty())
                 {
                     static const std::map<std::string, backend_type> backends{
@@ -1244,9 +1278,21 @@ namespace sogen
                     split_and_insert(options.ignored_functions, functions);
                 }
 
+                options.root_mode = parse_filesystem_mode(root_mode).value();
+
                 for (const auto& [source, target] : path_mappings)
                 {
-                    options.path_mappings[windows_path(source)] = std::filesystem::absolute(target);
+                    options.mounts.push_back(mount_spec{
+                        .host_path = std::filesystem::absolute(target),
+                        .guest_path = windows_path(source),
+                    });
+                }
+
+                for (const auto& mount : mounts)
+                {
+                    auto spec = parse_mount_spec(mount);
+                    spec.host_path = std::filesystem::absolute(spec.host_path);
+                    options.mounts.push_back(std::move(spec));
                 }
 
                 for (const auto& [name, value] : environment)

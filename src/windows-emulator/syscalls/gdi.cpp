@@ -29,6 +29,9 @@ namespace sogen
             constexpr uint8_t k_gdi_brush_type = 0x10;
             constexpr uint8_t k_gdi_pen_type = 0x30;
             constexpr int32_t k_gdi_dc_object_bitmap = 0x50000;
+            constexpr int32_t k_gdi_dc_object_font = 0xA0000;
+            constexpr int32_t k_gdi_dc_object_brush = 0x100000;
+            constexpr int32_t k_gdi_dc_object_pen = 0x300000;
 
             constexpr uint32_t k_gdi_dc_attr_size = 0x130;
             constexpr uint32_t k_gdi_brush_attr_size = 0x20;
@@ -200,9 +203,10 @@ namespace sogen
             constexpr uint32_t k_dxgk_device_handle = 0x5000;
             constexpr uint32_t k_dxgk_context_handle = 0x6000;
             constexpr uint32_t k_dxgk_shared_primary_handle = 0x7000;
-            constexpr LUID k_dxgk_adapter_luid = {0x1000, 0};
+            constexpr LUID k_dxgk_adapter_luid = {.LowPart = 0x1000, .HighPart = 0};
             // Stable emulator-only unique adapter id. Sequential, not a host device.
-            constexpr GUID k_dxgk_adapter_unique_id = {0x00000001, 0x0002, 0x0003, {0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}};
+            constexpr GUID k_dxgk_adapter_unique_id = {
+                .Data1 = 0x00000001, .Data2 = 0x0002, .Data3 = 0x0003, .Data4 = {0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}};
             constexpr uint32_t k_dxgk_adapter_source_count = 1;
             constexpr uint32_t k_dxgk_command_buffer_size = 0x1000;
             constexpr uint32_t k_dxgk_allocation_list_entry_size = 8;
@@ -1390,23 +1394,16 @@ namespace sogen
 
             void write_device_caps(const syscall_context& c, const emulator_pointer caps_ptr, const size_t count)
             {
-                std::vector<uint32_t> caps(count, 0);
-                const auto set_cap = [&](const size_t idx, const uint32_t value) {
-                    if (idx < caps.size())
-                    {
-                        caps[idx] = value;
-                    }
-                };
+                static constexpr std::array<uint32_t, 9> k_cap_indices = {4, 6, 8, 0xA, 0x28, 0x2A, 0x2C, 0x58, 0x5A};
 
-                set_cap(4, get_device_caps_value(4));
-                set_cap(6, get_device_caps_value(6));
-                set_cap(8, get_device_caps_value(8));
-                set_cap(0xA, get_device_caps_value(0xA));
-                set_cap(0x28, get_device_caps_value(0x28));
-                set_cap(0x2A, get_device_caps_value(0x2A));
-                set_cap(0x2C, get_device_caps_value(0x2C));
-                set_cap(0x58, get_device_caps_value(0x58));
-                set_cap(0x5A, get_device_caps_value(0x5A));
+                std::vector<uint32_t> caps(count, 0);
+                for (const auto index : k_cap_indices)
+                {
+                    if (index < caps.size())
+                    {
+                        caps[index] = get_device_caps_value(index);
+                    }
+                }
 
                 if (caps_ptr != 0)
                 {
@@ -2099,7 +2096,7 @@ namespace sogen
 
             const size_t total_size = stride * surface.height;
 
-            if (total_size > static_cast<size_t>((std::numeric_limits<int32_t>::max)()))
+            if (total_size > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
             {
                 return 0;
             }
@@ -2184,7 +2181,7 @@ namespace sogen
 
             const auto allocation_bytes = static_cast<uint64_t>(stride) * abs_height;
 
-            if (allocation_bytes == 0 || allocation_bytes > (std::numeric_limits<size_t>::max)())
+            if (allocation_bytes == 0 || allocation_bytes > std::numeric_limits<size_t>::max())
             {
                 return 0;
             }
@@ -3894,6 +3891,105 @@ namespace sogen
                                           srccopy, 0);
         }
 
+        // BLENDFUNCTION is passed by value: BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat from the low byte up.
+        BOOL handle_NtGdiAlphaBlend(const syscall_context& c, const hdc dst_dc, const LONG x_dst, const LONG y_dst, const LONG dst_width,
+                                    const LONG dst_height, const hdc src_dc, const LONG x_src, const LONG y_src, const LONG src_width,
+                                    const LONG src_height, const DWORD blend_function, const handle /*color_transform*/)
+        {
+            constexpr uint8_t ac_src_over = 0x00;
+            constexpr uint8_t ac_src_alpha = 0x01;
+
+            if (dst_dc == 0 || src_dc == 0 || dst_width <= 0 || dst_height <= 0 || src_width <= 0 || src_height <= 0 ||
+                (blend_function & 0xFFu) != ac_src_over)
+            {
+                return FALSE;
+            }
+
+            const auto constant_alpha = static_cast<uint32_t>((blend_function >> 16) & 0xFFu);
+            const bool per_pixel_alpha = ((blend_function >> 24) & ac_src_alpha) != 0;
+
+            (void)handle_NtGdiFlush(c);
+
+            int32_t dst_origin_x = 0;
+            int32_t dst_origin_y = 0;
+            uint32_t present_handle = 0;
+            gdi_bitmap_surface* dst_surface = resolve_dc_surface(c, dst_dc, dst_origin_x, dst_origin_y, present_handle);
+            if (!dst_surface || dst_surface->width == 0 || dst_surface->height == 0 || dst_surface->pixels.empty())
+            {
+                return FALSE;
+            }
+
+            int32_t src_origin_x = 0;
+            int32_t src_origin_y = 0;
+            uint32_t unused_present_handle = 0;
+            const gdi_bitmap_surface* src_surface = resolve_dc_surface(c, src_dc, src_origin_x, src_origin_y, unused_present_handle);
+            if (!src_surface || src_surface->width == 0 || src_surface->height == 0 || src_surface->pixels.empty())
+            {
+                return FALSE;
+            }
+
+            // Windows fails rather than clips when the source rectangle leaves the source surface, and when source and
+            // destination overlap on the same surface.
+            const auto src_left = static_cast<int64_t>(x_src) + src_origin_x;
+            const auto src_top = static_cast<int64_t>(y_src) + src_origin_y;
+            if (src_left < 0 || src_top < 0 || src_left + src_width > static_cast<int64_t>(src_surface->width) ||
+                src_top + src_height > static_cast<int64_t>(src_surface->height))
+            {
+                return FALSE;
+            }
+
+            const auto dst_left = static_cast<int64_t>(x_dst) + dst_origin_x;
+            const auto dst_top = static_cast<int64_t>(y_dst) + dst_origin_y;
+            if (src_surface == dst_surface && dst_left < src_left + src_width && src_left < dst_left + dst_width &&
+                dst_top < src_top + src_height && src_top < dst_top + dst_height)
+            {
+                return FALSE;
+            }
+
+            const auto blend_channel = [](const uint32_t src, const uint32_t dst, const int shift, const uint32_t src_weight,
+                                          const uint32_t dst_weight) {
+                const auto s = (src >> shift) & 0xFFu;
+                const auto d = (dst >> shift) & 0xFFu;
+                return std::min<uint32_t>(255, (s * src_weight + d * dst_weight + 127) / 255) << shift;
+            };
+
+            for (LONG dy = 0; dy < dst_height; ++dy)
+            {
+                const auto out_y = dst_top + dy;
+                if (out_y < 0 || out_y >= static_cast<int64_t>(dst_surface->height))
+                {
+                    continue;
+                }
+
+                const auto sy = src_top + (static_cast<int64_t>(dy) * src_height / dst_height);
+                auto* dst_row = dst_surface->pixels.data() + static_cast<size_t>(out_y) * dst_surface->width;
+                const auto* src_row = src_surface->pixels.data() + static_cast<size_t>(sy) * src_surface->width;
+
+                for (LONG dx = 0; dx < dst_width; ++dx)
+                {
+                    const auto out_x = dst_left + dx;
+                    if (out_x < 0 || out_x >= static_cast<int64_t>(dst_surface->width))
+                    {
+                        continue;
+                    }
+
+                    const uint32_t src = src_row[src_left + (static_cast<int64_t>(dx) * src_width / dst_width)];
+                    const uint32_t dst = dst_row[out_x];
+
+                    // With AC_SRC_ALPHA the source is premultiplied.
+                    const auto src_alpha = per_pixel_alpha ? (src >> 24) & 0xFFu : 255u;
+                    const auto dst_weight = 255 - ((src_alpha * constant_alpha + 127) / 255);
+
+                    dst_row[out_x] =
+                        blend_channel(src, dst, 0, constant_alpha, dst_weight) | blend_channel(src, dst, 8, constant_alpha, dst_weight) |
+                        blend_channel(src, dst, 16, constant_alpha, dst_weight) | blend_channel(src, dst, 24, constant_alpha, dst_weight);
+                }
+            }
+
+            present_win_surface(c, present_handle, dst_surface);
+            return TRUE;
+        }
+
         BOOL handle_NtGdiPatBlt(const syscall_context& c, const hdc dc, const LONG x, const LONG y, const LONG width, const LONG height,
                                 const DWORD /*rop*/)
         {
@@ -4014,21 +4110,62 @@ namespace sogen
             return TRUE;
         }
 
-        BOOL handle_NtGdiGetRealizationInfo(const syscall_context& c, const hdc dc, const emulator_pointer realization_info,
-                                            const uint64_t /*font*/)
+        // The caller sets the size: 16 bytes for GetFontRealizationInfo, 24 when it also wants the face, and 812 for the
+        // variant that lists the font files. The emulated fonts are raster fonts without font files, so everything after
+        // the common header stays zero.
+        BOOL handle_NtGdiGetRealizationInfo(const syscall_context& c, const hdc dc, const emulator_pointer realization_info)
         {
-            if (dc == 0)
+            struct font_realization_info_header
+            {
+                uint32_t size;
+                uint32_t flags;
+                uint32_t cache_num;
+                uint32_t instance_id;
+            };
+
+            constexpr std::array<uint32_t, 3> supported_sizes{sizeof(font_realization_info_header), 24, 812};
+            constexpr uint32_t realized = 1;
+
+            uint64_t dc_attr = 0;
+            if (dc == 0 || realization_info == 0 || !get_gdi_object_address(c, static_cast<uint32_t>(dc), k_gdi_dc_type, dc_attr))
             {
                 return FALSE;
             }
 
-            if (realization_info != 0)
+            uint32_t size = 0;
+            c.emu.read_memory(realization_info, &size, sizeof(size));
+            if (std::ranges::find(supported_sizes, size) == supported_sizes.end())
             {
-                std::array<uint8_t, 0x20> zeroed{};
-                c.emu.write_memory(realization_info, zeroed.data(), zeroed.size());
+                return FALSE;
             }
 
+            uint32_t font_handle = 0;
+            c.emu.read_memory(dc_attr + k_gdi_dc_attr_font_offset, &font_handle, sizeof(font_handle));
+
+            std::vector<uint8_t> info(size);
+            const font_realization_info_header header{
+                .size = size,
+                .flags = realized,
+                .cache_num = font_handle,
+                .instance_id = font_handle,
+            };
+            std::memcpy(info.data(), &header, sizeof(header));
+
+            c.emu.write_memory(realization_info, info.data(), info.size());
             return TRUE;
+        }
+
+        BOOL handle_NtGdiFontIsLinked(const syscall_context&, const hdc /*dc*/)
+        {
+            return FALSE;
+        }
+
+        // The emulated fonts are raster fonts without TrueType tables, which GetFontData reports with GDI_ERROR.
+        uint32_t handle_NtGdiGetFontData(const syscall_context&, const hdc /*dc*/, const uint32_t /*table*/, const uint32_t /*offset*/,
+                                         const emulator_pointer /*buffer*/, const uint32_t /*size*/)
+        {
+            constexpr uint32_t gdi_error = 0xFFFFFFFF;
+            return gdi_error;
         }
 
         BOOL handle_NtGdiMoveToEx(const syscall_context& c, const hdc dc, const LONG x, const LONG y, const emulator_pointer old_point_ptr)
@@ -4117,8 +4254,36 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        std::optional<uint32_t> get_dc_attr_object_offset(const int32_t object_type)
+        {
+            switch (object_type)
+            {
+            case k_gdi_dc_object_font:
+                return k_gdi_dc_attr_font_offset;
+            case k_gdi_dc_object_brush:
+                return k_gdi_dc_attr_hbrush_offset;
+            case k_gdi_dc_object_pen:
+                return k_gdi_dc_attr_hpen_offset;
+            default:
+                return std::nullopt;
+            }
+        }
+
         uint64_t handle_NtGdiGetDCObject(const syscall_context& c, const hdc dc, const int32_t object_type)
         {
+            if (const auto offset = get_dc_attr_object_offset(object_type))
+            {
+                uint64_t dc_attr = 0;
+                if (!get_gdi_object_address(c, static_cast<uint32_t>(dc), k_gdi_dc_type, dc_attr))
+                {
+                    return 0;
+                }
+
+                uint32_t object = 0;
+                c.win_emu.memory.try_read_memory(dc_attr + *offset, &object, sizeof(object));
+                return object;
+            }
+
             if (object_type != k_gdi_dc_object_bitmap)
             {
                 return 0;

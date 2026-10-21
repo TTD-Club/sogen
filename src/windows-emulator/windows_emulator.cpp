@@ -12,7 +12,6 @@
 #include "apiset/apiset.hpp"
 #include "syscall_dispatcher.hpp"
 
-#include "network/static_socket_factory.hpp"
 #include "memory_permission_ext.hpp"
 #include "worker_factory_support.hpp"
 
@@ -107,7 +106,7 @@ namespace sogen
             return result;
         }
 
-        std::optional<POINT> get_window_origin_relative_to_ancestor(const process_context& process, const hwnd window, const hwnd ancestor)
+        std::optional<POINT> get_client_origin_relative_to_ancestor(const process_context& process, const hwnd window, const hwnd ancestor)
         {
             POINT origin{};
             auto current_handle = window;
@@ -119,8 +118,8 @@ namespace sogen
                     return std::nullopt;
                 }
 
-                origin.x += current->x;
-                origin.y += current->y;
+                origin.x += current->client_x();
+                origin.y += current->client_y();
                 current_handle = current->parent_handle;
             }
 
@@ -181,6 +180,45 @@ namespace sogen
         bool is_key_up_message(const uint32_t message)
         {
             return message == WM_KEYUP || message == WM_SYSKEYUP;
+        }
+
+        constexpr int k_wh_keyboard_ll = 13;
+        constexpr int k_wh_mouse_ll = 14;
+
+        bool is_character_message(const uint32_t message)
+        {
+            return message == WM_CHAR || message == WM_SYSCHAR || message == WM_DEADCHAR || message == WM_SYSDEADCHAR;
+        }
+
+        int low_level_hook_id(const uint32_t message)
+        {
+            switch (message)
+            {
+            case WM_KEYDOWN:
+            case WM_KEYUP:
+            case WM_SYSKEYDOWN:
+            case WM_SYSKEYUP:
+                return k_wh_keyboard_ll;
+            case WM_MOUSEMOVE:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_RBUTTONDOWN:
+            case WM_RBUTTONUP:
+            case WM_MBUTTONDOWN:
+            case WM_MBUTTONUP:
+            case WM_XBUTTONDOWN:
+            case WM_XBUTTONUP:
+            case WM_MOUSEWHEEL:
+            case WM_MOUSEHWHEEL:
+                return k_wh_mouse_ll;
+            default:
+                return 0;
+            }
+        }
+
+        bool is_input_message(const uint32_t message)
+        {
+            return low_level_hook_id(message) != 0 || is_character_message(message) || is_pointer_message(message);
         }
 
         bool is_keyboard_message(const uint32_t message)
@@ -321,8 +359,8 @@ namespace sogen
                     // Capture sends every pointer event to the capturing window, even one reported for
                     // another top-level. Translate via screen coordinates (origin relative to the root)
                     // so it works across top-levels; for a child of top_level this is the same offset.
-                    const auto captured_origin = get_window_origin_relative_to_ancestor(process, captured->handle, 0);
-                    const auto top_level_origin = get_window_origin_relative_to_ancestor(process, top_level, 0);
+                    const auto captured_origin = get_client_origin_relative_to_ancestor(process, captured->handle, 0);
+                    const auto top_level_origin = get_client_origin_relative_to_ancestor(process, top_level, 0);
                     if (captured_origin && top_level_origin)
                     {
                         const auto screen_x = top_level_origin->x + x;
@@ -402,11 +440,13 @@ namespace sogen
 
         void perform_context_switch_work(windows_emulator& win_emu, vcpu_context& vcpu)
         {
+            win_emu.apply_pending_guest_event_signals();
+
             auto& threads = win_emu.process.threads;
 
             for (auto it = threads.begin(); it != threads.end();)
             {
-                if (!it->second.is_terminated() || it->second.ref_count > 0)
+                if (!it->second.is_terminated() || it->second.ref_count > 0 || it->second.registers_in_transit)
                 {
                     ++it;
                     continue;
@@ -548,14 +588,21 @@ namespace sogen
                 return false;
             }
 
+            if (thread.registers_in_transit)
+            {
+                return false;
+            }
+
             auto& emu = vcpu.cpu;
             auto& context = win_emu.process;
 
             const auto is_ready = thread.is_thread_ready(win_emu);
             const auto has_pending_status = thread.pending_status.has_value();
             const auto can_dispatch_apcs = thread.apc_alertable && !thread.pending_apcs.empty();
+            const auto can_run_low_level_hook =
+                !is_ready && thread.message_wait_syscall_id.has_value() && win_emu.has_low_level_hook_work(thread.id);
 
-            if (!is_ready && !force && !can_dispatch_apcs)
+            if (!is_ready && !force && !can_dispatch_apcs && !can_run_low_level_hook)
             {
                 return false;
             }
@@ -567,12 +614,11 @@ namespace sogen
                 if (active_thread)
                 {
                     win_emu.callbacks.on_thread_switch(*active_thread, thread);
-                    active_thread->save(emu);
                 }
 
                 vcpu.active_thread = &thread;
 
-                thread.restore(emu);
+                win_emu.transfer_thread_registers(vcpu, active_thread, thread);
             }
 
             thread.setup_if_necessary(emu, context);
@@ -581,6 +627,11 @@ namespace sogen
             {
                 thread.mark_as_ready(STATUS_USER_APC);
                 dispatch_next_apc(win_emu, vcpu, thread);
+            }
+            else if (can_run_low_level_hook)
+            {
+                // The message syscall runs the hook first when it executes again.
+                thread.restart_message_wait(emu);
             }
 
             thread.apc_alertable = false;
@@ -600,33 +651,28 @@ namespace sogen
 
         bool switch_to_next_thread(windows_emulator& win_emu, vcpu_context& vcpu)
         {
+            const scheduler_clock::scope time_scope{win_emu.scheduling_clock()};
             perform_context_switch_work(win_emu, vcpu);
 
-            auto& context = win_emu.process;
+            auto& threads = win_emu.process.threads;
 
-            bool next_thread = false;
-
-            for (auto& t : context.threads | std::views::values)
+            auto resume_at = vcpu.active_thread ? threads.find(*vcpu.active_thread) : threads.end();
+            if (resume_at != threads.end())
             {
-                if (next_thread)
-                {
-                    if (switch_to_thread(win_emu, vcpu, t))
-                    {
-                        return true;
-                    }
+                ++resume_at;
+            }
 
-                    continue;
-                }
-
-                if (&t == vcpu.active_thread)
+            for (auto it = resume_at; it != threads.end(); ++it)
+            {
+                if (switch_to_thread(win_emu, vcpu, it->second))
                 {
-                    next_thread = true;
+                    return true;
                 }
             }
 
-            for (auto& t : context.threads | std::views::values)
+            for (auto it = threads.begin(); it != resume_at; ++it)
             {
-                if (switch_to_thread(win_emu, vcpu, t))
+                if (switch_to_thread(win_emu, vcpu, it->second))
                 {
                     return true;
                 }
@@ -670,28 +716,24 @@ namespace sogen
             return std::make_unique<utils::clock>();
         }
 
-        std::unique_ptr<network::dns_lookup> get_dns_lookup(emulator_interfaces& interfaces)
+        std::unique_ptr<network::dns_lookup> get_dns_lookup(emulator_interfaces& interfaces, const network::network_mode mode)
         {
             if (interfaces.dns_lookup)
             {
                 return std::move(interfaces.dns_lookup);
             }
 
-            return std::make_unique<network::dns_lookup>();
+            return network::create_dns_lookup(mode);
         }
 
-        std::unique_ptr<network::socket_factory> get_socket_factory(emulator_interfaces& interfaces)
+        std::unique_ptr<network::socket_factory> get_socket_factory(emulator_interfaces& interfaces, const network::network_mode mode)
         {
             if (interfaces.socket_factory)
             {
                 return std::move(interfaces.socket_factory);
             }
 
-#ifdef OS_EMSCRIPTEN
-            return network::create_static_socket_factory();
-#else
-            return std::make_unique<network::socket_factory>();
-#endif
+            return network::create_socket_factory(mode);
         }
 
         std::unique_ptr<ui_backend> get_ui_backend(emulator_interfaces& interfaces)
@@ -760,9 +802,11 @@ namespace sogen
         : emu_(std::move(emu)),
           use_native_timestamp_counter_(!interfaces.clock && !settings.use_relative_time &&
                                         this->emu_->supports_native_timestamp_counter()),
-          clock_(get_clock(interfaces, this->executed_instructions_, this->idle_ticks_, settings.use_relative_time)),
-          dns_lookup_(get_dns_lookup(interfaces)),
-          socket_factory_(get_socket_factory(interfaces)),
+          clock_(std::make_unique<scheduler_clock>(
+              get_clock(interfaces, this->executed_instructions_, this->idle_ticks_, settings.use_relative_time))),
+          network_mode_(settings.network),
+          dns_lookup_(get_dns_lookup(interfaces, settings.network)),
+          socket_factory_(get_socket_factory(interfaces, settings.network)),
           ui_backend_(get_ui_backend(interfaces)),
           audio_backend_(get_audio_backend(interfaces)),
           crypt_protect_backend_(get_crypt_protect_backend(
@@ -772,7 +816,7 @@ namespace sogen
           emulation_root{settings.emulation_root.empty() ? settings.emulation_root : absolute(settings.emulation_root)},
           fake_env(effective_fake_env(settings, static_cast<uint32_t>(this->emu_->vcpu_count()))),
           callbacks(std::move(callbacks)),
-          file_sys(emulation_root.empty() ? emulation_root : emulation_root / "filesys"),
+          file_sys(emulation_root.empty() ? emulation_root : emulation_root / "filesys", settings.root_mode),
           memory(*this->emu_),
           registry(settings.load_registry
                        ? registry_manager{emulation_root.empty() ? settings.registry_directory : emulation_root / "registry"}
@@ -781,6 +825,8 @@ namespace sogen
           process(*this->emu_, memory, *this->clock_, this->callbacks),
           use_relative_time_(settings.use_relative_time),
           instruction_precision_(settings.use_instruction_precision && this->emu_->supports_instruction_counting()),
+          intercept_rdtsc_(settings.intercept_rdtsc),
+          intercept_kusd_(settings.intercept_kusd),
           vcpu_count_(static_cast<uint32_t>(this->emu_->vcpu_count()))
     {
         if (this->vcpu_count_ == 0)
@@ -821,9 +867,9 @@ namespace sogen
         }
 #endif
 
-        for (const auto& mapping : settings.path_mappings)
+        for (const auto& mount : settings.mounts)
         {
-            this->file_sys.map(mapping.first, mapping.second);
+            this->file_sys.map(mount.guest_path, mount.host_path, mount.mode);
         }
 
         for (const auto& mapping : settings.port_mappings)
@@ -864,16 +910,19 @@ namespace sogen
 
         const auto apiset_data = apiset::obtain(this->emulation_root);
 
-        this->process.setup(*this, this->application_settings_, *executable, *ntdll, apiset_data, this->mod_manager.wow64_modules_.ntdll32);
+        this->process.setup(*this, this->application_settings_, *executable, *ntdll, apiset_data, this->mod_manager.wow64_modules_.ntdll32,
+                            this->intercept_kusd_);
 
         const auto ntdll_data = emu.read_memory(ntdll->image_base, static_cast<size_t>(ntdll->size_of_image));
         const auto win32u_data = emu.read_memory(win32u->image_base, static_cast<size_t>(win32u->size_of_image));
 
         this->dispatcher.setup(ntdll->exports, ntdll_data, win32u->exports, win32u_data);
 
-        const auto main_thread_id = context.create_thread(this->memory, this->mod_manager.executable->entry_point, 0,
+        const auto initial_argument = this->process.is_wow64_process ? this->process.peb32->value() : this->process.peb64.value();
+        const auto main_thread_id = context.create_thread(this->memory, this->mod_manager.executable->entry_point, initial_argument,
                                                           this->mod_manager.executable->size_of_stack_reserve, 0, true);
 
+        const std::scoped_lock lock(this->kernel_lock_);
         switch_to_thread(*this, this->vcpu(0), main_thread_id);
     }
 
@@ -897,6 +946,7 @@ namespace sogen
         this->kernel_lock_.assert_held();
 
         const auto needed_switch = vcpu.switch_thread.exchange(false);
+        bool woken_by_signal = false;
 
         while (true)
         {
@@ -905,6 +955,8 @@ namespace sogen
             {
                 break;
             }
+
+            woken_by_signal = false;
 
             if (this->vcpu_count_ > 1 && vcpu.active_thread)
             {
@@ -930,6 +982,8 @@ namespace sogen
                 }
             }
 
+            ++this->idle_vcpus_;
+
             // Idle: nothing is ready. Release the kernel lock while pumping UI events
             // and sleeping so other threads (UI delivery, vCPU workers) can run.
             lock.unlock();
@@ -951,16 +1005,24 @@ namespace sogen
             }
             else
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                woken_by_signal = this->wait_for_idle_wakeup(std::chrono::milliseconds(1));
             }
 
+            --this->idle_vcpus_;
             lock.lock();
+
+            this->drain_low_level_input();
 
             if (this->should_stop)
             {
                 vcpu.switch_thread = needed_switch;
                 return false;
             }
+        }
+
+        if (woken_by_signal)
+        {
+            this->wake_idle_vcpu();
         }
 
         return true;
@@ -972,12 +1034,21 @@ namespace sogen
 
         while (!this->should_stop)
         {
-            if (vcpu.switch_thread || !vcpu.active_thread || !vcpu.thread().is_thread_ready(*this))
+            // A loop rather than a single check: the register transfer of a switch releases the kernel lock, so the
+            // chosen thread can be terminated or suspended before it runs.
+            bool switched = true;
+            while (vcpu.switch_thread || !vcpu.active_thread || !vcpu.thread().is_thread_ready(*this))
             {
-                if (!this->perform_thread_switch(vcpu, lock))
+                switched = this->perform_thread_switch(vcpu, lock);
+                if (!switched)
                 {
                     break;
                 }
+            }
+
+            if (!switched || this->should_stop)
+            {
+                break;
             }
 
             // Guest code executes with the kernel lock released; hook callbacks
@@ -996,6 +1067,61 @@ namespace sogen
 
         // One vCPU winding down (process exit, fatal error) ends the whole run.
         this->stop();
+    }
+
+    void windows_emulator::transfer_thread_registers(vcpu_context& vcpu, emulator_thread* outgoing, emulator_thread& incoming)
+    {
+        this->kernel_lock_.assert_held();
+
+        if (this->vcpu_count_ == 1)
+        {
+            if (outgoing)
+            {
+                outgoing->save(vcpu.cpu);
+            }
+
+            incoming.restore(vcpu.cpu);
+            return;
+        }
+
+        if (outgoing)
+        {
+            outgoing->registers_in_transit = true;
+        }
+        incoming.registers_in_transit = true;
+
+        {
+            this->kernel_lock_.unlock();
+            const auto _ = utils::finally([&] {
+                this->kernel_lock_.lock();
+                if (outgoing)
+                {
+                    outgoing->registers_in_transit = false;
+                }
+                incoming.registers_in_transit = false;
+            });
+
+            if (outgoing)
+            {
+                outgoing->save(vcpu.cpu);
+            }
+
+            incoming.load_registers(vcpu.cpu);
+        }
+
+        incoming.refresh_execution_context(vcpu.cpu);
+    }
+
+    void windows_emulator::wait_for_register_transfer(const emulator_thread& thread)
+    {
+        this->kernel_lock_.assert_held();
+
+        while (thread.registers_in_transit)
+        {
+            this->kernel_lock_.unlock();
+            std::this_thread::yield();
+            this->kernel_lock_.lock();
+        }
     }
 
     bool windows_emulator::activate_thread(vcpu_context& vcpu, const uint32_t id)
@@ -1190,47 +1316,53 @@ namespace sogen
             return instruction_hook_continuation::skip_instruction;
         });
 
-        this->emu().hook_instruction(x86_hookable_instructions::rdtscp, [&](cpu_interface& cpu, uint64_t) {
-            const std::scoped_lock lock(this->kernel_lock_);
-            auto& vcpu = this->vcpu(cpu.index());
-            const scoped_dispatch dispatch(*this, vcpu);
-            auto& acting = vcpu.cpu;
-            this->callbacks.on_rdtscp();
+        // rdtsc/rdtscp are intercepted only when timing must stay exact (the analyzer). Otherwise the
+        // guest reads the host TSC natively - the WHP backend serves the exit with the real TSC and no
+        // kernel lock - removing a hot VM-exit path for games.
+        if (this->intercept_rdtsc_ || !this->use_native_timestamp_counter_)
+        {
+            this->emu().hook_instruction(x86_hookable_instructions::rdtscp, [&](cpu_interface& cpu, uint64_t) {
+                const std::scoped_lock lock(this->kernel_lock_);
+                auto& vcpu = this->vcpu(cpu.index());
+                const scoped_dispatch dispatch(*this, vcpu);
+                auto& acting = vcpu.cpu;
+                this->callbacks.on_rdtscp();
 
-            if (this->use_native_timestamp_counter_)
-            {
-                return instruction_hook_continuation::run_instruction;
-            }
+                if (this->use_native_timestamp_counter_)
+                {
+                    return instruction_hook_continuation::run_instruction;
+                }
 
-            const auto ticks = this->clock_->timestamp_counter();
-            acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
-            acting.reg(x86_register::rdx, static_cast<uint32_t>(ticks >> 32));
+                const auto ticks = this->clock_->timestamp_counter();
+                acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
+                acting.reg(x86_register::rdx, static_cast<uint32_t>(ticks >> 32));
 
-            // Return the IA32_TSC_AUX value in RCX (low 32 bits)
-            auto tsc_aux = 0; // Need to replace this with proper CPUID later
-            acting.reg(x86_register::rcx, tsc_aux);
+                // Return the IA32_TSC_AUX value in RCX (low 32 bits)
+                auto tsc_aux = 0; // Need to replace this with proper CPUID later
+                acting.reg(x86_register::rcx, tsc_aux);
 
-            return instruction_hook_continuation::skip_instruction;
-        });
+                return instruction_hook_continuation::skip_instruction;
+            });
 
-        this->emu().hook_instruction(x86_hookable_instructions::rdtsc, [&](cpu_interface& cpu, uint64_t) {
-            const std::scoped_lock lock(this->kernel_lock_);
-            auto& vcpu = this->vcpu(cpu.index());
-            const scoped_dispatch dispatch(*this, vcpu);
-            auto& acting = vcpu.cpu;
-            this->callbacks.on_rdtsc();
+            this->emu().hook_instruction(x86_hookable_instructions::rdtsc, [&](cpu_interface& cpu, uint64_t) {
+                const std::scoped_lock lock(this->kernel_lock_);
+                auto& vcpu = this->vcpu(cpu.index());
+                const scoped_dispatch dispatch(*this, vcpu);
+                auto& acting = vcpu.cpu;
+                this->callbacks.on_rdtsc();
 
-            if (this->use_native_timestamp_counter_)
-            {
-                return instruction_hook_continuation::run_instruction;
-            }
+                if (this->use_native_timestamp_counter_)
+                {
+                    return instruction_hook_continuation::run_instruction;
+                }
 
-            const auto ticks = this->clock_->timestamp_counter();
-            acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
-            acting.reg(x86_register::rdx, static_cast<uint32_t>(ticks >> 32));
+                const auto ticks = this->clock_->timestamp_counter();
+                acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
+                acting.reg(x86_register::rdx, static_cast<uint32_t>(ticks >> 32));
 
-            return instruction_hook_continuation::skip_instruction;
-        });
+                return instruction_hook_continuation::skip_instruction;
+            });
+        }
 
         // TODO: Unicorn needs this - This should be handled in the backend
         this->emu().hook_instruction(x86_hookable_instructions::invalid, [&](cpu_interface& cpu, uint64_t) {
@@ -1452,9 +1584,11 @@ namespace sogen
             }
         });
 
-        if (!this->uses_instruction_precision() && this->emu().is_stop_thread_safe())
+        const bool preempt_vcpus = !this->uses_instruction_precision() && this->emu().is_stop_thread_safe();
+        const bool refresh_kusd = !this->intercept_kusd_;
+        if (preempt_vcpus || refresh_kusd)
         {
-            interrupt_thread = std::thread([&] {
+            interrupt_thread = std::thread([&, preempt_vcpus, refresh_kusd] {
                 while (!this->should_stop)
                 {
                     std::unique_lock lock{interrupt_mutex};
@@ -1462,7 +1596,18 @@ namespace sogen
                         return this->should_stop.load(); //
                     });
 
-                    if (!this->should_stop)
+                    if (this->should_stop)
+                    {
+                        break;
+                    }
+
+                    if (refresh_kusd)
+                    {
+                        const std::scoped_lock kernel_lock(this->kernel_lock_);
+                        this->process.kusd.refresh();
+                    }
+
+                    if (preempt_vcpus)
                     {
                         // Under the kernel lock so this switch_thread/stop() pair can't straddle a vCPU's
                         // own scheduling step: perform_thread_switch consumes switch_thread (exchange to
@@ -1629,10 +1774,277 @@ namespace sogen
                                 this->process.raw_keyboard_target);
     }
 
+    void windows_emulator::set_foreground_window(const hwnd window)
+    {
+        const auto previous = this->process.foreground_window;
+        if (previous == window)
+        {
+            return;
+        }
+
+        this->process.foreground_window = window;
+
+        if (const auto* previous_window = this->process.windows.get(previous))
+        {
+            if (auto* owner = get_thread_by_id(this->process, previous_window->thread_id); owner && owner->active_window == previous)
+            {
+                owner->set_active_window(0);
+            }
+        }
+
+        if (const auto* new_window = this->process.windows.get(window))
+        {
+            if (auto* owner = get_thread_by_id(this->process, new_window->thread_id))
+            {
+                owner->set_active_window(window);
+            }
+        }
+    }
+
     void windows_emulator::handle_ui_event(const ui_event& event)
     {
         const std::scoped_lock lock(this->kernel_lock_);
 
+        const auto hook_id = low_level_hook_id(event.message);
+        auto& pending = this->process.pending_low_level_input;
+
+        if (is_character_message(event.message) && this->process.drop_low_level_characters)
+        {
+            return;
+        }
+
+        if (hook_id == k_wh_keyboard_ll)
+        {
+            this->process.drop_low_level_characters = false;
+        }
+
+        std::vector<uint64_t> hooks{};
+        if (hook_id != 0)
+        {
+            for (auto& thread : this->process.threads | std::views::values)
+            {
+                if (thread.is_terminated())
+                {
+                    continue;
+                }
+
+                for (const auto& hook : thread.low_level_hooks)
+                {
+                    if (hook.id == hook_id)
+                    {
+                        hooks.push_back(hook.handle);
+                    }
+                }
+            }
+
+            // The most recently installed hook runs first.
+            std::ranges::sort(hooks, std::greater{});
+        }
+
+        // Input already waiting for hooks keeps everything after it waiting too, so the guest sees it in order.
+        if (hooks.empty() && (pending.empty() || !is_input_message(event.message)))
+        {
+            this->deliver_ui_event(event);
+            return;
+        }
+
+        auto [screen_x, screen_y] = std::pair{this->process.cursor_x, this->process.cursor_y};
+        if (is_pointer_message(event.message) && !is_mouse_wheel_message(event.message))
+        {
+            std::tie(screen_x, screen_y) = this->cursor_after_pointer_event(event);
+        }
+
+        const auto now = this->clock().steady_now();
+        pending.push_back(process_context::low_level_input{
+            .id = this->process.next_low_level_input_id++,
+            .event = event,
+            .screen_x = screen_x,
+            .screen_y = screen_y,
+            .time = static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count()),
+            .hooks = std::move(hooks),
+            .waiting_since = now,
+        });
+
+        if (auto* owner = this->drain_low_level_input())
+        {
+            this->wake_thread(*owner);
+        }
+    }
+
+    std::pair<emulator_thread*, const user_low_level_hook*> windows_emulator::find_low_level_hook(const uint64_t handle)
+    {
+        for (auto& thread : this->process.threads | std::views::values)
+        {
+            if (thread.is_terminated())
+            {
+                continue;
+            }
+
+            for (const auto& hook : thread.low_level_hooks)
+            {
+                if (hook.handle == handle)
+                {
+                    return {&thread, &hook};
+                }
+            }
+        }
+
+        return {};
+    }
+
+    // Windows passes input on when a low-level hook does not return within LowLevelHooksTimeout, and ignores the
+    // result of a hook that returns later.
+    emulator_thread* windows_emulator::drain_low_level_input()
+    {
+        constexpr auto low_level_hooks_timeout = std::chrono::seconds(1);
+
+        auto& pending = this->process.pending_low_level_input;
+        const auto now = this->clock().steady_now();
+        while (!pending.empty())
+        {
+            auto& front = pending.front();
+            const auto timed_out = now - front.waiting_since > low_level_hooks_timeout;
+            if (front.in_progress && !timed_out)
+            {
+                return nullptr;
+            }
+
+            while (!front.in_progress && !front.hooks.empty() && !this->find_low_level_hook(front.hooks.front()).second)
+            {
+                front.hooks.erase(front.hooks.begin());
+            }
+
+            if (front.hooks.empty() || timed_out)
+            {
+                const auto event = front.event;
+                pending.erase(pending.begin());
+                if (!pending.empty())
+                {
+                    pending.front().waiting_since = now;
+                }
+
+                this->deliver_ui_event(event);
+                continue;
+            }
+
+            return this->find_low_level_hook(front.hooks.front()).first;
+        }
+
+        return nullptr;
+    }
+
+    std::optional<std::pair<process_context::low_level_input, user_low_level_hook>> windows_emulator::begin_low_level_hook(
+        emulator_thread& thread)
+    {
+        if (!this->has_low_level_hook_work(thread.id))
+        {
+            return std::nullopt;
+        }
+
+        auto& front = this->process.pending_low_level_input.front();
+        front.in_progress = true;
+        front.waiting_since = this->clock().steady_now();
+        thread.running_low_level_inputs.push_back(front.id);
+        return std::pair{front, *this->find_low_level_hook(front.hooks.front()).second};
+    }
+
+    void windows_emulator::finish_low_level_hook(emulator_thread& thread, const bool swallow)
+    {
+        if (thread.running_low_level_inputs.empty())
+        {
+            return;
+        }
+
+        const auto id = thread.running_low_level_inputs.back();
+        thread.running_low_level_inputs.pop_back();
+
+        auto& pending = this->process.pending_low_level_input;
+        if (pending.empty() || !pending.front().in_progress || pending.front().id != id)
+        {
+            return;
+        }
+
+        const auto now = this->clock().steady_now();
+        auto& front = pending.front();
+        front.in_progress = false;
+        front.waiting_since = now;
+        if (swallow)
+        {
+            this->process.drop_low_level_characters = is_key_down_message(front.event.message);
+            pending.erase(pending.begin());
+
+            while (this->process.drop_low_level_characters && !pending.empty() && is_character_message(pending.front().event.message))
+            {
+                pending.erase(pending.begin());
+            }
+
+            if (!pending.empty())
+            {
+                pending.front().waiting_since = now;
+            }
+        }
+        else if (!front.hooks.empty())
+        {
+            front.hooks.erase(front.hooks.begin());
+        }
+
+        if (auto* owner = this->drain_low_level_input())
+        {
+            this->wake_thread(*owner);
+        }
+    }
+
+    bool windows_emulator::has_low_level_hook_work(const uint32_t thread_id)
+    {
+        this->drain_low_level_input();
+
+        const auto& pending = this->process.pending_low_level_input;
+        if (pending.empty() || pending.front().in_progress || pending.front().hooks.empty())
+        {
+            return false;
+        }
+
+        const auto* owner = this->find_low_level_hook(pending.front().hooks.front()).first;
+        return owner && owner->id == thread_id;
+    }
+
+    // Kick the vCPU running the thread so it promptly re-checks its message queue; if the thread is not running on
+    // any vCPU right now, fall back to vCPU 0 to force a reschedule that can pick up the now-ready thread.
+    void windows_emulator::wake_thread(emulator_thread& thread)
+    {
+        auto* running_on = find_vcpu_running_thread(*this, thread);
+        auto& vcpu = running_on ? *running_on : this->vcpu(0);
+        vcpu.switch_thread = true;
+        vcpu.cpu.stop();
+    }
+
+    std::pair<int32_t, int32_t> windows_emulator::cursor_after_pointer_event(const ui_event& event) const
+    {
+        int32_t cursor_x = this->process.cursor_x;
+        int32_t cursor_y = this->process.cursor_y;
+        if (event.relative_motion)
+        {
+            cursor_x += event.relative_motion->first;
+            cursor_y += event.relative_motion->second;
+            if (const auto& clip = this->process.cursor_clip)
+            {
+                const auto left = static_cast<int32_t>(clip->left);
+                const auto top = static_cast<int32_t>(clip->top);
+                cursor_x = std::clamp(cursor_x, left, std::max(left, static_cast<int32_t>(clip->right) - 1));
+                cursor_y = std::clamp(cursor_y, top, std::max(top, static_cast<int32_t>(clip->bottom) - 1));
+            }
+        }
+        else if (const auto origin = get_client_origin_relative_to_ancestor(this->process, event.window, 0))
+        {
+            cursor_x = origin->x + point_x(event.lParam);
+            cursor_y = origin->y + point_y(event.lParam);
+        }
+
+        return {cursor_x, cursor_y};
+    }
+
+    void windows_emulator::deliver_ui_event(const ui_event& event)
+    {
         const auto* win = this->process.windows.get(event.window);
         if (!win)
         {
@@ -1645,6 +2057,8 @@ namespace sogen
             return;
         }
 
+        const auto previous_foreground = this->process.foreground_window;
+
         msg m{};
         m.window = event.window;
         m.message = event.message;
@@ -1653,14 +2067,23 @@ namespace sogen
 
         if (is_pointer_message(event.message))
         {
-            // Track the cursor in screen coordinates (top-level window origin + window-local position) so
-            // GetCursorPos reflects it, and treat the window the user is pointing at as the foreground one.
-            int32_t new_cursor_x = this->process.cursor_x;
-            int32_t new_cursor_y = this->process.cursor_y;
-            if (const auto origin = get_window_origin_relative_to_ancestor(this->process, event.window, 0))
+            // Track the cursor in screen coordinates (client origin + client-local position) so GetCursorPos
+            // reflects it, and treat the window the user is pointing at as the foreground one.
+            const auto origin = get_client_origin_relative_to_ancestor(this->process, event.window, 0);
+            auto l_param = event.lParam;
+            const auto [new_cursor_x, new_cursor_y] = this->cursor_after_pointer_event(event);
+            int32_t raw_dx = new_cursor_x - this->process.cursor_x;
+            int32_t raw_dy = new_cursor_y - this->process.cursor_y;
+            if (event.relative_motion)
             {
-                new_cursor_x = origin->x + point_x(event.lParam);
-                new_cursor_y = origin->y + point_y(event.lParam);
+                // Like a ClipCursor-confined cursor on Windows: the position stops at the clip rectangle while the
+                // raw motion keeps flowing.
+                raw_dx = event.relative_motion->first;
+                raw_dy = event.relative_motion->second;
+                if (origin)
+                {
+                    l_param = pack_point(new_cursor_x - origin->x, new_cursor_y - origin->y);
+                }
             }
 
             // A game using raw input for mouse-look reads relative deltas from WM_INPUT, not WM_MOUSEMOVE.
@@ -1671,11 +2094,9 @@ namespace sogen
             {
                 if (event.message == WM_MOUSEMOVE)
                 {
-                    const int32_t dx = new_cursor_x - this->process.cursor_x;
-                    const int32_t dy = new_cursor_y - this->process.cursor_y;
-                    if (dx != 0 || dy != 0)
+                    if (raw_dx != 0 || raw_dy != 0)
                     {
-                        this->deliver_raw_mouse_input(dx, dy, 0);
+                        this->deliver_raw_mouse_input(raw_dx, raw_dy, 0);
                     }
                 }
                 else if (const uint16_t buttons = raw_mouse_button_flags(event.message, event.wParam); buttons != 0)
@@ -1688,9 +2109,9 @@ namespace sogen
 
             this->process.cursor_x = new_cursor_x;
             this->process.cursor_y = new_cursor_y;
-            this->process.foreground_window = event.window;
+            this->set_foreground_window(event.window);
 
-            const auto target = route_pointer(this->process, event.window, point_x(event.lParam), point_y(event.lParam));
+            const auto target = route_pointer(this->process, event.window, point_x(l_param), point_y(l_param));
             m.window = target.window;
             // WM_MOUSEWHEEL/WM_MOUSEHWHEEL carry screen coordinates in lParam, unlike button/move
             // messages which carry client coordinates. Keep the routed target but preserve screen coords.
@@ -1700,11 +2121,11 @@ namespace sogen
         {
             // The window just became active/focused: make it the foreground window so polling APIs
             // (GetForegroundWindow/GetActiveWindow) agree with the activation the game just received.
-            this->process.foreground_window = event.window;
+            this->set_foreground_window(event.window);
         }
         else if ((event.message == WM_ACTIVATE && event.wParam == 0) && this->process.foreground_window == event.window)
         {
-            this->process.foreground_window = 0;
+            this->set_foreground_window(0);
         }
 
         // Mirror the foreground window into the shared SERVERINFO so the guest's client-side
@@ -1775,13 +2196,12 @@ namespace sogen
         if (event.message == WM_CLOSE || event.message == WM_COMMAND || is_key_down_message(event.message) ||
             is_mouse_button_message(event.message) || is_mouse_wheel_message(event.message))
         {
-            // Kick the vCPU currently running the target thread so it promptly re-checks its message
-            // queue; if the thread is not running on any vCPU right now, fall back to vCPU 0 to force a
-            // reschedule that can pick up the now-ready thread.
-            auto* running_on = find_vcpu_running_thread(*this, *thread);
-            auto& vcpu = running_on ? *running_on : this->vcpu(0);
-            vcpu.switch_thread = true;
-            vcpu.cpu.stop();
+            this->wake_thread(*thread);
+        }
+
+        if (this->process.foreground_window != previous_foreground)
+        {
+            this->apply_cursor_capture();
         }
     }
 
@@ -1823,23 +2243,44 @@ namespace sogen
         }
     }
 
-    bool windows_emulator::try_signal_guest_event(const handle event_handle)
+    void windows_emulator::request_guest_event_signal(const handle event_handle, const uint32_t maximum_pending)
     {
-        if (!this->kernel_lock_.try_lock())
         {
-            return false;
+            const std::lock_guard lock{this->pending_event_signals_mutex_};
+            auto& pending = this->pending_event_signals_[event_handle.bits];
+            pending = std::min(pending + 1, maximum_pending);
         }
 
-        const std::lock_guard<kernel_lock> lock{this->kernel_lock_, std::adopt_lock};
+        this->credit_idle_wakeup();
+    }
 
-        auto* entry = this->process.events.get(event_handle);
-        if (!entry)
+    void windows_emulator::apply_pending_guest_event_signals()
+    {
+        this->kernel_lock_.assert_held();
+
+        const std::lock_guard lock{this->pending_event_signals_mutex_};
+
+        for (auto it = this->pending_event_signals_.begin(); it != this->pending_event_signals_.end();)
         {
-            return false;
-        }
+            auto* entry = this->process.events.get(make_handle(it->first));
+            if (!entry)
+            {
+                it = this->pending_event_signals_.erase(it);
+                continue;
+            }
 
-        entry->signaled = true;
-        return true;
+            if (!entry->signaled)
+            {
+                entry->signaled = true;
+                if (--it->second == 0)
+                {
+                    it = this->pending_event_signals_.erase(it);
+                    continue;
+                }
+            }
+
+            ++it;
+        }
     }
 
     void windows_emulator::dump_lock_profile()
@@ -1867,12 +2308,49 @@ namespace sogen
 
     void windows_emulator::stop()
     {
-        this->should_stop = true;
+        {
+            const std::lock_guard lock{this->idle_wakeup_mutex_};
+            this->should_stop = true;
+        }
+
+        this->idle_wakeup_cv_.notify_all();
 
         for (uint32_t i = 0; i < this->vcpu_count_; ++i)
         {
             this->vcpu(i).cpu.stop();
         }
+    }
+
+    void windows_emulator::wake_idle_vcpu()
+    {
+        if (this->idle_vcpus_.load() != 0)
+        {
+            this->credit_idle_wakeup();
+        }
+    }
+
+    void windows_emulator::credit_idle_wakeup()
+    {
+        {
+            const std::lock_guard lock{this->idle_wakeup_mutex_};
+            this->pending_idle_wakeups_ = std::min(this->pending_idle_wakeups_ + 1, this->vcpu_count_);
+        }
+
+        this->idle_wakeup_cv_.notify_one();
+    }
+
+    bool windows_emulator::wait_for_idle_wakeup(const std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock{this->idle_wakeup_mutex_};
+        this->idle_wakeup_cv_.wait_for(lock, timeout, [this] { return this->pending_idle_wakeups_ > 0 || this->should_stop; });
+
+        if (this->pending_idle_wakeups_ == 0)
+        {
+            return false;
+        }
+
+        --this->pending_idle_wakeups_;
+        return true;
     }
 
     void windows_emulator::register_factories(utils::buffer_deserializer& buffer)
@@ -1899,6 +2377,10 @@ namespace sogen
 
         buffer.register_factory<socket_factory_wrapper>([this] {
             return socket_factory_wrapper{this->socket_factory()}; //
+        });
+
+        buffer.register_factory<file_system_wrapper>([this] {
+            return file_system_wrapper{this->file_sys}; //
         });
 
         buffer.register_factory<window>([this] {
@@ -1993,6 +2475,21 @@ namespace sogen
         this->dispatcher.deserialize(buffer);
         this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
         this->process.restore_after_state_restore(*this);
+        this->apply_cursor_capture();
+    }
+
+    // The guest's ClipCursor is process-wide; the host confines whichever window is in the foreground, in relative mode while
+    // the guest cursor is hidden.
+    void windows_emulator::apply_cursor_capture()
+    {
+        std::optional<ui_rect> clip{};
+        if (const auto& rect = this->process.cursor_clip)
+        {
+            clip = ui_rect{.left = rect->left, .top = rect->top, .right = rect->right, .bottom = rect->bottom};
+        }
+
+        const bool hidden = this->process.cursor_show_count < 0 || !this->process.cursor_shape_visible;
+        this->ui().set_cursor_clip(this->process.foreground_window, clip, clip.has_value() && hidden);
     }
 
     void windows_emulator::save_snapshot()
@@ -2050,6 +2547,7 @@ namespace sogen
         this->dispatcher.deserialize(buffer);
         this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
         this->process.restore_after_state_restore(*this);
+        this->apply_cursor_capture();
     }
 
 } // namespace sogen

@@ -55,6 +55,7 @@ namespace sogen
 
     class windows_emulator;
     class module_manager;
+    class file_system;
     struct process_context;
 
     using clock_wrapper = object_wrapper<utils::clock>;
@@ -64,6 +65,7 @@ namespace sogen
     using process_context_wrapper = object_wrapper<process_context>;
     using windows_emulator_wrapper = object_wrapper<windows_emulator>;
     using socket_factory_wrapper = object_wrapper<network::socket_factory>;
+    using file_system_wrapper = object_wrapper<file_system>;
 
     template <typename T>
     class emulator_object
@@ -159,6 +161,7 @@ namespace sogen
         {
             if constexpr (sizeof(T) < 0x4000)
             {
+                // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
                 T obj{};
                 this->access_object(accessor, obj, index);
             }

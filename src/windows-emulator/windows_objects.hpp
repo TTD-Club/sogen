@@ -2,11 +2,11 @@
 
 #include "handles.hpp"
 #include "memory_manager.hpp"
+#include "filesystem/guest_file.hpp"
 
 #include <algorithm>
 #include <string_view>
 #include <serialization_helper.hpp>
-#include <utils/file_handle.hpp>
 #include <utils/stat.hpp>
 #include <utils/time.hpp>
 #include <platform/synchronisation.hpp>
@@ -804,10 +804,8 @@ namespace sogen
 
     struct file : ref_counted_object
     {
-        utils::file_handle handle{};
+        guest_file handle{};
         std::u16string name{};
-        std::u16string open_mode{};
-        std::filesystem::path host_path{};
         std::optional<file_enumeration_state> enumeration_state{};
         ACCESS_MASK access_mask{};
         // FILE_SHARE_* the open allows others: checked against later opens of the same file.
@@ -816,12 +814,12 @@ namespace sogen
         uint8_t drive_number{'c' - 'a' + 1};
         // The guest name a pending rename (done at close) moves it to, empty for none.
         std::u16string renamed_to{};
-        // Opened as the host reparse point itself (compat_open_reparse_point), which the host cannot follow.
-        bool host_reparse_point{};
+        // Where the open resolved on the host, empty for opens no mount resolves.
+        std::filesystem::path host_path{};
 
         bool is_file() const
         {
-            return this->handle;
+            return static_cast<bool>(this->handle);
         }
 
         bool is_directory() const
@@ -832,83 +830,27 @@ namespace sogen
         void serialize_object(utils::buffer_serializer& buffer) const override
         {
             buffer.write(this->name);
-            buffer.write(this->open_mode);
-            buffer.write(this->host_path.u16string());
             buffer.write_optional(this->enumeration_state);
             buffer.write(this->access_mask);
             buffer.write(this->share_access);
             buffer.write(this->file_mode);
             buffer.write(this->drive_number);
             buffer.write(this->renamed_to);
-            buffer.write(this->host_reparse_point);
-
-            const auto has_handle = static_cast<bool>(this->handle);
-            buffer.write(has_handle);
-
-            if (has_handle)
-            {
-                buffer.write(this->handle);
-            }
+            buffer.write(this->host_path.u16string());
+            buffer.write(this->handle);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
         {
             buffer.read(this->name);
-            buffer.read(this->open_mode);
-            this->host_path = buffer.read<std::u16string>();
             buffer.read_optional(this->enumeration_state);
             buffer.read(this->access_mask);
             buffer.read(this->share_access);
             buffer.read(this->file_mode);
             buffer.read(this->drive_number);
             buffer.read(this->renamed_to);
-            buffer.read(this->host_reparse_point);
-
-            const auto has_handle = buffer.read<bool>();
-
-            this->handle = {};
-
-            if (has_handle)
-            {
-                const auto open = [this](const std::u16string& mode) {
-                    if (this->host_reparse_point)
-                    {
-                        return compat_open_reparse_point(this->host_path, mode.find_first_of(u"+wa") != std::u16string::npos);
-                    }
-#if defined(OS_WINDOWS)
-                    return _wfopen(this->host_path.c_str(), reinterpret_cast<const wchar_t*>(mode.c_str()));
-#else
-                    return fopen(u16_to_u8(this->host_path.u16string()).c_str(), u16_to_u8(mode).c_str());
-#endif
-                };
-
-                // Reopening must not truncate the file as its "w" mode would, nor fail because a later part of the run
-                // deleted it (a replay seeking backwards); the handle then sees the host file as it is now.
-                auto reopen_mode = this->open_mode;
-                if (!reopen_mode.empty() && reopen_mode.front() == u'w')
-                {
-                    reopen_mode = u"r+" + reopen_mode.substr(reopen_mode.find(u'+') == std::u16string::npos ? 1 : 2);
-                }
-                FILE* native_file = open(reopen_mode);
-                if (!native_file)
-                {
-                    if (FILE* created = open(u"ab"))
-                    {
-                        fclose(created);
-                    }
-                    native_file = open(reopen_mode);
-                }
-
-                if (native_file)
-                {
-                    this->handle = native_file;
-                    buffer.read(this->handle);
-                }
-                else
-                {
-                    throw std::runtime_error("Failed to reobtain file handle");
-                }
-            }
+            this->host_path = buffer.read<std::u16string>();
+            buffer.read(this->handle);
         }
     };
 

@@ -32,8 +32,12 @@ def main() -> None:
     from sogen import ttd  # noqa: E402
 
     settings = {"registry_directory": str(analyzer.parent / "registry"), "disable_logging": True}
-    if emulator_args[:1] == ["-e"]:
-        settings["emulation_root"] = emulator_args[1]
+    # The Python emulators replay the recording, so they take the analyzer's options that shape its file system and
+    # network.
+    python_settings = {"-e": "emulation_root", "--network": "network", "--root-mode": "root_mode"}
+    for option, value in zip(emulator_args[::2], emulator_args[1::2]):
+        if option in python_settings:
+            settings[python_settings[option]] = value
 
     def run(*args: str) -> str:
         result = subprocess.run([str(analyzer), *args], text=True, capture_output=True, cwd=analyzer.parent)

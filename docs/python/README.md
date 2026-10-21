@@ -87,7 +87,9 @@ import sogen
 app = sogen.windows.create_application(
     "c:/test-sample.exe",
     emulation_root="./root",
-    path_mappings={"c:/a.txt": Path("./a.txt")},
+    root_mode="ro",
+    mounts=[(Path("./a.txt"), "c:/a.txt", "rw")],
+    network="live",
     port_mappings={28970: 28980},
 )
 
@@ -95,6 +97,12 @@ app.callbacks.on_stdout = lambda text: print(text, end="")
 app.start()
 print("exit status:", app.process.exit_status)
 ```
+
+`root_mode` sets the access mode of the drives in the emulation root. Each entry in `mounts` is
+`(host_path, guest_path)` or `(host_path, guest_path, mode)`. The host path can be a file or a directory. The mode is
+`"ro"` or `"rw"`, and both settings default to `"ro"`. A guest write to a `"ro"` path fails with
+`STATUS_ACCESS_DENIED`, and the host files do not change. `path_mappings={guest_path: host_path}` is the same as
+`mounts` with the default mode.
 
 Linux applications also accept guest cwd, filesystem mapping, and TCP port mapping kwargs:
 
@@ -130,6 +138,10 @@ are proxied to the configured host loopback port, while unmapped ports keep the
 synthetic Linux socket behavior.
 
 Path and port mappings explicitly opt into host filesystem and network access. They are convenience bridges for tests and controlled analysis workflows, not a malware sandbox boundary.
+
+Windows emulators accept `network="offline"` (default) or `network="live"`. Other strings raise `ValueError`, and non-string values raise `TypeError`. In offline mode, guest sockets use an in-process loopback that cannot reach the host network, DNS queries resolve to no addresses, and the Steam bridge is disabled. `port_mappings` apply only in live mode. A `dns_resolver` callback that returns `None` falls back to the resolver of the selected mode, which resolves to no addresses in offline mode.
+
+`app.callbacks.on_socket_activity` receives `(action, address)` when the guest calls `connect`, `bind`, or `sendto`. The action is one of `"connect"`, `"bind"`, or `"sendto"`, and the address is a string like `"127.0.0.1:28970"` with the port as the guest sees it.
 
 ## Choosing backend
 

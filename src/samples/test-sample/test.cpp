@@ -11,6 +11,7 @@
 #include <string_view>
 #include <array>
 #include <algorithm>
+#include <bit>
 
 #include "../../common/utils/finally.hpp"
 
@@ -196,6 +197,28 @@ namespace
         const auto blub = read_env("BLUB");
 
         return !computername.empty() && blub == "LUL";
+    }
+
+    bool test_critical_section_timeout()
+    {
+#ifdef _WIN64
+        constexpr size_t peb_critical_section_timeout_offset = 0xC0;
+        const auto* peb = reinterpret_cast<const uint8_t*>(__readgsqword(0x60));
+#else
+        constexpr size_t peb_critical_section_timeout_offset = 0x70;
+        const auto* peb = reinterpret_cast<const uint8_t*>(__readfsdword(0x30));
+#endif
+
+        int64_t timeout{};
+        memcpy(&timeout, peb + peb_critical_section_timeout_offset, sizeof(timeout));
+
+        if (timeout >= 0)
+        {
+            puts("PEB CriticalSectionTimeout is not a relative timeout");
+            return false;
+        }
+
+        return true;
     }
 
     bool test_lookup_account_sid()
@@ -1441,6 +1464,19 @@ namespace
         return validate_primary_monitor(mi);
     }
 
+    bool test_display_config_buffer_sizes()
+    {
+        UINT32 num_paths = 0;
+        UINT32 num_modes = 0;
+
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &num_paths, &num_modes) != ERROR_SUCCESS)
+        {
+            return false;
+        }
+
+        return num_paths >= 1 && num_modes >= num_paths;
+    }
+
     BOOL CALLBACK monitor_enum_proc(HMONITOR hMonitor, HDC, LPRECT, LPARAM dwData)
     {
         auto* valid = reinterpret_cast<bool*>(dwData);
@@ -1938,6 +1974,54 @@ namespace
 
         SleepEx(1, TRUE);
         return executions == 2;
+    }
+
+    bool test_apc_wait()
+    {
+        int executions = 0;
+
+        PAPCFUNC apc_func = [](const ULONG_PTR param) {
+            *reinterpret_cast<int*>(param) += 1; //
+        };
+
+        const auto event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!event)
+        {
+            return false;
+        }
+
+        QueueUserAPC(apc_func, GetCurrentThread(), reinterpret_cast<ULONG_PTR>(&executions));
+
+        if (WaitForSingleObjectEx(event, 0, FALSE) != WAIT_TIMEOUT || executions != 0)
+        {
+            CloseHandle(event);
+            return false;
+        }
+
+        using nt_wait_for_single_object = LONG(NTAPI*)(HANDLE, BOOLEAN, PLARGE_INTEGER);
+        const auto nt_wait =
+            std::bit_cast<nt_wait_for_single_object>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWaitForSingleObject"));
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        LARGE_INTEGER expired{};
+        expired.LowPart = now.dwLowDateTime;
+        expired.HighPart = static_cast<LONG>(now.dwHighDateTime);
+        expired.QuadPart -= 10'000'000;
+
+        if (!nt_wait || nt_wait(event, TRUE, &expired) != static_cast<LONG>(STATUS_USER_APC) || executions != 1)
+        {
+            CloseHandle(event);
+            return false;
+        }
+
+        QueueUserAPC(apc_func, GetCurrentThread(), reinterpret_cast<ULONG_PTR>(&executions));
+        SetEvent(event);
+
+        const auto signaled = WaitForSingleObjectEx(event, 0, FALSE) == WAIT_OBJECT_0;
+        SleepEx(1, TRUE);
+        CloseHandle(event);
+
+        return signaled && executions == 2;
     }
 
     bool test_window_geometry()
@@ -2629,6 +2713,41 @@ namespace
             puts("WM_TIMER timer id mismatch");
             return false;
         }
+
+        return true;
+    }
+
+    bool test_open_named_section()
+    {
+        constexpr auto* name = "sogen-open-named-section";
+
+        auto* const creator = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 0x1000, name);
+        if (!creator)
+        {
+            puts("CreateFileMappingA failed");
+            return false;
+        }
+
+        auto* const opener = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
+        if (!opener)
+        {
+            puts("OpenFileMappingA failed");
+            CloseHandle(creator);
+            return false;
+        }
+
+        CloseHandle(creator);
+
+        auto* const view = MapViewOfFile(opener, FILE_MAP_ALL_ACCESS, 0, 0, 0x1000);
+        if (!view)
+        {
+            puts("MapViewOfFile failed");
+            CloseHandle(opener);
+            return false;
+        }
+
+        UnmapViewOfFile(view);
+        CloseHandle(opener);
 
         return true;
     }
@@ -4255,10 +4374,12 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_app_execution_alias, "App Execution Alias")
     RUN_TEST(test_system_info, "System Info")
     RUN_TEST(test_monitor_info, "Monitor Info")
+    RUN_TEST(test_display_config_buffer_sizes, "Display Config Buffer Sizes")
     RUN_TEST(test_time_zone, "Time Zone")
     RUN_TEST(test_threads, "Threads")
     RUN_TEST(test_threads_winapi, "Threads WinAPI")
     RUN_TEST(test_env, "Environment")
+    RUN_TEST(test_critical_section_timeout, "Critical Section Timeout")
     RUN_TEST(test_lookup_account_sid, "LSA")
     RUN_TEST(test_exceptions, "Exceptions")
 #ifndef __MINGW64__
@@ -4271,6 +4392,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_tls, "TLS")
     RUN_TEST(test_socket, "Socket")
     RUN_TEST(test_apc, "APC")
+    RUN_TEST(test_apc_wait, "APC Wait")
     RUN_TEST(test_desktop_window_text, "Desktop Window Text")
     RUN_TEST(test_window_geometry, "Window Geometry")
     RUN_TEST(test_user_callback, "User Callback")
@@ -4279,6 +4401,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_paint_message_queue, "Message Queue (Paint)")
     RUN_TEST(test_settimer, "User Timer")
     RUN_TEST(test_private_namespace, "Private Namespace")
+    RUN_TEST(test_open_named_section, "Open Named Section")
     RUN_TEST(test_handle_tag_bits, "Handle Tag Bits")
     RUN_TEST(test_unicode_case_mapping, "Unicode Case Mapping")
     RUN_TEST(test_actctx, "Activation Context")

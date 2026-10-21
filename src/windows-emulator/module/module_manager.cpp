@@ -319,6 +319,13 @@ namespace sogen
         this->memory_->set_dep_enabled(this->executable->machine != static_cast<uint16_t>(PEMachineType::I386) ||
                                        (this->executable->dll_characteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT) != 0);
 
+        // Without high-entropy ASLR, Windows allocates bottom-up below 4 GB, and older programs truncate pointers to 32 bits.
+        constexpr auto high_entropy_aslr = IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+        if ((this->executable->dll_characteristics & high_entropy_aslr) != high_entropy_aslr)
+        {
+            this->memory_->set_default_allocation_address(MIN_ALLOCATION_ADDRESS);
+        }
+
         this->ntdll = this->map_module_or_throw(ntdll_path, logger, true);
         this->win32u = this->map_module_or_throw(win32u_path, logger, true);
     }
@@ -510,7 +517,13 @@ namespace sogen
 
     std::optional<uint64_t> module_manager::get_module_load_count_by_path(const windows_path& path)
     {
-        auto local_file = std::filesystem::weakly_canonical(std::filesystem::absolute(this->file_sys_->translate(path)));
+        const auto host_path = this->file_sys_->translate(path);
+        if (host_path.empty())
+        {
+            return {};
+        }
+
+        auto local_file = std::filesystem::weakly_canonical(std::filesystem::absolute(host_path));
 
         if (auto load_count_entry = modules_load_count.find(local_file); load_count_entry != modules_load_count.end())
         {
@@ -524,6 +537,11 @@ namespace sogen
                                               const uint64_t relocation_base)
     {
         auto local_file = this->file_sys_->translate(file);
+        if (local_file.empty())
+        {
+            logger.error("Failed to map module: %s does not resolve to a file\n", file.string().c_str());
+            return nullptr;
+        }
 
         if (local_file.filename() == "win32u.dll")
         {

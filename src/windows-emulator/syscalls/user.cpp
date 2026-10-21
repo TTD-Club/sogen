@@ -1,6 +1,7 @@
 #include "../std_include.hpp"
 #include "../emulated_display_adapter.hpp"
 #include "../emulator_utils.hpp"
+#include "../low_level_hooks.hpp"
 #include "../syscall_utils.hpp"
 #include "../win32k_userconnect.hpp"
 #include "../window_destroy_orchestrator.hpp"
@@ -33,6 +34,9 @@ namespace sogen
         constexpr uint32_t k_fn_inout_nc_calc_size_callback_id = 0x15;
         constexpr uint32_t k_fn_hk_in_lp_cbt_create_struct_callback_id = 0x2A;
         constexpr int k_wh_cbt = 5;
+        constexpr int k_wh_keyboard_ll = 13;
+        constexpr int k_wh_mouse_ll = 14;
+        constexpr DWORD k_error_global_only_hook = 1429;
         constexpr int k_hcbt_createwnd = 3;
 
         constexpr size_t k_client_pfn_button_wndproc_index = 7;
@@ -706,7 +710,7 @@ namespace sogen
             {
                 if (auto* thread = c.proc.find_thread_by_id(win.thread_id))
                 {
-                    thread->queue_status_changed_bits |= QS_PAINT;
+                    thread->mark_queue_status_changed(QS_PAINT);
                 }
             }
         }
@@ -718,7 +722,7 @@ namespace sogen
             {
                 if (auto* thread = c.proc.find_thread_by_id(win.thread_id))
                 {
-                    thread->queue_status_changed_bits |= QS_PAINT;
+                    thread->mark_queue_status_changed(QS_PAINT);
                 }
             }
         }
@@ -2496,12 +2500,18 @@ namespace sogen
                 return FALSE;
             }
 
-            // TODO: This should return the clip cursor. For simplicity, we return a best effort derived from the screen size.
-            RECT rect{0, 0, 1920, 1080};
-            const auto display_info = c.proc.user_handles.get_display_info().read();
-            if (const emulator_object<USER_MONITOR> monitor_obj(c.emu, display_info.pPrimaryMonitor); monitor_obj)
+            RECT rect{.left = 0, .top = 0, .right = 1920, .bottom = 1080};
+            if (c.proc.cursor_clip)
             {
-                rect = monitor_obj.read().rcMonitor;
+                rect = *c.proc.cursor_clip;
+            }
+            else
+            {
+                const auto display_info = c.proc.user_handles.get_display_info().read();
+                if (const emulator_object<USER_MONITOR> monitor_obj(c.emu, display_info.pPrimaryMonitor); monitor_obj)
+                {
+                    rect = monitor_obj.read().rcMonitor;
+                }
             }
 
             c.emu.write_memory(rect_ptr, &rect, sizeof(rect));
@@ -2519,8 +2529,16 @@ namespace sogen
 
         // SetCursorPos moves the cursor; games use it to recenter the pointer. Track the new position so a
         // following GetCursorPos reflects it (and relative-motion deltas compute correctly).
-        BOOL handle_NtUserSetCursorPos(const syscall_context& c, const int32_t x, const int32_t y)
+        BOOL handle_NtUserSetCursorPos(const syscall_context& c, int32_t x, int32_t y)
         {
+            if (const auto& clip = c.proc.cursor_clip)
+            {
+                x = std::clamp(x, static_cast<int32_t>(clip->left),
+                               std::max(static_cast<int32_t>(clip->left), static_cast<int32_t>(clip->right) - 1));
+                y = std::clamp(y, static_cast<int32_t>(clip->top),
+                               std::max(static_cast<int32_t>(clip->top), static_cast<int32_t>(clip->bottom) - 1));
+            }
+
             c.proc.cursor_x = x;
             c.proc.cursor_y = y;
             // Warp the host cursor to match, so the next host mouse-motion event measures movement from the
@@ -2532,10 +2550,27 @@ namespace sogen
             return TRUE;
         }
 
-        // ClipCursor confines the cursor to a rectangle. The emulated cursor is driven by the host window
-        // and never escapes it, so confinement is a no-op; just report success.
-        BOOL handle_NtUserClipCursor(const syscall_context& /*c*/, const emulator_pointer /*rect*/)
+        BOOL handle_NtUserClipCursor(const syscall_context& c, const emulator_pointer rect_ptr)
         {
+            if (rect_ptr == 0)
+            {
+                c.proc.cursor_clip.reset();
+            }
+            else
+            {
+                auto rect = c.emu.read_memory<RECT>(rect_ptr);
+                if (rect.left > rect.right)
+                {
+                    std::swap(rect.left, rect.right);
+                }
+                if (rect.top > rect.bottom)
+                {
+                    std::swap(rect.top, rect.bottom);
+                }
+                c.proc.cursor_clip = rect;
+            }
+
+            c.win_emu.apply_cursor_capture();
             return TRUE;
         }
 
@@ -2666,6 +2701,7 @@ namespace sogen
         void apply_cursor_visibility(const syscall_context& c)
         {
             c.win_emu.ui().set_cursor_visibility(c.proc.cursor_show_count >= 0 && c.proc.cursor_shape_visible);
+            c.win_emu.apply_cursor_capture();
         }
 
         // ShowCursor(bShow) adjusts the cursor display counter (+1 to show, -1 to hide) and returns the new
@@ -3174,12 +3210,31 @@ namespace sogen
                                                const DWORD thread_id, const int hook_id, const pointer proc, const BOOL ansi)
         {
             auto& thread = c.thread();
-            if (instance != 0 || thread_id != thread.id || hook_id != k_wh_cbt || proc == 0 || thread.cbt_hook)
+            if (proc == 0)
             {
                 return 0;
             }
 
-            const auto handle = thread.next_cbt_hook_handle++;
+            // Low-level hooks are global; they run on the installing thread while it retrieves messages.
+            if (hook_id == k_wh_keyboard_ll || hook_id == k_wh_mouse_ll)
+            {
+                if (thread_id != 0)
+                {
+                    set_guest_last_error(c, k_error_global_only_hook);
+                    return 0;
+                }
+
+                const auto handle = c.proc.next_hook_handle++;
+                thread.low_level_hooks.push_back(user_low_level_hook{.handle = handle, .id = hook_id, .proc = proc});
+                return handle;
+            }
+
+            if (instance != 0 || thread_id != thread.id || hook_id != k_wh_cbt || thread.cbt_hook)
+            {
+                return 0;
+            }
+
+            const auto handle = c.proc.next_hook_handle++;
             thread.cbt_hook = user_cbt_hook{
                 .handle = handle,
                 .proc = proc,
@@ -3190,14 +3245,21 @@ namespace sogen
 
         BOOL handle_NtUserUnhookWindowsHookEx(const syscall_context& c, const uint64_t hook)
         {
-            auto& current = c.thread().cbt_hook;
-            if (!current || current->handle != hook)
+            for (auto& thread : c.proc.threads | std::views::values)
             {
-                return FALSE;
+                if (thread.cbt_hook && thread.cbt_hook->handle == hook)
+                {
+                    thread.cbt_hook.reset();
+                    return TRUE;
+                }
+
+                if (std::erase_if(thread.low_level_hooks, [&](const user_low_level_hook& entry) { return entry.handle == hook; }) != 0)
+                {
+                    return TRUE;
+                }
             }
 
-            current.reset();
-            return TRUE;
+            return FALSE;
         }
 
         lresult handle_NtUserCallNextHookEx(const syscall_context&, const int, const wparam, const lparam, const BOOL)
@@ -4145,8 +4207,8 @@ namespace sogen
                 .right = client.right,
                 .bottom = client.bottom,
             };
-            RECT item_rect = item ? RECT{item->x, item->y, item->x + item->width, item->y + item->height}
-                                  : RECT{client.left, client.top, button_left, client.bottom};
+            RECT item_rect = item ? RECT{.left = item->x, .top = item->y, .right = item->x + item->width, .bottom = item->y + item->height}
+                                  : RECT{.left = client.left, .top = client.top, .right = button_left, .bottom = client.bottom};
             item_rect.right = std::max(item_rect.left, std::min(item_rect.right, button_left));
             uint32_t state_button = 0;
             if (simple)
@@ -4297,6 +4359,11 @@ namespace sogen
         BOOL handle_NtUserGetMessage(const syscall_context& c, const emulator_object<msg> message, const hwnd hwnd,
                                      const UINT msg_filter_min, const UINT msg_filter_max)
         {
+            if (dispatch_low_level_hook(c, callback_id::NtUserGetMessage))
+            {
+                return {};
+            }
+
             auto& t = c.thread();
 
             if (auto pending_msg = t.peek_pending_message(c.win_emu, hwnd, msg_filter_min, msg_filter_max, true))
@@ -4308,14 +4375,27 @@ namespace sogen
             }
 
             t.await_msg = {message, hwnd, msg_filter_min, msg_filter_max};
+            t.remember_message_wait(c.emu);
 
             c.win_emu.yield_thread(c.vcpu, false);
             return {};
         }
 
+        BOOL completion_NtUserGetMessage(const syscall_context& c, const emulator_object<msg> message, const hwnd hwnd,
+                                         const UINT msg_filter_min, const UINT msg_filter_max)
+        {
+            complete_low_level_hook(c);
+            return handle_NtUserGetMessage(c, message, hwnd, msg_filter_min, msg_filter_max);
+        }
+
         BOOL handle_NtUserPeekMessage(const syscall_context& c, const emulator_object<msg> message, const hwnd hwnd,
                                       const UINT msg_filter_min, const UINT msg_filter_max, const UINT remove_message)
         {
+            if (dispatch_low_level_hook(c, callback_id::NtUserPeekMessage))
+            {
+                return {};
+            }
+
             auto& t = c.thread();
 
             const bool should_remove = (remove_message & PM_REMOVE) != 0;
@@ -4332,17 +4412,36 @@ namespace sogen
             return FALSE;
         }
 
+        BOOL completion_NtUserPeekMessage(const syscall_context& c, const emulator_object<msg> message, const hwnd hwnd,
+                                          const UINT msg_filter_min, const UINT msg_filter_max, const UINT remove_message)
+        {
+            complete_low_level_hook(c);
+            return handle_NtUserPeekMessage(c, message, hwnd, msg_filter_min, msg_filter_max, remove_message);
+        }
+
         BOOL handle_NtUserWaitMessage(const syscall_context& c)
         {
+            if (dispatch_low_level_hook(c, callback_id::NtUserWaitMessage))
+            {
+                return {};
+            }
+
             auto& t = c.thread();
             if (t.peek_pending_message(c.win_emu))
             {
                 return TRUE;
             }
 
-            c.vcpu.active_thread->await_msg_mask = QS_ALLINPUT;
+            t.await_msg_mask = QS_ALLINPUT;
+            t.remember_message_wait(c.emu);
             c.win_emu.yield_thread(c.vcpu, false);
             return {};
+        }
+
+        BOOL completion_NtUserWaitMessage(const syscall_context& c)
+        {
+            complete_low_level_hook(c);
+            return handle_NtUserWaitMessage(c);
         }
 
         BOOL handle_NtUserInvalidateRect(const syscall_context& c, const hwnd hwnd, const emulator_object<RECT> rect, const BOOL erase)
@@ -5169,11 +5268,19 @@ namespace sogen
 
         hwnd handle_NtUserSetFocus(const syscall_context& c, const hwnd hwnd)
         {
+            if (hwnd != 0 && !c.proc.windows.get(hwnd))
+            {
+                return 0;
+            }
+
+            auto& thread = c.thread();
+            const auto previous = thread.focus_window;
+            thread.set_focus_window(hwnd);
             if (hwnd != 0)
             {
                 set_thread_window_context(c, hwnd);
             }
-            return hwnd;
+            return previous;
         }
 
         emulator_pointer handle_NtUserSetClassLongPtr(const syscall_context& c, handle hWnd, int nIndex, emulator_pointer dwNewLong,
@@ -5686,11 +5793,11 @@ namespace sogen
             return result;
         }
 
+        // user32 derives the mode count from the path count itself; the syscall only reports paths.
         NTSTATUS handle_NtUserGetDisplayConfigBufferSizes(const syscall_context& c, const UINT32 /*flags*/,
-                                                          const emulator_object<UINT32> num_path_array_elements,
-                                                          const emulator_object<UINT32> num_mode_info_array_elements)
+                                                          const emulator_object<UINT32> num_path_array_elements)
         {
-            if (!num_path_array_elements || !num_mode_info_array_elements)
+            if (!num_path_array_elements)
             {
                 return STATUS_INVALID_PARAMETER;
             }
@@ -5699,9 +5806,7 @@ namespace sogen
             // must surface as an error to the caller, not abort the whole emulator with an unhandled
             // host-side memory exception.
             const UINT32 path_count = 1;
-            const UINT32 mode_count = 2;
-            if (!c.win_emu.memory.try_write_memory(num_path_array_elements.value(), &path_count, sizeof(path_count)) ||
-                !c.win_emu.memory.try_write_memory(num_mode_info_array_elements.value(), &mode_count, sizeof(mode_count)))
+            if (!c.win_emu.memory.try_write_memory(num_path_array_elements.value(), &path_count, sizeof(path_count)))
             {
                 return STATUS_INVALID_PARAMETER;
             }
@@ -6062,7 +6167,7 @@ namespace sogen
         uint32_t handle_NtUserGetQueueStatus(const syscall_context& c, const UINT flags)
         {
             const auto result = handle_NtUserGetQueueStatusReadonly(c, flags);
-            c.vcpu.active_thread->queue_status_changed_bits &= ~flags;
+            c.vcpu.active_thread->clear_queue_status_changed(flags);
             return result;
         }
 
@@ -6832,6 +6937,83 @@ namespace sogen
             return TRUE;
         }
 
+        namespace
+        {
+            constexpr uint32_t k_spi_get_icontitle_logfont = 0x1F;
+            constexpr uint32_t k_spi_get_nonclientmetrics = 0x29;
+            constexpr uint32_t k_default_dpi = 96;
+
+            // The metrics and logfonts a Windows 11 desktop reports at 96 DPI.
+            void fill_ui_logfont(EMU_LOGFONTW& font, const uint32_t dpi)
+            {
+                font.lfHeight = -static_cast<LONG>(9ull * dpi / 72ull);
+                font.lfWeight = FW_NORMAL;
+                font.lfCharSet = DEFAULT_CHARSET;
+                std::ranges::copy(u"Segoe UI", font.lfFaceName);
+            }
+        }
+
+        BOOL handle_NtUserSystemParametersInfoForDpi(const syscall_context& c, const uint32_t action, const uint32_t param,
+                                                     const emulator_pointer value, const uint32_t /*win_ini*/, const uint32_t dpi)
+        {
+            const auto effective_dpi = dpi != 0 ? dpi : k_default_dpi;
+
+            if (action == k_spi_get_icontitle_logfont)
+            {
+                if (value == 0 || (param != 0 && param < sizeof(EMU_LOGFONTW)))
+                {
+                    return FALSE;
+                }
+
+                EMU_LOGFONTW font{};
+                fill_ui_logfont(font, effective_dpi);
+                emulator_object<EMU_LOGFONTW>{c.emu, value}.write(font);
+                return TRUE;
+            }
+
+            if (action == k_spi_get_nonclientmetrics)
+            {
+                if (value == 0)
+                {
+                    return FALSE;
+                }
+
+                const auto cb_size = emulator_object<uint32_t>{c.emu, value}.read();
+                const auto length = std::min(cb_size, param != 0 ? param : cb_size);
+                if (cb_size < offsetof(EMU_NONCLIENTMETRICS, lfMessageFont) + sizeof(EMU_LOGFONTW) ||
+                    length < offsetof(EMU_NONCLIENTMETRICS, lfMessageFont) + sizeof(EMU_LOGFONTW))
+                {
+                    return FALSE;
+                }
+
+                EMU_NONCLIENTMETRICS metrics{};
+                metrics.cbSize = cb_size;
+                metrics.iBorderWidth = 5;
+                metrics.iScrollWidth = 17;
+                metrics.iScrollHeight = 17;
+                metrics.iCaptionWidth = 22;
+                metrics.iCaptionHeight = 22;
+                metrics.iSmCaptionWidth = 22;
+                metrics.iSmCaptionHeight = 22;
+                fill_ui_logfont(metrics.lfCaptionFont, effective_dpi);
+                fill_ui_logfont(metrics.lfSmCaptionFont, effective_dpi);
+                fill_ui_logfont(metrics.lfMenuFont, effective_dpi);
+                fill_ui_logfont(metrics.lfStatusFont, effective_dpi);
+                fill_ui_logfont(metrics.lfMessageFont, effective_dpi);
+
+                c.emu.write_memory(value, &metrics, std::min(length, static_cast<uint32_t>(sizeof(metrics))));
+                return TRUE;
+            }
+
+            return FALSE;
+        }
+
+        BOOL handle_NtUserSystemParametersInfo(const syscall_context& c, const uint32_t action, const uint32_t param,
+                                               const emulator_pointer value, const uint32_t win_ini)
+        {
+            return handle_NtUserSystemParametersInfoForDpi(c, action, param, value, win_ini, k_default_dpi);
+        }
+
         uint32_t handle_NtUserGetClipboardSequenceNumber()
         {
             return 1;
@@ -6848,6 +7030,16 @@ namespace sogen
         }
 
         BOOL handle_NtUserEmptyClipboard()
+        {
+            return TRUE;
+        }
+
+        BOOL handle_NtUserAddClipboardFormatListener(const syscall_context& /*c*/, const hwnd /*window*/)
+        {
+            return TRUE;
+        }
+
+        BOOL handle_NtUserRemoveClipboardFormatListener(const syscall_context& /*c*/, const hwnd /*window*/)
         {
             return TRUE;
         }
@@ -6874,9 +7066,9 @@ namespace sogen
             return USER_DEFAULT_DPI_CONTEXT;
         }
 
-        NTSTATUS handle_NtUserSetProcessDpiAwarenessContext()
+        BOOL handle_NtUserSetProcessDpiAwarenessContext()
         {
-            return 0;
+            return TRUE;
         }
 
         uint32_t handle_NtUserMapVirtualKeyEx(const syscall_context& /*c*/, const uint32_t code, const uint32_t map_type,

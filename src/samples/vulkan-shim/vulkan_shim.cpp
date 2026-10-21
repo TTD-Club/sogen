@@ -220,7 +220,11 @@ namespace
     // VkDeviceMemory is host-side; the guest can't see a host pointer. We emulate vkMapMemory by
     // staging a guest-side copy: download the host range on map, hand the app that buffer, and upload
     // it back on unmap so writes persist. allocationSize is tracked here to resolve VK_WHOLE_SIZE.
-    std::unordered_map<gb::object_id, uint64_t> g_memory_sizes;
+    std::unordered_map<gb::object_id, uint64_t>& memory_sizes()
+    {
+        static std::unordered_map<gb::object_id, uint64_t> sizes;
+        return sizes;
+    }
 
     struct mapped_range
     {
@@ -229,11 +233,19 @@ namespace
         uint64_t size{};
     };
 
-    std::unordered_map<gb::object_id, mapped_range> g_mapped_ranges;
+    std::unordered_map<gb::object_id, mapped_range>& mapped_ranges()
+    {
+        static std::unordered_map<gb::object_id, mapped_range> ranges;
+        return ranges;
+    }
 
     // Memory objects the bridge aliased straight into the guest address space (no staging copy). These are
-    // not in g_mapped_ranges; vkUnmapMemory tears them down via the bridge instead of uploading.
-    std::unordered_set<gb::object_id> g_direct_mapped;
+    // not in mapped_ranges(); vkUnmapMemory tears them down via the bridge instead of uploading.
+    std::unordered_set<gb::object_id>& direct_mapped()
+    {
+        static std::unordered_set<gb::object_id> memory;
+        return memory;
+    }
 
     // vkDestroyX(device, child) for the non-dispatchable device children that share device_child_request.
     template <typename Handle>
@@ -254,7 +266,11 @@ namespace
     // in a single IOCTL at vkEndCommandBuffer. This amortises the boundary crossing, which dominates
     // emulated frame time. The shim only runs inside the single-threaded emulator, so the map needs no
     // lock. Each record is a gb::command_record_header followed by that command's request payload.
-    std::unordered_map<gb::object_id, std::vector<uint8_t>> g_command_streams;
+    std::unordered_map<gb::object_id, std::vector<uint8_t>>& command_streams()
+    {
+        static std::unordered_map<gb::object_id, std::vector<uint8_t>> streams;
+        return streams;
+    }
 
     // Pending coalesced vkUpdateDescriptorSets blobs (the hottest bridge call - DXVK updates per draw).
     // Unlike the per-command-buffer streams (each synchronised to one thread by Vulkan), this global is
@@ -284,7 +300,7 @@ namespace
 
     void record_command(gb::object_id command_buffer, gb::command command, const void* payload, size_t size)
     {
-        auto& stream = g_command_streams[command_buffer];
+        auto& stream = command_streams()[command_buffer];
         gb::command_record_header header{.command = static_cast<uint32_t>(command), .size = static_cast<uint32_t>(size)};
         const auto* header_bytes = reinterpret_cast<const uint8_t*>(&header);
         stream.insert(stream.end(), header_bytes, header_bytes + sizeof(header));
@@ -412,8 +428,8 @@ extern "C"
         }
 
         static const VkExtensionProperties extensions[] = {
-            {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
-            {VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_SPEC_VERSION},
+            {.extensionName = VK_KHR_SURFACE_EXTENSION_NAME, .specVersion = VK_KHR_SURFACE_SPEC_VERSION},
+            {.extensionName = VK_KHR_WIN32_SURFACE_EXTENSION_NAME, .specVersion = VK_KHR_WIN32_SURFACE_SPEC_VERSION},
         };
         constexpr auto available = static_cast<uint32_t>(sizeof(extensions) / sizeof(extensions[0]));
 
@@ -788,7 +804,7 @@ extern "C"
             std::memcpy(message.data(), &request, sizeof(request));
         }
 
-        g_command_streams[request.command_buffer].clear();
+        command_streams()[request.command_buffer].clear();
         record_command(request.command_buffer, gb::command::begin_command_buffer, message.data(), message.size());
         return VK_SUCCESS;
     }
@@ -818,13 +834,13 @@ extern "C"
         request.command_buffer = command_buffer;
         record_command(command_buffer, gb::command::end_command_buffer, &request, sizeof(request));
 
-        const auto it = g_command_streams.find(command_buffer);
-        if (it == g_command_streams.end())
+        const auto it = command_streams().find(command_buffer);
+        if (it == command_streams().end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const std::vector<uint8_t> stream = std::move(it->second);
-        g_command_streams.erase(it);
+        command_streams().erase(it);
 
         gb::result_response response{};
         if (!bridge_call(gb::ioctl_record_commands, stream.data(), static_cast<DWORD>(stream.size()), &response, sizeof(response)))
@@ -854,7 +870,7 @@ extern "C"
                                                                               VkCommandBufferResetFlags flags)
     {
         // Drop any half-recorded local stream; recording only reaches the bridge at vkEndCommandBuffer.
-        g_command_streams.erase(to_object_id(commandBuffer));
+        command_streams().erase(to_object_id(commandBuffer));
 
         gb::reset_command_buffer_request request{};
         request.command_buffer = to_object_id(commandBuffer);
@@ -1196,54 +1212,95 @@ extern "C"
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
                                                                        VkFence fence)
     {
-        // Count the command buffers so the fence can be attached to the final submission only.
-        uint32_t total = 0;
-        for (uint32_t s = 0; s < submitCount; ++s)
-        {
-            total += pSubmits[s].commandBufferCount;
-        }
-
-        // A zero-batch submission (no command buffers) is still a valid fence signal in Vulkan. Forward
-        // a fence-only submit so a later vkWaitForFences doesn't spin forever on an unsignaled fence.
-        if (total == 0)
+        VkSubmitInfo empty_submit{};
+        if (submitCount == 0)
         {
             if (!fence)
             {
                 return VK_SUCCESS;
             }
+            empty_submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            pSubmits = &empty_submit;
+            submitCount = 1;
+        }
 
-            gb::queue_submit_request request{};
-            request.queue = to_object_id(queue);
-            request.command_buffer = gb::null_object;
-            request.fence = to_object_id(fence);
+        for (uint32_t s = 0; s < submitCount; ++s)
+        {
+            const VkSubmitInfo& si = pSubmits[s];
+            const VkTimelineSemaphoreSubmitInfo* timeline_info = nullptr;
+            for (const auto* pnext = static_cast<const VkBaseInStructure*>(si.pNext); pnext; pnext = pnext->pNext)
+            {
+                if (pnext->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
+                {
+                    timeline_info = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo*>(pnext);
+                    break;
+                }
+            }
+
+            const uint32_t wait_count = si.waitSemaphoreCount;
+            const uint32_t command_buffer_count = si.commandBufferCount;
+            const uint32_t signal_count = si.signalSemaphoreCount;
+            size_t message_size = sizeof(gb::queue_submit_request);
+            const auto add_array_size = [&](size_t count, size_t item_size) {
+                if (count > (MAXDWORD - message_size) / item_size)
+                {
+                    return false;
+                }
+                message_size += count * item_size;
+                return true;
+            };
+            if (!add_array_size(wait_count, sizeof(gb::submit_semaphore_entry)) ||
+                !add_array_size(command_buffer_count, sizeof(uint64_t)) ||
+                !add_array_size(signal_count, sizeof(gb::submit_semaphore_entry)))
+            {
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+            std::vector<uint8_t> message(message_size);
+            auto* header = reinterpret_cast<gb::queue_submit_request*>(message.data());
+            header->queue = to_object_id(queue);
+            header->fence = (s + 1 == submitCount) ? to_object_id(fence) : gb::null_object;
+            header->wait_count = wait_count;
+            header->command_buffer_count = command_buffer_count;
+            header->signal_count = signal_count;
+            header->has_timeline_info = timeline_info != nullptr;
+
+            size_t offset = sizeof(*header);
+            auto* waits = reinterpret_cast<gb::submit_semaphore_entry*>(message.data() + offset);
+            for (uint32_t i = 0; i < wait_count; ++i)
+            {
+                waits[i] = {.semaphore = to_object_id(si.pWaitSemaphores[i]),
+                            .stage_mask = si.pWaitDstStageMask[i],
+                            .reserved = 0,
+                            .value = timeline_info && timeline_info->pWaitSemaphoreValues && i < timeline_info->waitSemaphoreValueCount
+                                         ? timeline_info->pWaitSemaphoreValues[i]
+                                         : 0};
+            }
+            offset += static_cast<size_t>(wait_count) * sizeof(gb::submit_semaphore_entry);
+
+            auto* command_buffers = reinterpret_cast<uint64_t*>(message.data() + offset);
+            for (uint32_t i = 0; i < command_buffer_count; ++i)
+            {
+                command_buffers[i] = to_object_id(si.pCommandBuffers[i]);
+            }
+            offset += static_cast<size_t>(command_buffer_count) * sizeof(uint64_t);
+
+            auto* signals = reinterpret_cast<gb::submit_semaphore_entry*>(message.data() + offset);
+            for (uint32_t i = 0; i < signal_count; ++i)
+            {
+                signals[i] = {.semaphore = to_object_id(si.pSignalSemaphores[i]),
+                              .stage_mask = 0,
+                              .reserved = 0,
+                              .value =
+                                  timeline_info && timeline_info->pSignalSemaphoreValues && i < timeline_info->signalSemaphoreValueCount
+                                      ? timeline_info->pSignalSemaphoreValues[i]
+                                      : 0};
+            }
 
             gb::result_response response{};
-            if (!bridge_call(gb::ioctl_queue_submit, &request, sizeof(request), &response, sizeof(response)) ||
+            if (!bridge_call(gb::ioctl_queue_submit, message.data(), static_cast<DWORD>(message.size()), &response, sizeof(response)) ||
                 response.vk_result != VK_SUCCESS)
             {
                 return VK_ERROR_INITIALIZATION_FAILED;
-            }
-            return VK_SUCCESS;
-        }
-
-        uint32_t emitted = 0;
-        for (uint32_t s = 0; s < submitCount; ++s)
-        {
-            for (uint32_t i = 0; i < pSubmits[s].commandBufferCount; ++i)
-            {
-                ++emitted;
-
-                gb::queue_submit_request request{};
-                request.queue = to_object_id(queue);
-                request.command_buffer = to_object_id(pSubmits[s].pCommandBuffers[i]);
-                request.fence = (emitted == total) ? to_object_id(fence) : gb::null_object;
-
-                gb::result_response response{};
-                if (!bridge_call(gb::ioctl_queue_submit, &request, sizeof(request), &response, sizeof(response)) ||
-                    response.vk_result != VK_SUCCESS)
-                {
-                    return VK_ERROR_INITIALIZATION_FAILED;
-                }
             }
         }
         return VK_SUCCESS;
@@ -1394,7 +1451,7 @@ extern "C"
             return static_cast<VkResult>(response.vk_result);
         }
 
-        g_memory_sizes[response.memory] = pAllocateInfo->allocationSize;
+        memory_sizes()[response.memory] = pAllocateInfo->allocationSize;
         *pMemory = to_handle<VkDeviceMemory>(response.memory);
         return VK_SUCCESS;
     }
@@ -1412,8 +1469,8 @@ extern "C"
         request.memory = mem_id;
         bridge_call(gb::ioctl_free_memory, &request, sizeof(request), nullptr, 0);
 
-        g_memory_sizes.erase(mem_id);
-        g_mapped_ranges.erase(mem_id);
+        memory_sizes().erase(mem_id);
+        mapped_ranges().erase(mem_id);
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
@@ -1424,8 +1481,8 @@ extern "C"
         uint64_t actual = size;
         if (size == VK_WHOLE_SIZE)
         {
-            const auto it = g_memory_sizes.find(mem_id);
-            const uint64_t total = (it != g_memory_sizes.end()) ? it->second : 0;
+            const auto it = memory_sizes().find(mem_id);
+            const uint64_t total = (it != memory_sizes().end()) ? it->second : 0;
             actual = (total > offset) ? (total - offset) : 0;
         }
 
@@ -1443,7 +1500,7 @@ extern "C"
             if (bridge_call(gb::ioctl_map_memory_direct, &request, sizeof(request), &response, sizeof(response)) &&
                 response.vk_result == VK_SUCCESS && response.guest_address != 0)
             {
-                g_direct_mapped.insert(mem_id);
+                direct_mapped().insert(mem_id);
                 *ppData = reinterpret_cast<void*>(static_cast<uintptr_t>(response.guest_address));
                 return VK_SUCCESS;
             }
@@ -1468,7 +1525,7 @@ extern "C"
             }
         }
 
-        auto& stored = (g_mapped_ranges[mem_id] = std::move(range));
+        auto& stored = (mapped_ranges()[mem_id] = std::move(range));
         *ppData = stored.staging.data();
         return VK_SUCCESS;
     }
@@ -1477,7 +1534,7 @@ extern "C"
     {
         const gb::object_id mem_id = to_object_id(memory);
 
-        if (g_direct_mapped.erase(mem_id) != 0)
+        if (direct_mapped().erase(mem_id) != 0)
         {
             gb::unmap_memory_direct_request request{};
             request.device = to_object_id(device);
@@ -1486,8 +1543,8 @@ extern "C"
             return;
         }
 
-        const auto it = g_mapped_ranges.find(mem_id);
-        if (it == g_mapped_ranges.end())
+        const auto it = mapped_ranges().find(mem_id);
+        if (it == mapped_ranges().end())
         {
             return;
         }
@@ -1508,7 +1565,7 @@ extern "C"
             bridge_call(gb::ioctl_upload_memory, message.data(), static_cast<DWORD>(message.size()), &response, sizeof(response));
         }
 
-        g_mapped_ranges.erase(it);
+        mapped_ranges().erase(it);
     }
 
     // The bridge models a map as a private staging copy synced by download (map) / upload (unmap). DXVK may
@@ -1520,7 +1577,7 @@ extern "C"
         for (uint32_t i = 0; i < memoryRangeCount; ++i)
         {
             const gb::object_id mem_id = to_object_id(pMemoryRanges[i].memory);
-            if (g_direct_mapped.contains(mem_id))
+            if (direct_mapped().contains(mem_id))
             {
                 gb::mapped_memory_range_request request{};
                 request.device = to_object_id(device);
@@ -1540,8 +1597,8 @@ extern "C"
                 continue;
             }
 
-            const auto it = g_mapped_ranges.find(mem_id);
-            if (it == g_mapped_ranges.end() || it->second.staging.empty())
+            const auto it = mapped_ranges().find(mem_id);
+            if (it == mapped_ranges().end() || it->second.staging.empty())
             {
                 continue;
             }
@@ -1567,7 +1624,7 @@ extern "C"
         for (uint32_t i = 0; i < memoryRangeCount; ++i)
         {
             const gb::object_id mem_id = to_object_id(pMemoryRanges[i].memory);
-            if (g_direct_mapped.contains(mem_id))
+            if (direct_mapped().contains(mem_id))
             {
                 gb::mapped_memory_range_request request{};
                 request.device = to_object_id(device);
@@ -1587,8 +1644,8 @@ extern "C"
                 continue;
             }
 
-            const auto it = g_mapped_ranges.find(mem_id);
-            if (it == g_mapped_ranges.end() || it->second.staging.empty())
+            const auto it = mapped_ranges().find(mem_id);
+            if (it == mapped_ranges().end() || it->second.staging.empty())
             {
                 continue;
             }
@@ -2643,8 +2700,6 @@ extern "C"
         }
     }
 
-    // Copies are remoted assuming tight packing of mip 0 / layer 0 at image offset 0 to buffer offset 0
-    // (bufferRowLength/bufferImageHeight/imageOffset are not yet honored).
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage,
                                                                             VkImageLayout srcImageLayout, VkBuffer dstBuffer,
                                                                             uint32_t regionCount, const VkBufferImageCopy* pRegions)
@@ -2656,9 +2711,19 @@ extern "C"
             request.command_buffer = to_object_id(commandBuffer);
             request.image = to_object_id(srcImage);
             request.buffer = to_object_id(dstBuffer);
+            request.buffer_offset = r.bufferOffset;
             request.image_layout = static_cast<uint32_t>(srcImageLayout);
+            request.buffer_row_length = r.bufferRowLength;
+            request.buffer_image_height = r.bufferImageHeight;
+            request.image_offset_x = r.imageOffset.x;
+            request.image_offset_y = r.imageOffset.y;
+            request.image_offset_z = r.imageOffset.z;
             request.width = r.imageExtent.width;
             request.height = r.imageExtent.height;
+            request.depth = r.imageExtent.depth;
+            request.mip_level = r.imageSubresource.mipLevel;
+            request.base_array_layer = r.imageSubresource.baseArrayLayer;
+            request.layer_count = r.imageSubresource.layerCount;
             request.aspect_mask = r.imageSubresource.aspectMask;
             record_command(request.command_buffer, gb::command::cmd_copy_image_to_buffer, &request, sizeof(request));
         }
@@ -2725,8 +2790,6 @@ extern "C"
         }
     }
 
-    // Resolves a multisampled source image into a single-sample destination. DXVK uses this to resolve an
-    // MSAA backbuffer before presenting it. Remoted assuming full image, mip 0 / layer 0, offset 0.
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage,
                                                                        VkImageLayout srcImageLayout, VkImage dstImage,
                                                                        VkImageLayout dstImageLayout, uint32_t regionCount,
@@ -2741,9 +2804,23 @@ extern "C"
             request.dst_image = to_object_id(dstImage);
             request.src_layout = static_cast<uint32_t>(srcImageLayout);
             request.dst_layout = static_cast<uint32_t>(dstImageLayout);
+            request.src_aspect_mask = r.srcSubresource.aspectMask;
+            request.src_mip_level = r.srcSubresource.mipLevel;
+            request.src_base_array_layer = r.srcSubresource.baseArrayLayer;
+            request.src_layer_count = r.srcSubresource.layerCount;
+            request.src_offset_x = r.srcOffset.x;
+            request.src_offset_y = r.srcOffset.y;
+            request.src_offset_z = r.srcOffset.z;
+            request.dst_aspect_mask = r.dstSubresource.aspectMask;
+            request.dst_mip_level = r.dstSubresource.mipLevel;
+            request.dst_base_array_layer = r.dstSubresource.baseArrayLayer;
+            request.dst_layer_count = r.dstSubresource.layerCount;
+            request.dst_offset_x = r.dstOffset.x;
+            request.dst_offset_y = r.dstOffset.y;
+            request.dst_offset_z = r.dstOffset.z;
             request.width = r.extent.width;
             request.height = r.extent.height;
-            request.aspect_mask = r.srcSubresource.aspectMask;
+            request.depth = r.extent.depth;
             record_command(request.command_buffer, gb::command::cmd_resolve_image, &request, sizeof(request));
         }
     }
@@ -2780,9 +2857,23 @@ extern "C"
             request.dst_image = to_object_id(pResolveImageInfo->dstImage);
             request.src_layout = static_cast<uint32_t>(pResolveImageInfo->srcImageLayout);
             request.dst_layout = static_cast<uint32_t>(pResolveImageInfo->dstImageLayout);
+            request.src_aspect_mask = r.srcSubresource.aspectMask;
+            request.src_mip_level = r.srcSubresource.mipLevel;
+            request.src_base_array_layer = r.srcSubresource.baseArrayLayer;
+            request.src_layer_count = r.srcSubresource.layerCount;
+            request.src_offset_x = r.srcOffset.x;
+            request.src_offset_y = r.srcOffset.y;
+            request.src_offset_z = r.srcOffset.z;
+            request.dst_aspect_mask = r.dstSubresource.aspectMask;
+            request.dst_mip_level = r.dstSubresource.mipLevel;
+            request.dst_base_array_layer = r.dstSubresource.baseArrayLayer;
+            request.dst_layer_count = r.dstSubresource.layerCount;
+            request.dst_offset_x = r.dstOffset.x;
+            request.dst_offset_y = r.dstOffset.y;
+            request.dst_offset_z = r.dstOffset.z;
             request.width = r.extent.width;
             request.height = r.extent.height;
-            request.aspect_mask = r.srcSubresource.aspectMask;
+            request.depth = r.extent.depth;
             record_command(request.command_buffer, gb::command::cmd_resolve_image, &request, sizeof(request));
         }
     }
@@ -2943,9 +3034,19 @@ extern "C"
             request.command_buffer = to_object_id(commandBuffer);
             request.image = to_object_id(pCopyImageToBufferInfo->srcImage);
             request.buffer = to_object_id(pCopyImageToBufferInfo->dstBuffer);
+            request.buffer_offset = r.bufferOffset;
             request.image_layout = static_cast<uint32_t>(pCopyImageToBufferInfo->srcImageLayout);
+            request.buffer_row_length = r.bufferRowLength;
+            request.buffer_image_height = r.bufferImageHeight;
+            request.image_offset_x = r.imageOffset.x;
+            request.image_offset_y = r.imageOffset.y;
+            request.image_offset_z = r.imageOffset.z;
             request.width = r.imageExtent.width;
             request.height = r.imageExtent.height;
+            request.depth = r.imageExtent.depth;
+            request.mip_level = r.imageSubresource.mipLevel;
+            request.base_array_layer = r.imageSubresource.baseArrayLayer;
+            request.layer_count = r.imageSubresource.layerCount;
             request.aspect_mask = r.imageSubresource.aspectMask;
             record_command(request.command_buffer, gb::command::cmd_copy_image_to_buffer, &request, sizeof(request));
         }
@@ -2991,6 +3092,7 @@ extern "C"
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         *pSurfaceCapabilities = {};
 
         gb::get_surface_capabilities_request request{};
@@ -4481,12 +4583,12 @@ extern "C"
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
-                                                                            const VkWriteDescriptorSet* pDescriptorWrites, uint32_t,
-                                                                            const VkCopyDescriptorSet*)
+                                                                            const VkWriteDescriptorSet* pDescriptorWrites,
+                                                                            uint32_t descriptorCopyCount,
+                                                                            const VkCopyDescriptorSet* pDescriptorCopies)
     {
-        // Descriptor copies are not modeled; only writes are forwarded. Non-inline writes are flattened
-        // to `descriptorCount` single-descriptor wire writes.
         std::vector<gb::descriptor_write> writes;
+        std::vector<gb::descriptor_copy> copies;
         std::vector<uint8_t> inline_uniform_data;
         for (uint32_t w = 0; w < descriptorWriteCount; ++w)
         {
@@ -4552,9 +4654,24 @@ extern "C"
             }
         }
 
+        copies.reserve(descriptorCopyCount);
+        for (uint32_t i = 0; i < descriptorCopyCount; ++i)
+        {
+            const VkCopyDescriptorSet& src = pDescriptorCopies[i];
+            copies.push_back({.src_set = to_object_id(src.srcSet),
+                              .src_binding = src.srcBinding,
+                              .src_array_element = src.srcArrayElement,
+                              .dst_set = to_object_id(src.dstSet),
+                              .dst_binding = src.dstBinding,
+                              .dst_array_element = src.dstArrayElement,
+                              .descriptor_count = src.descriptorCount,
+                              .reserved = 0});
+        }
+
         gb::update_descriptor_sets_request header{};
         header.device = to_object_id(device);
         header.write_count = static_cast<uint32_t>(writes.size());
+        header.copy_count = static_cast<uint32_t>(copies.size());
         header.inline_uniform_data_size = static_cast<uint32_t>(inline_uniform_data.size());
 
         // Append to the pending batch instead of issuing an IOCTL now (drained before the next bridge call).
@@ -4566,6 +4683,12 @@ extern "C"
         {
             g_pending_descriptor_updates.insert(g_pending_descriptor_updates.end(), write_bytes,
                                                 write_bytes + writes.size() * sizeof(gb::descriptor_write));
+        }
+        const auto* copy_bytes = reinterpret_cast<const uint8_t*>(copies.data());
+        if (!copies.empty())
+        {
+            g_pending_descriptor_updates.insert(g_pending_descriptor_updates.end(), copy_bytes,
+                                                copy_bytes + copies.size() * sizeof(gb::descriptor_copy));
         }
         g_pending_descriptor_updates.insert(g_pending_descriptor_updates.end(), inline_uniform_data.begin(), inline_uniform_data.end());
     }
@@ -4705,6 +4828,24 @@ extern "C"
         request.max_anisotropy = pCreateInfo->maxAnisotropy;
         request.min_lod = pCreateInfo->minLod;
         request.max_lod = pCreateInfo->maxLod;
+        request.flags = pCreateInfo->flags;
+        request.unnormalized_coordinates = pCreateInfo->unnormalizedCoordinates;
+
+        for (const auto* next = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext); next; next = next->pNext)
+        {
+            if (next->sType == VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO)
+            {
+                request.has_reduction_mode = VK_TRUE;
+                request.reduction_mode = reinterpret_cast<const VkSamplerReductionModeCreateInfo*>(next)->reductionMode;
+            }
+            else if (next->sType == VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT)
+            {
+                const auto* custom = reinterpret_cast<const VkSamplerCustomBorderColorCreateInfoEXT*>(next);
+                request.has_custom_border_color = VK_TRUE;
+                request.custom_border_format = static_cast<uint32_t>(custom->format);
+                std::memcpy(request.custom_border_color.data(), &custom->customBorderColor, sizeof(request.custom_border_color));
+            }
+        }
 
         gb::object_response response{};
         if (!bridge_call(gb::ioctl_create_sampler, &request, sizeof(request), &response, sizeof(response)))
@@ -5562,20 +5703,19 @@ extern "C"
         request.command_buffer = to_object_id(commandBuffer);
         request.buffer = to_object_id(buffer);
         request.offset = offset;
+        request.size = VK_WHOLE_SIZE;
         request.index_type = static_cast<uint32_t>(indexType);
         record_command(request.command_buffer, gb::command::cmd_bind_index_buffer, &request, sizeof(request));
     }
 
-    // VK_KHR_maintenance5 / core 1.4: like vkCmdBindIndexBuffer but with an explicit size. The bridge does
-    // not model the size (the base bind covers the buffer from offset, which matches the usual VK_WHOLE_SIZE).
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer, VkBuffer buffer,
-                                                                              VkDeviceSize offset, VkDeviceSize /*size*/,
-                                                                              VkIndexType indexType)
+                                                                              VkDeviceSize offset, VkDeviceSize size, VkIndexType indexType)
     {
         gb::cmd_bind_index_buffer_request request{};
         request.command_buffer = to_object_id(commandBuffer);
         request.buffer = to_object_id(buffer);
         request.offset = offset;
+        request.size = size;
         request.index_type = static_cast<uint32_t>(indexType);
         record_command(request.command_buffer, gb::command::cmd_bind_index_buffer, &request, sizeof(request));
     }
