@@ -236,6 +236,14 @@ def main() -> None:
         assert pathlib.PurePath(sample).name.lower() in manifest["command_line"].lower(), manifest
         assert ttd_format.Trace(cli_trace).manifest == manifest
         assert replay.manifest_differences() == []
+        # The same check before building an emulator, and the registry fingerprint on its own. An emulation root's
+        # hives are its registry folder; registry_directory applies only without one.
+        assert ttd.environment_differences(trace, **settings) == [], ttd.environment_differences(trace, **settings)
+        hives = (pathlib.Path(settings["emulation_root"]) / "registry" if settings.get("emulation_root")
+                 else pathlib.Path(settings["registry_directory"]))
+        assert ttd.registry_fingerprint(str(hives)) == manifest["registry"]
+        other_hives = ttd.environment_differences(trace, **{**settings, "emulation_root": "", "registry_directory": directory})
+        assert "registry differs" in [difference.split(":")[0] for difference in other_hives], other_hives
 
         # Replay scans: the transient string, the generated function's write-then-execute wave, and written buffers.
         transient = [found for found in replay.strings() if "SOGEN_TTD_TRANSIENT_STRING_FOR_RECOVERY" in found.value]

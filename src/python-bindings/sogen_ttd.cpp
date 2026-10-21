@@ -954,6 +954,19 @@ namespace sogen::py
                   "The format version of a Sogen TTD trace file (read from its first 8 bytes), or None if it is not one");
             m.def("is_supported_trace_version", &ttd::is_supported_trace_version, nb::arg("version"),
                   "Whether this build reads traces of that format version");
+            m.def(
+                "environment_differences",
+                [](const ttd_trace& recorded, const nb::kwargs& kwargs) {
+                    return ttd::environment_differences(recorded.native(), make_emulator_settings(kwargs));
+                },
+                nb::arg("trace"), nb::arg("kwargs"),
+                "Before building an emulator: the recorded inputs outside the checkpoints (emulation_root, registry, "
+                "system_dlls, build) that an emulator with these keyword arguments (as for create_emulator) would read "
+                "differently. Replay.manifest_differences is the same check after a seek.");
+            m.def("registry_fingerprint", &ttd::registry_fingerprint, nb::arg("hive_directory"),
+                  "The manifest's \"registry\" value for a folder of hives; compare it with Trace.manifest[\"registry\"]");
+            m.def("system_dll_fingerprint", &ttd::system_dll_fingerprint, nb::arg("system32"),
+                  "The manifest's \"system_dlls\" value for a System32 folder on this machine");
         }
 
         void register_replay(nb::module_& m)

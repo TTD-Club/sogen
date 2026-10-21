@@ -460,7 +460,12 @@ found through the section table (24-byte entries `type, offset, size`):
   seek refuses a trace with another `backend` or `cpuid`. The emulation root,
   hives, system DLLs, and build live outside the checkpoints and are read
   again by a replay, so a divergence message lists those that differ
-  (`Replay.manifest_differences()` in Python).
+  (`Replay.manifest_differences()` in Python). `environment_differences`
+  (`ttd.environment_differences(trace, **settings)`) checks the same before
+  an emulator exists, and `registry_fingerprint` / `system_dll_fingerprint`
+  (also in `sogen.ttd`) compute the two values for a folder. `SECURITY` and
+  `SAM` are optional: the emulator does not read them, and a registry
+  without them (no password hashes or LSA secrets) records and replays.
 
 - UI inputs (type 7, size = entry count; absent in older traces): 56-byte
   entries `checkpoint, event_number, step, window, message (uint32), reserved

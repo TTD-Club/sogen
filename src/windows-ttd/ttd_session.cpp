@@ -6,6 +6,7 @@
 #include <utils/finally.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -88,33 +89,30 @@ namespace sogen::ttd
 
         std::string registry_fingerprint(const windows_emulator& win_emu)
         {
-            const auto& directory = win_emu.registry.get_hive_path();
-            if (directory.empty())
-            {
-                return {};
-            }
-            file_fingerprint fingerprint{};
-            for (const auto* hive : {"SYSTEM", "SECURITY", "SAM", "SOFTWARE", "HARDWARE", "NTUSER.DAT"})
-            {
-                fingerprint.add_file(hive, directory / hive);
-            }
-            return fingerprint.text();
+            return ttd::registry_fingerprint(win_emu.registry.get_hive_path());
         }
 
         // The DLLs every process loads, from the emulation root or, in host mode, the host.
-        std::string system_dll_fingerprint(const windows_emulator& win_emu)
+        constexpr std::array<const char*, 3> system_dlls{"ntdll.dll", "kernel32.dll", "kernelbase.dll"};
+
+        std::string system_dll_fingerprint(const file_system& file_sys, const windows_path& system_root)
         {
-            const auto& system_root = win_emu.version.get_system_root();
             if (system_root.is_relative())
             {
                 return {};
             }
+            // Each file through the file system, which finds it ignoring case on case-sensitive hosts.
             file_fingerprint fingerprint{};
-            for (const auto* dll : {"ntdll.dll", "kernel32.dll", "kernelbase.dll"})
+            for (const auto* dll : system_dlls)
             {
-                fingerprint.add_file(dll, win_emu.file_sys.translate(system_root / windows_path{"System32"} / windows_path{dll}));
+                fingerprint.add_file(dll, file_sys.translate(system_root / windows_path{"System32"} / windows_path{dll}));
             }
             return fingerprint.text();
+        }
+
+        std::string system_dll_fingerprint(const windows_emulator& win_emu)
+        {
+            return system_dll_fingerprint(win_emu.file_sys, win_emu.version.get_system_root());
         }
 
         std::string command_line(windows_emulator& win_emu)
@@ -176,20 +174,96 @@ namespace sogen::ttd
         }
     }
 
+    std::string registry_fingerprint(const std::filesystem::path& hive_directory)
+    {
+        if (hive_directory.empty())
+        {
+            return {};
+        }
+        file_fingerprint fingerprint{};
+        for (const auto* hive : {"SYSTEM", "SECURITY", "SAM", "SOFTWARE", "HARDWARE", "NTUSER.DAT"})
+        {
+            fingerprint.add_file(hive, hive_directory / hive);
+        }
+        return fingerprint.text();
+    }
+
+    std::string system_dll_fingerprint(const std::filesystem::path& system32)
+    {
+        file_fingerprint fingerprint{};
+        for (const auto* dll : system_dlls)
+        {
+            fingerprint.add_file(dll, system32 / dll);
+        }
+        return fingerprint.text();
+    }
+
+    namespace
+    {
+        using environment = std::array<std::pair<std::string_view, std::string>, 4>;
+
+        std::vector<std::string> differences_from(const trace& recorded, const environment& replayed)
+        {
+            std::vector<std::string> differences{};
+            for (const auto& [key, value] : replayed)
+            {
+                if (const auto recorded_value = recorded.manifest_value(key); recorded_value && *recorded_value != value)
+                {
+                    differences.push_back(std::string(key) + " differs: recorded \"" + std::string(*recorded_value) + "\", replay \"" +
+                                          value + "\"");
+                }
+            }
+            return differences;
+        }
+    }
+
     std::vector<std::string> manifest_differences(const windows_emulator& win_emu, const trace& recorded)
     {
-        std::vector<std::string> differences{};
-        const auto compare = [&](const std::string_view key, const std::string& replayed) {
-            if (const auto value = recorded.manifest_value(key); value && *value != replayed)
+        return differences_from(recorded, {{
+                                              {"emulation_root", path_text(win_emu.emulation_root)},
+                                              {"registry", registry_fingerprint(win_emu)},
+                                              {"system_dlls", system_dll_fingerprint(win_emu)},
+                                              {"build", std::string(build_commit)},
+                                          }});
+    }
+
+    std::vector<std::string> environment_differences(const trace& recorded, const emulator_settings& settings)
+    {
+        // As windows_emulator sets up its emulation root, hives, and file system.
+        const auto root = settings.emulation_root.empty() ? settings.emulation_root : std::filesystem::absolute(settings.emulation_root);
+        const auto hive_directory = !settings.load_registry ? std::filesystem::path{}
+                                    : root.empty()          ? std::filesystem::absolute(settings.registry_directory)
+                                                            : root / "registry";
+        file_system file_sys(root.empty() ? root : root / "filesys", settings.root_mode);
+        for (const auto& mount : settings.mounts)
+        {
+            file_sys.map(mount.guest_path, mount.host_path, mount.mode);
+        }
+
+        // The system root is what the hives name; without readable hives, the emulator would not start either.
+        windows_path system_root{};
+        if (!hive_directory.empty())
+        {
+            try
             {
-                differences.push_back(std::string(key) + " differs: recorded \"" + std::string(*value) + "\", replay \"" + replayed + "\"");
+                registry_manager registry(hive_directory);
+                logger quiet{};
+                quiet.set_silent(true);
+                windows_version_manager version{};
+                version.load_from_registry(registry, quiet);
+                system_root = version.get_system_root();
             }
-        };
-        compare("emulation_root", path_text(win_emu.emulation_root));
-        compare("registry", registry_fingerprint(win_emu));
-        compare("system_dlls", system_dll_fingerprint(win_emu));
-        compare("build", build_commit);
-        return differences;
+            catch (const std::exception&)
+            {
+            }
+        }
+
+        return differences_from(recorded, {{
+                                              {"emulation_root", path_text(root)},
+                                              {"registry", registry_fingerprint(hive_directory)},
+                                              {"system_dlls", system_dll_fingerprint(file_sys, system_root)},
+                                              {"build", std::string(build_commit)},
+                                          }});
     }
 
     std::optional<cpuid_result> cpuid_override(const uint32_t leaf, const bool hide_rdrand)
