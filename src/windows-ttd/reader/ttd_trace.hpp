@@ -207,6 +207,16 @@ namespace sogen::ttd
 
         std::optional<std::string_view> manifest_value(std::string_view key) const;
 
+        // Whether the trace holds what the recording read of its registry hives (registry_hives), so that replays need
+        // no hive files.
+        bool has_registry_hives() const
+        {
+            return !registry_hives_.empty();
+        }
+
+        // What the recording read of each registry hive file (decoded on each call; empty without has_registry_hives).
+        std::vector<recorded_hive_file> registry_hives() const;
+
         // Identifies this recording: ASCII that differs between any two recordings (also of the same program) and stays
         // with the file when it is moved or copied, at most 33 characters. Recordings store a random id of 32 hex digits
         // (manifest key "trace_id"); for older ones it is "h" and 32 hex digits of a hash of the file's header and
@@ -479,6 +489,8 @@ namespace sogen::ttd
         bool has_memory_regions_{};
         // Per checkpoint, where the memory manager's state begins in its decoded state; empty for traces without it.
         std::vector<uint64_t> checkpoint_memory_offsets_{};
+        // The registry hives section as stored (compressed); empty for traces without it.
+        std::vector<std::byte> registry_hives_{};
 
         // memory_at from the accesses to the memory, then the checkpoint for bytes they don't show.
         std::vector<std::optional<uint8_t>> memory_from_accesses(uint64_t position, uint64_t address, uint64_t size,

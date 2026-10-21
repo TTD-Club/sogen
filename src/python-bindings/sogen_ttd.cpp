@@ -800,6 +800,10 @@ namespace sogen::py
                 .def_prop_ro(
                     "has_checkpoint_memory", [](const ttd_trace& self) { return self.native().has_checkpoint_memory(); },
                     "Whether memory_at takes bytes no access shows from checkpoints")
+                .def_prop_ro(
+                    "has_registry_hives", [](const ttd_trace& self) { return self.native().has_registry_hives(); },
+                    "Whether the trace holds what the recording read of its registry hives: replays then need no hive files "
+                    "(create_emulator(..., load_registry=False))")
                 .def_prop_rw(
                     "checkpoint_cache_size", [](const ttd_trace& self) { return self.native().checkpoint_cache_size(); },
                     [](const ttd_trace& self, const size_t count) { self.native().set_checkpoint_cache_size(count); },

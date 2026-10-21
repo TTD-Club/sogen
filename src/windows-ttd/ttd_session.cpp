@@ -87,9 +87,30 @@ namespace sogen::ttd
             }
         };
 
+        // The fingerprint of the hive files the emulator's registry comes from: noted in its identity once known (see
+        // use_recorded_registry; recorded hives are named by the recording's fingerprint and id), computed otherwise.
         std::string registry_fingerprint(const windows_emulator& win_emu)
         {
+            if (const auto& identity = win_emu.registry.get_hive_identity(); !identity.empty())
+            {
+                return identity.substr(0, identity.find('/'));
+            }
             return ttd::registry_fingerprint(win_emu.registry.get_hive_path());
+        }
+
+        recorded_hives to_registry_hives(const std::vector<recorded_hive_file>& files)
+        {
+            recorded_hives hives{};
+            for (const auto& file : files)
+            {
+                auto& hive = hives[file.name];
+                hive.size = file.size;
+                for (const auto& [offset, bytes] : file.ranges)
+                {
+                    hive.contents.emplace(offset, bytes);
+                }
+            }
+            return hives;
         }
 
         // The DLLs every process loads, from the emulation root or, in host mode, the host.
@@ -149,7 +170,9 @@ namespace sogen::ttd
             return manifest;
         }
 
-        void check_manifest(const windows_emulator& win_emu, const trace& recorded)
+        // Refuses traces the emulator cannot replay and serves the registry from the trace's hives if it has them; before
+        // the emulator restores a checkpoint or sets up the process.
+        void prepare_emulator(windows_emulator& win_emu, const trace& recorded)
         {
             const auto backend = win_emu.emu().get_name();
             if (const auto recorded_backend = recorded.manifest_value("backend"); recorded_backend && *recorded_backend != backend)
@@ -161,6 +184,7 @@ namespace sogen::ttd
                 throw std::runtime_error("TTD trace was recorded with CPUID results " + std::string(*cpuid) + "; this build reports " +
                                          std::string(cpuid_scheme));
             }
+            use_recorded_registry(win_emu, recorded);
         }
 
         std::string difference_suffix(const std::vector<std::string>& differences)
@@ -196,6 +220,27 @@ namespace sogen::ttd
             fingerprint.add_file(dll, system32 / dll);
         }
         return fingerprint.text();
+    }
+
+    void use_recorded_registry(windows_emulator& win_emu, const trace& recorded)
+    {
+        if (!recorded.has_registry_hives())
+        {
+            return;
+        }
+        auto& registry = win_emu.registry;
+        const std::string fingerprint(recorded.manifest_value("registry").value_or(""));
+        const auto identity = fingerprint + "/" + recorded.id();
+        if (registry.get_hive_identity() == identity)
+        {
+            return;
+        }
+        // The recording's own hive files answer as the recorded parts do, and also beyond them, as a fork may need. A fork
+        // hands on the recorded parts with what it read, so that its own replays (also those that set up the process
+        // again) need no files either.
+        const auto own_files =
+            !fingerprint.empty() && !registry.get_hive_path().empty() && ttd::registry_fingerprint(registry.get_hive_path()) == fingerprint;
+        registry.use_recorded_hives(to_registry_hives(recorded.registry_hives()), identity, own_files);
     }
 
     namespace
@@ -240,13 +285,26 @@ namespace sogen::ttd
             file_sys.map(mount.guest_path, mount.host_path, mount.mode);
         }
 
+        // A trace that carries its hives replays with them (use_recorded_registry), whatever the settings give.
+        const auto carries_hives = recorded.has_registry_hives();
+        const auto registry_value =
+            carries_hives ? std::string(recorded.manifest_value("registry").value_or("")) : registry_fingerprint(hive_directory);
+
         // The system root is what the hives name; without readable hives, the emulator would not start either.
         windows_path system_root{};
-        if (!hive_directory.empty())
+        if (carries_hives || !hive_directory.empty())
         {
             try
             {
-                registry_manager registry(hive_directory);
+                registry_manager registry{};
+                if (carries_hives)
+                {
+                    registry.use_recorded_hives(to_registry_hives(recorded.registry_hives()), {});
+                }
+                else
+                {
+                    registry = registry_manager(hive_directory);
+                }
                 logger quiet{};
                 quiet.set_silent(true);
                 windows_version_manager version{};
@@ -260,7 +318,7 @@ namespace sogen::ttd
 
         return differences_from(recorded, {{
                                               {"emulation_root", path_text(root)},
-                                              {"registry", registry_fingerprint(hive_directory)},
+                                              {"registry", registry_value},
                                               {"system_dlls", system_dll_fingerprint(file_sys, system_root)},
                                               {"build", std::string(build_commit)},
                                           }});
@@ -547,7 +605,7 @@ namespace sogen::ttd
                      const operation_control& control)
     {
         require_deterministic(win_emu);
-        check_manifest(win_emu, recorded);
+        prepare_emulator(win_emu, recorded);
         auto& store = keyframes(recorded);
         const auto checkpoint_step = recorded.checkpoint_step_for(position);
         auto from = checkpoint_step;
@@ -569,7 +627,7 @@ namespace sogen::ttd
         for (auto* emulator : emulators)
         {
             require_deterministic(*emulator);
-            check_manifest(*emulator, recorded);
+            prepare_emulator(*emulator, recorded);
         }
 
         const auto end = recorded.metadata().instruction_count;
@@ -661,7 +719,7 @@ namespace sogen::ttd
                        const operation_control& control)
     {
         require_deterministic(win_emu);
-        check_manifest(win_emu, recorded);
+        prepare_emulator(win_emu, recorded);
         const auto from = win_emu.get_executed_instructions();
         if (from < recorded.start_position() || from > recorded.metadata().instruction_count)
         {
@@ -686,7 +744,7 @@ namespace sogen::ttd
         const auto end = recorded.metadata().instruction_count;
         if (restore)
         {
-            check_manifest(win_emu, recorded);
+            prepare_emulator(win_emu, recorded);
             snapshot::load_emulator_state(win_emu, *recorded.checkpoint_for_step(start).state);
         }
         else
@@ -696,8 +754,8 @@ namespace sogen::ttd
                 throw std::runtime_error("A TTD replay from the application's setup needs a trace and an emulator at position 0, "
                                          "not a forked trace");
             }
+            prepare_emulator(win_emu, recorded);
             win_emu.setup_process_if_necessary();
-            check_manifest(win_emu, recorded);
         }
         attach();
         try

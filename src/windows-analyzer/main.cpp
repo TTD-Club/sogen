@@ -699,6 +699,7 @@ namespace sogen
                 .use_instruction_precision = !options.disable_instruction_precision,
                 .emulation_root = options.emulation_root,
                 .registry_directory = options.registry_path,
+                .load_registry = ttd::needs_hive_files(options.ttd),
                 .root_mode = options.root_mode,
                 .mounts = options.mounts,
                 .network = options.network,

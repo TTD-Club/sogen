@@ -68,6 +68,15 @@ namespace sogen::ttd
     // it on an emulator that holds a restored checkpoint: the system root comes from the emulator state.
     std::vector<std::string> manifest_differences(const windows_emulator& win_emu, const trace& recorded);
 
+    // For a trace that carries its registry hives (trace::has_registry_hives, recordings since 2026-10-21): serves the
+    // emulator's registry from what the recording read of them, so hive files are not needed
+    // (emulator_settings::load_registry = false). If the emulator's hive files are the recording's own (their fingerprint
+    // matches), data beyond that comes from them, as a fork may need; otherwise a run that reads hive data the recording
+    // never read throws. Keeps changes made to the registry. A recording made afterwards (a fork) stores the recorded
+    // parts and what it read. seek, run_to, replay_to_end and prepare_keyframes call it; call it before restoring a
+    // checkpoint any other way.
+    void use_recorded_registry(windows_emulator& win_emu, const trace& recorded);
+
     // The same check before building an emulator: what an emulator built with `settings` would read differently from
     // the recording, without the cost of an emulator. The system root comes from the hives, as at setup (system_dlls
     // reads empty when they name none); manifest_differences takes it from the restored checkpoint instead.

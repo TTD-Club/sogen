@@ -98,8 +98,18 @@ namespace sogen
     struct exposed_hive_key
     {
         hive_key& key;
-        std::ifstream& file;
+        hive_file& file;
     };
+
+    // The parts of a hive file a run read: the file's size and the ranges, with their bytes.
+    struct recorded_hive
+    {
+        uint64_t size{};
+        hive_file::ranges contents{};
+    };
+
+    // Hive file name (SYSTEM, SECURITY, SAM, SOFTWARE, HARDWARE, NTUSER.DAT) -> what a run read of it.
+    using recorded_hives = std::map<std::string, recorded_hive>;
 
     class registry_manager
     {
@@ -117,10 +127,26 @@ namespace sogen
         registry_manager(const registry_manager&) = delete;
         registry_manager& operator=(const registry_manager&) = delete;
 
-        // The directory the hive files are read from; empty for a manager without hives.
+        // The directory the hive files are read from; empty for a manager without hive files.
         const std::filesystem::path& get_hive_path() const
         {
             return this->hive_path_;
+        }
+
+        // What this run depends on of each hive: everything it read since the hives were set up, and for recorded hives
+        // also all they were given.
+        recorded_hives read_hives();
+
+        // Serves the hives from what an earlier run read (read_hives), keeping the changes made to the registry. Data
+        // outside it comes from the hive files if `fall_back_to_files` (they must be the ones the earlier run read)
+        // and is an error otherwise. `identity` names the contents (get_hive_identity).
+        void use_recorded_hives(const recorded_hives& hives, std::string identity, bool fall_back_to_files = false);
+
+        // The name use_recorded_hives gave the hive contents, so that a caller can tell them apart without reading them;
+        // empty for hives from files.
+        const std::string& get_hive_identity() const
+        {
+            return this->hive_identity_;
         }
 
         std::optional<registry_key> get_key(const utils::path_key& key);
@@ -208,6 +234,9 @@ namespace sogen
 
         std::filesystem::path hive_path_{};
         hive_map hives_{};
+        // Hive file name -> its key in hives_.
+        std::map<std::string, utils::path_key> hive_files_{};
+        std::string hive_identity_{};
         std::map<utils::path_key, utils::path_key> path_mapping_{};
         std::map<utils::path_key, overlay_bucket> overlay_values_{};
 
@@ -218,7 +247,7 @@ namespace sogen
         hive_map::iterator find_hive(const utils::path_key& key);
         hive_map::const_iterator find_hive(const utils::path_key& key) const;
 
-        void setup();
+        void setup(const recorded_hives* recorded);
     };
 
 } // namespace sogen

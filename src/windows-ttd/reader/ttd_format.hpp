@@ -113,6 +113,20 @@ namespace sogen::ttd
         // take memory contents from checkpoints without parsing the rest; encoded as described at
         // encode_checkpoint_memory_offsets; size = compressed bytes.
         checkpoint_memory = 18,
+        // The parts of the registry hive files the recording read (see recorded_hive_file), encoded as described at
+        // encode_registry_hives; size = compressed bytes. A replay serves the registry from them instead of from files.
+        registry_hives = 19,
+    };
+
+    // What a recording read of one registry hive file, from the emulator's start: every byte a replay of the recording
+    // reads from the hive lies in one of the ranges.
+    struct recorded_hive_file
+    {
+        // SYSTEM, SECURITY, SAM, SOFTWARE, HARDWARE or NTUSER.DAT.
+        std::string name{};
+        uint64_t size{};
+        // Starting offset and bytes, ascending, neither overlapping nor touching.
+        std::vector<std::pair<uint64_t, std::vector<std::byte>>> ranges{};
     };
 
     // What NtQueryVirtualMemory showed for [address, address + size) from position `step` on (after `event_number`

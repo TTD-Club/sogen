@@ -60,58 +60,15 @@ namespace sogen
 
         // NOLINTEND(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
 
-        bool read_file_data_safe(std::ifstream& file, const uint64_t offset, void* buffer, const size_t size)
+        void read_file_data(hive_file& file, const uint64_t offset, void* buffer, const size_t size)
         {
-            // The parser maps fixed-size structs (key/value/subkey-list blocks) onto variable-size hive
-            // cells, so a full-size read of a cell near the end of the hive legitimately runs past EOF --
-            // uncompacted hives leave trailing slack that absorbs it, but a compacted hive (e.g. produced
-            // by REG SAVE, which drops that slack) does not. Read whatever is available and zero-fill the
-            // remainder; callers only consume the real cell fields, and an offset wholly past EOF yields a
-            // zeroed block that parses as empty rather than crashing.
-            std::memset(buffer, 0, size);
-
-            if (file.bad())
-            {
-                return false;
-            }
-
-            file.clear();
-
-            file.seekg(0, std::ios::end);
-            if (!file.good())
-            {
-                return false;
-            }
-
-            const auto file_size = static_cast<uint64_t>(file.tellg());
-            if (offset >= file_size)
-            {
-                return true; // wholly past EOF: leave the buffer zero-filled
-            }
-
-            const auto available = static_cast<size_t>(file_size - offset);
-            const auto to_read = size < available ? size : available;
-
-            file.seekg(static_cast<std::streamoff>(offset));
-            if (!file.good())
-            {
-                return false;
-            }
-
-            file.read(static_cast<char*>(buffer), static_cast<std::streamsize>(to_read));
-
-            return !file.bad();
-        }
-
-        void read_file_data(std::ifstream& file, const uint64_t offset, void* buffer, const size_t size)
-        {
-            if (!read_file_data_safe(file, offset, buffer, size))
+            if (!file.read(offset, buffer, size))
             {
                 throw std::runtime_error("Failed to read file data");
             }
         }
 
-        std::vector<std::byte> read_file_data(std::ifstream& file, const uint64_t offset, const size_t size)
+        std::vector<std::byte> read_file_data(hive_file& file, const uint64_t offset, const size_t size)
         {
             std::vector<std::byte> result{};
             result.resize(size);
@@ -120,7 +77,7 @@ namespace sogen
             return result;
         }
 
-        std::string read_file_data_string(std::ifstream& file, const uint64_t offset, const size_t size)
+        std::string read_file_data_string(hive_file& file, const uint64_t offset, const size_t size)
         {
             std::string result{};
             result.resize(size);
@@ -131,14 +88,14 @@ namespace sogen
 
         template <typename T>
             requires(std::is_trivially_copyable_v<T>)
-        T read_file_object(std::ifstream& file, const uint64_t offset, const size_t array_index = 0)
+        T read_file_object(hive_file& file, const uint64_t offset, const size_t array_index = 0)
         {
             T obj{};
             read_file_data(file, offset + (array_index * sizeof(T)), &obj, sizeof(T));
             return obj;
         }
 
-        hive_key parse_root_block(std::ifstream& file, const std::filesystem::path& file_path)
+        hive_key parse_root_block(hive_file& file, const std::filesystem::path& file_path)
         {
             try
             {
@@ -158,7 +115,156 @@ namespace sogen
         }
     }
 
-    const hive_value* hive_key::get_value(std::ifstream& file, const std::string_view name)
+    namespace
+    {
+        // Adds [start, end) to a set of ranges (start -> end), merging it with those it overlaps or touches.
+        void add_range(std::map<uint64_t, uint64_t>& ranges, uint64_t start, uint64_t end)
+        {
+            if (start == end)
+            {
+                return;
+            }
+
+            auto next = ranges.upper_bound(start);
+            if (next != ranges.begin())
+            {
+                if (const auto previous = std::prev(next); previous->second >= start)
+                {
+                    if (previous->second >= end)
+                    {
+                        return;
+                    }
+                    start = previous->first;
+                    next = previous;
+                }
+            }
+            while (next != ranges.end() && next->first <= end)
+            {
+                end = std::max(end, next->second);
+                next = ranges.erase(next);
+            }
+            ranges.emplace(start, end);
+        }
+    }
+
+    hive_file::hive_file(const std::filesystem::path& path)
+        : file_(path, std::ios::binary)
+    {
+        std::error_code error{};
+        this->size_ = std::filesystem::file_size(path, error);
+        if (error)
+        {
+            this->size_ = 0;
+        }
+    }
+
+    hive_file::hive_file(const uint64_t size, ranges contents, const std::filesystem::path& path)
+        : size_(size),
+          recorded_(true),
+          contents_(std::move(contents))
+    {
+        if (!path.empty())
+        {
+            this->file_.open(path, std::ios::binary);
+        }
+    }
+
+    bool hive_file::read(const uint64_t offset, void* buffer, const size_t size)
+    {
+        // The parser maps fixed-size structs (key/value/subkey-list blocks) onto variable-size hive
+        // cells, so a full-size read of a cell near the end of the hive legitimately runs past EOF --
+        // uncompacted hives leave trailing slack that absorbs it, but a compacted hive (e.g. produced
+        // by REG SAVE, which drops that slack) does not. Read whatever is available and zero-fill the
+        // remainder; callers only consume the real cell fields, and an offset wholly past EOF yields a
+        // zeroed block that parses as empty rather than crashing.
+        std::memset(buffer, 0, size);
+
+        if (!this->recorded_ && !this->file_.is_open())
+        {
+            return false;
+        }
+
+        if (offset >= this->size_)
+        {
+            return true; // wholly past EOF: leave the buffer zero-filled
+        }
+
+        const auto length = static_cast<size_t>(std::min<uint64_t>(size, this->size_ - offset));
+        const std::span target(static_cast<std::byte*>(buffer), length);
+        if (auto range = this->contents_.upper_bound(offset);
+            range != this->contents_.begin() && (--range, range->first + range->second.size() >= offset + length))
+        {
+            std::memcpy(target.data(), range->second.data() + (offset - range->first), length);
+        }
+        else if (this->file_.is_open())
+        {
+            if (!this->read_from_file(offset, target))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            throw std::runtime_error("The recorded registry holds no data at hive offset " + std::to_string(offset) +
+                                     ": this run reads registry data the recording never read, so it needs the hive files");
+        }
+
+        add_range(this->read_, offset, offset + length);
+        return true;
+    }
+
+    bool hive_file::read_from_file(const uint64_t offset, const std::span<std::byte> buffer)
+    {
+        auto& file = this->file_;
+        if (file.bad())
+        {
+            return false;
+        }
+
+        file.clear();
+        file.seekg(static_cast<std::streamoff>(offset));
+        if (!file.good())
+        {
+            return false;
+        }
+
+        file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        return !file.bad();
+    }
+
+    hive_file::ranges hive_file::known_ranges()
+    {
+        std::map<uint64_t, uint64_t> known = this->read_;
+        for (const auto& [start, bytes] : this->contents_)
+        {
+            add_range(known, start, start + bytes.size());
+        }
+
+        // Without a file, every range read lies in the contents given.
+        ranges result{};
+        for (const auto& [start, end] : known)
+        {
+            std::vector<std::byte> bytes(static_cast<size_t>(end - start));
+            if (this->file_.is_open())
+            {
+                if (!this->read_from_file(start, bytes))
+                {
+                    throw std::runtime_error("Failed to read hive data");
+                }
+            }
+            else
+            {
+                for (auto part = this->contents_.lower_bound(start); part != this->contents_.end() && part->first < end; ++part)
+                {
+                    std::ranges::copy(part->second, bytes.begin() + static_cast<ptrdiff_t>(part->first - start));
+                }
+            }
+            result.emplace(start, std::move(bytes));
+        }
+        return result;
+    }
+
+    const hive_value* hive_key::get_value(hive_file& file, const std::string_view name)
     {
         this->parse(file);
 
@@ -179,7 +285,7 @@ namespace sogen
         return &value;
     }
 
-    const hive_value* hive_key::get_value(std::ifstream& file, const size_t index)
+    const hive_value* hive_key::get_value(hive_file& file, const size_t index)
     {
         this->parse(file);
 
@@ -191,7 +297,7 @@ namespace sogen
         return get_value(file, values_by_index_[index]);
     }
 
-    void hive_key::parse_subkey_list(std::ifstream& file, const int32_t block_offset, const bool allow_root_index)
+    void hive_key::parse_subkey_list(hive_file& file, const int32_t block_offset, const bool allow_root_index)
     {
         const auto item = read_file_object<offsets_t>(file, MAIN_ROOT_OFFSET + block_offset);
 
@@ -228,7 +334,7 @@ namespace sogen
         }
     }
 
-    void hive_key::parse(std::ifstream& file)
+    void hive_key::parse(hive_file& file)
     {
         if (this->parsed_)
         {
@@ -272,8 +378,14 @@ namespace sogen
     }
 
     hive_parser::hive_parser(const std::filesystem::path& file_path)
-        : file_(file_path, std::ios::binary),
+        : file_(file_path),
           root_key_(parse_root_block(file_, file_path))
+    {
+    }
+
+    hive_parser::hive_parser(const uint64_t size, hive_file::ranges contents, const std::filesystem::path& fallback)
+        : file_(size, std::move(contents), fallback),
+          root_key_(parse_root_block(file_, fallback.empty() ? std::filesystem::path{"(recorded)"} : fallback))
     {
     }
 

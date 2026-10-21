@@ -222,7 +222,25 @@ def main() -> None:
             plain_replay.seek(load.position)
             assert read_u64(keyed_emulator, address) == NEW_VALUE
             assert keyed_emulator.serialize_state() == plain_replay.emulator.serialize_state()
-        del plain_replay, keyed_replay, strict_replay
+        # A trace carries what the recording read of its registry hives, so its replay needs no hive files, and neither
+        # does that of a fork recorded from such a replay.
+        assert trace.has_registry_hives
+        hiveless_settings = {**settings, "load_registry": False}
+        assert ttd.environment_differences(trace, **hiveless_settings) == []
+        hiveless = ttd.Replay(keyed, hiveless_emulator := ttd.create_emulator(sample, **hiveless_settings))
+        for position in (load.position, store.position, keyed.instruction_count):
+            hiveless.seek(position)
+            plain_replay.seek(position)
+            assert hiveless_emulator.serialize_state() == plain_replay.emulator.serialize_state(), position
+        assert hiveless.manifest_differences() == [], hiveless.manifest_differences()
+        hiveless.seek(store.position)
+        hiveless_fork_trace = str(pathlib.Path(directory) / "hiveless-fork.sogttd")
+        with ttd.record(hiveless_emulator, hiveless_fork_trace, checkpoint_interval=5000, max_instructions=20000) as hiveless_fork:
+            assert hiveless_fork.has_registry_hives
+            assert hiveless_fork.manifest["registry"] == trace.manifest["registry"], hiveless_fork.manifest
+            ttd.Replay(hiveless_fork, ttd.create_emulator(sample, **hiveless_settings), strict=True).seek(
+                hiveless_fork.instruction_count)
+        del plain_replay, keyed_replay, strict_replay, hiveless
         plain.close()
         keyed.close()
 
@@ -242,8 +260,9 @@ def main() -> None:
         hives = (pathlib.Path(settings["emulation_root"]) / "registry" if settings.get("emulation_root")
                  else pathlib.Path(settings["registry_directory"]))
         assert ttd.registry_fingerprint(str(hives)) == manifest["registry"]
+        # The trace carries what it read of its hives (see has_registry_hives below), so other hive files do not matter.
         other_hives = ttd.environment_differences(trace, **{**settings, "emulation_root": "", "registry_directory": directory})
-        assert "registry differs" in [difference.split(":")[0] for difference in other_hives], other_hives
+        assert "registry differs" not in [difference.split(":")[0] for difference in other_hives], other_hives
 
         # Replay scans: the transient string, the generated function's write-then-execute wave, and written buffers.
         transient = [found for found in replay.strings() if "SOGEN_TTD_TRANSIENT_STRING_FOR_RECOVERY" in found.value]
@@ -312,17 +331,18 @@ def main() -> None:
                               if (event.step, event.address, event.kind) == (store.position, address, ttd_format.WRITE))
         recorded_store.data = (0x3333333333333333).to_bytes(8, "little")
         ttd_format.replace_chunk(tampered, store_chunk, chunk_events)
-        # It also names recorded inputs that differ for the replay, such as the registry hives.
-        ttd_format.replace_manifest(tampered, {**manifest, "registry": "0" * 16})
+        # It also names recorded inputs that differ for the replay, such as the system DLLs (not the registry hives,
+        # which the trace carries).
+        ttd_format.replace_manifest(tampered, {**manifest, "system_dlls": "0" * 16})
         with ttd.Trace(tampered) as tampered_trace:
             tampered_replay = ttd.Replay(tampered_trace, emulator)
             try:
                 tampered_replay.seek(store.position)
             except ttd.DivergenceError as error:
                 assert isinstance(error, RuntimeError) and "accessed different data" in str(error), error
-                assert "registry differs" in str(error), error
+                assert "system_dlls differs" in str(error), error
                 assert [difference.split(":")[0] for difference in tampered_replay.manifest_differences()] == [
-                    "registry differs"]
+                    "system_dlls differs"]
             else:
                 raise AssertionError("A tampered recording replayed without divergence")
             del tampered_replay

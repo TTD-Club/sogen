@@ -371,6 +371,7 @@ namespace sogen::py
         settings.use_relative_time = get_kwarg<bool>(kwargs, "use_relative_time", false);
         settings.emulation_root = get_kwarg<std::filesystem::path>(kwargs, "emulation_root", {});
         settings.registry_directory = get_kwarg<std::filesystem::path>(kwargs, "registry_directory", std::filesystem::path{"./registry"});
+        settings.load_registry = get_kwarg<bool>(kwargs, "load_registry", true);
         settings.root_mode =
             parse_python_filesystem_mode(get_kwarg<std::string>(kwargs, "root_mode", std::string(to_string(default_root_mode))));
         parse_path_mappings(kwargs.contains("path_mappings") ? kwargs["path_mappings"] : nb::none(), settings.mounts);

@@ -504,6 +504,14 @@ namespace sogen::ttd
                 }
                 checkpoint_memory_offsets_ = decode_checkpoint_memory_offsets(read_bytes(section.offset, section.size));
             }
+            else if (section.type == section_type::registry_hives)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                registry_hives_ = read_bytes(section.offset, section.size);
+            }
             else if (section.type == section_type::modules || section.type == section_type::threads ||
                      section.type == section_type::exports || section.type == section_type::export_forwarders ||
                      section.type == section_type::module_machines)
@@ -983,6 +991,11 @@ namespace sogen::ttd
             return std::nullopt;
         }
         return entry->second;
+    }
+
+    std::vector<recorded_hive_file> trace::registry_hives() const
+    {
+        return registry_hives_.empty() ? std::vector<recorded_hive_file>{} : decode_registry_hives(registry_hives_);
     }
 
     std::optional<std::string_view> trace::syscall_name(const uint32_t id) const
