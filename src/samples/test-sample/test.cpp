@@ -11,6 +11,7 @@
 #include <string_view>
 #include <array>
 #include <algorithm>
+#include <bit>
 
 #include "../../common/utils/finally.hpp"
 
@@ -198,6 +199,28 @@ namespace
         return !computername.empty() && blub == "LUL";
     }
 
+    bool test_critical_section_timeout()
+    {
+#ifdef _WIN64
+        constexpr size_t peb_critical_section_timeout_offset = 0xC0;
+        const auto* peb = reinterpret_cast<const uint8_t*>(__readgsqword(0x60));
+#else
+        constexpr size_t peb_critical_section_timeout_offset = 0x70;
+        const auto* peb = reinterpret_cast<const uint8_t*>(__readfsdword(0x30));
+#endif
+
+        int64_t timeout{};
+        memcpy(&timeout, peb + peb_critical_section_timeout_offset, sizeof(timeout));
+
+        if (timeout >= 0)
+        {
+            puts("PEB CriticalSectionTimeout is not a relative timeout");
+            return false;
+        }
+
+        return true;
+    }
+
     bool test_lookup_account_sid()
     {
         HANDLE token{};
@@ -378,8 +401,15 @@ namespace
             LsaCallAuthenticationPackage(lsa, package, &request, sizeof(request), &response, &response_length, &protocol_status);
         const auto* policies = static_cast<const extended_policies*>(response);
         constexpr ULONG dac_disabled = 1;
+#ifdef _WIN64
         const auto ok = status == 0 && protocol_status == 0 && response_length == sizeof(extended_policies) && policies &&
                         policies->message_type == 32 && policies->flags == dac_disabled;
+#else
+        // Kerberos refuses the request's 32-bit layout from a WOW64 client.
+        constexpr auto status_invalid_parameter = static_cast<NTSTATUS>(0xC000000D);
+        const auto ok = status == 0 && protocol_status == status_invalid_parameter && response_length == 0 && !policies;
+        (void)dac_disabled;
+#endif
         if (response)
         {
             LsaFreeReturnBuffer(response);
@@ -1141,6 +1171,42 @@ namespace
         return true;
     }
 
+    // A rename that changes only the case of a name needs no MOVEFILE_REPLACE_EXISTING, and the name takes the new case.
+    bool test_case_only_rename()
+    {
+        const auto base = scratch_directory() + L"CaseRename" + std::to_wstring(GetCurrentProcessId());
+        const auto file = base + L"\\name.txt";
+        const auto renamed = base + L"\\NAME.txt";
+        const auto cleanup = sogen::utils::finally([&] {
+            DeleteFileW(renamed.c_str());
+            RemoveDirectoryW(base.c_str());
+        });
+
+        if (!CreateDirectoryW(base.c_str(), nullptr))
+        {
+            return false;
+        }
+        CloseHandle(CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr));
+
+        if (!MoveFileExW(file.c_str(), renamed.c_str(), 0))
+        {
+            printf("Case-only rename failed: %lu\n", GetLastError());
+            return false;
+        }
+
+        auto* const handle = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        std::array<wchar_t, MAX_PATH> final_name{};
+        const auto length = GetFinalPathNameByHandleW(handle, final_name.data(), static_cast<DWORD>(final_name.size()), 0);
+        CloseHandle(handle);
+        if (length == 0 || !std::wstring_view(final_name.data(), length).ends_with(L"\\NAME.txt"))
+        {
+            printf("Final name after rename: %ls\n", final_name.data());
+            return false;
+        }
+
+        return true;
+    }
+
     // A directory is not replaced (moving a file onto it fails and leaves both), while a directory may replace a file.
     bool test_replace_refusals()
     {
@@ -1396,6 +1462,19 @@ namespace
         }
 
         return validate_primary_monitor(mi);
+    }
+
+    bool test_display_config_buffer_sizes()
+    {
+        UINT32 num_paths = 0;
+        UINT32 num_modes = 0;
+
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &num_paths, &num_modes) != ERROR_SUCCESS)
+        {
+            return false;
+        }
+
+        return num_paths >= 1 && num_modes >= num_paths;
     }
 
     BOOL CALLBACK monitor_enum_proc(HMONITOR hMonitor, HDC, LPRECT, LPARAM dwData)
@@ -1895,6 +1974,54 @@ namespace
 
         SleepEx(1, TRUE);
         return executions == 2;
+    }
+
+    bool test_apc_wait()
+    {
+        int executions = 0;
+
+        PAPCFUNC apc_func = [](const ULONG_PTR param) {
+            *reinterpret_cast<int*>(param) += 1; //
+        };
+
+        const auto event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!event)
+        {
+            return false;
+        }
+
+        QueueUserAPC(apc_func, GetCurrentThread(), reinterpret_cast<ULONG_PTR>(&executions));
+
+        if (WaitForSingleObjectEx(event, 0, FALSE) != WAIT_TIMEOUT || executions != 0)
+        {
+            CloseHandle(event);
+            return false;
+        }
+
+        using nt_wait_for_single_object = LONG(NTAPI*)(HANDLE, BOOLEAN, PLARGE_INTEGER);
+        const auto nt_wait =
+            std::bit_cast<nt_wait_for_single_object>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWaitForSingleObject"));
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        LARGE_INTEGER expired{};
+        expired.LowPart = now.dwLowDateTime;
+        expired.HighPart = static_cast<LONG>(now.dwHighDateTime);
+        expired.QuadPart -= 10'000'000;
+
+        if (!nt_wait || nt_wait(event, TRUE, &expired) != static_cast<LONG>(STATUS_USER_APC) || executions != 1)
+        {
+            CloseHandle(event);
+            return false;
+        }
+
+        QueueUserAPC(apc_func, GetCurrentThread(), reinterpret_cast<ULONG_PTR>(&executions));
+        SetEvent(event);
+
+        const auto signaled = WaitForSingleObjectEx(event, 0, FALSE) == WAIT_OBJECT_0;
+        SleepEx(1, TRUE);
+        CloseHandle(event);
+
+        return signaled && executions == 2;
     }
 
     bool test_window_geometry()
@@ -2590,6 +2717,41 @@ namespace
         return true;
     }
 
+    bool test_open_named_section()
+    {
+        constexpr auto* name = "sogen-open-named-section";
+
+        auto* const creator = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 0x1000, name);
+        if (!creator)
+        {
+            puts("CreateFileMappingA failed");
+            return false;
+        }
+
+        auto* const opener = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
+        if (!opener)
+        {
+            puts("OpenFileMappingA failed");
+            CloseHandle(creator);
+            return false;
+        }
+
+        CloseHandle(creator);
+
+        auto* const view = MapViewOfFile(opener, FILE_MAP_ALL_ACCESS, 0, 0, 0x1000);
+        if (!view)
+        {
+            puts("MapViewOfFile failed");
+            CloseHandle(opener);
+            return false;
+        }
+
+        UnmapViewOfFile(view);
+        CloseHandle(opener);
+
+        return true;
+    }
+
     bool test_handle_tag_bits()
     {
         using nt_close_t = LONG(NTAPI*)(HANDLE);
@@ -2997,6 +3159,66 @@ namespace
         constexpr std::string_view text = "[console] ";
         written = 0;
         return WriteConsoleA(output, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) && written == text.size();
+    }
+
+    // Input buffer flushes, scrolling and cursor shape (timeout, choice, pause and cls use them), and an input call on an
+    // output handle or the reverse failing with ERROR_INVALID_HANDLE.
+    bool test_console_buffers()
+    {
+        auto* const input =
+            CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        auto* const output =
+            CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        const auto close_handles = sogen::utils::finally([&] {
+            CloseHandle(input);
+            CloseHandle(output);
+        });
+        DWORD mode{};
+        if (input == INVALID_HANDLE_VALUE || output == INVALID_HANDLE_VALUE || !GetConsoleMode(input, &mode))
+        {
+            return true;
+        }
+
+        const auto fails_as_wrong_handle = [](const BOOL result) { return !result && GetLastError() == ERROR_INVALID_HANDLE; };
+
+        constexpr SMALL_RECT scrolled{.Left = 0, .Top = 0, .Right = 79, .Bottom = 24};
+        CHAR_INFO fill{};
+        fill.Char.UnicodeChar = L' ';
+        fill.Attributes = 7;
+        if (!FlushConsoleInputBuffer(input) || !fails_as_wrong_handle(FlushConsoleInputBuffer(output)) ||
+            !ScrollConsoleScreenBufferW(output, &scrolled, nullptr, COORD{.X = 0, .Y = -25}, &fill) ||
+            !fails_as_wrong_handle(ScrollConsoleScreenBufferW(input, &scrolled, nullptr, COORD{.X = 0, .Y = -25}, &fill)))
+        {
+            puts("Flushing or scrolling the console failed");
+            return false;
+        }
+
+        CONSOLE_CURSOR_INFO original{};
+        CONSOLE_CURSOR_INFO cursor{};
+        constexpr CONSOLE_CURSOR_INFO hidden{.dwSize = 50, .bVisible = FALSE};
+        constexpr CONSOLE_CURSOR_INFO too_small{.dwSize = 0, .bVisible = TRUE};
+        const auto cursor_ok = GetConsoleCursorInfo(output, &original) && SetConsoleCursorInfo(output, &hidden) &&
+                               GetConsoleCursorInfo(output, &cursor) && cursor.dwSize == 50 && !cursor.bVisible &&
+                               !SetConsoleCursorInfo(output, &too_small) && GetLastError() == ERROR_INVALID_PARAMETER &&
+                               fails_as_wrong_handle(GetConsoleCursorInfo(input, &cursor));
+        SetConsoleCursorInfo(output, &original);
+        if (!cursor_ok)
+        {
+            puts("Console cursor information is wrong");
+            return false;
+        }
+
+        DWORD count{};
+        DWORD written{};
+        if (!fails_as_wrong_handle(GetNumberOfConsoleInputEvents(output, &count)) ||
+            !fails_as_wrong_handle(WriteConsoleW(input, L"x", 1, &written, nullptr)) ||
+            !fails_as_wrong_handle(SetConsoleTextAttribute(input, 7)))
+        {
+            puts("A console call on the wrong kind of handle did not fail as on Windows");
+            return false;
+        }
+
+        return true;
     }
 
     bool test_anonymous_pipe()
@@ -3766,21 +3988,22 @@ namespace
         const PTIMERAPCROUTINE on_timer = [](void* context, DWORD, DWORD) { ++*static_cast<int*>(context); };
 
         // The period must outlast running the routine: under the emulator's relative clock an instruction takes a
-        // millisecond, and a timer that is due again whenever its APC returns starves the thread (as on Windows).
+        // millisecond, and a timer that is due again whenever its APC returns starves the thread (as on Windows). A
+        // WOW64 process takes about 2,000 instructions from the APC to NtContinue, a 64-bit one under 500.
         LARGE_INTEGER due_time{};
         due_time.QuadPart = -10'000;
-        if (!SetWaitableTimer(timer, &due_time, 500, on_timer, &apc_count, FALSE))
+        if (!SetWaitableTimer(timer, &due_time, 4000, on_timer, &apc_count, FALSE))
         {
             return false;
         }
 
-        for (int i = 0; i < 100 && apc_count < 3; ++i)
+        for (int i = 0; i < 100 && apc_count < 2; ++i)
         {
             SleepEx(1000, TRUE);
         }
 
         CancelWaitableTimer(timer);
-        if (apc_count < 3)
+        if (apc_count < 2)
         {
             puts("Periodic timer did not run its completion routine");
             return false;
@@ -4107,6 +4330,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_dir_io, "Dir I/O")
     RUN_TEST(test_apis, "APIs")
     RUN_TEST(test_console_write, "Console Write")
+    RUN_TEST(test_console_buffers, "Console Buffers")
     RUN_TEST(test_oem_conversion, "OEM Conversion")
     RUN_TEST(test_anonymous_pipe, "Anonymous Pipe")
     RUN_TEST(test_pipe_data, "Pipe Data")
@@ -4142,6 +4366,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_drives_and_volumes, "Drives and Volumes")
     RUN_TEST(test_replace_refusals, "Replace Refusals")
     RUN_TEST(test_read_only_and_final_names, "Read-Only and Final Names")
+    RUN_TEST(test_case_only_rename, "Case-Only Rename")
     RUN_TEST(test_read_after_write, "Read After Write")
     RUN_TEST(test_file_mappings, "File Mappings")
     RUN_TEST(test_environment_and_names, "Environment and Names")
@@ -4149,10 +4374,12 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_app_execution_alias, "App Execution Alias")
     RUN_TEST(test_system_info, "System Info")
     RUN_TEST(test_monitor_info, "Monitor Info")
+    RUN_TEST(test_display_config_buffer_sizes, "Display Config Buffer Sizes")
     RUN_TEST(test_time_zone, "Time Zone")
     RUN_TEST(test_threads, "Threads")
     RUN_TEST(test_threads_winapi, "Threads WinAPI")
     RUN_TEST(test_env, "Environment")
+    RUN_TEST(test_critical_section_timeout, "Critical Section Timeout")
     RUN_TEST(test_lookup_account_sid, "LSA")
     RUN_TEST(test_exceptions, "Exceptions")
 #ifndef __MINGW64__
@@ -4165,6 +4392,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_tls, "TLS")
     RUN_TEST(test_socket, "Socket")
     RUN_TEST(test_apc, "APC")
+    RUN_TEST(test_apc_wait, "APC Wait")
     RUN_TEST(test_desktop_window_text, "Desktop Window Text")
     RUN_TEST(test_window_geometry, "Window Geometry")
     RUN_TEST(test_user_callback, "User Callback")
@@ -4173,6 +4401,7 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_paint_message_queue, "Message Queue (Paint)")
     RUN_TEST(test_settimer, "User Timer")
     RUN_TEST(test_private_namespace, "Private Namespace")
+    RUN_TEST(test_open_named_section, "Open Named Section")
     RUN_TEST(test_handle_tag_bits, "Handle Tag Bits")
     RUN_TEST(test_unicode_case_mapping, "Unicode Case Mapping")
     RUN_TEST(test_actctx, "Activation Context")

@@ -58,6 +58,30 @@ namespace sogen
             {
                 if (writer.pointer_size() == utils::aligned_binary_writer::pointer_size_32)
                 {
+                    // 32-bit (WOW64) clients: LsaConnectUntrusted, LsaDeregisterLogonProcess and the SPM API calls
+                    // (package lookups and calls) are handled here; the rest as the LSA policy port answers it.
+                    if (this->bound_interface() == k_sspi_rpc_interface)
+                    {
+                        switch (procedure_id)
+                        {
+                        case 0:
+                            return handle_connect_rpc(win_emu, c, writer);
+                        case 1:
+                            return handle_disconnect_rpc(win_emu, c, writer);
+                        case 3:
+                            if (auto request = read_request(win_emu, c))
+                            {
+                                if (const auto api = spm_api(*request, 0x1c); api && *api != spm_enumerate_packages)
+                                {
+                                    return handle_spm_message_rpc(win_emu, *request, writer);
+                                }
+                            }
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+
                     auto fallback = create_lsa_policy_lookup_port();
                     return dynamic_cast<rpc_port&>(*fallback).handle_rpc(win_emu, procedure_id, c, writer, reply_handles);
                 }
@@ -410,10 +434,12 @@ namespace sogen
             static constexpr uint32_t spm_call_package = 1;
             static constexpr uint32_t spm_enumerate_packages = 4;
 
-            static std::optional<uint32_t> spm_api(const std::span<const uint8_t> request)
+            // `message_offset`: where the message starts in the request, 0x20 in NDR64 and 0x1c from 32-bit clients.
+            static std::optional<uint32_t> spm_api(const std::span<const uint8_t> request, const size_t message_offset = 0x20)
             {
                 uint32_t api{};
-                if (request.size() < 0x20 || !has_port_context(request) || !read_value(request, 0x20 + spm_api_offset, api))
+                if (request.size() < message_offset || !has_port_context(request) ||
+                    !read_value(request, message_offset + spm_api_offset, api))
                 {
                     return std::nullopt;
                 }
@@ -483,8 +509,10 @@ namespace sogen
 
             // LsaCallAuthenticationPackage: only Kerberos' domain extended policies query (whoami's claims check), answered
             // as for a machine outside a domain, Dynamic Access Control disabled. lsass allocates the return buffer in the
-            // caller, which frees it with LsaFreeReturnBuffer.
-            static NTSTATUS call_package_api(windows_emulator& win_emu, std::vector<uint8_t>& message)
+            // caller, which frees it with LsaFreeReturnBuffer. A 32-bit (WOW64) client's request has the 32-bit layout,
+            // which Kerberos refuses: lsass reports STATUS_INVALID_PARAMETER as the protocol status, right after the
+            // submit length, and no buffer (captured on Windows 11).
+            static NTSTATUS call_package_api(windows_emulator& win_emu, std::vector<uint8_t>& message, const bool wow64_client)
             {
                 constexpr uint32_t kerberos_package = 2;
                 constexpr uint32_t kerb_query_domain_extended_policies_message = 32;
@@ -518,9 +546,16 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
 
+                if (wow64_client)
+                {
+                    constexpr NTSTATUS protocol_status = STATUS_INVALID_PARAMETER;
+                    std::memcpy(message.data() + spm_arguments_offset + 0x14, &protocol_status, sizeof(protocol_status));
+                    return STATUS_SUCCESS;
+                }
+
                 const std::array<uint32_t, 4> response{kerb_query_domain_extended_policies_message, dac_disabled, 0, 0};
-                const auto response_buffer =
-                    win_emu.memory.allocate_memory(page_align_up(sizeof(response)), nt_memory_permission{memory_permission::read_write});
+                const auto response_buffer = win_emu.memory.allocate_memory(static_cast<size_t>(page_align_up(sizeof(response))),
+                                                                            nt_memory_permission{memory_permission::read_write});
                 if (response_buffer == 0)
                 {
                     return STATUS_NO_MEMORY;
@@ -535,21 +570,31 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            // Replies with the request's SPM message, its arguments updated by the API and its status set.
+            // Replies with the request's SPM message, its arguments updated by the API and its status set. The message
+            // follows its length and conformant count (8 bytes in NDR64, 4 from 32-bit clients); 32-bit clients build
+            // it with the 64-bit layout too.
             static NTSTATUS handle_spm_message_rpc(windows_emulator& win_emu, const std::span<const uint8_t> request,
                                                    utils::aligned_binary_writer& writer)
             {
+                const auto ndr64 = writer.pointer_size() == utils::aligned_binary_writer::pointer_size_64;
+                const size_t message_offset = ndr64 ? 0x20 : 0x1c;
                 uint32_t declared_length{};
                 uint64_t conformant_count{};
-                if (writer.pointer_size() != utils::aligned_binary_writer::pointer_size_64 || writer.offset() != 0x18 ||
-                    !read_value(request, 0x14, declared_length) || !read_value(request, 0x18, conformant_count) ||
+                uint32_t conformant_count_32{};
+                const auto count_read =
+                    ndr64 ? read_value(request, 0x18, conformant_count) : read_value(request, 0x18, conformant_count_32);
+                if (!ndr64)
+                {
+                    conformant_count = conformant_count_32;
+                }
+                if (writer.offset() != 0x18 || !read_value(request, 0x14, declared_length) || !count_read ||
                     declared_length != conformant_count || declared_length < spm_arguments_offset ||
-                    request.size() != 0x20 + static_cast<size_t>(declared_length))
+                    request.size() != message_offset + static_cast<size_t>(declared_length))
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
 
-                std::vector<uint8_t> message(request.begin() + 0x20, request.end());
+                std::vector<uint8_t> message(request.begin() + static_cast<ptrdiff_t>(message_offset), request.end());
                 uint32_t api{};
                 read_value(message, spm_api_offset, api);
 
@@ -560,7 +605,7 @@ namespace sogen
                     status = lookup_package_api(message);
                     break;
                 case spm_call_package:
-                    status = call_package_api(win_emu, message);
+                    status = call_package_api(win_emu, message, !ndr64);
                     break;
                 default:
                     win_emu.log.warn("Unsupported SSPI SPM API %u\n", api);
@@ -576,7 +621,9 @@ namespace sogen
                 writer.write(message.data(), message.size(), 1);
                 writer.align_to(8);
                 write_callback_result(writer);
-                return finish_reply(writer, start, 0x68 + static_cast<size_t>(declared_length)) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+                const size_t reply_overhead = ndr64 ? 0x68 : 0x48;
+                return finish_reply(writer, start, reply_overhead + static_cast<size_t>(declared_length)) ? STATUS_SUCCESS
+                                                                                                          : STATUS_INVALID_PARAMETER;
             }
 
             NTSTATUS handle_call_rpc(windows_emulator& win_emu, const lpc_request_context& c, utils::aligned_binary_writer& writer)
@@ -985,14 +1032,16 @@ namespace sogen
 
             NTSTATUS handle_connect_rpc(windows_emulator& win_emu, const lpc_request_context& c, utils::aligned_binary_writer& writer)
             {
-                uint64_t client_name_referent{};
-                uint32_t mode{};
-                if (c.send_buffer_length != 12 || c.send_buffer == 0)
+                // The client name's referent (pointer-sized), then the mode.
+                const auto pointer_size = writer.pointer_size();
+                if (c.send_buffer_length != pointer_size + sizeof(uint32_t) || c.send_buffer == 0)
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                client_name_referent = win_emu.emu().read_memory<uint64_t>(c.send_buffer);
-                mode = win_emu.emu().read_memory<uint32_t>(c.send_buffer + 8);
+                const uint64_t client_name_referent = pointer_size == utils::aligned_binary_writer::pointer_size_64
+                                                          ? win_emu.emu().read_memory<uint64_t>(c.send_buffer)
+                                                          : win_emu.emu().read_memory<uint32_t>(c.send_buffer);
+                const auto mode = win_emu.emu().read_memory<uint32_t>(c.send_buffer + pointer_size);
                 if (client_name_referent != 0 || (mode != 0 && mode != 2))
                 {
                     return STATUS_INVALID_PARAMETER;
@@ -1012,8 +1061,7 @@ namespace sogen
             NTSTATUS handle_disconnect_rpc(windows_emulator& win_emu, const lpc_request_context& c, utils::aligned_binary_writer& writer)
             {
                 const auto request = read_request(win_emu, c);
-                if (writer.pointer_size() != utils::aligned_binary_writer::pointer_size_64 || writer.offset() != 0x18 || !request ||
-                    !has_port_context(*request))
+                if (writer.offset() != 0x18 || !request || !has_port_context(*request))
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
@@ -1022,7 +1070,8 @@ namespace sogen
                 const auto start = writer.offset();
                 writer.pad(k_sspi_context_handle.size());
                 writer.write<int32_t>(0);
-                return finish_reply(writer, start, 0x44) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+                const size_t reply_size = writer.pointer_size() == utils::aligned_binary_writer::pointer_size_64 ? 0x44 : 0x40;
+                return finish_reply(writer, start, reply_size) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
             }
 
             bool connected_{};

@@ -12,6 +12,7 @@
 #define LPC_DEBUG_EVENT        8
 #define LPC_ERROR_EVENT        9
 #define LPC_CONNECTION_REQUEST 10
+#define LPC_CONNECTION_REPLY   11
 #define LPC_NO_IMPERSONATE     0x4000
 #define LPC_KERNELMODE_MESSAGE 0x8000
 
@@ -105,7 +106,7 @@ namespace sogen
     struct ALPC_HANDLE_ATTR
     {
         ULONG Flags;
-        typename Traits::HANDLE Handle;
+        Traits::HANDLE Handle;
         ULONG ObjectType;
         ULONG DesiredAccess; // GrantedAccess on receive
     };
@@ -114,9 +115,9 @@ namespace sogen
     struct ALPC_DATA_VIEW_ATTR
     {
         ULONG Flags;
-        typename Traits::HANDLE SectionHandle;
-        typename Traits::PVOID ViewBase;
-        typename Traits::SIZE_T ViewSize;
+        Traits::HANDLE SectionHandle;
+        Traits::PVOID ViewBase;
+        Traits::SIZE_T ViewSize;
     };
 
     static_assert(sizeof(ALPC_DATA_VIEW_ATTR<EmulatorTraits<Emu32>>) == 16);
@@ -136,6 +137,29 @@ namespace sogen
         Traits::PVOID SecurityQos;
         Traits::HANDLE ContextHandle;
     };
+
+    template <typename Traits>
+    struct ALPC_CONTEXT_ATTR
+    {
+        Traits::PVOID PortContext;
+        Traits::PVOID MessageContext;
+        ULONG Sequence;
+        ULONG MessageId;
+        ULONG CallbackId;
+    };
+
+    static_assert(sizeof(ALPC_CONTEXT_ATTR<EmulatorTraits<Emu32>>) == 20);
+    static_assert(sizeof(ALPC_CONTEXT_ATTR<EmulatorTraits<Emu64>>) == 32);
+
+    template <typename Traits>
+    struct ALPC_PORT_ASSOCIATE_COMPLETION_PORT
+    {
+        Traits::PVOID CompletionKey;
+        Traits::HANDLE CompletionPort;
+    };
+
+    static_assert(sizeof(ALPC_PORT_ASSOCIATE_COMPLETION_PORT<EmulatorTraits<Emu32>>) == 8);
+    static_assert(sizeof(ALPC_PORT_ASSOCIATE_COMPLETION_PORT<EmulatorTraits<Emu64>>) == 16);
 
     // NOLINTEND(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-use-enum-class)
 } // namespace sogen

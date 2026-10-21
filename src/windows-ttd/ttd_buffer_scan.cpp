@@ -143,7 +143,7 @@ namespace sogen::ttd
             throw std::runtime_error("TTD buffer scan requires a trace recorded with write events");
         }
         auto& cpu = emu_.emu();
-        emu_.memory.set_mapping_change_callback([this](const uint64_t address, const size_t size) {
+        emu_.memory.set_mapping_change_callback([this](const uint64_t address, const uint64_t size) {
             if (!size)
             {
                 return;

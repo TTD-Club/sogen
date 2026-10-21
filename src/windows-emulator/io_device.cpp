@@ -119,6 +119,12 @@ namespace sogen
         return registry;
     }
 
+    bool is_device_supported(std::u16string_view device)
+    {
+        const auto& registry = get_device_registry();
+        return registry.contains(device);
+    }
+
     bool needs_32_bit_devices(const windows_emulator& win_emu)
     {
         return win_emu.process.is_wow64_process;
@@ -177,6 +183,7 @@ namespace sogen
             if (auto* e = win_emu.process.events.get(request.event); e)
             {
                 e->signaled = true;
+                win_emu.wake_idle_vcpu();
             }
         }
 
@@ -208,6 +215,7 @@ namespace sogen
         message.apc_context = context.apc_context;
         message.io_status_block = context.io_status_block.read();
         completion->enqueue(message);
+        win_emu.wake_idle_vcpu();
     }
 
     NTSTATUS io_device_container::io_control(windows_emulator& win_emu, const io_device_context& context)
@@ -227,13 +235,24 @@ namespace sogen
         }
         request.completion_notification_flags = this->file_->completion_notification_flags;
         request.granted_access = this->granted_access;
+        if (request.vcpu && request.vcpu->active_thread)
+        {
+            request.issuing_thread_id = request.thread().id;
+        }
         return request;
     }
 
-    bool io_device_container::cancel_io(windows_emulator& win_emu, const uint64_t io_status_block)
+    bool io_device_container::cancel_io(windows_emulator& win_emu, const uint64_t io_status_block,
+                                        const std::optional<uint32_t> issuing_thread_id)
     {
         this->assert_validity();
-        return this->file_->device->cancel_io(win_emu, io_status_block);
+        return this->file_->device->cancel_io(win_emu, io_status_block, issuing_thread_id);
+    }
+
+    bool io_device_container::has_pending_io(const uint32_t issuing_thread_id) const
+    {
+        this->assert_validity();
+        return this->file_->device->has_pending_io(issuing_thread_id);
     }
 
     NTSTATUS io_device_container::set_completion_association(process_context& process, const emulator_thread* active_thread,

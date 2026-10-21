@@ -56,8 +56,12 @@ namespace sogen
         }
 #endif
 
+        // Not an aggregate: GCC 15+ reports the set members as uninitialized once
+        // the value-initialization of the base is inlined.
         struct analysis_options : analysis_settings
         {
+            analysis_options() = default;
+
             mutable bool use_gdb{false};
             std::string gdb_host{"127.0.0.1"};
             uint16_t gdb_port{28960};
@@ -78,6 +82,7 @@ namespace sogen
             std::string report_format{"jsonl"};
             std::string whp_execution_hook_mode{"auto"};
             std::optional<backend_type> backend{};
+            network::network_mode network{network::network_mode::offline};
             bool disable_instruction_precision{false};
             uint32_t vcpu_count{1};
             std::filesystem::path registry_path{get_current_binary_dir() / "registry"};
@@ -87,15 +92,134 @@ namespace sogen
             uint16_t managed_process_port{};
             std::string managed_process_token{};
             managed_process_connection* managed_process{};
-            std::unordered_map<windows_path, std::filesystem::path> path_mappings{};
+            filesystem_mode root_mode{default_root_mode};
+            std::vector<mount_spec> mounts{};
             utils::unordered_insensitive_u16string_map<std::u16string> environment{};
+            // The text after the application on the analyzer's own command line, quotes and escapes as typed, which the
+            // guest's command line ends with (see raw_application_arguments).
+            std::optional<std::u16string> raw_application_arguments{};
         };
+
+#ifdef _WIN32
+        // What follows the token naming the application on this process's command line, so that the guest gets its
+        // arguments as typed: argv no longer shows quotes around words without spaces or how an argument was escaped,
+        // and programs such as cmd and find parse their command line themselves. The command line is split as the CRT
+        // splits it (the program name ends at the first blank outside quotes; then backslashes escape quotes, and ""
+        // inside quotes is a quote); `application_args` are the application and its arguments as argv has them.
+        // Nothing if the command line does not end with exactly those tokens.
+        std::optional<std::u16string> raw_application_arguments(const std::span<const std::string_view> application_args)
+        {
+            const std::u16string_view line{reinterpret_cast<const char16_t*>(GetCommandLineW())};
+
+            struct token
+            {
+                size_t end{};
+                std::u16string value{};
+            };
+
+            std::vector<token> tokens{};
+
+            size_t position = 0;
+            {
+                token program{};
+                const auto quoted = !line.empty() && line.front() == u'"';
+                position = quoted ? 1 : 0;
+                while (position < line.size() && (quoted ? line[position] != u'"' : line[position] != u' ' && line[position] != u'\t'))
+                {
+                    program.value.push_back(line[position++]);
+                }
+                position += quoted && position < line.size() ? 1 : 0;
+                program.end = position;
+                tokens.push_back(std::move(program));
+            }
+
+            while (true)
+            {
+                while (position < line.size() && (line[position] == u' ' || line[position] == u'\t'))
+                {
+                    ++position;
+                }
+                if (position >= line.size())
+                {
+                    break;
+                }
+
+                token argument{};
+                bool in_quotes = false;
+                while (position < line.size() && (in_quotes || (line[position] != u' ' && line[position] != u'\t')))
+                {
+                    if (line[position] == u'\\')
+                    {
+                        size_t backslashes = 0;
+                        while (position < line.size() && line[position] == u'\\')
+                        {
+                            ++backslashes;
+                            ++position;
+                        }
+                        if (position < line.size() && line[position] == u'"')
+                        {
+                            argument.value.append(backslashes / 2, u'\\');
+                            if (backslashes % 2 != 0)
+                            {
+                                argument.value.push_back(u'"');
+                                ++position;
+                            }
+                        }
+                        else
+                        {
+                            argument.value.append(backslashes, u'\\');
+                        }
+                        continue;
+                    }
+                    if (line[position] == u'"')
+                    {
+                        if (in_quotes && position + 1 < line.size() && line[position + 1] == u'"')
+                        {
+                            argument.value.push_back(u'"');
+                            position += 2;
+                            continue;
+                        }
+                        in_quotes = !in_quotes;
+                        ++position;
+                        continue;
+                    }
+                    argument.value.push_back(line[position++]);
+                }
+                argument.end = position;
+                tokens.push_back(std::move(argument));
+            }
+
+            if (application_args.empty() || tokens.size() < application_args.size() + 1)
+            {
+                return std::nullopt;
+            }
+
+            const auto first = tokens.size() - application_args.size();
+            for (size_t i = 0; i < application_args.size(); ++i)
+            {
+                if (tokens[first + i].value != u8_to_u16(application_args[i]))
+                {
+                    return std::nullopt;
+                }
+            }
+
+            return std::u16string{line.substr(tokens[first].end)};
+        }
+#endif
+
+        // A path as the first token of a command line: quoted if it holds a blank.
+        std::u16string quote_program_name(const std::u16string& program)
+        {
+            return program.find_first_of(u" \t") == std::u16string::npos ? program : u"\"" + program + u"\"";
+        }
 
 #ifndef OS_EMSCRIPTEN
         std::vector<std::string> create_managed_process_arguments(const analysis_options& options, const uint16_t port,
                                                                   const std::string& token)
         {
             std::vector<std::string> arguments{"--managed-process-port", std::to_string(port), "--managed-process-token", token};
+            arguments.emplace_back("--network");
+            arguments.emplace_back(network::to_string(options.network));
 
             const auto add_path = [&](const std::string_view option, const std::filesystem::path& path) {
                 if (!path.empty())
@@ -111,11 +235,12 @@ namespace sogen
                 arguments.emplace_back("--reg-file");
                 arguments.push_back(registry_file.string());
             }
-            for (const auto& [source, target] : options.path_mappings)
+            arguments.emplace_back("--root-mode");
+            arguments.emplace_back(to_string(options.root_mode));
+            for (const auto& mount : options.mounts)
             {
-                arguments.emplace_back("--path");
-                arguments.push_back(u16_to_u8(source.u16string()));
-                arguments.push_back(target.string());
+                arguments.emplace_back("--mount");
+                arguments.push_back(render_mount_spec(mount));
             }
 
             return arguments;
@@ -561,8 +686,7 @@ namespace sogen
 
             for (size_t i = 1; i < args.size(); ++i)
             {
-                const auto& arg = args[i];
-                wide_args.emplace_back(arg.begin(), arg.end());
+                wide_args.emplace_back(u8_to_u16(args[i]));
             }
 
             return wide_args;
@@ -575,7 +699,9 @@ namespace sogen
                 .use_instruction_precision = !options.disable_instruction_precision,
                 .emulation_root = options.emulation_root,
                 .registry_directory = options.registry_path,
-                .path_mappings = options.path_mappings,
+                .root_mode = options.root_mode,
+                .mounts = options.mounts,
+                .network = options.network,
             };
         }
 
@@ -635,6 +761,11 @@ namespace sogen
             if (!options.working_directory.empty())
             {
                 app_settings.working_directory = windows_path(options.working_directory);
+            }
+            if (options.raw_application_arguments)
+            {
+                const auto argument0 = app_settings.argument0.empty() ? app_settings.application.u16string() : app_settings.argument0;
+                app_settings.command_line = quote_program_name(argument0) + *options.raw_application_arguments;
             }
 
             const auto settings = create_emulator_settings(options);
@@ -731,6 +862,10 @@ namespace sogen
             }
             const auto win_emu = setup_emulator(options, args, emulator_interfaces{.ui = std::move(ui), .processes = manager.get()});
             ttd::prepare_replay(*win_emu, options.ttd);
+            if (options.network == network::network_mode::live)
+            {
+                win_emu->log.warn("Network mode is live: the guest can use the host network\n");
+            }
             apply_registry_files(*win_emu, options);
 #ifndef OS_EMSCRIPTEN
             std::unique_ptr<emulator_process_target> managed_target{};
@@ -1054,6 +1189,11 @@ namespace sogen
             app.add_option("--vcpus", options.vcpu_count, "Number of virtual CPUs (requires a backend with multi-vCPU support)")
                 ->capture_default_str();
 
+            std::string network_name{network::to_string(network::network_mode::offline)};
+            app.add_option("--network", network_name, "Guest network access: offline (no host network) or live")
+                ->capture_default_str()
+                ->check(CLI::IsMember({"offline", "live"}));
+
             std::string backend_name{};
             app.add_option("--backend", backend_name, "Select CPU backend: unicorn, icicle, whp, kvm or fex (overrides env)")
                 ->check(CLI::IsMember({"unicorn", "icicle", "whp", "kvm", "fex"}));
@@ -1065,7 +1205,19 @@ namespace sogen
             app.add_option("-i,--ignore", ignored_functions, "Comma-separated list of functions to ignore")->allow_extra_args(false);
 
             std::vector<std::pair<std::string, std::string>> path_mappings{};
-            app.add_option("-p,--path", path_mappings, "Map a Windows path to a host path")->type_name("SRC DST")->allow_extra_args(false);
+            app.add_option("-p,--path", path_mappings, "Map a Windows path to a host path, same as --mount DST:SRC")
+                ->type_name("SRC DST")
+                ->allow_extra_args(false);
+
+            std::vector<std::string> mounts{};
+            app.add_option("--mount", mounts, "Mount a host path into the guest file system (MODE is ro or rw)")
+                ->type_name("HOST:GUEST[:MODE]")
+                ->allow_extra_args(false);
+
+            std::string root_mode{to_string(default_root_mode)};
+            app.add_option("--root-mode", root_mode, "Access mode of the emulation root drives")
+                ->capture_default_str()
+                ->check(CLI::IsMember({"ro", "rw"}));
 
             std::vector<std::pair<std::string, std::string>> environment{};
             app.add_option("--env", environment, "Set an environment variable")->type_name("NAME VALUE")->allow_extra_args(false);
@@ -1105,6 +1257,8 @@ namespace sogen
                     throw std::runtime_error("GDB debugging requires --vcpus 1");
                 }
 
+                options.network = network::parse_network_mode(network_name);
+
                 if (!backend_name.empty())
                 {
                     static const std::map<std::string, backend_type> backends{
@@ -1124,17 +1278,33 @@ namespace sogen
                     split_and_insert(options.ignored_functions, functions);
                 }
 
+                options.root_mode = parse_filesystem_mode(root_mode).value();
+
                 for (const auto& [source, target] : path_mappings)
                 {
-                    options.path_mappings[windows_path(source)] = std::filesystem::absolute(target);
+                    options.mounts.push_back(mount_spec{
+                        .host_path = std::filesystem::absolute(target),
+                        .guest_path = windows_path(source),
+                    });
+                }
+
+                for (const auto& mount : mounts)
+                {
+                    auto spec = parse_mount_spec(mount);
+                    spec.host_path = std::filesystem::absolute(spec.host_path);
+                    options.mounts.push_back(std::move(spec));
                 }
 
                 for (const auto& [name, value] : environment)
                 {
-                    options.environment[std::u16string(name.begin(), name.end())] = std::u16string(value.begin(), value.end());
+                    options.environment[u8_to_u16(name)] = u8_to_u16(value);
                 }
 
                 auto application = app.remaining();
+#ifdef _WIN32
+                options.raw_application_arguments =
+                    raw_application_arguments(std::vector<std::string_view>{application.begin(), application.end()});
+#endif
 #ifndef OS_EMSCRIPTEN
                 if (options.managed_process_port != 0)
                 {
@@ -1147,6 +1317,7 @@ namespace sogen
                     options.managed_process = &*managed_process;
                     const auto& request = managed_process->request();
 
+                    options.raw_application_arguments.reset();
                     application.clear();
                     application.push_back(request.application);
                     for (const auto& argument : request.arguments)

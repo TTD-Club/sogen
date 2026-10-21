@@ -124,7 +124,11 @@ namespace sogen::test
         const auto scratch = std::filesystem::temp_directory_path() / ("emulator-test-scratch-" + std::to_string(getpid()));
         std::error_code ec{};
         std::filesystem::create_directories(scratch, ec);
-        settings.path_mappings["C:\\sogen-test-scratch"] = scratch;
+        settings.mounts.push_back(mount_spec{
+            .host_path = scratch,
+            .guest_path = windows_path{'c', {u"sogen-test-scratch"}},
+            .mode = filesystem_mode::read_write,
+        });
     }
 
     inline windows_emulator create_emulator(emulator_settings settings, emulator_callbacks callbacks = {},
@@ -141,8 +145,11 @@ namespace sogen::test
 
         settings.emulation_root = get_emulator_root();
 
-        settings.path_mappings["C:\\a.txt"] =
-            std::filesystem::temp_directory_path() / ("emulator-test-file-" + std::to_string(getpid()) + ".txt");
+        settings.mounts.push_back(mount_spec{
+            .host_path = std::filesystem::temp_directory_path() / ("emulator-test-file-" + std::to_string(getpid()) + ".txt"),
+            .guest_path = windows_path{'c', {u"a.txt"}},
+            .mode = filesystem_mode::read_write,
+        });
         add_scratch_directory(settings);
 
         if (!interfaces.socket_factory)
@@ -181,8 +188,11 @@ namespace sogen::test
 
         settings.emulation_root = get_emulator_root();
 
-        settings.path_mappings["C:\\a.txt"] =
-            std::filesystem::temp_directory_path() / ("emulator-test-file-" + std::to_string(getpid()) + ".txt");
+        settings.mounts.push_back(mount_spec{
+            .host_path = std::filesystem::temp_directory_path() / ("emulator-test-file-" + std::to_string(getpid()) + ".txt"),
+            .guest_path = windows_path{'c', {u"a.txt"}},
+            .mode = filesystem_mode::read_write,
+        });
         add_scratch_directory(settings);
 
         if (!interfaces.socket_factory)

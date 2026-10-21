@@ -42,7 +42,7 @@ namespace sogen
     struct region_info : basic_memory_region<nt_memory_permission>
     {
         uint64_t allocation_base{};
-        size_t allocation_length{};
+        uint64_t allocation_length{};
         bool is_reserved{};
         bool is_committed{};
         nt_memory_permission initial_permissions{};
@@ -86,7 +86,7 @@ namespace sogen
 
         struct reserved_region
         {
-            size_t length{};
+            uint64_t length{};
             memory_permission initial_permission{};
             committed_region_map committed_regions{};
             memory_region_kind kind{memory_region_kind::private_allocation};
@@ -95,7 +95,7 @@ namespace sogen
 
         using reserved_region_map = std::map<uint64_t, reserved_region>;
 
-        void set_mapping_change_callback(std::function<void(uint64_t, size_t)> callback)
+        void set_mapping_change_callback(std::function<void(uint64_t, uint64_t)> callback)
         {
             if (callback && mapping_change_callback_)
             {
@@ -107,7 +107,7 @@ namespace sogen
         // Called with each range whose regions, as NtQueryVirtualMemory shows them (reservation, commit, protection,
         // kind, mapped file), changed: get_region_info then describes it anew. Unlike the mapping change callback, it
         // reports the guest's protections, not the backend's effective ones.
-        void set_region_change_callback(std::function<void(uint64_t, size_t)> callback)
+        void set_region_change_callback(std::function<void(uint64_t, uint64_t)> callback)
         {
             if (callback && region_change_callback_)
             {
@@ -124,7 +124,7 @@ namespace sogen
         void write_memory(uint64_t address, const void* data, size_t size) final;
         bool try_write_memory(uint64_t address, const void* data, size_t size) final;
 
-        bool protect_memory(uint64_t address, size_t size, nt_memory_permission permissions,
+        bool protect_memory(uint64_t address, uint64_t size, nt_memory_permission permissions,
                             nt_memory_permission* old_permissions = nullptr);
 
         // Pre-reserves the host ranges the backend reports (memory_interface::reserved_host_ranges) so
@@ -134,11 +134,11 @@ namespace sogen
 
         // Windowed form of reserve_host_memory_ranges, for the fixed-address allocate_memory overload,
         // which only needs its own target window checked rather than a full-address-space rescan.
-        void reserve_host_memory_ranges_in(uint64_t address, size_t size);
+        void reserve_host_memory_ranges_in(uint64_t address, uint64_t size);
 
         // Pure probe: true if no foreign host mapping currently intersects [address, size). Unlike
         // reserve_host_memory_ranges_in it records nothing.
-        bool host_window_is_free(uint64_t address, size_t size) const;
+        bool host_window_is_free(uint64_t address, uint64_t size) const;
 
         // reserve_host_memory_ranges, but releasing every previously-tracked range first. Momentarily
         // un-reserves everything and doubles the syscall cost, so it must stay off hot paths - it is
@@ -156,38 +156,38 @@ namespace sogen
         // alias host memory into the guest non-coherently.
         bool host_memory_aliasing_is_coherent() const override;
         void flush_host_memory_cache(const void* host_pointer, size_t size) override;
-        bool allocate_memory(uint64_t address, size_t size, nt_memory_permission permissions, bool reserve_only = false,
+        bool allocate_memory(uint64_t address, uint64_t size, nt_memory_permission permissions, bool reserve_only = false,
                              memory_region_kind kind = memory_region_kind::private_allocation);
 
-        bool commit_memory(uint64_t address, size_t size, nt_memory_permission permissions);
-        bool commit_image_memory(uint64_t address, size_t size, nt_memory_permission permissions);
-        bool decommit_memory(uint64_t address, size_t size);
+        bool commit_memory(uint64_t address, uint64_t size, nt_memory_permission permissions);
+        bool commit_image_memory(uint64_t address, uint64_t size, nt_memory_permission permissions);
+        bool decommit_memory(uint64_t address, uint64_t size);
 
-        bool release_memory(uint64_t address, size_t size);
+        bool release_memory(uint64_t address, uint64_t size);
 
-        bool split_placeholder(uint64_t address, size_t size);
-        bool coalesce_placeholders(uint64_t address, size_t size);
-        bool replace_placeholder(uint64_t address, size_t size, nt_memory_permission permissions, bool commit);
-        bool preserve_placeholder(uint64_t address, size_t size);
+        bool split_placeholder(uint64_t address, uint64_t size);
+        bool coalesce_placeholders(uint64_t address, uint64_t size);
+        bool replace_placeholder(uint64_t address, uint64_t size, nt_memory_permission permissions, bool commit);
+        bool preserve_placeholder(uint64_t address, uint64_t size);
 
         void unmap_all_memory();
 
-        uint64_t allocate_memory(size_t size, nt_memory_permission permissions, bool reserve_only = false, uint64_t start = 0,
+        uint64_t allocate_memory(uint64_t size, nt_memory_permission permissions, bool reserve_only = false, uint64_t start = 0,
                                  memory_region_kind kind = memory_region_kind::private_allocation);
 
-        uint64_t find_free_allocation_base(size_t size, uint64_t start = 0) const;
-        uint64_t find_free_allocation_base(size_t size, uint64_t start, uint64_t alignment, uint64_t lowest_address,
+        uint64_t find_free_allocation_base(uint64_t size, uint64_t start = 0) const;
+        uint64_t find_free_allocation_base(uint64_t size, uint64_t start, uint64_t alignment, uint64_t lowest_address,
                                            uint64_t highest_address) const;
 
         // find_free_allocation_base, plus a confirmation that the pick is free at the host level and not
         // merely per sogen's own bookkeeping, re-picking past any foreign host mapping that claimed it
         // since the last scan (bounded retry, returns 0 if no pick could be confirmed). Identical to
         // find_free_allocation_base on backends with an independent guest address space.
-        uint64_t find_free_host_allocation_base(size_t size, uint64_t start);
+        uint64_t find_free_host_allocation_base(uint64_t size, uint64_t start);
 
         // Same, but capped at highest_address for callers with a hard architectural ceiling (e.g. a
         // below-4GB requirement) where a higher pick would be useless even if free.
-        uint64_t find_free_host_allocation_base(size_t size, uint64_t start, uint64_t highest_address);
+        uint64_t find_free_host_allocation_base(uint64_t size, uint64_t start, uint64_t highest_address);
 
         region_info get_region_info(uint64_t address);
         std::optional<std::u16string> get_region_mapped_filename(uint64_t address) const;
@@ -197,7 +197,7 @@ namespace sogen
 
         // ignore_host_reserved skips memory_region_kind::host_reserved entries - used when mapping an
         // existing host allocation or MMIO, neither of which needs a new host address range.
-        bool overlaps_reserved_region(uint64_t address, size_t size, bool ignore_host_reserved = false) const;
+        bool overlaps_reserved_region(uint64_t address, uint64_t size, bool ignore_host_reserved = false) const;
 
         memory_region_kind get_region_kind(uint64_t address) const;
 
@@ -242,8 +242,8 @@ namespace sogen
         std::uint64_t default_allocation_address_{0x100000000ULL};
         bool dep_enabled_{true};
         std::vector<uint64_t> host_reserved_addresses_{};
-        std::function<void(uint64_t, size_t)> mapping_change_callback_{};
-        std::function<void(uint64_t, size_t)> region_change_callback_{};
+        std::function<void(uint64_t, uint64_t)> mapping_change_callback_{};
+        std::function<void(uint64_t, uint64_t)> region_change_callback_{};
 
         // Returns the committed regions that stayed mapped; the others are mapped anew.
         std::set<uint64_t> restore_memory_layout(utils::buffer_deserializer& buffer);
@@ -257,16 +257,16 @@ namespace sogen
 
         // After a change to the regions in [address, address + size).
         void update_layout_version(uint64_t address, uint64_t size);
-        bool commit_memory(uint64_t address, size_t size, nt_memory_permission permissions, bool allow_image_section);
+        bool commit_memory(uint64_t address, uint64_t size, nt_memory_permission permissions, bool allow_image_section);
         memory_permission get_effective_permissions(nt_memory_permission permissions) const;
 
         // allocate_memory(address, ...) without the host-range rescan the public overload performs
         // first; reserve_host_memory_ranges calls this to avoid recursing back into itself.
-        bool allocate_memory_raw(uint64_t address, size_t size, nt_memory_permission permissions, bool reserve_only,
+        bool allocate_memory_raw(uint64_t address, uint64_t size, nt_memory_permission permissions, bool reserve_only,
                                  memory_region_kind kind);
 
-        void reserve_host_range_gaps(uint64_t address, size_t size);
-        void carve_host_reserved_hole(uint64_t address, size_t size);
+        void reserve_host_range_gaps(uint64_t address, uint64_t size);
+        void carve_host_reserved_hole(uint64_t address, uint64_t size);
         void release_host_claims(uint64_t released_end);
     };
 

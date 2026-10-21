@@ -21,15 +21,33 @@ namespace sogen
             write_console = 0x01000006,
             get_console_locale = 0x01000008,
             fill_console_output = 0x02000000,
+            flush_console_input_buffer = 0x02000003,
+            get_console_cursor_info = 0x02000005,
+            set_console_cursor_info = 0x02000006,
             set_console_cursor_position = 0x0200000A,
+            scroll_console_screen_buffer = 0x0200000C,
             set_console_text_attribute = 0x0200000D,
             get_console_title = 0x02000014,
             set_console_title = 0x02000015,
             get_console_screen_buffer_info = 0x02000007,
             get_largest_console_window_size = 0x0200000B,
             get_current_console_font = 0x03000004,
+            get_console_window = 0x0300001F,
             set_current_console_font = 0x0300002C,
         };
+
+        // CONSOLE_GETCURSORINFO_MSG and CONSOLE_SETCURSORINFO_MSG.
+        struct console_cursor_info
+        {
+            uint32_t size;
+            uint8_t visible;
+            std::array<uint8_t, 3> padding;
+        };
+
+        static_assert(sizeof(console_cursor_info) == 8);
+
+        // CONSOLE_SCROLLSCREENBUFFER_MSG.
+        constexpr uint32_t scroll_console_screen_buffer_size = 26;
 
         constexpr uint32_t default_input_mode = 0x00F7;
         constexpr uint32_t default_output_mode = 0x0003;
@@ -197,7 +215,8 @@ namespace sogen
                 {
                     record.virtual_key_code = static_cast<uint16_t>('A' + event.character - 'a');
                 }
-                else
+                else if ((event.character >= 'A' && event.character <= 'Z') || (event.character >= '0' && event.character <= '9') ||
+                         event.character == u' ')
                 {
                     record.virtual_key_code = event.character;
                 }
@@ -288,6 +307,8 @@ namespace sogen
                 buffer.write(font_info_);
                 buffer.write_string(title_);
                 buffer.write_string(original_title_);
+                buffer.write(cursor_size_);
+                buffer.write(cursor_visible_);
             }
 
             void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -299,6 +320,8 @@ namespace sogen
                 buffer.read(font_info_);
                 buffer.read_string(title_);
                 buffer.read_string(original_title_);
+                buffer.read(cursor_size_);
+                buffer.read(cursor_visible_);
             }
 
             void restore_after_state_restore(windows_emulator& win_emu) override
@@ -320,12 +343,12 @@ namespace sogen
 
                 console_ioctl_header header{};
                 win_emu.emu().read_memory(context.input_buffer, &header, sizeof(header));
-                if (header.target_handle != STDIN_HANDLE.h && header.target_handle != STDOUT_HANDLE.h &&
-                    header.target_handle != CONSOLE_HANDLE.h && header.target_handle != 0)
+                const auto target = canonical_console_handle(make_handle(header.target_handle));
+                if (target != STDIN_HANDLE && target != STDOUT_HANDLE && target != CONSOLE_HANDLE && header.target_handle != 0)
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                const auto endpoint = effective_console_endpoint(context, header.target_handle);
+                const auto endpoint = effective_console_endpoint(context, target.bits);
 
                 if (!header.input_count || !header.output_count || header.input_count > max_console_io_buffers ||
                     header.output_count > max_console_io_buffers - header.input_count ||
@@ -352,6 +375,9 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
                 const auto data = api_message.address;
+
+                // An input API on an output handle, or the reverse, fails as on Windows.
+                const auto input = is_input_endpoint(endpoint);
 
                 switch (static_cast<console_api>(message.api_number))
                 {
@@ -484,8 +510,11 @@ namespace sogen
                 }
 
                 case console_api::get_console_input_event_count: {
-                    if (!is_input_endpoint(endpoint) || header.input_count != 1 || header.output_count != 1 ||
-                        message.data_size != sizeof(uint32_t))
+                    if (!input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (header.input_count != 1 || header.output_count != 1 || message.data_size != sizeof(uint32_t))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
@@ -497,8 +526,11 @@ namespace sogen
                 case console_api::read_console_input: {
                     constexpr uint16_t console_read_noremove = 0x0001;
                     constexpr uint16_t console_read_nowait = 0x0002;
-                    if (!is_input_endpoint(endpoint) || header.input_count != 1 || header.output_count != 2 ||
-                        message.data_size != sizeof(read_console_input_request))
+                    if (!input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (header.input_count != 1 || header.output_count != 2 || message.data_size != sizeof(read_console_input_request))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
@@ -533,8 +565,11 @@ namespace sogen
                     return STATUS_SUCCESS;
                 }
                 case console_api::write_console: {
-                    if (is_input_endpoint(endpoint) || header.input_count != 2 || header.output_count != 1 ||
-                        message.data_size != sizeof(write_console_request))
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (header.input_count != 2 || header.output_count != 1 || message.data_size != sizeof(write_console_request))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
@@ -565,11 +600,16 @@ namespace sogen
                 }
 
                 case console_api::fill_console_output: {
-                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(fill_console_output_request))
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != sizeof(fill_console_output_request))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
 
+                    // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
                     fill_console_output_request request{};
                     win_emu.emu().read_memory(data, &request, sizeof(request));
                     switch (request.type)
@@ -586,7 +626,11 @@ namespace sogen
                 }
 
                 case console_api::set_console_cursor_position:
-                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(cursor_position_))
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != sizeof(cursor_position_))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
@@ -595,7 +639,11 @@ namespace sogen
                     return STATUS_SUCCESS;
 
                 case console_api::set_console_text_attribute: {
-                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(text_attributes_))
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != sizeof(text_attributes_))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
@@ -604,8 +652,88 @@ namespace sogen
                     return STATUS_SUCCESS;
                 }
 
+                case console_api::flush_console_input_buffer:
+                    if (!input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != 0)
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+
+                    while (win_emu.console().input_available())
+                    {
+                        if (!win_emu.console().read_input_event(false, true))
+                        {
+                            break;
+                        }
+                    }
+                    return STATUS_SUCCESS;
+
+                case console_api::get_console_cursor_info:
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != sizeof(console_cursor_info))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+
+                    win_emu.emu().write_memory(data, console_cursor_info{.size = cursor_size_, .visible = cursor_visible_, .padding = {}});
+                    return STATUS_SUCCESS;
+
+                case console_api::set_console_cursor_info: {
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != sizeof(console_cursor_info))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+
+                    const auto cursor = win_emu.emu().read_memory<console_cursor_info>(data);
+                    constexpr uint32_t max_cursor_size = 100;
+                    if (cursor.size == 0 || cursor.size > max_cursor_size)
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    cursor_size_ = cursor.size;
+                    cursor_visible_ = cursor.visible != 0;
+                    return STATUS_SUCCESS;
+                }
+
+                case console_api::scroll_console_screen_buffer:
+                    // The screen buffer contents are not modeled (see fill_console_output).
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != scroll_console_screen_buffer_size)
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    return STATUS_SUCCESS;
+
+                case console_api::get_console_window: {
+                    // No console window: the console is the analyzer's terminal.
+                    if (message.data_size != sizeof(uint64_t) && message.data_size != sizeof(uint32_t))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    constexpr uint64_t no_window = 0;
+                    win_emu.emu().write_memory(data, &no_window, message.data_size);
+                    return STATUS_SUCCESS;
+                }
+
                 case console_api::get_current_console_font: {
-                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(console_font_info_response))
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != sizeof(console_font_info_response))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
@@ -614,7 +742,11 @@ namespace sogen
                 }
 
                 case console_api::set_current_console_font: {
-                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(console_font_info_response))
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != sizeof(console_font_info_response))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
@@ -638,24 +770,34 @@ namespace sogen
                 }
 
                 case console_api::get_largest_console_window_size: {
-                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(console_coordinate))
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != sizeof(console_coordinate))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
-                    constexpr console_coordinate size{.x = 80, .y = 25};
+                    const auto dimensions = win_emu.console().get_size();
+                    const console_coordinate size{.x = dimensions.width, .y = dimensions.height};
                     win_emu.emu().write_memory(data, size);
                     return STATUS_SUCCESS;
                 }
 
                 case console_api::get_console_screen_buffer_info: {
-                    if (is_input_endpoint(endpoint) || message.data_size != sizeof(console_screen_buffer_info_response))
+                    if (input)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    if (message.data_size != sizeof(console_screen_buffer_info_response))
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
 
                     console_screen_buffer_info_response response{};
-                    response.size_x = 80;
-                    response.size_y = 25;
+                    const auto dimensions = win_emu.console().get_size();
+                    response.size_x = dimensions.width;
+                    response.size_y = dimensions.height;
                     response.cursor_x = cursor_position_.x;
                     response.cursor_y = cursor_position_.y;
                     response.window_width = response.size_x;
@@ -674,6 +816,7 @@ namespace sogen
                     break;
                 }
 
+                win_emu.log.warn("Unsupported console API %08X (%u bytes)\n", message.api_number, message.data_size);
                 return STATUS_INVALID_PARAMETER;
             }
 
@@ -682,6 +825,8 @@ namespace sogen
             uint32_t input_mode_{default_input_mode};
             uint32_t output_mode_{default_output_mode};
             console_coordinate cursor_position_{};
+            uint32_t cursor_size_{25};
+            bool cursor_visible_{true};
             console_font_info_response font_info_{default_console_font()};
             std::u16string title_{};
             std::u16string original_title_{};

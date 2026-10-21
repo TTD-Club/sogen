@@ -32,8 +32,12 @@ def main() -> None:
     from sogen import ttd  # noqa: E402
 
     settings = {"registry_directory": str(analyzer.parent / "registry"), "disable_logging": True}
-    if emulator_args[:1] == ["-e"]:
-        settings["emulation_root"] = emulator_args[1]
+    # The Python emulators replay the recording, so they take the analyzer's options that shape its file system and
+    # network.
+    python_settings = {"-e": "emulation_root", "--network": "network", "--root-mode": "root_mode"}
+    for option, value in zip(emulator_args[::2], emulator_args[1::2]):
+        if option in python_settings:
+            settings[python_settings[option]] = value
 
     def run(*args: str) -> str:
         result = subprocess.run([str(analyzer), *args], text=True, capture_output=True, cwd=analyzer.parent)
@@ -134,6 +138,11 @@ def main() -> None:
             positions.update(syscall.position + delta for delta in (-1, 0, 1))
         for switch in trace.thread_switches[1:8]:
             positions.update({switch.position, switch.position + 1})
+        random_code = int(re.search(r"ttd-random-code ([0-9A-Fa-f]+)", recording).group(1), 16)
+        random_instructions = [event.position for event in trace.accesses(random_code, 0x1000, kinds=ttd.EXECUTE)
+                               if bytes(event.data[-3:-1]) == b"\x0f\xc7"]
+        assert len(random_instructions) == 4, random_instructions
+        positions.update(position + delta for position in random_instructions for delta in (-1, 0, 1))
         positions.update(rng.randrange(1, trace.instruction_count + 1) for _ in range(25))
         compared = 0
         for position in sorted(p for p in positions - before_switch if 0 < p <= trace.instruction_count):
@@ -150,6 +159,20 @@ def main() -> None:
         assert compared > 40, compared
         for position in sorted(before_switch)[:5]:
             trace.cpu_at(position)
+        # cpu_at_many: one replay per snapshot interval for every position in it, in the order given (duplicates
+        # included), each view equal to cpu_at's.
+        batch = [p for p in positions if 0 < p <= trace.instruction_count] + sorted(before_switch)[:5]
+        batch += batch[:3]
+        rng.shuffle(batch)
+        views = trace.cpu_at_many(batch)
+        assert [view.position for view in views] == batch
+        for position, view in zip(batch, views):
+            single = trace.cpu_at(position)
+            assert view.replayed_instructions == single.replayed_instructions, position
+            for name in names:
+                register = getattr(sogen.Register, name)
+                assert view.read_register(register) == single.read_register(register), (position, name)
+        assert trace.cpu_at_many([]) == []
         assert len(trace.cpu_at(store.position).read_register_bytes(sogen.Register.xmm0)) == 16
         # The global's old value comes from the image, and no access shows it before the store changes it: the checkpoint
         # memory does.

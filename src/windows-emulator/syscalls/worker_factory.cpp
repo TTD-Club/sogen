@@ -114,6 +114,7 @@ namespace sogen
                     win_emu.process.create_thread(win_emu.memory, factory.start_routine, factory.start_parameter, stack_size, create_flags);
                 factory.worker_threads.push_back(thread_handle);
                 factory.starting_worker_threads.push_back(thread_handle);
+                win_emu.wake_idle_vcpu();
             }
 
             bool is_blocked(const emulator_thread& thread)
@@ -532,6 +533,8 @@ namespace sogen
                     --factory->pending_release_count;
                     return STATUS_INVALID_HANDLE;
                 }
+
+                c.win_emu.wake_idle_vcpu();
             }
 
             ensure_worker_factory_threads(c, *factory);

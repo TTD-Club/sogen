@@ -324,6 +324,39 @@ namespace sogen::ttd
             return {};
         }
 
+        // Where an offset into the serialized state of `win_emu` lies: in which committed guest page, or outside guest memory
+        // (emulator state).
+        std::string describe_state_offset(const windows_emulator& win_emu, const size_t offset)
+        {
+            size_t memory_offset{};
+            (void)snapshot::create_emulator_state(win_emu, 0, {}, memory_offset);
+            utils::buffer_serializer layout{};
+            win_emu.memory.serialize_memory_state(layout, true);
+
+            // Each committed region follows the layout, prefixed with one size byte (see write_in_place).
+            auto position = memory_offset + layout.get_buffer().size();
+            for (const auto& reserved : win_emu.memory.get_reserved_regions() | std::views::values)
+            {
+                if (reserved.kind == memory_region_kind::mmio)
+                {
+                    continue;
+                }
+                for (const auto& [address, region] : reserved.committed_regions)
+                {
+                    position += 1;
+                    if (offset >= position && offset < position + region.length)
+                    {
+                        std::ostringstream description;
+                        description << ", guest memory at " << std::hex << (address + (offset - position));
+                        return description.str();
+                    }
+                    position += region.length;
+                }
+            }
+
+            return offset < memory_offset ? ", before guest memory" : ", after guest memory (modules, dispatcher or process state)";
+        }
+
         replay_result verify_checkpoints(windows_emulator& win_emu, const cli_options& options)
         {
             trace recorded(options.replay);
@@ -365,9 +398,10 @@ namespace sogen::ttd
                     continue;
                 }
                 ++mismatches;
-                printf("TTD checkpoint %llx:0 differs at state offset %llx (replayed %zu bytes, recorded %zu bytes)\n",
-                       static_cast<unsigned long long>(target.step), static_cast<unsigned long long>(observed_end - observed.begin()),
-                       observed.size(), expected.size());
+                const auto offset = static_cast<size_t>(observed_end - observed.begin());
+                printf("TTD checkpoint %llx:0 differs at state offset %llx (replayed %zu bytes, recorded %zu bytes)%s\n",
+                       static_cast<unsigned long long>(target.step), static_cast<unsigned long long>(offset), observed.size(),
+                       expected.size(), describe_state_offset(win_emu, offset).c_str());
             }
             if (mismatches)
             {

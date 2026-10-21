@@ -6,6 +6,7 @@
 #include "../windows_emulator.hpp"
 #include "../network/socket_factory.hpp"
 
+#include <algorithm>
 #include <network/address.hpp>
 #include <network/socket.hpp>
 
@@ -27,7 +28,14 @@ namespace sogen
             int address_family;
             int type;
             int protocol;
+
             // ...
+
+            friend void serialize(utils::buffer_serializer& buffer, const afd_creation_data& value)
+            {
+                buffer.write_zero_padded(value, &afd_creation_data::unk1, &afd_creation_data::afd_open_packet_xx, &afd_creation_data::unk2,
+                                         &afd_creation_data::address_family, &afd_creation_data::type, &afd_creation_data::protocol);
+            }
         };
 
         struct win_sockaddr
@@ -170,6 +178,19 @@ namespace sogen
             }
 
             throw std::runtime_error("Unsupported host address family for conversion: " + std::to_string(a.get_family()));
+        }
+
+        void report_socket_activity(windows_emulator& win_emu, const network::socket_activity activity,
+                                    const network::address& host_address)
+        {
+            if (!win_emu.callbacks.on_socket_activity)
+            {
+                return;
+            }
+
+            auto guest_address = host_address;
+            guest_address.set_port(win_emu.get_emulator_port(host_address.get_port()));
+            win_emu.callbacks.on_socket_activity(activity, guest_address);
         }
 
         network::address convert_to_host_address(const windows_emulator& win_emu, const std::span<const std::byte> data)
@@ -487,22 +508,40 @@ namespace sogen
                 }
             }
 
-            bool cancel_io(windows_emulator& win_emu, const uint64_t io_status_block) override
+            bool has_pending_io(const uint32_t issuing_thread_id) const override
             {
-                const auto poll = std::ranges::find_if(this->pending_polls_, [io_status_block](const pending_poll& pending) {
-                    return pending.context.io_status_block.value() == io_status_block;
-                });
-                if (poll != this->pending_polls_.end())
+                return (this->delayed_ioctl_ && this->delayed_ioctl_->issuing_thread_id == issuing_thread_id) ||
+                       std::ranges::any_of(this->pending_polls_, [issuing_thread_id](const pending_poll& poll) {
+                           return poll.context.issuing_thread_id == issuing_thread_id;
+                       });
+            }
+
+            bool cancel_io(windows_emulator& win_emu, const uint64_t io_status_block,
+                           const std::optional<uint32_t> issuing_thread_id = {}) override
+            {
+                const auto matches = [&](const io_device_context& context) {
+                    return (!io_status_block || context.io_status_block.value() == io_status_block) &&
+                           (!issuing_thread_id || context.issuing_thread_id == *issuing_thread_id);
+                };
+
+                bool cancelled = false;
+                for (auto it = this->pending_polls_.begin(); it != this->pending_polls_.end();)
                 {
-                    this->complete_io(win_emu, poll->context, STATUS_CANCELLED);
-                    io_completion_wait::release_handle_reference(win_emu.process, poll->retained_completion_port);
-                    this->pending_polls_.erase(poll);
-                    return true;
+                    if (!matches(it->context))
+                    {
+                        ++it;
+                        continue;
+                    }
+
+                    this->complete_io(win_emu, it->context, STATUS_CANCELLED);
+                    io_completion_wait::release_handle_reference(win_emu.process, it->retained_completion_port);
+                    it = this->pending_polls_.erase(it);
+                    cancelled = true;
                 }
 
-                if (!this->delayed_ioctl_ || this->delayed_ioctl_->io_status_block.value() != io_status_block)
+                if (!this->delayed_ioctl_ || !matches(*this->delayed_ioctl_))
                 {
-                    return false;
+                    return cancelled;
                 }
 
                 this->complete_io(win_emu, *this->delayed_ioctl_, STATUS_CANCELLED);
@@ -578,6 +617,7 @@ namespace sogen
                 if (auto* event = win_emu.process.events.get(context.event))
                 {
                     event->signaled = true;
+                    win_emu.wake_idle_vcpu();
                 }
                 io_device::queue_io_completion(win_emu, context);
             }
@@ -787,6 +827,7 @@ namespace sogen
                         if (auto* event = win_emu.process.events.get(*this->event_select_event_))
                         {
                             event->signaled = true;
+                            win_emu.wake_idle_vcpu();
                         }
                     }
                 }
@@ -955,6 +996,7 @@ namespace sogen
                 }
 
                 const auto addr = convert_to_host_address(win_emu, std::span(data).subspan(address_offset));
+                report_socket_activity(win_emu, network::socket_activity::connect, addr);
                 const auto connected = this->s_->connect(addr);
                 if (!connected)
                 {
@@ -999,6 +1041,7 @@ namespace sogen
                 }
 
                 const auto addr = convert_to_host_address(win_emu, std::span(data).subspan(address_offset));
+                report_socket_activity(win_emu, network::socket_activity::bind, addr);
 
                 if (!this->s_->bind(addr))
                 {
@@ -1543,6 +1586,7 @@ namespace sogen
 
                 const auto& buffer = request.buffers.front();
                 const auto target = convert_to_host_address(win_emu, request.remote_address);
+                report_socket_activity(win_emu, network::socket_activity::sendto, target);
                 const auto data = emu.read_memory(buffer.buf, buffer.len);
 
                 const auto sent_data = this->s_->sendto(target, data);

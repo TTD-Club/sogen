@@ -82,7 +82,7 @@ namespace sogen
 
         // reserved_host_ranges() restricted to [address, address + size), for callers checking one
         // specific target instead of re-enumerating the whole address space.
-        virtual std::vector<host_reserved_range> reserved_host_ranges_in(uint64_t /*address*/, size_t /*size*/) const
+        virtual std::vector<host_reserved_range> reserved_host_ranges_in(uint64_t /*address*/, uint64_t /*size*/) const
         {
             return this->reserved_host_ranges();
         }
@@ -91,7 +91,7 @@ namespace sogen
         // not backed by a real mapping yet. Backends sharing the address space with the guest (see
         // reserved_host_ranges) must claim it at the host OS level here, otherwise an unconstrained
         // host allocation (e.g. a JIT code buffer) can land inside a reserved-but-uncommitted range.
-        virtual void reserve_guest_address_range(uint64_t /*address*/, size_t /*size*/)
+        virtual void reserve_guest_address_range(uint64_t /*address*/, uint64_t /*size*/)
         {
         }
 
@@ -107,6 +107,7 @@ namespace sogen
         T read_memory(const uint64_t address) const
         {
             static_assert(std::is_trivially_copyable_v<T>, "Type must be trivially copyable!");
+            // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
             T value{};
             this->read_memory(address, &value, sizeof(value));
             return value;

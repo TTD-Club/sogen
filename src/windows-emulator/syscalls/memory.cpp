@@ -55,6 +55,29 @@ namespace sogen
                 }
             }
 
+            NTSTATUS check_protectable_range(memory_manager& memory, const uint64_t start, const uint64_t length)
+            {
+                const auto end = start + length;
+                const auto allocation = memory.get_region_info(start);
+                if (end < start || !allocation.is_reserved || allocation.kind == memory_region_kind::host_reserved ||
+                    allocation.allocation_base + allocation.allocation_length < end)
+                {
+                    return STATUS_CONFLICTING_ADDRESSES;
+                }
+
+                for (auto address = start; address < end;)
+                {
+                    const auto region = memory.get_region_info(address);
+                    if (!region.is_committed)
+                    {
+                        return STATUS_NOT_COMMITTED;
+                    }
+                    address = region.start + region.length;
+                }
+
+                return STATUS_SUCCESS;
+            }
+
             std::optional<uint64_t> checked_add(const uint64_t lhs, const uint64_t rhs)
             {
                 if (lhs > UINT64_MAX - rhs)
@@ -363,7 +386,7 @@ namespace sogen
 
         NTSTATUS handle_NtProtectVirtualMemory(const syscall_context& c, const handle process_handle,
                                                const emulator_object<uint64_t> base_address,
-                                               const emulator_object<uint32_t> bytes_to_protect, const uint32_t protection,
+                                               const emulator_object<uint64_t> bytes_to_protect, const uint32_t protection,
                                                const emulator_object<uint32_t> old_protection)
         {
             const auto orig_start = base_address.read();
@@ -372,14 +395,27 @@ namespace sogen
             const auto aligned_start = page_align_down(orig_start);
             const auto aligned_length = page_align_up(orig_start + orig_length) - aligned_start;
 
-            base_address.write(aligned_start);
-            bytes_to_protect.write(static_cast<uint32_t>(aligned_length));
-
             const auto requested_protection = try_map_nt_to_emulator_protection(protection);
             if (!requested_protection.has_value())
             {
                 return STATUS_INVALID_PAGE_PROTECTION;
             }
+
+            if (c.proc.is_current_process_handle(process_handle))
+            {
+                const auto status = check_protectable_range(c.win_emu.memory, aligned_start, aligned_length);
+                if (status != STATUS_SUCCESS)
+                {
+                    if (old_protection)
+                    {
+                        old_protection.write(PAGE_NOACCESS);
+                    }
+                    return status;
+                }
+            }
+
+            base_address.write(aligned_start);
+            bytes_to_protect.write(aligned_length);
 
             if (!c.proc.is_current_process_handle(process_handle))
             {
@@ -408,8 +444,7 @@ namespace sogen
 
             try
             {
-                c.win_emu.memory.protect_memory(aligned_start, static_cast<size_t>(aligned_length), *requested_protection,
-                                                &old_protection_value);
+                c.win_emu.memory.protect_memory(aligned_start, aligned_length, *requested_protection, &old_protection_value);
             }
             catch (...)
             {
@@ -559,11 +594,11 @@ namespace sogen
                 // memory_manager::find_free_host_allocation_base.
                 for (int attempt = 0;; ++attempt)
                 {
-                    potential_base = c.win_emu.memory.find_free_allocation_base(
-                        static_cast<size_t>(allocation_bytes), 0, address_requirements.alignment, address_requirements.lowest_address,
-                        address_requirements.highest_address);
+                    potential_base = c.win_emu.memory.find_free_allocation_base(allocation_bytes, 0, address_requirements.alignment,
+                                                                                address_requirements.lowest_address,
+                                                                                address_requirements.highest_address);
 
-                    if (!potential_base || c.win_emu.memory.host_window_is_free(potential_base, static_cast<size_t>(allocation_bytes)))
+                    if (!potential_base || c.win_emu.memory.host_window_is_free(potential_base, allocation_bytes))
                     {
                         break;
                     }
@@ -575,7 +610,7 @@ namespace sogen
                     }
 
                     c.win_emu.memory.reserve_host_memory_ranges();
-                    c.win_emu.memory.reserve_host_memory_ranges_in(potential_base, static_cast<size_t>(allocation_bytes));
+                    c.win_emu.memory.reserve_host_memory_ranges_in(potential_base, allocation_bytes);
                 }
             }
             else
@@ -613,7 +648,7 @@ namespace sogen
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                if (!c.win_emu.memory.replace_placeholder(potential_base, static_cast<size_t>(allocation_bytes), *protection, commit))
+                if (!c.win_emu.memory.replace_placeholder(potential_base, allocation_bytes, *protection, commit))
                 {
                     return STATUS_CONFLICTING_ADDRESSES;
                 }
@@ -621,7 +656,7 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            if (commit && !reserve && c.win_emu.memory.commit_memory(potential_base, static_cast<size_t>(allocation_bytes), *protection))
+            if (commit && !reserve && c.win_emu.memory.commit_memory(potential_base, allocation_bytes, *protection))
             {
                 c.win_emu.callbacks.on_memory_allocate(potential_base, allocation_bytes, *protection, true);
                 return STATUS_SUCCESS;
@@ -630,7 +665,7 @@ namespace sogen
             c.win_emu.callbacks.on_memory_allocate(potential_base, allocation_bytes, *protection, false);
 
             const auto kind = placeholder ? memory_region_kind::placeholder : memory_region_kind::private_allocation;
-            if (!c.win_emu.memory.allocate_memory(potential_base, static_cast<size_t>(allocation_bytes), *protection, !commit, kind))
+            if (!c.win_emu.memory.allocate_memory(potential_base, allocation_bytes, *protection, !commit, kind))
             {
                 return STATUS_MEMORY_NOT_ALLOCATED;
             }
@@ -697,10 +732,9 @@ namespace sogen
                     {
                         return STATUS_INVALID_PARAMETER_3;
                     }
-                    const auto success =
-                        free_type & MEM_PRESERVE_PLACEHOLDER
-                            ? c.win_emu.memory.preserve_placeholder(allocation_base, static_cast<size_t>(allocation_size))
-                            : c.win_emu.memory.coalesce_placeholders(allocation_base, static_cast<size_t>(allocation_size));
+                    const auto success = free_type & MEM_PRESERVE_PLACEHOLDER
+                                             ? c.win_emu.memory.preserve_placeholder(allocation_base, allocation_size)
+                                             : c.win_emu.memory.coalesce_placeholders(allocation_base, allocation_size);
                     return success ? STATUS_SUCCESS : STATUS_CONFLICTING_ADDRESSES;
                 }
                 if (allocation_size)
@@ -757,7 +791,7 @@ namespace sogen
                 }
 
                 auto decommit_base = allocation_base;
-                auto decommit_size = static_cast<size_t>(allocation_size);
+                uint64_t decommit_size = allocation_size;
                 if (!decommit_size)
                 {
                     const auto region_info = c.win_emu.memory.get_region_info(allocation_base);
@@ -777,7 +811,7 @@ namespace sogen
                 {
                     // NtFreeVirtualMemory decommits whole pages: round the base down and the end up.
                     decommit_base = page_align_down(allocation_base);
-                    decommit_size = static_cast<size_t>(page_align_up(allocation_base + decommit_size) - decommit_base);
+                    decommit_size = page_align_up(allocation_base + decommit_size) - decommit_base;
                 }
 
                 const bool success = c.win_emu.memory.decommit_memory(decommit_base, decommit_size);

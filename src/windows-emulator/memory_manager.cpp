@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstring>
+#include <limits>
 #include <vector>
 #include <optional>
 #include <stdexcept>
@@ -17,6 +18,12 @@ namespace sogen
 
     namespace
     {
+        // Guest reservations may exceed the host's address space (a 32-bit host), but committed memory is mapped there.
+        bool fits_host_mapping(const uint64_t size)
+        {
+            return size <= std::numeric_limits<size_t>::max();
+        }
+
         void split_regions(memory_manager::committed_region_map& regions, const std::vector<uint64_t>& split_points)
         {
             for (auto i = regions.begin(); i != regions.end(); ++i)
@@ -98,7 +105,7 @@ namespace sogen
             buffer.read(region.kind);
             buffer.read(region.mapped_filename);
             buffer.read(region.initial_permission);
-            region.length = static_cast<size_t>(buffer.read<uint64_t>());
+            region.length = buffer.read<uint64_t>();
             buffer.read_map(region.committed_regions);
         }
     }
@@ -110,7 +117,7 @@ namespace sogen
 #endif
         if (this->region_change_callback_ && size)
         {
-            this->region_change_callback_(address, static_cast<size_t>(size));
+            this->region_change_callback_(address, size);
         }
     }
 
@@ -374,7 +381,7 @@ namespace sogen
         }
     }
 
-    bool memory_manager::protect_memory(const uint64_t address, const size_t size, const nt_memory_permission permissions,
+    bool memory_manager::protect_memory(const uint64_t address, const uint64_t size, const nt_memory_permission permissions,
                                         nt_memory_permission* old_permissions)
     {
         const auto entry = this->find_reserved_region(address);
@@ -536,7 +543,7 @@ namespace sogen
         }
     }
 
-    void memory_manager::reserve_host_memory_ranges_in(const uint64_t address, const size_t size)
+    void memory_manager::reserve_host_memory_ranges_in(const uint64_t address, const uint64_t size)
     {
         for (const auto& range : this->memory_->reserved_host_ranges_in(address, size))
         {
@@ -544,7 +551,7 @@ namespace sogen
         }
     }
 
-    void memory_manager::reserve_host_range_gaps(const uint64_t address, const size_t size)
+    void memory_manager::reserve_host_range_gaps(const uint64_t address, const uint64_t size)
     {
         // A backend-reported range can partially overlap existing entries - its own earlier records,
         // guest allocations made since, or an MMIO hole carved by allocate_mmio - so each still
@@ -569,8 +576,8 @@ namespace sogen
             }
 
             const auto gap_end = next == this->reserved_regions_.end() ? end : std::min<uint64_t>(end, next->first);
-            if (gap_end > cursor && this->allocate_memory_raw(cursor, static_cast<size_t>(gap_end - cursor), nt_memory_permission{}, true,
-                                                              memory_region_kind::host_reserved))
+            if (gap_end > cursor &&
+                this->allocate_memory_raw(cursor, gap_end - cursor, nt_memory_permission{}, true, memory_region_kind::host_reserved))
             {
                 this->host_reserved_addresses_.push_back(cursor);
             }
@@ -579,7 +586,7 @@ namespace sogen
         }
     }
 
-    void memory_manager::carve_host_reserved_hole(const uint64_t address, const size_t size)
+    void memory_manager::carve_host_reserved_hole(const uint64_t address, const uint64_t size)
     {
         // allocate_mmio may claim addresses inside a host_reserved range (see
         // overlaps_reserved_region's ignore_host_reserved). Nesting the MMIO entry inside it would
@@ -614,7 +621,7 @@ namespace sogen
             if (region_start < address)
             {
                 this->reserved_regions_.try_emplace(region_start, reserved_region{
-                                                                      .length = static_cast<size_t>(address - region_start),
+                                                                      .length = address - region_start,
                                                                       .kind = memory_region_kind::host_reserved,
                                                                   });
                 if (was_tracked)
@@ -628,7 +635,7 @@ namespace sogen
                 it = this->reserved_regions_
                          .try_emplace(end,
                                       reserved_region{
-                                          .length = static_cast<size_t>(region_end - end),
+                                          .length = region_end - end,
                                           .kind = memory_region_kind::host_reserved,
                                       })
                          .first;
@@ -646,7 +653,7 @@ namespace sogen
         }
     }
 
-    bool memory_manager::host_window_is_free(const uint64_t address, const size_t size) const
+    bool memory_manager::host_window_is_free(const uint64_t address, const uint64_t size) const
     {
         return this->memory_->reserved_host_ranges_in(address, size).empty();
     }
@@ -662,7 +669,7 @@ namespace sogen
         this->reserve_host_memory_ranges();
     }
 
-    bool memory_manager::allocate_memory(const uint64_t address, const size_t size, const nt_memory_permission permissions,
+    bool memory_manager::allocate_memory(const uint64_t address, const uint64_t size, const nt_memory_permission permissions,
                                          const bool reserve_only, const memory_region_kind kind)
     {
         // On a backend sharing the address space with the guest (FEX on Apple), a host framework can
@@ -692,10 +699,10 @@ namespace sogen
         return true;
     }
 
-    bool memory_manager::allocate_memory_raw(const uint64_t address, const size_t size, const nt_memory_permission permissions,
+    bool memory_manager::allocate_memory_raw(const uint64_t address, const uint64_t size, const nt_memory_permission permissions,
                                              const bool reserve_only, const memory_region_kind kind)
     {
-        if (this->overlaps_reserved_region(address, size))
+        if ((!reserve_only && !fits_host_mapping(size)) || this->overlaps_reserved_region(address, size))
         {
             return false;
         }
@@ -711,9 +718,9 @@ namespace sogen
 
         if (!reserve_only)
         {
-            this->map_memory(address, size, this->get_effective_permissions(permissions));
+            this->map_memory(address, static_cast<size_t>(size), this->get_effective_permissions(permissions));
             entry->second.committed_regions[address] = committed_region{
-                .length = size,
+                .length = static_cast<size_t>(size),
                 .permissions = permissions,
             };
         }
@@ -723,12 +730,12 @@ namespace sogen
         return true;
     }
 
-    bool memory_manager::commit_memory(const uint64_t address, const size_t size, const nt_memory_permission permissions)
+    bool memory_manager::commit_memory(const uint64_t address, const uint64_t size, const nt_memory_permission permissions)
     {
         return this->commit_memory(address, size, permissions, false);
     }
 
-    bool memory_manager::commit_image_memory(const uint64_t address, const size_t size, const nt_memory_permission permissions)
+    bool memory_manager::commit_image_memory(const uint64_t address, const uint64_t size, const nt_memory_permission permissions)
     {
         const auto entry = this->find_reserved_region(address);
         if (entry == this->reserved_regions_.end() || entry->second.kind != memory_region_kind::section_image)
@@ -739,11 +746,11 @@ namespace sogen
         return this->commit_memory(address, size, permissions, true);
     }
 
-    bool memory_manager::commit_memory(const uint64_t address, const size_t size, const nt_memory_permission permissions,
+    bool memory_manager::commit_memory(const uint64_t address, const uint64_t size, const nt_memory_permission permissions,
                                        const bool allow_image_section)
     {
         const auto entry = this->find_reserved_region(address);
-        if (entry == this->reserved_regions_.end())
+        if (entry == this->reserved_regions_.end() || !fits_host_mapping(size))
         {
             return false;
         }
@@ -826,7 +833,7 @@ namespace sogen
         return true;
     }
 
-    bool memory_manager::decommit_memory(const uint64_t address, const size_t size)
+    bool memory_manager::decommit_memory(const uint64_t address, const uint64_t size)
     {
         const auto entry = this->find_reserved_region(address);
         if (entry == this->reserved_regions_.end())
@@ -903,7 +910,7 @@ namespace sogen
         this->memory_->release_guest_address_range(gap_start, gap_end - gap_start);
     }
 
-    bool memory_manager::split_placeholder(const uint64_t address, const size_t size)
+    bool memory_manager::split_placeholder(const uint64_t address, const uint64_t size)
     {
         const auto entry = this->reserved_regions_.find(address);
         if (entry == this->reserved_regions_.end() || entry->second.kind != memory_region_kind::placeholder || !size ||
@@ -919,7 +926,7 @@ namespace sogen
         return true;
     }
 
-    bool memory_manager::coalesce_placeholders(const uint64_t address, const size_t size)
+    bool memory_manager::coalesce_placeholders(const uint64_t address, const uint64_t size)
     {
         if (!size || address > MAX_ALLOCATION_END_EXCL || size > MAX_ALLOCATION_END_EXCL - address)
         {
@@ -948,7 +955,7 @@ namespace sogen
         return true;
     }
 
-    bool memory_manager::replace_placeholder(const uint64_t address, const size_t size, const nt_memory_permission permissions,
+    bool memory_manager::replace_placeholder(const uint64_t address, const uint64_t size, const nt_memory_permission permissions,
                                              const bool commit)
     {
         const auto entry = this->reserved_regions_.find(address);
@@ -967,7 +974,7 @@ namespace sogen
         return true;
     }
 
-    bool memory_manager::preserve_placeholder(const uint64_t address, const size_t size)
+    bool memory_manager::preserve_placeholder(const uint64_t address, const uint64_t size)
     {
         const auto entry = this->reserved_regions_.find(address);
         if (entry == this->reserved_regions_.end())
@@ -992,7 +999,7 @@ namespace sogen
         return true;
     }
 
-    bool memory_manager::release_memory(const uint64_t address, size_t size)
+    bool memory_manager::release_memory(const uint64_t address, uint64_t size)
     {
         if (!size)
         {
@@ -1019,7 +1026,7 @@ namespace sogen
 
         const auto aligned_start = page_align_down(address);
         const auto aligned_end = page_align_up(address + size);
-        size = static_cast<size_t>(aligned_end - aligned_start);
+        size = aligned_end - aligned_start;
 
         const auto entry = this->find_reserved_region(aligned_start);
         if (entry == this->reserved_regions_.end())
@@ -1078,7 +1085,7 @@ namespace sogen
         if (reserved_start < aligned_start)
         {
             reserved_region left_region{};
-            left_region.length = static_cast<size_t>(aligned_start - reserved_start);
+            left_region.length = aligned_start - reserved_start;
             left_region.initial_permission = region.initial_permission;
             left_region.kind = region.kind;
             left_region.mapped_filename = region.mapped_filename;
@@ -1089,7 +1096,7 @@ namespace sogen
         if (aligned_end < reserved_end)
         {
             reserved_region right_region{};
-            right_region.length = static_cast<size_t>(reserved_end - aligned_end);
+            right_region.length = reserved_end - aligned_end;
             right_region.initial_permission = region.initial_permission;
             right_region.kind = region.kind;
             right_region.mapped_filename = region.mapped_filename;
@@ -1110,7 +1117,7 @@ namespace sogen
         constexpr int max_host_reserved_retries = 8;
     }
 
-    uint64_t memory_manager::allocate_memory(const size_t size, const nt_memory_permission permissions, const bool reserve_only,
+    uint64_t memory_manager::allocate_memory(const uint64_t size, const nt_memory_permission permissions, const bool reserve_only,
                                              uint64_t start, const memory_region_kind kind)
     {
         // Backends sharing the address space with the guest (e.g. FEX) allocate their own host memory
@@ -1142,12 +1149,12 @@ namespace sogen
         return allocation_base;
     }
 
-    uint64_t memory_manager::find_free_host_allocation_base(const size_t size, const uint64_t start)
+    uint64_t memory_manager::find_free_host_allocation_base(const uint64_t size, const uint64_t start)
     {
         return this->find_free_host_allocation_base(size, start, MAX_ALLOCATION_END_EXCL - 1);
     }
 
-    uint64_t memory_manager::find_free_host_allocation_base(const size_t size, const uint64_t start, const uint64_t highest_address)
+    uint64_t memory_manager::find_free_host_allocation_base(const uint64_t size, const uint64_t start, const uint64_t highest_address)
     {
         // The confirm uses the pure host_window_is_free probe rather than reserve_host_memory_ranges_in,
         // which would record a clamped window slice and stop the rescan below from recording an
@@ -1182,7 +1189,7 @@ namespace sogen
         }
     }
 
-    uint64_t memory_manager::find_free_allocation_base(const size_t size, const uint64_t start) const
+    uint64_t memory_manager::find_free_allocation_base(const uint64_t size, const uint64_t start) const
     {
         return this->find_free_allocation_base(size, start, ALLOCATION_GRANULARITY, MIN_ALLOCATION_ADDRESS, MAX_ALLOCATION_END_EXCL - 1);
     }
@@ -1205,8 +1212,8 @@ namespace sogen
         }
     }
 
-    uint64_t memory_manager::find_free_allocation_base(const size_t size, const uint64_t start, uint64_t alignment, uint64_t lowest_address,
-                                                       uint64_t highest_address) const
+    uint64_t memory_manager::find_free_allocation_base(const uint64_t size, const uint64_t start, uint64_t alignment,
+                                                       uint64_t lowest_address, uint64_t highest_address) const
     {
         if (!is_power_of_two(alignment) || alignment < ALLOCATION_GRANULARITY || size == 0)
         {
@@ -1308,7 +1315,7 @@ namespace sogen
     {
         region_info result{};
         result.start = page_align_down(address);
-        result.length = static_cast<size_t>(MAX_ALLOCATION_END_EXCL - result.start);
+        result.length = MAX_ALLOCATION_END_EXCL - result.start;
         result.permissions = nt_memory_permission();
         result.initial_permissions = nt_memory_permission();
         result.allocation_base = {};
@@ -1324,7 +1331,7 @@ namespace sogen
         auto upper_bound = this->reserved_regions_.upper_bound(address);
         if (upper_bound == this->reserved_regions_.begin())
         {
-            result.length = static_cast<size_t>(upper_bound->first - result.start);
+            result.length = upper_bound->first - result.start;
             return result;
         }
 
@@ -1336,8 +1343,7 @@ namespace sogen
             auto next = std::next(entry);
 
             result.start = page_align_down(address);
-            result.length = next == this->reserved_regions_.end() ? static_cast<size_t>(MAX_ALLOCATION_END_EXCL - result.start)
-                                                                  : static_cast<size_t>(next->first - result.start);
+            result.length = next == this->reserved_regions_.end() ? MAX_ALLOCATION_END_EXCL - result.start : next->first - result.start;
 
             return result;
         }
@@ -1351,7 +1357,7 @@ namespace sogen
         result.initial_permissions = reserved_region.initial_permission;
         result.kind = reserved_region.kind;
         result.start = page_align_down(address);
-        result.length = static_cast<size_t>(reserved_end - result.start);
+        result.length = reserved_end - result.start;
 
         if (committed_regions.empty())
         {
@@ -1361,7 +1367,7 @@ namespace sogen
         auto committed_bound = committed_regions.upper_bound(address);
         if (committed_bound == committed_regions.begin())
         {
-            result.length = static_cast<size_t>(committed_bound->first - result.start);
+            result.length = committed_bound->first - result.start;
             return result;
         }
 
@@ -1372,15 +1378,14 @@ namespace sogen
         {
             auto next_committed = std::next(committed_entry);
 
-            result.length = next_committed == committed_regions.end() ? static_cast<size_t>(reserved_end - result.start)
-                                                                      : static_cast<size_t>(next_committed->first - result.start);
+            result.length = next_committed == committed_regions.end() ? reserved_end - result.start : next_committed->first - result.start;
 
             return result;
         }
 
         result.is_committed = true;
         result.permissions = committed_entry->second.permissions;
-        result.length = static_cast<size_t>(committed_end - result.start);
+        result.length = committed_end - result.start;
 
         return result;
     }
@@ -1441,7 +1446,7 @@ namespace sogen
         return entry;
     }
 
-    bool memory_manager::overlaps_reserved_region(const uint64_t address, const size_t size, const bool ignore_host_reserved) const
+    bool memory_manager::overlaps_reserved_region(const uint64_t address, const uint64_t size, const bool ignore_host_reserved) const
     {
         // reserved_regions_ entries are pairwise non-overlapping - every insertion path checks this
         // function first, and allocate_mmio splits host_reserved coverage around its claim (see

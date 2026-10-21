@@ -177,7 +177,7 @@ namespace sogen
     {
         handle h{};
         h.bits = resolve_argument<uint64_t>(emu, index);
-        return h;
+        return canonical_console_handle(h);
     }
 
     template <typename T>

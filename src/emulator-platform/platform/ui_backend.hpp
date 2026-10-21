@@ -52,12 +52,30 @@ namespace sogen
         const void* pixels{};
     };
 
+    struct ui_extent
+    {
+        uint32_t width{};
+        uint32_t height{};
+    };
+
+    struct ui_rect
+    {
+        int32_t left{};
+        int32_t top{};
+        int32_t right{};
+        int32_t bottom{};
+    };
+
     struct ui_event
     {
         hwnd window{};
         uint32_t message{};
         uint64_t wParam{};
         uint64_t lParam{};
+
+        // Set on WM_MOUSEMOVE while the host reports relative motion: the host cursor does not move, so the
+        // emulator moves the guest cursor by this delta instead of taking the position from lParam.
+        std::optional<std::pair<int32_t, int32_t>> relative_motion{};
     };
 
     class ui_backend
@@ -116,6 +134,13 @@ namespace sogen
             return 0;
         }
 
+        // The extent a Vulkan swapchain on the window should have, for backends whose surface does not follow the
+        // guest window's size by itself. std::nullopt keeps the extent the driver reports.
+        virtual std::optional<ui_extent> vulkan_surface_extent(const hwnd /*window*/)
+        {
+            return std::nullopt;
+        }
+
         // Warp the host cursor so it tracks a guest SetCursorPos. Without this, the next host mouse-motion
         // event reports the (unchanged) host position and overwrites the recentered guest cursor, making
         // relative-mouse deltas (in-game look) jump. screen_x/y are emulated-desktop screen coordinates.
@@ -127,6 +152,13 @@ namespace sogen
         // SetCursor(NULL)) and recenter every frame; without honoring this the host cursor stays visible
         // and flickers as the guest warps it back to the center.
         virtual void set_cursor_visibility(const bool /*visible*/)
+        {
+        }
+
+        // Confine the host cursor to a guest ClipCursor rectangle (emulated screen coordinates), or release it.
+        // With relative set, the host reports raw motion instead, which a hidden cursor needs: mouse-look keeps
+        // receiving deltas at the edge of the clip rectangle, as raw input does on Windows.
+        virtual void set_cursor_clip(const hwnd /*window*/, const std::optional<ui_rect>& /*screen_rect*/, const bool /*relative*/)
         {
         }
     };

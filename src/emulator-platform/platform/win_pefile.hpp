@@ -102,6 +102,10 @@
 #define IMAGE_FILE_MACHINE_CEE         0xC0EE
 #endif
 
+#ifndef OS_WINDOWS
+#define IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA 0x0020
+#endif
+
 #define PROCESSOR_ARCHITECTURE_INTEL         0
 #define PROCESSOR_ARCHITECTURE_IA32_ON_WIN64 10
 #define PROCESSOR_ARCHITECTURE_AMD64         9
@@ -137,9 +141,10 @@ namespace sogen
         AXP64 = ALPHA64,
         TRICORE = 0x0520, // Infineon
         CEF = 0x0CEF,
-        EBC = 0x0EBC,   // EFI Byte Code
-        AMD64 = 0x8664, // AMD64 (K8)
-        M32R = 0x9041,  // M32R little-endian
+        EBC = 0x0EBC,     // EFI Byte Code
+        AMD64 = 0x8664,   // AMD64 (K8)
+        M32R = 0x9041,    // M32R little-endian
+        ARM64EC = 0xA641, // ARM64EC hybrid image with x64-compatible code ranges
         CEE = 0xC0EE,
     };
 

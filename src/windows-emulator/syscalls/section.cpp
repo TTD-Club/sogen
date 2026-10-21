@@ -315,6 +315,7 @@ namespace sogen
             }
 
             if (utils::string::equals_ignore_case(filename_sv, u"windows_shell_global_counters"sv) ||
+                utils::string::equals_ignore_case(filename_sv, u"\\Windows\\ThemeSection"sv) ||
                 utils::string::equals_ignore_case(filename_sv, u"Global\\__ComCatalogCache__"sv) ||
                 utils::string::equals_ignore_case(filename_sv, u"{00020000-0000-1005-8005-0000C06B5161}"sv) ||
                 utils::string::equals_ignore_case(filename_sv, u"Global\\{00020000-0000-1005-8005-0000C06B5161}"sv))
@@ -542,7 +543,7 @@ namespace sogen
                 std::error_code ec{};
                 if (open_file.handle && std::filesystem::equivalent(open_file.host_path, host_path, ec))
                 {
-                    fflush(open_file.handle);
+                    (void)open_file.handle.flush();
                 }
             }
 

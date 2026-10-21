@@ -68,6 +68,7 @@ namespace sogen
 
     void syscall_dispatcher::dispatch(windows_emulator& win_emu, vcpu_context& vcpu)
     {
+        const scheduler_clock::scope time_scope{win_emu.scheduling_clock()};
         auto& emu = vcpu.cpu;
         auto& context = win_emu.process;
 
@@ -201,7 +202,5 @@ namespace sogen
     {
         this->setup(ntdll_exports, ntdll_data, win32u_exports, win32u_data);
     }
-
-    std::map<callback_id, std::function<std::unique_ptr<completion_state>()>> syscall_dispatcher::completion_state_factories_{};
 
 } // namespace sogen

@@ -9,7 +9,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -266,6 +268,9 @@ namespace sogen
         struct device_data
         {
             VkDevice handle{};
+            bool maintenance5_enabled{};
+            // Held shared by presents running without the caller's locks, so destroying the device waits for them.
+            std::shared_ptr<std::shared_mutex> presents = std::make_shared<std::shared_mutex>();
             uint64_t instance_id{};
             VkPhysicalDevice physical_device{}; // the device this was created from (for memory queries)
             uint32_t queue_family_index{};      // the single family this device was created with
@@ -392,6 +397,7 @@ namespace sogen
             PFN_vkCmdBindVertexBuffers cmd_bind_vertex_buffers{};
             PFN_vkCmdBindVertexBuffers2 cmd_bind_vertex_buffers2{};
             PFN_vkCmdBindIndexBuffer cmd_bind_index_buffer{};
+            PFN_vkCmdBindIndexBuffer2KHR cmd_bind_index_buffer2{};
             PFN_vkCmdDrawIndexed cmd_draw_indexed{};
             PFN_vkCmdDrawIndexedIndirect cmd_draw_indexed_indirect{};
             PFN_vkCmdDrawIndexedIndirectCount cmd_draw_indexed_indirect_count{};
@@ -515,6 +521,20 @@ namespace sogen
 
         std::unordered_map<uint64_t, device_data> devices;
         std::unordered_map<uint64_t, queue_data> queues;
+        // Vulkan requires host access to a queue to be externally synchronized. Several queue ids can name the same
+        // native queue, so the locks are keyed by it.
+        std::unordered_map<VkQueue, std::shared_ptr<std::mutex>> queue_locks;
+
+        std::shared_ptr<std::mutex> queue_lock(const VkQueue queue)
+        {
+            auto& lock = this->queue_locks[queue];
+            if (!lock)
+            {
+                lock = std::make_shared<std::mutex>();
+            }
+            return lock;
+        }
+
         std::unordered_map<uint64_t, command_pool_data> command_pools;
         std::unordered_map<uint64_t, command_buffer_data> command_buffers;
         std::unordered_map<uint64_t, fence_data> fences;
@@ -760,6 +780,9 @@ namespace sogen
                 return;
             }
 
+            const auto presents = it->second.presents;
+            const std::unique_lock presents_done(*presents);
+
             // Descriptor pools (which free their sets) before descriptor set layouts those sets used.
             for (auto& [id, pool] : this->descriptor_pools)
             {
@@ -936,6 +959,13 @@ namespace sogen
             this->erase_owned(this->images, [&](const image_data& d) { return d.device_id == device_id; });
             this->erase_owned(this->samplers, [&](const sampler_data& d) { return d.device_id == device_id; });
             this->erase_owned(this->memories, [&](const memory_data& d) { return d.device_id == device_id; });
+            for (const auto& queue : this->queues | std::views::values)
+            {
+                if (queue.device_id == device_id)
+                {
+                    this->queue_locks.erase(queue.handle);
+                }
+            }
             this->erase_owned(this->queues, [&](const queue_data& d) { return d.device_id == device_id; });
 
             if (it->second.handle && it->second.destroy_device)
@@ -2128,6 +2158,14 @@ namespace sogen
 
         impl::device_data data{};
         data.handle = device;
+        const bool maintenance5_extension_enabled =
+            std::ranges::any_of(extensions, [](const char* name) { return std::strcmp(name, "VK_KHR_maintenance5") == 0; });
+        const bool maintenance5_feature_enabled = std::ranges::any_of(chained, [](const std::vector<std::byte>& buffer) {
+            const auto* base = reinterpret_cast<const VkBaseInStructure*>(buffer.data());
+            return base->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR &&
+                   reinterpret_cast<const VkPhysicalDeviceMaintenance5FeaturesKHR*>(base)->maintenance5 == VK_TRUE;
+        });
+        data.maintenance5_enabled = maintenance5_extension_enabled && maintenance5_feature_enabled;
         data.instance_id = pd->second.instance_id;
         data.physical_device = pd->second.handle;
         data.queue_family_index = primary_family;
@@ -2283,6 +2321,10 @@ namespace sogen
             data.cmd_bind_vertex_buffers = reinterpret_cast<PFN_vkCmdBindVertexBuffers>(resolve("vkCmdBindVertexBuffers"));
             data.cmd_bind_vertex_buffers2 = reinterpret_cast<PFN_vkCmdBindVertexBuffers2>(resolve("vkCmdBindVertexBuffers2"));
             data.cmd_bind_index_buffer = reinterpret_cast<PFN_vkCmdBindIndexBuffer>(resolve("vkCmdBindIndexBuffer"));
+            if (data.maintenance5_enabled)
+            {
+                data.cmd_bind_index_buffer2 = reinterpret_cast<PFN_vkCmdBindIndexBuffer2KHR>(resolve("vkCmdBindIndexBuffer2KHR"));
+            }
             data.cmd_draw_indexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(resolve("vkCmdDrawIndexed"));
             data.cmd_draw_indexed_indirect = reinterpret_cast<PFN_vkCmdDrawIndexedIndirect>(resolve("vkCmdDrawIndexedIndirect"));
             data.cmd_draw_indexed_indirect_count =
@@ -2484,6 +2526,7 @@ namespace sogen
         // A secondary command buffer recorded inside dynamic rendering needs an inheritance chain describing
         // the attachment formats it will render to (VkCommandBufferInheritanceRenderingInfo).
         VkCommandBufferInheritanceInfo inheritance{};
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         VkCommandBufferInheritanceRenderingInfo rendering{};
         std::vector<VkFormat> color_format_handles;
         if (is_secondary)
@@ -2606,6 +2649,8 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
+        const auto lock = this->impl_->queue_lock(queue_it->second.handle);
+        const std::scoped_lock guard(*lock);
         return dev->second.queue_wait_idle(queue_it->second.handle);
     }
 
@@ -2615,6 +2660,26 @@ namespace sogen
         if (dev == this->impl_->devices.end() || !dev->second.device_wait_idle)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        std::vector<std::shared_ptr<std::mutex>> locks{};
+        for (const auto& queue : this->impl_->queues | std::views::values)
+        {
+            if (queue.device_id == device)
+            {
+                auto lock = this->impl_->queue_lock(queue.handle);
+                if (std::ranges::find(locks, lock) == locks.end())
+                {
+                    locks.push_back(std::move(lock));
+                }
+            }
+        }
+
+        std::vector<std::unique_lock<std::mutex>> guards{};
+        guards.reserve(locks.size());
+        for (const auto& lock : locks)
+        {
+            guards.emplace_back(*lock);
         }
 
         return dev->second.device_wait_idle(dev->second.handle);
@@ -2910,7 +2975,9 @@ namespace sogen
         return dev->second.reset_event(dev->second.handle, it->second.handle);
     }
 
-    int32_t vulkan_host::queue_submit(uint64_t queue, uint64_t command_buffer, uint64_t fence)
+    int32_t vulkan_host::queue_submit(uint64_t queue, uint64_t fence, const void* wait_entries, uint32_t wait_count,
+                                      const void* command_buffer_ids, uint32_t command_buffer_count, const void* signal_entries,
+                                      uint32_t signal_count, bool has_timeline_info)
     {
         const auto queue_it = this->impl_->queues.find(queue);
         if (queue_it == this->impl_->queues.end())
@@ -2935,23 +3002,76 @@ namespace sogen
             fence_handle = fence_it->second.handle;
         }
 
-        // Zero-command-buffer submission: still a valid fence signal operation (no work batched).
-        if (command_buffer == 0)
-        {
-            return dev->second.queue_submit(queue_it->second.handle, 0, nullptr, fence_handle);
-        }
+        const auto build_semaphores = [&](const void* entries, uint32_t count, std::vector<VkSemaphore>& semaphores,
+                                          std::vector<VkPipelineStageFlags>* stage_masks, std::vector<uint64_t>& values) {
+            const auto* records = static_cast<const gpu_bridge::submit_semaphore_entry*>(entries);
+            semaphores.reserve(count);
+            if (stage_masks)
+            {
+                stage_masks->reserve(count);
+            }
+            values.reserve(count);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const auto sem = this->impl_->semaphores.find(records[i].semaphore);
+                if (sem == this->impl_->semaphores.end() || sem->second.device_id != queue_it->second.device_id)
+                {
+                    return false;
+                }
+                semaphores.push_back(sem->second.handle);
+                if (stage_masks)
+                {
+                    stage_masks->push_back(static_cast<VkPipelineStageFlags>(records[i].stage_mask));
+                }
+                values.push_back(records[i].value);
+            }
+            return true;
+        };
 
-        const auto cb = this->impl_->command_buffers.find(command_buffer);
-        if (cb == this->impl_->command_buffers.end() || cb->second.device_id != queue_it->second.device_id)
+        std::vector<VkSemaphore> waits;
+        std::vector<VkPipelineStageFlags> wait_stage_masks;
+        std::vector<uint64_t> wait_values;
+        std::vector<VkSemaphore> signals;
+        std::vector<uint64_t> signal_values;
+        if (!build_semaphores(wait_entries, wait_count, waits, &wait_stage_masks, wait_values) ||
+            !build_semaphores(signal_entries, signal_count, signals, nullptr, signal_values))
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
+        const auto* command_ids = static_cast<const uint64_t*>(command_buffer_ids);
+        std::vector<VkCommandBuffer> command_buffers;
+        command_buffers.reserve(command_buffer_count);
+        for (uint32_t i = 0; i < command_buffer_count; ++i)
+        {
+            const auto cb = this->impl_->command_buffers.find(command_ids[i]);
+            if (cb == this->impl_->command_buffers.end() || cb->second.device_id != queue_it->second.device_id)
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            command_buffers.push_back(cb->second.handle);
+        }
+
+        VkTimelineSemaphoreSubmitInfo timeline_info{};
+        timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_info.waitSemaphoreValueCount = static_cast<uint32_t>(wait_values.size());
+        timeline_info.pWaitSemaphoreValues = wait_values.data();
+        timeline_info.signalSemaphoreValueCount = static_cast<uint32_t>(signal_values.size());
+        timeline_info.pSignalSemaphoreValues = signal_values.data();
+
         VkSubmitInfo submit{};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &cb->second.handle;
+        submit.pNext = has_timeline_info ? &timeline_info : nullptr;
+        submit.waitSemaphoreCount = wait_count;
+        submit.pWaitSemaphores = waits.data();
+        submit.pWaitDstStageMask = wait_stage_masks.data();
+        submit.commandBufferCount = command_buffer_count;
+        submit.pCommandBuffers = command_buffers.data();
+        submit.signalSemaphoreCount = signal_count;
+        submit.pSignalSemaphores = signals.data();
 
+        const auto lock = this->impl_->queue_lock(queue_it->second.handle);
+        const std::scoped_lock guard(*lock);
         return dev->second.queue_submit(queue_it->second.handle, 1, &submit, fence_handle);
     }
 
@@ -3034,6 +3154,8 @@ namespace sogen
         submit.signalSemaphoreInfoCount = static_cast<uint32_t>(signals.size());
         submit.pSignalSemaphoreInfos = signals.data();
 
+        const auto lock = this->impl_->queue_lock(queue_it->second.handle);
+        const std::scoped_lock guard(*lock);
         return dev->second.queue_submit2(queue_it->second.handle, 1, &submit, fence_handle);
     }
 
@@ -3483,6 +3605,7 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         VkImageCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         info.flags = flags;
@@ -3735,7 +3858,7 @@ namespace sogen
     }
 
     int32_t vulkan_host::cmd_copy_image_to_buffer(uint64_t command_buffer, uint64_t image, uint32_t image_layout, uint64_t buffer,
-                                                  uint32_t width, uint32_t height, uint32_t aspect_mask)
+                                                  const buffer_image_copy_region& r)
     {
         const auto cb = this->impl_->command_buffers.find(command_buffer);
         const auto img = this->impl_->images.find(image);
@@ -3753,15 +3876,15 @@ namespace sogen
         }
 
         VkBufferImageCopy region{};
-        region.bufferOffset = 0;
-        region.bufferRowLength = 0;   // tightly packed
-        region.bufferImageHeight = 0; // tightly packed
-        region.imageSubresource.aspectMask = aspect_mask;
-        region.imageSubresource.mipLevel = 0;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = 1;
-        region.imageOffset = {.x = 0, .y = 0, .z = 0};
-        region.imageExtent = {.width = width, .height = height, .depth = 1};
+        region.bufferOffset = r.buffer_offset;
+        region.bufferRowLength = r.buffer_row_length;
+        region.bufferImageHeight = r.buffer_image_height;
+        region.imageSubresource.aspectMask = r.aspect_mask;
+        region.imageSubresource.mipLevel = r.mip_level;
+        region.imageSubresource.baseArrayLayer = r.base_array_layer;
+        region.imageSubresource.layerCount = r.layer_count ? r.layer_count : 1;
+        region.imageOffset = {.x = r.image_offset_x, .y = r.image_offset_y, .z = r.image_offset_z};
+        region.imageExtent = {.width = r.width, .height = r.height, .depth = r.depth ? r.depth : 1};
 
         dev->second.cmd_copy_image_to_buffer(cb->second.handle, img->second.handle, translate_layout(image_layout), buf->second.handle, 1,
                                              &region);
@@ -3769,7 +3892,7 @@ namespace sogen
     }
 
     int32_t vulkan_host::cmd_resolve_image(uint64_t command_buffer, uint64_t src_image, uint32_t src_layout, uint64_t dst_image,
-                                           uint32_t dst_layout, uint32_t width, uint32_t height, uint32_t aspect_mask)
+                                           uint32_t dst_layout, const image_copy_region& r)
     {
         const auto cb = this->impl_->command_buffers.find(command_buffer);
         const auto src = this->impl_->images.find(src_image);
@@ -3787,11 +3910,17 @@ namespace sogen
         }
 
         VkImageResolve region{};
-        region.srcSubresource = {.aspectMask = aspect_mask, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1};
-        region.srcOffset = {.x = 0, .y = 0, .z = 0};
-        region.dstSubresource = {.aspectMask = aspect_mask, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1};
-        region.dstOffset = {.x = 0, .y = 0, .z = 0};
-        region.extent = {.width = width, .height = height, .depth = 1};
+        region.srcSubresource = {.aspectMask = r.src_aspect_mask,
+                                 .mipLevel = r.src_mip_level,
+                                 .baseArrayLayer = r.src_base_array_layer,
+                                 .layerCount = r.src_layer_count};
+        region.srcOffset = {.x = r.src_offset_x, .y = r.src_offset_y, .z = r.src_offset_z};
+        region.dstSubresource = {.aspectMask = r.dst_aspect_mask,
+                                 .mipLevel = r.dst_mip_level,
+                                 .baseArrayLayer = r.dst_base_array_layer,
+                                 .layerCount = r.dst_layer_count};
+        region.dstOffset = {.x = r.dst_offset_x, .y = r.dst_offset_y, .z = r.dst_offset_z};
+        region.extent = {.width = r.width, .height = r.height, .depth = r.depth};
 
         dev->second.cmd_resolve_image(cb->second.handle, src->second.handle, translate_layout(src_layout), dst->second.handle,
                                       translate_layout(dst_layout), 1, &region);
@@ -3924,10 +4053,7 @@ namespace sogen
         return VK_SUCCESS;
     }
 
-    int32_t vulkan_host::create_sampler(uint64_t device, uint32_t mag_filter, uint32_t min_filter, uint32_t address_mode_u,
-                                        uint32_t address_mode_v, uint32_t address_mode_w, uint32_t mipmap_mode, uint32_t compare_enable,
-                                        uint32_t compare_op, uint32_t anisotropy_enable, uint32_t border_color, float mip_lod_bias,
-                                        float max_anisotropy, float min_lod, float max_lod, uint64_t& out_sampler)
+    int32_t vulkan_host::create_sampler(const uint64_t device, const sampler_desc& desc, uint64_t& out_sampler)
     {
         out_sampler = 0;
         const auto dev = this->impl_->devices.find(device);
@@ -3936,32 +4062,45 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
-        // Custom border colors carry their RGBA in a VkSamplerCustomBorderColorCreateInfoEXT pNext that the
-        // bridge does not forward; without it the enum is invalid, so fall back to opaque black.
-        auto border = static_cast<VkBorderColor>(border_color);
-        if (border == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT || border == VK_BORDER_COLOR_INT_CUSTOM_EXT)
-        {
-            border = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
-        }
-
         VkSamplerCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        info.magFilter = static_cast<VkFilter>(mag_filter);
-        info.minFilter = static_cast<VkFilter>(min_filter);
-        info.mipmapMode = static_cast<VkSamplerMipmapMode>(mipmap_mode);
-        info.addressModeU = static_cast<VkSamplerAddressMode>(address_mode_u);
-        info.addressModeV = static_cast<VkSamplerAddressMode>(address_mode_v);
-        info.addressModeW = static_cast<VkSamplerAddressMode>(address_mode_w);
-        info.mipLodBias = mip_lod_bias;
-        info.anisotropyEnable = anisotropy_enable ? VK_TRUE : VK_FALSE;
-        info.maxAnisotropy = max_anisotropy < 1.0f ? 1.0f : max_anisotropy;
+        info.flags = desc.flags;
+        info.magFilter = static_cast<VkFilter>(desc.mag_filter);
+        info.minFilter = static_cast<VkFilter>(desc.min_filter);
+        info.mipmapMode = static_cast<VkSamplerMipmapMode>(desc.mipmap_mode);
+        info.addressModeU = static_cast<VkSamplerAddressMode>(desc.address_mode_u);
+        info.addressModeV = static_cast<VkSamplerAddressMode>(desc.address_mode_v);
+        info.addressModeW = static_cast<VkSamplerAddressMode>(desc.address_mode_w);
+        info.mipLodBias = desc.mip_lod_bias;
+        info.anisotropyEnable = desc.anisotropy_enable ? VK_TRUE : VK_FALSE;
+        info.maxAnisotropy = desc.max_anisotropy < 1.0f ? 1.0f : desc.max_anisotropy;
         // Depth-compare / PCF sampling (sampler2DShadow): a non-comparison sampler yields undefined results
         // here, which is what made shadow-mapped sun lighting render as fully shadowed.
-        info.compareEnable = compare_enable ? VK_TRUE : VK_FALSE;
-        info.compareOp = static_cast<VkCompareOp>(compare_op);
-        info.minLod = min_lod;
-        info.maxLod = max_lod;
-        info.borderColor = border;
+        info.compareEnable = desc.compare_enable ? VK_TRUE : VK_FALSE;
+        info.compareOp = static_cast<VkCompareOp>(desc.compare_op);
+        info.minLod = desc.min_lod;
+        info.maxLod = desc.max_lod;
+        info.borderColor = static_cast<VkBorderColor>(desc.border_color);
+        info.unnormalizedCoordinates = desc.unnormalized_coordinates ? VK_TRUE : VK_FALSE;
+
+        VkSamplerReductionModeCreateInfo reduction{};
+        if (desc.reduction_mode)
+        {
+            reduction.sType = VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO;
+            reduction.reductionMode = static_cast<VkSamplerReductionMode>(*desc.reduction_mode);
+            reduction.pNext = info.pNext;
+            info.pNext = &reduction;
+        }
+
+        VkSamplerCustomBorderColorCreateInfoEXT custom_border{};
+        if (desc.custom_border_color)
+        {
+            custom_border.sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT;
+            custom_border.format = static_cast<VkFormat>(desc.custom_border_color->first);
+            std::memcpy(&custom_border.customBorderColor, desc.custom_border_color->second.data(), sizeof(custom_border.customBorderColor));
+            custom_border.pNext = info.pNext;
+            info.pNext = &custom_border;
+        }
 
         VkSampler sampler{};
         const VkResult result = dev->second.create_sampler(dev->second.handle, &info, nullptr, &sampler);
@@ -4049,7 +4188,8 @@ namespace sogen
         return result;
     }
 
-    int32_t vulkan_host::get_surface_capabilities(uint64_t physical_device, uint64_t surface, void* out, size_t out_size)
+    int32_t vulkan_host::get_surface_capabilities(uint64_t physical_device, uint64_t surface, void* out, size_t out_size,
+                                                  const std::optional<std::pair<uint32_t, uint32_t>> current_extent)
     {
         const auto pd = this->impl_->physical_devices.find(physical_device);
         const auto surf = this->impl_->surfaces.find(surface);
@@ -4065,11 +4205,17 @@ namespace sogen
             return VK_ERROR_EXTENSION_NOT_PRESENT;
         }
 
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         VkSurfaceCapabilitiesKHR caps{};
         const VkResult result = instance->second.get_surface_capabilities(pd->second.handle, surf->second.handle, &caps);
         if (result != VK_SUCCESS)
         {
             return result;
+        }
+        if (current_extent)
+        {
+            caps.currentExtent.width = std::clamp(current_extent->first, caps.minImageExtent.width, caps.maxImageExtent.width);
+            caps.currentExtent.height = std::clamp(current_extent->second, caps.minImageExtent.height, caps.maxImageExtent.height);
         }
         if (out && out_size > 0)
         {
@@ -4204,6 +4350,7 @@ namespace sogen
             native_old_swapchain = old->second.handle;
         }
 
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         VkSwapchainCreateInfoKHR info{};
         info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         info.flags = static_cast<VkSwapchainCreateFlagsKHR>(flags);
@@ -4341,7 +4488,8 @@ namespace sogen
     }
 
     int32_t vulkan_host::queue_present(uint64_t queue, uint64_t swapchain, uint32_t image_index,
-                                       const std::vector<uint64_t>& wait_semaphores)
+                                       const std::vector<uint64_t>& wait_semaphores,
+                                       const std::function<int32_t(const std::function<int32_t()>&)>& run_unlocked)
     {
         const auto queue_it = this->impl_->queues.find(queue);
         const auto sc_it = this->impl_->swapchains.find(swapchain);
@@ -4377,7 +4525,24 @@ namespace sogen
         info.swapchainCount = 1;
         info.pSwapchains = &native_swapchain;
         info.pImageIndices = &image_index;
-        return dev_it->second.queue_present(queue_it->second.handle, &info);
+
+        const auto native_present = dev_it->second.queue_present;
+        auto* const native_queue = queue_it->second.handle;
+        const auto queue_lock = this->impl_->queue_lock(native_queue);
+        const auto presents = dev_it->second.presents;
+        std::shared_lock device_in_use(*presents);
+
+        // The device lock is released before run_unlocked returns, since its caller may then wait for a lock that a
+        // thread destroying the device holds.
+        return run_unlocked([&] {
+            int32_t result{};
+            {
+                const std::scoped_lock guard(*queue_lock);
+                result = native_present(native_queue, &info);
+            }
+            device_in_use.unlock();
+            return result;
+        });
     }
 
     int32_t vulkan_host::create_shader_module(uint64_t device, uint32_t flags, const void* code, size_t code_size, uint64_t& out_module)
@@ -5001,6 +5166,7 @@ namespace sogen
 
         const bool has_depth = depth_format != 0;
 
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         std::array<VkAttachmentDescription, 2> attachments{};
         attachments[0].format = static_cast<VkFormat>(format);
         attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -5507,7 +5673,8 @@ namespace sogen
         return result;
     }
 
-    int32_t vulkan_host::update_descriptor_sets(uint64_t device, std::span<const descriptor_write> writes)
+    int32_t vulkan_host::update_descriptor_sets(uint64_t device, std::span<const descriptor_write> writes,
+                                                std::span<const descriptor_copy> copies)
     {
         const auto dev = this->impl_->devices.find(device);
         if (dev == this->impl_->devices.end() || !dev->second.update_descriptor_sets)
@@ -5524,12 +5691,15 @@ namespace sogen
         static thread_local std::vector<VkDescriptorImageInfo> image_infos;
         static thread_local std::vector<VkBufferView> texel_buffer_views;
         static thread_local std::vector<VkWriteDescriptorSetInlineUniformBlock> inline_uniform_blocks;
+        static thread_local std::vector<VkCopyDescriptorSet> vk_copies;
         vk_writes.clear();
         buffer_infos.resize(writes.size());
         image_infos.resize(writes.size());
         texel_buffer_views.resize(writes.size());
         inline_uniform_blocks.resize(writes.size());
         vk_writes.reserve(writes.size());
+        vk_copies.clear();
+        vk_copies.reserve(copies.size());
 
         // Consecutive writes usually target the same descriptor set; cache the last lookup to avoid a hash
         // probe per write.
@@ -5643,9 +5813,32 @@ namespace sogen
             vk_writes.push_back(vw);
         }
 
-        if (!vk_writes.empty())
+        for (const descriptor_copy& c : copies)
         {
-            dev->second.update_descriptor_sets(dev->second.handle, static_cast<uint32_t>(vk_writes.size()), vk_writes.data(), 0, nullptr);
+            const auto src_set = this->impl_->descriptor_sets.find(c.src_set);
+            const auto dst_set = this->impl_->descriptor_sets.find(c.dst_set);
+            if (src_set == this->impl_->descriptor_sets.end() || dst_set == this->impl_->descriptor_sets.end() ||
+                src_set->second.device_id != device || dst_set->second.device_id != device)
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+
+            VkCopyDescriptorSet copy{};
+            copy.sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
+            copy.srcSet = src_set->second.handle;
+            copy.srcBinding = c.src_binding;
+            copy.srcArrayElement = c.src_array_element;
+            copy.dstSet = dst_set->second.handle;
+            copy.dstBinding = c.dst_binding;
+            copy.dstArrayElement = c.dst_array_element;
+            copy.descriptorCount = c.descriptor_count;
+            vk_copies.push_back(copy);
+        }
+
+        if (!vk_writes.empty() || !vk_copies.empty())
+        {
+            dev->second.update_descriptor_sets(dev->second.handle, static_cast<uint32_t>(vk_writes.size()), vk_writes.data(),
+                                               static_cast<uint32_t>(vk_copies.size()), vk_copies.data());
         }
         return VK_SUCCESS;
     }
@@ -5884,6 +6077,7 @@ namespace sogen
             return &identifier;
         };
 
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].pNext = initialize_identifier(0, vertex_shader);
@@ -6005,6 +6199,7 @@ namespace sogen
         rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rasterization.lineWidth = 1.0f;
 
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         VkPipelineMultisampleStateCreateInfo multisample{};
         multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         // The pipeline's sample count must match the render target it is used with; DXVK renders the menu
@@ -6140,6 +6335,7 @@ namespace sogen
             cache_handle = cache->second.handle;
         }
 
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         VkComputePipelineCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         info.flags = static_cast<VkPipelineCreateFlags>(flags);
@@ -6372,7 +6568,8 @@ namespace sogen
         return VK_SUCCESS;
     }
 
-    int32_t vulkan_host::cmd_bind_index_buffer(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint32_t index_type)
+    int32_t vulkan_host::cmd_bind_index_buffer(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t size,
+                                               uint32_t index_type)
     {
         const auto cb = this->impl_->command_buffers.find(command_buffer);
         const auto buf = this->impl_->buffers.find(buffer);
@@ -6381,11 +6578,22 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
-        if (dev == this->impl_->devices.end() || !dev->second.cmd_bind_index_buffer)
+        if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
-        dev->second.cmd_bind_index_buffer(cb->second.handle, buf->second.handle, offset, static_cast<VkIndexType>(index_type));
+        if (dev->second.maintenance5_enabled && dev->second.cmd_bind_index_buffer2)
+        {
+            dev->second.cmd_bind_index_buffer2(cb->second.handle, buf->second.handle, offset, size, static_cast<VkIndexType>(index_type));
+        }
+        else if (size == VK_WHOLE_SIZE && dev->second.cmd_bind_index_buffer)
+        {
+            dev->second.cmd_bind_index_buffer(cb->second.handle, buf->second.handle, offset, static_cast<VkIndexType>(index_type));
+        }
+        else
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
         return VK_SUCCESS;
     }
 

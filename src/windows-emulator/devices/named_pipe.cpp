@@ -2,6 +2,7 @@
 #include "named_pipe.hpp"
 #include "../windows_emulator.hpp"
 #include "../io_completion_wait.hpp"
+#include <algorithm>
 #include <utils/finally.hpp>
 
 namespace sogen
@@ -70,6 +71,8 @@ namespace sogen
         {
             io_device::queue_io_completion(win_emu, context);
         }
+
+        win_emu.wake_idle_vcpu();
     }
 
     NTSTATUS named_pipe::start_io(windows_emulator& win_emu, io_device_context context, const bool reading)
@@ -205,6 +208,7 @@ namespace sogen
     NTSTATUS named_pipe::enqueue_operation(windows_emulator& win_emu, io_device_context context,
                                            std::unique_ptr<utils::host_pipe_operation> operation, const operation_kind kind)
     {
+        context.issuing_thread_id = context.thread().id;
         pending_operation pending{.context = context,
                                   .operation = std::move(operation),
                                   .issuing_thread = win_emu.process.threads.find_handle(&context.thread()),
@@ -285,11 +289,23 @@ namespace sogen
         }
     }
 
-    bool named_pipe::cancel_io(windows_emulator& win_emu, const uint64_t io_status_block)
+    bool named_pipe::has_pending_io(const uint32_t issuing_thread_id) const
+    {
+        return std::ranges::any_of(this->pending_, [issuing_thread_id](const auto& operation) {
+            return operation.context.issuing_thread_id == issuing_thread_id;
+        });
+    }
+
+    bool named_pipe::cancel_io(windows_emulator& win_emu, const uint64_t io_status_block, const std::optional<uint32_t> issuing_thread_id)
     {
         bool cancelled{};
         for (auto it = this->pending_.begin(); it != this->pending_.end();)
         {
+            if (issuing_thread_id && it->context.issuing_thread_id != *issuing_thread_id)
+            {
+                ++it;
+                continue;
+            }
             if (io_status_block && it->context.io_status_block.value() != io_status_block &&
                 it->context.wow64_io_status_block.value() != io_status_block)
             {

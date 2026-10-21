@@ -392,26 +392,31 @@ namespace sogen
                 }
             }
 
-            // The RPC_UNICODE_STRING the request carries after the policy handle (NDR64: length, maximum length, buffer
-            // pointer, then the conformant varying array). Nothing if the request does not hold one.
-            static std::optional<std::u16string> read_request_string(windows_emulator& win_emu, const lpc_request_context& c)
+            // The RPC_UNICODE_STRING the request carries after the policy handle (length, maximum length, buffer pointer,
+            // then the conformant varying array: maximum count, offset, actual count, characters). NDR64 aligns the
+            // header to 8 and has 8-byte pointers and counts; NDR (32-bit clients) has 4-byte ones. Nothing if the
+            // request does not hold one.
+            static std::optional<std::u16string> read_request_string(windows_emulator& win_emu, const lpc_request_context& c,
+                                                                     const utils::aligned_binary_writer& writer)
             {
-                constexpr size_t length_offset = 0x18;
-                constexpr size_t actual_count_offset = 0x38;
-                constexpr size_t characters_offset = 0x40;
+                const auto ndr64 = writer.pointer_size() == utils::aligned_binary_writer::pointer_size_64;
+                const size_t length_offset = ndr64 ? 0x18 : 0x14;
+                const size_t actual_count_offset = ndr64 ? 0x38 : 0x24;
+                const size_t characters_offset = ndr64 ? 0x40 : 0x28;
                 if (c.send_buffer_length < characters_offset)
                 {
                     return std::nullopt;
                 }
 
                 const auto length = win_emu.emu().read_memory<uint16_t>(c.send_buffer + length_offset);
-                const auto count = win_emu.emu().read_memory<uint64_t>(c.send_buffer + actual_count_offset);
+                const auto count = ndr64 ? win_emu.emu().read_memory<uint64_t>(c.send_buffer + actual_count_offset)
+                                         : win_emu.emu().read_memory<uint32_t>(c.send_buffer + actual_count_offset);
                 if (count * sizeof(char16_t) != length || characters_offset + length > c.send_buffer_length)
                 {
                     return std::nullopt;
                 }
 
-                std::u16string value(count, u'\0');
+                std::u16string value(static_cast<size_t>(count), u'\0');
                 win_emu.emu().read_memory(c.send_buffer + characters_offset, value.data(), length);
                 return value;
             }
@@ -427,7 +432,7 @@ namespace sogen
             static NTSTATUS handle_lookup_privilege_value(windows_emulator& win_emu, const lpc_request_context& c,
                                                           utils::aligned_binary_writer& writer)
             {
-                const auto name = read_request_string(win_emu, c);
+                const auto name = read_request_string(win_emu, c, writer);
                 const auto* privilege = name ? find_privilege(*name) : nullptr;
                 writer.write<uint32_t>(privilege ? privilege->luid : 0);
                 writer.write<int32_t>(0);
@@ -463,7 +468,7 @@ namespace sogen
             static NTSTATUS handle_lookup_privilege_display_name(windows_emulator& win_emu, const lpc_request_context& c,
                                                                  utils::aligned_binary_writer& writer)
             {
-                const auto name = read_request_string(win_emu, c);
+                const auto name = read_request_string(win_emu, c, writer);
                 const auto* privilege = name ? find_privilege(*name) : nullptr;
                 if (!privilege)
                 {

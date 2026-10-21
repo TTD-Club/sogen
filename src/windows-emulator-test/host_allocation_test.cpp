@@ -30,13 +30,13 @@ namespace sogen::test
             // rescan would re-pick these identically every iteration.
             std::vector<host_reserved_range> hidden_from_full_scan{};
 
-            std::vector<host_reserved_range> claimed_ranges{};
+            std::vector<guest_address_range> claimed_ranges{};
             std::vector<guest_address_range> released_ranges{};
             bool requires_host_identity{};
             std::optional<uint64_t> mapped_host_address{};
             void* mapped_host_pointer{};
 
-            void reserve_guest_address_range(const uint64_t address, const size_t size) override
+            void reserve_guest_address_range(const uint64_t address, const uint64_t size) override
             {
                 this->claimed_ranges.push_back({.address = address, .size = size});
             }
@@ -51,7 +51,7 @@ namespace sogen::test
                 return this->foreign_ranges;
             }
 
-            std::vector<host_reserved_range> reserved_host_ranges_in(const uint64_t address, const size_t size) const override
+            std::vector<host_reserved_range> reserved_host_ranges_in(const uint64_t address, const uint64_t size) const override
             {
                 std::vector<host_reserved_range> result{};
                 const auto window_end = address + size;

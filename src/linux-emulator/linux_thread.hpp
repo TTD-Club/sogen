@@ -179,6 +179,16 @@ namespace sogen
             emu.set_segment_base(x86_register::fs, this->saved_regs.fs_base);
             emu.set_segment_base(x86_register::gs, this->saved_regs.gs_base);
         }
+
+        friend void serialize(utils::buffer_serializer& buffer, const linux_thread& value)
+        {
+            buffer.write_zero_padded(value, &linux_thread::tid, &linux_thread::stack_base, &linux_thread::stack_size,
+                                     &linux_thread::fs_base, &linux_thread::clear_child_tid, &linux_thread::set_child_tid,
+                                     &linux_thread::robust_list_head, &linux_thread::signal_mask, &linux_thread::terminated,
+                                     &linux_thread::exit_code, &linux_thread::executed_instructions, &linux_thread::wait_state,
+                                     &linux_thread::futex_wait_address, &linux_thread::futex_wait_val, &linux_thread::futex_wait_bitset,
+                                     &linux_thread::sleep_deadline_ns, &linux_thread::saved_regs);
+        }
     };
 
 } // namespace sogen

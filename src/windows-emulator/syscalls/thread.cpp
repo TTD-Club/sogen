@@ -134,6 +134,7 @@ namespace sogen
                     const bool needs_switch = thread != c.vcpu.active_thread;
                     if (needs_switch)
                     {
+                        c.win_emu.wait_for_register_transfer(*thread);
                         c.vcpu.active_thread->save(c.emu);
                         thread->restore(c.emu);
                     }
@@ -276,6 +277,16 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            if (info_class == ThreadPagePriority)
+            {
+                if (thread_information_length != sizeof(ULONG))
+                {
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+
+                return STATUS_SUCCESS;
+            }
+
             c.win_emu.log.error("Unsupported thread set info class: %X\n", info_class);
             c.emu.stop();
             return STATUS_NOT_SUPPORTED;
@@ -331,6 +342,26 @@ namespace sogen
             }
 
             emulator_thread& cur_emulator_thread = c.thread();
+
+            if (info_class == ThreadIsIoPending)
+            {
+                if (thread_information_length != sizeof(ULONG))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if (thread_information % alignof(ULONG) != 0)
+                {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                const auto pending = std::ranges::any_of(c.proc.devices | std::views::values,
+                                                         [thread](const auto& device) { return device.has_pending_io(thread->id); });
+                const emulator_object<ULONG> info{c.emu, thread_information};
+                if (!info.try_write(pending) || (return_length && !return_length.try_write(sizeof(ULONG))))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                return STATUS_SUCCESS;
+            }
 
             if (info_class == ThreadWow64Context)
             {
@@ -574,6 +605,26 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            if (info_class == ThreadPagePriority)
+            {
+                constexpr ULONG normal_page_priority = 5; // MEMORY_NORMAL_PRIORITY
+
+                if (return_length)
+                {
+                    return_length.write(sizeof(ULONG));
+                }
+
+                if (thread_information_length != sizeof(ULONG))
+                {
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+
+                const emulator_object<ULONG> info{c.emu, thread_information};
+                info.write(normal_page_priority);
+
+                return STATUS_SUCCESS;
+            }
+
             c.win_emu.log.error("Unsupported thread query info class: 0x%X\n", info_class);
             c.emu.stop();
 
@@ -687,6 +738,7 @@ namespace sogen
 
             c.proc.terminate_thread(*thread, exit_status);
             c.win_emu.callbacks.on_thread_terminated(thread_handle, *thread);
+            c.win_emu.wake_idle_vcpu();
 
             if (thread == c.vcpu.active_thread)
             {
@@ -702,7 +754,9 @@ namespace sogen
             auto& t = c.thread();
             if (delay_interval.value())
             {
-                t.await_time = utils::convert_delay_interval_to_time_point(c.win_emu.clock(), delay_interval.read());
+                const auto interval = delay_interval.read();
+                t.await_time = interval.QuadPart == 0 ? std::chrono::steady_clock::time_point{}
+                                                      : utils::convert_delay_interval_to_time_point(c.win_emu.clock(), interval);
             }
             c.win_emu.yield_thread(c.vcpu, alertable);
 
@@ -719,6 +773,7 @@ namespace sogen
                     // subsequent NtWaitForAlertByThreadId consumes it instead of blocking forever. This race-free
                     // delivery is what ntdll's critical sections and SRW locks rely on.
                     t.alerted = true;
+                    c.win_emu.wake_idle_vcpu();
                     return STATUS_SUCCESS;
                 }
             }
@@ -847,6 +902,10 @@ namespace sogen
             if (old_count > 0)
             {
                 thread->suspended -= 1;
+                if (old_count == 1)
+                {
+                    c.win_emu.wake_idle_vcpu();
+                }
             }
 
             return STATUS_SUCCESS;
@@ -936,6 +995,7 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
+            c.win_emu.wait_for_register_transfer(*thread);
             c.vcpu.active_thread->save(c.emu);
             const auto _ = utils::finally([&] {
                 c.vcpu.active_thread->restore(c.emu); //
@@ -958,7 +1018,7 @@ namespace sogen
         NTSTATUS handle_NtSetContextThread(const syscall_context& c, const handle thread_handle,
                                            const emulator_object<CONTEXT64> thread_context)
         {
-            const auto* thread = thread_handle == CURRENT_THREAD ? c.vcpu.active_thread : c.proc.threads.get(thread_handle);
+            auto* thread = thread_handle == CURRENT_THREAD ? c.vcpu.active_thread : c.proc.threads.get(thread_handle);
 
             if (!thread)
             {
@@ -969,6 +1029,7 @@ namespace sogen
 
             if (needs_swich)
             {
+                c.win_emu.wait_for_register_transfer(*thread);
                 c.vcpu.active_thread->save(c.emu);
                 thread->restore(c.emu);
             }
@@ -976,7 +1037,8 @@ namespace sogen
             const auto _ = utils::finally([&] {
                 if (needs_swich)
                 {
-                    c.vcpu.active_thread->restore(c.emu); //
+                    thread->save(c.emu);
+                    c.vcpu.active_thread->restore(c.emu);
                 }
             });
 
@@ -1048,6 +1110,11 @@ namespace sogen
 
             const auto h = c.proc.create_thread(c.win_emu.memory, start_routine, argument, actual_stack_size, create_flags);
             c.proc.threads.get(h)->inherit = object_attributes && (object_attributes.read().Attributes & OBJ_INHERIT) != 0;
+
+            if (!(create_flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED))
+            {
+                c.win_emu.wake_idle_vcpu();
+            }
 
             thread_handle.write(h);
 
@@ -1130,6 +1197,7 @@ namespace sogen
                 .apc_argument3 = apc_argument3,
             });
 
+            c.win_emu.wake_idle_vcpu();
             return STATUS_SUCCESS;
         }
 

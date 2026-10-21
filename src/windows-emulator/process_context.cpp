@@ -321,10 +321,15 @@ namespace sogen
 
             return env_map;
         }
+
+        // RtlpWaitOnCriticalSection waits PEB->CriticalSectionTimeout; zero times out immediately instead of blocking. Windows seeds it
+        // from MmCritsectTimeout (30 days).
+        constexpr auto critical_section_timeout = static_cast<uint64_t>(-25920000000000LL);
     }
 
     void process_context::setup(windows_emulator& win_emu, const application_settings& app_settings, const mapped_module& executable,
-                                const mapped_module& ntdll, const apiset::container& apiset_container, const mapped_module* ntdll32)
+                                const mapped_module& ntdll, const apiset::container& apiset_container, const mapped_module* ntdll32,
+                                const bool intercept_kusd)
     {
         this->process_id = app_settings.process_id;
         this->initial_thread_id = app_settings.thread_id;
@@ -341,7 +346,7 @@ namespace sogen
 
         setup_gdt(emu, win_emu.memory);
 
-        this->kusd.setup(version, fake_env);
+        this->kusd.setup(version, fake_env, intercept_kusd);
 
         this->base_allocator = create_allocator(win_emu.memory, PEB_SEGMENT_SIZE, this->is_wow64_process);
         auto& allocator = this->base_allocator;
@@ -445,6 +450,7 @@ namespace sogen
             p.NumberOfHeaps = 0x00000000;
             p.MaximumNumberOfHeaps = 0x00000010;
             p.NumberOfProcessors = fake_env.number_of_processors;
+            p.CriticalSectionTimeout.QuadPart = critical_section_timeout;
             p.ImageSubsystemMajorVersion = 6;
 
             // TODO: p.SessionId = 1;
@@ -473,9 +479,9 @@ namespace sogen
                 params32.Flags = RTL_USER_PROCESS_PARAMETERS_IMAGE_KEY_MISSING | RTL_USER_PROCESS_PARAMETERS_APP_MANIFEST_PRESENT |
                                  RTL_USER_PROCESS_PARAMETERS_NORMALIZED;
 
-                params32.ConsoleHandle = static_cast<uint32_t>(CONSOLE_HANDLE.h);
-                params32.StandardOutput = static_cast<uint32_t>(STDOUT_HANDLE.h);
-                params32.StandardInput = static_cast<uint32_t>(STDIN_HANDLE.h);
+                params32.ConsoleHandle = static_cast<uint32_t>(CONSOLE_HANDLE_WOW64.bits);
+                params32.StandardOutput = static_cast<uint32_t>(STDOUT_HANDLE_WOW64.bits);
+                params32.StandardInput = static_cast<uint32_t>(STDIN_HANDLE_WOW64.bits);
                 params32.StandardError = params32.StandardOutput;
 
                 this->process_params64.access([&](const RTL_USER_PROCESS_PARAMETERS64& params64) {
@@ -494,11 +500,15 @@ namespace sogen
                     // Copy other fields
                     params32.CurrentDirectory.Handle = static_cast<uint32_t>(params64.CurrentDirectory.Handle);
                     params32.ShowWindowFlags = params64.ShowWindowFlags;
-                    params32.ConsoleHandle = static_cast<uint32_t>(params64.ConsoleHandle);
+                    // Console handles as 32-bit code can use them (see CONSOLE_HANDLE_WOW64).
+                    const auto console_handle32 = [](const uint64_t value) {
+                        return static_cast<uint32_t>(console_handle_for(make_handle(value), true).bits);
+                    };
+                    params32.ConsoleHandle = console_handle32(params64.ConsoleHandle);
                     params32.ConsoleFlags = params64.ConsoleFlags;
-                    params32.StandardInput = static_cast<uint32_t>(params64.StandardInput);
-                    params32.StandardOutput = static_cast<uint32_t>(params64.StandardOutput);
-                    params32.StandardError = static_cast<uint32_t>(params64.StandardError);
+                    params32.StandardInput = console_handle32(params64.StandardInput);
+                    params32.StandardOutput = console_handle32(params64.StandardOutput);
+                    params32.StandardError = console_handle32(params64.StandardError);
                     params32.StartingX = params64.StartingX;
                     params32.StartingY = params64.StartingY;
                     params32.CountX = params64.CountX;
@@ -542,6 +552,7 @@ namespace sogen
                 p32.NumberOfHeaps = 0;
                 p32.MaximumNumberOfHeaps = 0x10;
                 p32.NumberOfProcessors = fake_env.number_of_processors;
+                p32.CriticalSectionTimeout.QuadPart = critical_section_timeout;
                 p32.ImageSubsystemMajorVersion = 6;
 
                 // TODO: p32.SessionId = 1;
@@ -747,6 +758,7 @@ namespace sogen
         buffer.write(this->kusd);
 
         buffer.write(this->is_wow64_process);
+        buffer.write(this->hard_error_mode);
         buffer.write(this->ntdll_image_base);
         buffer.write(this->ldr_initialize_thunk);
         buffer.write(this->rtl_user_thread_start);
@@ -768,6 +780,8 @@ namespace sogen
         buffer.write_optional(this->etw_notification_event);
         buffer.write(this->mouse_capture_window);
         buffer.write(this->foreground_window);
+        buffer.write_optional(this->timer_resolution_request);
+        buffer.write_optional(this->cursor_clip);
         buffer.write(this->cursor_x);
         buffer.write(this->cursor_y);
         buffer.write(this->current_cursor);
@@ -779,6 +793,10 @@ namespace sogen
         buffer.write(this->raw_mouse_target);
         buffer.write(this->raw_keyboard_registered);
         buffer.write(this->raw_keyboard_target);
+        buffer.write_vector(this->pending_low_level_input);
+        buffer.write(this->next_low_level_input_id);
+        buffer.write(this->next_hook_handle);
+        buffer.write(this->drop_low_level_characters);
         buffer.write_map(this->raw_inputs);
         buffer.write(this->next_raw_input_token);
         buffer.write_map(this->token_privileges);
@@ -856,6 +874,7 @@ namespace sogen
         buffer.read(this->kusd);
 
         buffer.read(this->is_wow64_process);
+        buffer.read(this->hard_error_mode);
         buffer.read(this->ntdll_image_base);
         buffer.read(this->ldr_initialize_thunk);
         buffer.read(this->rtl_user_thread_start);
@@ -877,6 +896,8 @@ namespace sogen
         buffer.read_optional(this->etw_notification_event);
         buffer.read(this->mouse_capture_window);
         buffer.read(this->foreground_window);
+        buffer.read_optional(this->timer_resolution_request);
+        buffer.read_optional(this->cursor_clip);
         buffer.read(this->cursor_x);
         buffer.read(this->cursor_y);
         buffer.read(this->current_cursor);
@@ -888,6 +909,10 @@ namespace sogen
         buffer.read(this->raw_mouse_target);
         buffer.read(this->raw_keyboard_registered);
         buffer.read(this->raw_keyboard_target);
+        buffer.read_vector(this->pending_low_level_input);
+        buffer.read(this->next_low_level_input_id);
+        buffer.read(this->next_hook_handle);
+        buffer.read(this->drop_low_level_characters);
         buffer.read_map(this->raw_inputs);
         buffer.read(this->next_raw_input_token);
         buffer.read_map(this->token_privileges);

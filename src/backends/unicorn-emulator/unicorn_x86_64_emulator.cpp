@@ -214,8 +214,10 @@ namespace sogen::unicorn
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
 #endif
+                // 2 GB of translated code on 64-bit hosts. A 32-bit host has 2 GB of address space in all, and two
+                // emulators (a restored copy next to its source) must fit in it.
                 constexpr auto is_64_bit = sizeof(void*) >= 8;
-                uce(uc_ctl_set_tcg_buffer_size(this->uc_, (is_64_bit ? 2 : 1) << 30 /* 2 gb */));
+                uce(uc_ctl_set_tcg_buffer_size(this->uc_, is_64_bit ? (2u << 30) : (256u << 20)));
 
 #ifndef OS_WINDOWS
 #pragma GCC diagnostic pop
@@ -312,7 +314,7 @@ namespace sogen::unicorn
                 }
 
                 size_t result_size = sizeof(msr_value);
-                uce(uc_reg_read2(*this, (int)x86_register::msr, &msr_val, &result_size));
+                uce(uc_reg_read2(*this, static_cast<int>(x86_register::msr), &msr_val, &result_size));
 
                 return msr_val.value;
             }
@@ -321,6 +323,10 @@ namespace sogen::unicorn
             {
                 auto result_size = size;
                 ++this->register_generation_;
+                if (reg == UC_X86_REG_RIP || reg == UC_X86_REG_EIP || reg == UC_X86_REG_IP)
+                {
+                    this->violation_ip_ = std::nullopt;
+                }
                 uce(uc_reg_write2(*this, reg, value, &result_size));
 
                 if (size < result_size)
@@ -855,6 +861,7 @@ namespace sogen::unicorn
 
                 this->touch_memory();
                 ++this->register_generation_;
+                this->violation_ip_ = std::nullopt;
                 const uc_context_serializer serializer(this->uc_, is_snapshot);
                 serializer.deserialize(buffer);
             }
@@ -889,6 +896,7 @@ namespace sogen::unicorn
             {
                 utils::buffer_deserializer buffer{register_data};
                 ++this->register_generation_;
+                this->violation_ip_ = std::nullopt;
                 const uc_context_serializer serializer(this->uc_, false);
                 serializer.deserialize(buffer);
             }
