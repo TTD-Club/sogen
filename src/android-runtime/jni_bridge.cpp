@@ -3,6 +3,9 @@
 
 #include <android/native_window_jni.h>
 
+#include <algorithm>
+#include <array>
+
 namespace
 {
     using sogen::android::session;
@@ -97,11 +100,11 @@ extern "C"
         delete reinterpret_cast<session*>(handle);
     }
 
-    JNIEXPORT jint JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeRun(JNIEnv* env, jobject /*self*/, const jlong handle, jstring root,
-                                                                            jstring application, jobjectArray arguments,
-                                                                            jobjectArray environment, jobjectArray path_mappings,
-                                                                            jstring working_directory, jstring backend,
-                                                                            const jboolean live_network)
+    JNIEXPORT jint JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeRun(
+        JNIEnv* env, jobject /*self*/, const jlong handle, jstring root, jstring application, jobjectArray arguments,
+        jobjectArray environment, jobjectArray path_mappings, jstring working_directory, jstring backend, const jboolean live_network,
+        jstring sandbox_executable, jstring vulkan_hook_directory, jstring vulkan_driver_directory, jstring vulkan_driver_name,
+        jstring snapshot_directory, jstring resume_file)
     {
         const sogen::android::run_config config{
             .emulation_root = to_string(*env, root),
@@ -112,6 +115,15 @@ extern "C"
             .working_directory = to_string(*env, working_directory),
             .backend = to_string(*env, backend),
             .live_network = live_network == JNI_TRUE,
+            .sandbox_executable = to_string(*env, sandbox_executable),
+            .vulkan =
+                {
+                    .hook_directory = to_string(*env, vulkan_hook_directory),
+                    .custom_directory = to_string(*env, vulkan_driver_directory),
+                    .custom_name = to_string(*env, vulkan_driver_name),
+                },
+            .snapshot_directory = to_string(*env, snapshot_directory),
+            .resume_file = to_string(*env, resume_file),
         };
 
         return get_session(handle).run(config);
@@ -120,6 +132,52 @@ extern "C"
     JNIEXPORT void JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeStop(JNIEnv* /*env*/, jobject /*self*/, const jlong handle)
     {
         get_session(handle).stop();
+    }
+
+    JNIEXPORT jboolean JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeSuspend(JNIEnv* env, jobject /*self*/, const jlong handle,
+                                                                                    jstring destination)
+    {
+        return get_session(handle).suspend(to_string(*env, destination)) ? JNI_TRUE : JNI_FALSE;
+    }
+
+    JNIEXPORT void JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeSetFrameLimit(JNIEnv* /*env*/, jobject /*self*/, const jlong handle,
+                                                                                      const jint frames_per_second)
+    {
+        get_session(handle).set_frame_limit(static_cast<uint32_t>(std::max(frames_per_second, 0)));
+    }
+
+    // Frames presented so far and the longest present interval since the last call, or null while nothing runs.
+    JNIEXPORT jlongArray JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeFrameStatistics(JNIEnv* env, jobject /*self*/,
+                                                                                              const jlong handle)
+    {
+        const auto statistics = get_session(handle).frame_statistics();
+        if (!statistics)
+        {
+            return nullptr;
+        }
+
+        const std::array<jlong, 2> values{static_cast<jlong>(statistics->frames),
+                                          static_cast<jlong>(statistics->worst_present_interval_ns)};
+        auto* result = env->NewLongArray(static_cast<jsize>(values.size()));
+        if (result)
+        {
+            env->SetLongArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());
+        }
+        return result;
+    }
+
+    JNIEXPORT void JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeConsoleInput(JNIEnv* env, jobject /*self*/, const jlong handle,
+                                                                                     jbyteArray data)
+    {
+        std::string bytes(static_cast<size_t>(env->GetArrayLength(data)), '\0');
+        env->GetByteArrayRegion(data, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<jbyte*>(bytes.data()));
+        get_session(handle).console_input(bytes);
+    }
+
+    JNIEXPORT void JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeConsoleResize(JNIEnv* /*env*/, jobject /*self*/, const jlong handle,
+                                                                                      const jint columns, const jint rows)
+    {
+        get_session(handle).console_resize(static_cast<uint16_t>(columns), static_cast<uint16_t>(rows));
     }
 
     JNIEXPORT void JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeAttachSurface(JNIEnv* env, jobject /*self*/, const jlong handle,
@@ -154,6 +212,13 @@ extern "C"
     {
         get_session(handle).with_ui(
             [&](sogen::android::android_ui_backend& ui) { ui.post_mouse_move(static_cast<sogen::hwnd>(window), x, y); });
+    }
+
+    JNIEXPORT void JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeMouseMotion(JNIEnv* /*env*/, jobject /*self*/, const jlong handle,
+                                                                                    const jlong window, const jint dx, const jint dy)
+    {
+        get_session(handle).with_ui(
+            [&](sogen::android::android_ui_backend& ui) { ui.post_mouse_motion(static_cast<sogen::hwnd>(window), dx, dy); });
     }
 
     JNIEXPORT void JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeMouseButton(JNIEnv* /*env*/, jobject /*self*/, const jlong handle,

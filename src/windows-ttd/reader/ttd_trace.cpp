@@ -2035,8 +2035,10 @@ namespace sogen::ttd
         // its layout version, default allocation address and DEP flag, the reservations (base, kind, mapped file name,
         // initial protection, length, and committed ranges with their protection), then the contents of the committed
         // ranges of every reservation but MMIO, in that order. By address: each range's length and its offset in `data`,
-        // SIZE_MAX (trace::checkpoint_memory::no_contents) for MMIO.
-        std::map<uint64_t, std::pair<uint64_t, size_t>> parse_checkpoint_memory(const std::span<const std::byte> data, const size_t offset)
+        // SIZE_MAX (trace::checkpoint_memory::no_contents) for MMIO. Before version 9, each character of a mapped file
+        // name is a field of its own; since then the name is one field.
+        std::map<uint64_t, std::pair<uint64_t, size_t>> parse_checkpoint_memory(const std::span<const std::byte> data, const size_t offset,
+                                                                                const bool whole_strings)
         {
             constexpr uint8_t mmio_kind = 5;
             constexpr size_t no_contents = SIZE_MAX;
@@ -2059,9 +2061,21 @@ namespace sogen::ttd
             {
                 (void)fields.u64();
                 reserved.kind = fields.u8();
-                for (auto name_length = fields.u64(); name_length; --name_length)
+                const auto name_length = fields.u64();
+                if (whole_strings)
                 {
-                    (void)fields.field(name_char_size);
+                    if (name_length > data.size() / name_char_size)
+                    {
+                        throw std::runtime_error("Invalid TTD checkpoint memory");
+                    }
+                    (void)fields.field(name_length * name_char_size);
+                }
+                else
+                {
+                    for (auto remaining = name_length; remaining; --remaining)
+                    {
+                        (void)fields.field(name_char_size);
+                    }
                 }
                 (void)fields.u8();
                 (void)fields.u64();
@@ -2100,8 +2114,8 @@ namespace sogen::ttd
         }
         auto memory = std::make_shared<checkpoint_memory>();
         memory->state = checkpoint_state_at(index);
-        memory->ranges =
-            parse_checkpoint_memory(*memory->state, static_cast<size_t>(checkpoint_memory_offsets_.at(static_cast<size_t>(index))));
+        memory->ranges = parse_checkpoint_memory(
+            *memory->state, static_cast<size_t>(checkpoint_memory_offsets_.at(static_cast<size_t>(index))), version_ >= 9);
         cache_checkpoint<checkpoint_memory>(checkpoint_memory_cache_, index, memory, checkpoint_cache_size_);
         return memory;
     }

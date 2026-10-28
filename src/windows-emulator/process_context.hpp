@@ -1,4 +1,6 @@
 #pragma once
+#include "section_view_manager.hpp"
+#include "arch/windows_abi.hpp"
 
 #include "emulator_utils.hpp"
 #include "handles.hpp"
@@ -377,14 +379,17 @@ namespace sogen
             }
         };
 
-        process_context(x86_64_emulator& emu, memory_manager& memory, utils::clock& clock, callbacks& cb)
+        process_context(memory_interface& emu, memory_manager& memory, utils::clock& clock, callbacks& cb, const bool intercept_kusd,
+                        const windows_guest_architecture architecture = windows_guest_architecture::x86_64)
             : callbacks_(&cb),
               base_allocator(emu),
               peb64(emu),
               process_params64(emu),
-              kusd(memory, clock),
+              kusd(memory, clock, intercept_kusd),
               user_handles(memory)
         {
+            (void)windows_abi_for(architecture);
+            this->native_architecture = architecture;
             emulator_process current_process{};
             current_process.id = process_id;
             [[maybe_unused]] const auto process_handle = this->processes.store(std::move(current_process));
@@ -392,8 +397,7 @@ namespace sogen
         }
 
         void setup(windows_emulator& win_emu, const application_settings& app_settings, const mapped_module& executable,
-                   const mapped_module& ntdll, const apiset::container& apiset_container, const mapped_module* ntdll32 = nullptr,
-                   bool intercept_kusd = true);
+                   const mapped_module& ntdll, const apiset::container& apiset_container, const mapped_module* ntdll32 = nullptr);
 
         static emulator_pointer allocate_user_class(memory_manager& memory, std::u16string_view class_name);
 
@@ -436,6 +440,12 @@ namespace sogen
 
         // WOW64 support flag - set during process setup based on executable architecture
         bool is_wow64_process{false};
+        windows_guest_architecture native_architecture{windows_guest_architecture::x86_64};
+
+        const windows_arch_abi& abi() const
+        {
+            return windows_abi_for(this->native_architecture);
+        }
 
         uint32_t hard_error_mode{0};
 
@@ -447,6 +457,8 @@ namespace sogen
         uint64_t shared_section_size{0};
         uint64_t dbwin_buffer{0};
         uint64_t dbwin_buffer_size{0};
+        std::map<uint64_t, uint32_t> orphaned_section_backings{};
+        section_view_manager section_views{};
 
         std::optional<NTSTATUS> exit_status{};
 
@@ -642,11 +654,6 @@ namespace sogen
         // opens follow them here.
         std::map<std::u16string, std::vector<uint8_t>> reparse_points{};
 
-        // Views mapped of each pagefile section's backing (by its address), and the backings whose section is closed:
-        // such a backing stays until its last view is unmapped, as a view keeps its section's pages.
-        std::map<uint64_t, uint32_t> pagefile_view_counts{};
-        std::map<uint64_t, bool> closed_pagefile_backings{};
-
         static uint64_t hash_page(std::span<const std::byte> page);
         // Writes the changed pages of the view at `base` overlapping [start, end) back to its file.
         void write_back_file_section_view(windows_emulator& win_emu, uint64_t base, uint64_t start, uint64_t end);
@@ -659,6 +666,15 @@ namespace sogen
         user_handle_table user_handles;
         handle default_monitor_handle{};
         handle default_desktop_window_handle{};
+
+        static constexpr uint32_t default_display_width = 1920;
+        static constexpr uint32_t default_display_height = 1080;
+        uint32_t display_width{default_display_width};
+        uint32_t display_height{default_display_height};
+        uint32_t registry_display_width{default_display_width};
+        uint32_t registry_display_height{default_display_height};
+
+        void set_display_mode(windows_emulator& win_emu, uint32_t width, uint32_t height);
         handle_store<handle_types::event, event> events{};
         handle_store<handle_types::file, file> files{};
         utils::insensitive_u16string_map<file_lock_ranges> file_locks{};
@@ -670,6 +686,7 @@ namespace sogen
         handle_store<handle_types::wait_completion_packet, wait_completion_packet> wait_completion_packets{};
         handle_store<handle_types::worker_factory, worker_factory> worker_factories{};
         handle_store<handle_types::job, job_object> jobs{};
+        handle_store<handle_types::thread_state_change, thread_state_change> thread_state_changes{};
         handle_store<handle_types::port, port_container> ports{};
         handle_store<handle_types::mutant, mutant> mutants{};
         handle_store<handle_types::private_namespace, private_namespace> private_namespaces{};
@@ -705,12 +722,17 @@ namespace sogen
         std::vector<alpc_reply_handle> pending_alpc_message_handles{};
         std::map<uint32_t, std::vector<std::array<uint64_t, 2>>> pending_alpc_reply_views{};
 
-        // The guest event a WASAPI EVENTCALLBACK client registered via SetEventHandle on its render endpoint.
-        // The audio render thread signals it at the device rate so the client's render loop wakes and refills the
-        // shared buffer. Stored as a handle rather than a pointer: the render thread is host-owned, so it signals
-        // this through windows_emulator::request_guest_event_signal, which resolves it under the kernel lock instead
-        // of racing a close on an emulator thread.
-        std::atomic<uint64_t> audio_render_event{};
+        // Guest events WASAPI EVENTCALLBACK clients registered via SetEventHandle, keyed by the stream whose endpoint
+        // port received them. The audio service hands each to its stream when the stream starts.
+        std::map<uint32_t, uint64_t> audio_render_events_by_stream{};
+
+        // Events registered through an unnamed endpoint port, keyed by the registering thread instead, which also
+        // starts the stream. An entry whose stream is never started stays until that thread registers again.
+        std::map<uint32_t, uint64_t> pending_audio_render_events{};
+
+        // Audio streams are numbered per process, so an endpoint port name identifies one stream across every
+        // audio-service connection.
+        uint32_t next_audio_stream_id{1};
 
         // Extended parameters from last NtMapViewOfSectionEx call
         // These can be used by other syscalls like NtAllocateVirtualMemoryEx

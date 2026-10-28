@@ -210,7 +210,7 @@ def events(path):
     """(step, ip, address, size, kind, payload, thread) tuples; thread is None without recorded thread switches."""
     with open(path, "rb") as file:
         magic = file.read(8)
-    if magic in (b"SOGTTD7\0", b"SOGTTD8\0"):
+    if magic in (b"SOGTTD7\0", b"SOGTTD8\0", b"SOGTTD9\0"):
         import ttd_format
 
         trace = ttd_format.Trace(path)

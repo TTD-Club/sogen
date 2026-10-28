@@ -16,13 +16,19 @@ namespace sogen
     class windows_emulator;
     class windows_version_manager;
 
+    // The simulated physical memory, about 48 GB, which the KUSD and every memory query report.
+    constexpr uint32_t simulated_physical_page_count = 0x00bf0958;
+
+    // Describes an ARM64 machine the way Windows on ARM does: ARM64 image numbers and architecture, no
+    // XState, and processor features derived from the CPU's identification registers.
+    void apply_arm64_processor(KUSER_SHARED_DATA64& kusd, uint64_t isar0, uint64_t isar1);
+
     class kusd_mmio
     {
       public:
-        kusd_mmio(memory_manager& memory, utils::clock& clock);
+        // Trapping every guest read keeps the times exact; otherwise the page is plain memory that refresh() updates.
+        kusd_mmio(memory_manager& memory, utils::clock& clock, bool intercept);
         ~kusd_mmio();
-
-        kusd_mmio(utils::buffer_deserializer& buffer);
 
         kusd_mmio(kusd_mmio&&) = delete;
         kusd_mmio(const kusd_mmio&) = delete;
@@ -50,7 +56,7 @@ namespace sogen
 
         static uint64_t address();
 
-        void setup(const windows_version_manager& version, const fake_environment_config& fake_env, bool intercept = true);
+        void setup(const windows_version_manager& version, const fake_environment_config& fake_env);
 
         void refresh();
 
@@ -59,7 +65,7 @@ namespace sogen
         utils::clock* clock_{};
 
         bool registered_{};
-        bool intercept_{true};
+        bool intercept_{};
 
         // The MMIO read callback runs on the WHP worker thread during guest execution
         // (outside the kernel lock), so multiple vCPUs can read KUSD concurrently. This

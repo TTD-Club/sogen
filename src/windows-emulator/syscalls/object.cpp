@@ -12,7 +12,7 @@ namespace sogen
     {
         NTSTATUS handle_NtSetEvent(const syscall_context& c, uint64_t handle, emulator_object<LONG> previous_state);
         NTSTATUS handle_NtReleaseMutant(const syscall_context& c, handle mutant_handle, emulator_object<LONG> previous_count);
-        NTSTATUS handle_NtReleaseSemaphore(const syscall_context& c, handle semaphore_handle, ULONG release_count,
+        NTSTATUS handle_NtReleaseSemaphore(const syscall_context& c, handle semaphore_handle, LONG release_count,
                                            emulator_object<LONG> previous_count);
 
         namespace
@@ -63,6 +63,25 @@ namespace sogen
         constexpr ULONG duplicate_close_source = 1;
         constexpr ULONG duplicate_same_access = 2;
 
+        void resume_state_change_suspensions(const syscall_context& c, const thread_state_change& state)
+        {
+            for (auto& thread : c.proc.threads | std::views::values)
+            {
+                if (thread.id != state.thread_id)
+                {
+                    continue;
+                }
+
+                const auto resumed = std::min(thread.suspended, state.suspend_count);
+                thread.suspended -= resumed;
+                if (resumed != 0 && thread.suspended == 0)
+                {
+                    c.win_emu.wake_idle_vcpu();
+                }
+                return;
+            }
+        }
+
         NTSTATUS handle_NtClose(const syscall_context& c, const handle h)
         {
             const auto value = h.value;
@@ -84,6 +103,15 @@ namespace sogen
             if (object && object->protect_from_close)
             {
                 return STATUS_HANDLE_NOT_CLOSABLE;
+            }
+
+            if (value.type == handle_types::thread_state_change)
+            {
+                const auto* state = c.proc.thread_state_changes.get(h);
+                if (state && state->ref_count == 1)
+                {
+                    resume_state_change_suspensions(c, *state);
+                }
             }
 
             if (value.type == handle_types::wait_completion_packet)
@@ -158,12 +186,16 @@ namespace sogen
             }
 
             uint64_t section_backing_address = 0;
+            uint32_t section_mapped_views = 0;
+            uint64_t section_view_storage_id = 0;
             if (value.type == handle_types::section)
             {
                 auto* section = c.proc.sections.get(h);
                 if (section && section->ref_count == 1)
                 {
                     section_backing_address = section->backing_address;
+                    section_mapped_views = section->mapped_view_count;
+                    section_view_storage_id = section->view_storage_id;
                 }
             }
 
@@ -180,19 +212,20 @@ namespace sogen
 
             if (handle_store && handle_store->erase(h))
             {
-                if (closing)
+                if (section_view_storage_id != 0)
                 {
-                    update_reparse_points_after_close(c.proc, *closing);
+                    c.proc.section_views.release_storage(section_view_storage_id);
                 }
-
-                // Mapped views keep the section's pages: the backing goes with the last of them.
-                if (section_backing_address != 0 && c.proc.pagefile_view_counts.contains(section_backing_address))
+                if (section_backing_address != 0)
                 {
-                    c.proc.closed_pagefile_backings[section_backing_address] = true;
-                }
-                else if (section_backing_address != 0)
-                {
-                    c.win_emu.memory.release_memory(section_backing_address, 0);
+                    if (section_mapped_views == 0)
+                    {
+                        c.win_emu.memory.release_memory(section_backing_address, 0);
+                    }
+                    else
+                    {
+                        c.proc.orphaned_section_backings[section_backing_address] = section_mapped_views;
+                    }
                 }
                 return STATUS_SUCCESS;
             }
@@ -306,6 +339,8 @@ namespace sogen
                 return u"TpWorkerFactory";
             case handle_types::job:
                 return u"Job";
+            case handle_types::thread_state_change:
+                return u"ThreadStateChange";
             case handle_types::private_namespace:
                 return u"Directory";
             case handle_types::process:
@@ -814,7 +849,7 @@ namespace sogen
 
             if (wake_mask != 0)
             {
-                t.remember_message_wait(c.emu);
+                t.remember_message_wait(c.emu, c.win_emu.abi());
             }
 
             c.win_emu.yield_thread(c.vcpu, false);
@@ -833,16 +868,14 @@ namespace sogen
                                                  const WAIT_TYPE wait_type, const BOOLEAN alertable,
                                                  const emulator_object<LARGE_INTEGER> timeout)
         {
-            if (wait_type != WaitAny && wait_type != WaitAll)
-            {
-                c.win_emu.log.error("Wait type not supported!\n");
-                c.emu.stop();
-                return STATUS_NOT_SUPPORTED;
-            }
-
             if (count == 0 || count > 64) // MAXIMUM_WAIT_OBJECTS
             {
-                return STATUS_INVALID_PARAMETER;
+                return STATUS_INVALID_PARAMETER_1;
+            }
+
+            if (wait_type != WaitAny && wait_type != WaitAll)
+            {
+                return STATUS_INVALID_PARAMETER_3;
             }
 
             auto& t = c.thread();
@@ -891,16 +924,14 @@ namespace sogen
                                                    const WAIT_TYPE wait_type, const BOOLEAN alertable,
                                                    const emulator_object<LARGE_INTEGER> timeout)
         {
-            if (wait_type != WaitAny && wait_type != WaitAll)
-            {
-                c.win_emu.log.error("Wait type not supported!\n");
-                c.emu.stop();
-                return STATUS_NOT_SUPPORTED;
-            }
-
             if (count == 0 || count > 64) // MAXIMUM_WAIT_OBJECTS
             {
-                return STATUS_INVALID_PARAMETER;
+                return STATUS_INVALID_PARAMETER_1;
+            }
+
+            if (wait_type != WaitAny && wait_type != WaitAll)
+            {
+                return STATUS_INVALID_PARAMETER_3;
             }
 
             auto& t = c.thread();

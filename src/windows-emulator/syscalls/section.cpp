@@ -197,6 +197,65 @@ namespace sogen
 
                 return std::nullopt;
             }
+
+            NTSTATUS map_section_storage_view(const syscall_context& c, const section& section_entry, const uint64_t offset,
+                                              const nt_memory_permission protection, const uint64_t highest_address,
+                                              const emulator_object<uint64_t> base_address,
+                                              const emulator_object<EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T)> view_size)
+            {
+                const auto storage_size = c.proc.section_views.storage_size(section_entry.view_storage_id);
+                if (offset >= storage_size)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                const auto aligned_offset = page_align_down(offset);
+                uint64_t size = storage_size - aligned_offset;
+                if (const auto requested_size = view_size ? static_cast<uint64_t>(view_size.read()) : 0; requested_size != 0)
+                {
+                    if (requested_size > storage_size - offset)
+                    {
+                        return STATUS_INVALID_VIEW_SIZE;
+                    }
+                    size = page_align_up(offset + requested_size) - aligned_offset;
+                }
+
+                const auto address = c.proc.section_views.map_view(c.win_emu.memory, section_entry.view_storage_id, aligned_offset,
+                                                                   static_cast<size_t>(size), protection, highest_address);
+                if (address == 0)
+                {
+                    return STATUS_NO_MEMORY;
+                }
+
+                if (view_size)
+                {
+                    view_size.write(size);
+                }
+                base_address.write(address);
+                return STATUS_SUCCESS;
+            }
+
+            void release_pagefile_view(const syscall_context& c, const uint64_t backing)
+            {
+                for (auto& [_, section_entry] : c.proc.sections)
+                {
+                    if (section_entry.backing_address == backing)
+                    {
+                        if (section_entry.mapped_view_count > 0)
+                        {
+                            --section_entry.mapped_view_count;
+                        }
+                        return;
+                    }
+                }
+
+                const auto orphan = c.proc.orphaned_section_backings.find(backing);
+                if (orphan != c.proc.orphaned_section_backings.end() && --orphan->second == 0)
+                {
+                    c.proc.orphaned_section_backings.erase(orphan);
+                    c.win_emu.memory.release_memory(backing, 0);
+                }
+            }
         }
 
         NTSTATUS handle_NtCreateSection(const syscall_context& c, const emulator_object<handle> section_handle,
@@ -264,7 +323,7 @@ namespace sogen
             if ((allocation_attributes & SEC_IMAGE) && !s.file_name.empty())
             {
                 std::vector<std::byte> file_data;
-                if (utils::io::read_file(c.win_emu.file_sys.translate(s.file_name), &file_data))
+                if (c.win_emu.file_sys.read_file(s.file_name, &file_data))
                 {
                     s.cache_image_info_from_filedata(file_data);
                 }
@@ -381,7 +440,7 @@ namespace sogen
 
         NTSTATUS handle_NtMapViewOfSection(const syscall_context& c, const handle section_handle, const handle process_handle,
                                            const emulator_object<uint64_t> base_address,
-                                           const EMULATOR_CAST(EmulatorTraits<Emu64>::ULONG_PTR, ULONG_PTR) /*zero_bits*/,
+                                           const EMULATOR_CAST(EmulatorTraits<Emu64>::ULONG_PTR, ULONG_PTR) zero_bits,
                                            const EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T) /*commit_size*/,
                                            const emulator_object<LARGE_INTEGER> section_offset,
                                            const emulator_object<EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T)> view_size,
@@ -444,8 +503,7 @@ namespace sogen
 
             if (section_entry->is_image())
             {
-                const auto file_path =
-                    std::filesystem::weakly_canonical(std::filesystem::absolute(c.win_emu.file_sys.translate(section_entry->file_name)));
+                const auto file_path = module_manager::module_identity(section_entry->file_name);
                 uint64_t relocation_base{};
                 for (const auto& loaded_module : c.win_emu.mod_manager.modules() | std::views::values)
                 {
@@ -495,11 +553,8 @@ namespace sogen
             }
 
             const auto protection = map_nt_to_emulator_protection(section_entry->section_page_protection);
+            const auto highest_address = highest_address_for_zero_bits(zero_bits);
 
-            // Pagefile-backed section: keep ONE persistent backing per section and hand out views into it
-            // (view = backing + offset). Real Windows shares the section's pages across every view; allocating
-            // a fresh region per map (the old behavior) broke view coherency and exhausted the 32-bit address
-            // space for callers like DXVK's D3D9 memory allocator, which maps one large section at many offsets.
             if (section_entry->file_name.empty())
             {
                 const auto backing_size = static_cast<size_t>(page_align_up(section_entry->maximum_size));
@@ -508,16 +563,43 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
 
+                if (section_entry->view_storage_id == 0 && section_entry->backing_address == 0 &&
+                    section_entry->allocation_attributes != SEC_RESERVE && c.win_emu.memory.can_alias_host_memory_anywhere())
+                {
+                    try
+                    {
+                        section_entry->view_storage_id = c.proc.section_views.create_storage(backing_size);
+                    }
+                    catch (const std::bad_alloc&)
+                    {
+                        return STATUS_NO_MEMORY;
+                    }
+                }
+
+                if (section_entry->view_storage_id != 0)
+                {
+                    return map_section_storage_view(c, *section_entry, static_cast<uint64_t>(offset), protection, highest_address,
+                                                    base_address, view_size);
+                }
+
+                // Without host memory that can be aliased anywhere, all views share ONE persistent guest backing
+                // (view = backing + offset), which keeps them coherent at the cost of address space.
                 if (section_entry->backing_address == 0)
                 {
                     const auto reserve_only = section_entry->allocation_attributes == SEC_RESERVE;
                     const auto backing = c.win_emu.memory.allocate_memory(backing_size, protection, reserve_only, 0,
-                                                                          memory_region_kind::pagefile_section_view);
+                                                                          memory_region_kind::pagefile_section_view, highest_address);
                     if (!backing)
                     {
                         return STATUS_NO_MEMORY;
                     }
                     section_entry->backing_address = backing;
+                }
+
+                // Every view shares the one backing, so a caller whose pointers cannot reach it gets no view at all.
+                if (section_entry->backing_address + backing_size - 1 > highest_address)
+                {
+                    return STATUS_NO_MEMORY;
                 }
 
                 const auto aligned_offset = page_align_down(static_cast<uint64_t>(offset));
@@ -531,7 +613,7 @@ namespace sogen
                     view_size.write(backing_size - aligned_offset);
                 }
                 base_address.write(section_entry->backing_address + aligned_offset);
-                ++c.proc.pagefile_view_counts[section_entry->backing_address];
+                ++section_entry->mapped_view_count;
                 return STATUS_SUCCESS;
             }
 
@@ -548,7 +630,7 @@ namespace sogen
             }
 
             std::vector<std::byte> file_data{};
-            if (!utils::io::read_file(host_path, &file_data))
+            if (!c.win_emu.file_sys.read_file(section_entry->file_name, &file_data))
             {
                 return STATUS_INVALID_PARAMETER;
             }
@@ -569,8 +651,8 @@ namespace sogen
 
             const auto aligned_size = static_cast<size_t>(page_align_up(size));
             const auto reserve_only = section_entry->allocation_attributes == SEC_RESERVE;
-            const auto address =
-                c.win_emu.memory.allocate_memory(aligned_size, protection, reserve_only, 0, memory_region_kind::file_section_view);
+            const auto address = c.win_emu.memory.allocate_memory(aligned_size, protection, reserve_only, 0,
+                                                                  memory_region_kind::file_section_view, highest_address);
             if (!address)
             {
                 return STATUS_NO_MEMORY;
@@ -749,6 +831,11 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            if (c.proc.section_views.unmap_view(c.win_emu.memory, base_address))
+            {
+                return STATUS_SUCCESS;
+            }
+
             const auto* mod = c.win_emu.mod_manager.find_by_address(base_address);
             if (mod != nullptr)
             {
@@ -765,21 +852,10 @@ namespace sogen
             {
                 // A pagefile section keeps one persistent backing shared by every view, so unmapping a view
                 // must not free it (other views and open section handles may still reference it); it is released
-                // when the last section handle is closed.
+                // once the last section handle is closed and the last view is unmapped.
                 if (region_info.kind == memory_region_kind::pagefile_section_view)
                 {
-                    // The last view of a closed section takes its backing with it.
-                    const auto backing = region_info.allocation_base;
-                    if (const auto views = c.proc.pagefile_view_counts.find(backing);
-                        views != c.proc.pagefile_view_counts.end() && --views->second == 0)
-                    {
-                        c.proc.pagefile_view_counts.erase(views);
-                        if (c.proc.closed_pagefile_backings.erase(backing))
-                        {
-                            c.win_emu.memory.release_memory(backing, 0);
-                        }
-                    }
-
+                    release_pagefile_view(c, region_info.allocation_base);
                     return STATUS_SUCCESS;
                 }
 

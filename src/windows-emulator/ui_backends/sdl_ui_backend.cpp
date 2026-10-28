@@ -726,6 +726,11 @@ namespace sogen
                 this->sink_ = std::move(sink);
             }
 
+            void set_snapshot_request_sink(const std::function<void()>& sink) override
+            {
+                this->snapshot_request_sink_ = sink;
+            }
+
             void pump_events() override
             {
                 {
@@ -783,18 +788,36 @@ namespace sogen
                     case SDL_EVENT_WINDOW_RESIZED:
                     case SDL_EVENT_WINDOW_MAXIMIZED:
                     case SDL_EVENT_WINDOW_RESTORED:
-                    case SDL_EVENT_WINDOW_EXPOSED:
-                        if (auto* state = this->resolve_window(this->resolve_guest(event.window.windowID)))
+                    case SDL_EVENT_WINDOW_EXPOSED: {
+                        const auto guest = this->resolve_guest(event.window.windowID);
+                        if (auto* state = this->resolve_window(guest))
                         {
                             render_window(*state);
+                            if (event.type != SDL_EVENT_WINDOW_EXPOSED)
+                            {
+                                this->post_host_resize(guest, *state);
+                            }
                         }
                         this->apply_cursor_capture();
                         break;
+                    }
 
                     case SDL_EVENT_KEY_DOWN: {
                         const auto guest = this->resolve_guest(event.key.windowID);
                         if (guest == 0)
                         {
+                            break;
+                        }
+
+                        const auto modifiers = event.key.mod;
+                        if (event.key.key == SDLK_S && (modifiers & SDL_KMOD_CTRL) != 0 && (modifiers & SDL_KMOD_ALT) != 0 &&
+                            (modifiers & SDL_KMOD_SHIFT) != 0 && this->snapshot_request_sink_)
+                        {
+                            if (!event.key.repeat)
+                            {
+                                this->snapshot_request_sink_();
+                            }
+                            this->snapshot_key_held_ = true;
                             break;
                         }
 
@@ -841,6 +864,12 @@ namespace sogen
                         const auto guest = this->resolve_guest(event.key.windowID);
                         if (guest == 0)
                         {
+                            break;
+                        }
+
+                        if (event.key.key == SDLK_S && this->snapshot_key_held_)
+                        {
+                            this->snapshot_key_held_ = false;
                             break;
                         }
 
@@ -1731,6 +1760,27 @@ namespace sogen
                 }
             }
 
+            // A window the user can resize takes the host size as its new client size, like a sizing border on Windows.
+            // Fixed-size windows keep their size and are scaled to fit.
+            void post_host_resize(const hwnd guest, const window_state& state) const
+            {
+                const auto flags = SDL_GetWindowFlags(state.window);
+                if ((flags & SDL_WINDOW_RESIZABLE) == 0 || (flags & SDL_WINDOW_MINIMIZED) != 0)
+                {
+                    return;
+                }
+
+                int width{};
+                int height{};
+                if (!SDL_GetWindowSize(state.window, &width, &height))
+                {
+                    return;
+                }
+
+                const uint64_t size = (static_cast<uint64_t>(static_cast<uint16_t>(height)) << 16) | static_cast<uint16_t>(width);
+                this->post_event(guest, WM_SIZE, (flags & SDL_WINDOW_MAXIMIZED) != 0 ? SIZE_MAXIMIZED : SIZE_RESTORED, size);
+            }
+
             void post_event(const hwnd window, const uint32_t message, const uint64_t w_param, const uint64_t l_param,
                             const std::optional<std::pair<int32_t, int32_t>>& relative = std::nullopt) const
             {
@@ -1780,6 +1830,8 @@ namespace sogen
             }
 
             event_sink sink_{};
+            std::function<void()> snapshot_request_sink_{};
+            bool snapshot_key_held_{};
             bool initialized_{};
             bool vulkan_library_loaded_{};
             hwnd active_window_{};

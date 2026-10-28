@@ -1,5 +1,5 @@
 #include "ttd_record.hpp"
-#include "snapshot.hpp"
+#include "emulator_state.hpp"
 
 #include <disassembler.hpp>
 #include <memory_utils.hpp>
@@ -39,7 +39,7 @@ namespace sogen::ttd
             {
                 return reported;
             }
-            auto& cpu = emu.emu();
+            auto& cpu = emu.active_x64_cpu();
             std::array<uint8_t, max_instruction_size> bytes{};
             size_t readable = 0;
             while (readable < bytes.size() && cpu.try_read_memory(address + readable, bytes.data() + readable, 1))
@@ -107,7 +107,7 @@ namespace sogen::ttd
                 operand_size = 8;
             }
 
-            auto& cpu = emu.emu();
+            auto& cpu = emu.active_x64_cpu();
             const auto value = mix_position(emu.get_executed_instructions());
             auto result = value;
             if (operand_size == 4)
@@ -341,7 +341,7 @@ namespace sogen::ttd
 
         // This also makes the initial process/thread state explicit in the snapshot.
         emu_.setup_process_if_necessary();
-        instruction_ip_ = emu_.emu().read_instruction_pointer();
+        instruction_ip_ = emu_.active_cpu().read_instruction_pointer();
         write_checkpoint(emu_.get_executed_instructions());
 
         auto& cpu = emu_.emu();
@@ -572,7 +572,7 @@ namespace sogen::ttd
         open_syscall_.reset();
         entry.id = id;
         entry.event_count = header_.event_count - entry.event_number;
-        entry.result = emu_.emu().reg<uint64_t>(x86_register::rax);
+        entry.result = emu_.active_x64_cpu().reg<uint64_t>(x86_register::rax);
         if (!syscalls_.names.contains(id))
         {
             try
@@ -707,7 +707,8 @@ namespace sogen::ttd
         }
         // A guest access belongs to the instruction the execute hook just reported. Host writes happen outside guest
         // instructions (syscalls, exception dispatch), where the instruction pointer can differ.
-        const auto ip = kind != access_kind::host_write && tracks_instructions_ ? instruction_ip_ : emu_.emu().read_instruction_pointer();
+        const auto ip =
+            kind != access_kind::host_write && tracks_instructions_ ? instruction_ip_ : emu_.active_cpu().read_instruction_pointer();
         if (kind != access_kind::read)
         {
             forget_instructions(address, data.size());
@@ -733,7 +734,7 @@ namespace sogen::ttd
     {
         host_changed_memory_ = false;
         snapshot_register_generation_ = emu_.emu().get_register_generation();
-        auto registers = std::make_shared<const std::vector<std::byte>>(emu_.emu().save_registers());
+        auto registers = std::make_shared<const std::vector<std::byte>>(emu_.active_cpu().save_registers());
         const auto index = static_cast<uint64_t>(register_snapshots_.size());
         register_snapshot_entry entry{.step = position, .event_number = header_.event_count};
         if (index % register_snapshots_per_base == 0)
@@ -1253,7 +1254,7 @@ namespace sogen::ttd
             recorded.push_back(*event);
         }
 
-        auto& cpu = emu_.emu();
+        auto& cpu = emu_.active_x64_cpu();
         const auto result = cpu.reg<uint64_t>(x86_register::rax);
         std::optional<size_t> different_event{};
         for (size_t i = 0; i < std::max(recorded.size(), syscall_events_.size()); ++i)
@@ -1389,7 +1390,7 @@ namespace sogen::ttd
             instruction_ip_ = address;
         }
         const auto ip = kind == access_kind::host_write || !(access_mask_ & static_cast<uint64_t>(access_kind::execute))
-                            ? emu_.emu().read_instruction_pointer()
+                            ? emu_.active_cpu().read_instruction_pointer()
                             : instruction_ip_;
         access_event observed{.step = emu_.get_executed_instructions(), .ip = ip, .address = address, .size = size, .kind = kind};
         const auto has_bytes = kind == access_kind::execute && trace_.has_instruction_bytes() && size < inline_data_limit;
@@ -1595,7 +1596,7 @@ namespace sogen::ttd
                 }
                 const auto number = expected_writes_.last_number();
                 const auto step = emu_.get_executed_instructions();
-                const auto ip = emu_.emu().read_instruction_pointer();
+                const auto ip = emu_.active_cpu().read_instruction_pointer();
                 if (expected->step != step || expected->ip != ip || expected->address != address || expected->size != size)
                 {
                     std::ostringstream message;
@@ -1656,7 +1657,7 @@ namespace sogen::ttd
                                                         .write_step = writer.step,
                                                         .write_ip = writer.ip,
                                                         .execute_step = emu_.get_executed_instructions(),
-                                                        .execute_ip = emu_.emu().read_instruction_pointer(),
+                                                        .execute_ip = emu_.active_cpu().read_instruction_pointer(),
                                                         .executions = 1};
                     if (!first_hit_)
                     {

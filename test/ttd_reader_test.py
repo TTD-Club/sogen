@@ -50,7 +50,7 @@ def main() -> None:
         copy = str(pathlib.Path(directory) / "copy.sogttd")
         shutil.copy(path, copy)
         assert ttd.Trace(copy).id == trace.id
-        assert ttd.trace_file_version(path) == trace.version == 8 and ttd.is_supported_trace_version(8)
+        assert ttd.trace_file_version(path) == trace.version == 9 and ttd.is_supported_trace_version(9)
         assert ttd.trace_file_version(str(analyzer)) is None and not ttd.is_supported_trace_version(6)
 
         # The reader-only inspector agrees.

@@ -1648,7 +1648,12 @@ namespace sogen::whp
                 }
             }
 
-            void map_host_memory(const uint64_t address, const size_t size, void* host_pointer,
+            bool supports_host_memory_mapping() const override
+            {
+                return true;
+            }
+
+            bool map_host_memory(const uint64_t address, const size_t size, void* host_pointer,
                                  const memory_permission permissions) override
             {
                 if (!is_page_aligned(address) || !is_page_aligned(size))
@@ -1684,6 +1689,7 @@ namespace sogen::whp
                 }
 
                 this->remap_pages(address, size);
+                return true;
             }
 
             void unmap_memory(const uint64_t address, const size_t size) override
@@ -2175,9 +2181,10 @@ namespace sogen::whp
                 {
                     WHV_PARTITION_PROPERTY exception_exit_bitmap{};
                     exception_exit_bitmap.ExceptionExitBitmap =
-                        (1ull << WHvX64ExceptionTypeDebugTrapOrFault) | (1ull << WHvX64ExceptionTypeBreakpointTrap) |
-                        (1ull << WHvX64ExceptionTypeInvalidOpcodeFault) | (1ull << WHvX64ExceptionTypePageFault) |
-                        (1ull << WHvX64ExceptionTypeFloatingPointErrorFault) | (1ull << WHvX64ExceptionTypeSimdFloatingPointFault);
+                        (1ull << WHvX64ExceptionTypeDivideErrorFault) | (1ull << WHvX64ExceptionTypeDebugTrapOrFault) |
+                        (1ull << WHvX64ExceptionTypeBreakpointTrap) | (1ull << WHvX64ExceptionTypeInvalidOpcodeFault) |
+                        (1ull << WHvX64ExceptionTypePageFault) | (1ull << WHvX64ExceptionTypeFloatingPointErrorFault) |
+                        (1ull << WHvX64ExceptionTypeSimdFloatingPointFault);
 
                     WHP_CHECK_HR(WHvSetPartitionProperty(this->partition_, WHvPartitionPropertyCodeExceptionExitBitmap,
                                                          &exception_exit_bitmap, sizeof(exception_exit_bitmap)));

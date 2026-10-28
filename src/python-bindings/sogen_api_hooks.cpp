@@ -54,11 +54,16 @@ namespace sogen::py
 
             return expected == name || expected == stem;
         }
+
+        size_t parameter_count(const api_hook_entry& entry)
+        {
+            return entry.params.is_none() ? size_t{} : static_cast<size_t>(nb::len(entry.params));
+        }
     }
 
     // ----- hook_handle -----
 
-    hook_handle::hook_state::hook_state(sogen::x86_64_emulator& emulator, emulator_hook* hook)
+    hook_handle::hook_state::hook_state(sogen::guest_machine& emulator, emulator_hook* hook)
         : emu(&emulator),
           hook(hook)
     {
@@ -110,7 +115,7 @@ namespace sogen::py
         this->callback = nb::none();
     }
 
-    hook_handle::hook_handle(sogen::x86_64_emulator& emulator, emulator_hook* hook, nb::object owner)
+    hook_handle::hook_handle(sogen::guest_machine& emulator, emulator_hook* hook, nb::object owner)
         : shared_state(std::make_shared<hook_state>(emulator, hook)),
           owner(std::move(owner))
     {
@@ -164,7 +169,7 @@ namespace sogen::py
         }
         this->entries.clear();
         this->address_index.clear();
-        this->remove_execution_hook();
+        this->address_hooks.clear();
     }
 
     void api_hook_registry::del_item(const std::string& key)
@@ -197,22 +202,48 @@ namespace sogen::py
     nb::list api_hook_registry::resolve_params(const api_hook_entry& entry) const
     {
         nb::list params{};
-        const auto count = entry.params.is_none() ? size_t{} : static_cast<size_t>(nb::len(entry.params));
-        const auto cc = is_32bit_code_segment(this->win_emu->emu()) ? entry.cc : function_calling_convention::x64_fastcall;
-        for (const auto value : get_function_arguments(this->win_emu->emu(), cc, count))
+        const auto count = parameter_count(entry);
+        auto& cpu = this->win_emu->active_cpu();
+        auto* x64 = dynamic_cast<x86_64_cpu*>(&cpu);
+        if (!x64)
+        {
+            for (size_t i = 0; i < count; ++i)
+            {
+                params.append(this->win_emu->abi().function_argument(cpu, i));
+            }
+            return params;
+        }
+
+        const auto cc = is_32bit_code_segment(*x64) ? entry.cc : function_calling_convention::x64_fastcall;
+        for (const auto value : get_function_arguments(*x64, cc, count))
         {
             params.append(value);
         }
         return params;
     }
 
-    void api_hook_registry::return_from_api(const api_call_info& call) const
+    void api_hook_registry::return_from_api(const api_call_info& call, const api_hook_entry& entry) const
     {
-        auto& backend = this->win_emu->emu();
-        const auto stack_adjust = is_32bit_code_segment(backend) ? sizeof(uint32_t) : sizeof(uint64_t);
-        backend.reg<uint64_t>(x86_register::rax, call.return_value);
-        backend.reg<uint64_t>(x86_register::rsp, call.stack_pointer + stack_adjust);
-        backend.reg<uint64_t>(x86_register::rip, call.return_address);
+        auto& cpu = this->win_emu->active_cpu();
+        const auto& abi = this->win_emu->abi();
+        abi.return_value(cpu, call.return_value);
+        if (auto* x64 = dynamic_cast<x86_64_cpu*>(&cpu))
+        {
+            auto stack_adjust = static_cast<uint64_t>(sizeof(uint64_t));
+            if (is_32bit_code_segment(*x64))
+            {
+                // Intercepting replaces the callee, so the return has to do the callee's cleanup itself.
+                // A stdcall callee pops its arguments; a cdecl one leaves them to the caller.
+                stack_adjust = sizeof(uint32_t);
+                if (entry.cc == function_calling_convention::x86_stdcall)
+                {
+                    stack_adjust += sizeof(uint32_t) * parameter_count(entry);
+                }
+            }
+
+            abi.stack_pointer(cpu, call.stack_pointer + stack_adjust);
+        }
+        abi.instruction_pointer(cpu, call.return_address);
     }
 
     void api_hook_registry::invoke_hook(const api_hook_hit& hit)
@@ -229,7 +260,7 @@ namespace sogen::py
         call->name = hit.export_name;
         call->address = hit.address;
         call->return_address = hit.return_address;
-        call->stack_pointer = this->win_emu->emu().reg<uint64_t>(x86_register::rsp);
+        call->stack_pointer = this->win_emu->abi().stack_pointer(this->win_emu->active_cpu());
 
         nb::gil_scoped_acquire gil{};
 
@@ -239,7 +270,7 @@ namespace sogen::py
             const auto result = coerce_api_continuation(entry.callback(nb::cast(call), params));
             if (result == api_call_continuation::intercept)
             {
-                this->return_from_api(*call);
+                this->return_from_api(*call, entry);
             }
         }
         catch (const std::exception& e)
@@ -264,14 +295,6 @@ namespace sogen::py
             entry.hooks.clear();
         }
 
-        if (this->entries.empty())
-        {
-            this->remove_execution_hook();
-            return;
-        }
-
-        this->ensure_execution_hook();
-
         for (const auto& [_, module] : this->win_emu->mod_manager.modules())
         {
             for (auto& [key, entry] : this->entries)
@@ -279,36 +302,34 @@ namespace sogen::py
                 this->add_entry_for_module(key, entry, module);
             }
         }
+
+        this->sync_address_hooks();
     }
 
-    void api_hook_registry::ensure_execution_hook()
+    // One execution hook per hooked export address works on every backend, including the hardware
+    // ones that cannot report every executed instruction. Unchanged addresses keep their hooks.
+    void api_hook_registry::sync_address_hooks()
     {
-        if (this->execution_hook.has_value())
+        std::erase_if(this->address_hooks, [this](const auto& hook) { return !this->address_index.contains(hook.first); });
+
+        for (const auto& [address, _] : this->address_index)
         {
-            return;
-        }
-
-        auto* hook = this->win_emu->emu().hook_memory_execution([this](cpu_interface&, uint64_t address) {
-            try
+            if (this->address_hooks.contains(address))
             {
-                this->dispatch_address(address);
+                continue;
             }
-            catch (...)
-            {
-            }
-        });
-        this->execution_hook.emplace(this->win_emu->emu(), hook, nb::none());
-    }
 
-    void api_hook_registry::remove_execution_hook()
-    {
-        if (!this->execution_hook.has_value())
-        {
-            return;
+            auto* hook = this->win_emu->emu().hook_memory_execution(address, [this, address](cpu_interface&, uint64_t) {
+                try
+                {
+                    this->dispatch_address(address);
+                }
+                catch (...)
+                {
+                }
+            });
+            this->address_hooks.emplace(address, hook_handle{this->win_emu->emu(), hook, nb::none()});
         }
-
-        this->execution_hook->remove();
-        this->execution_hook.reset();
     }
 
     void api_hook_registry::add_entry_for_module(const std::string& key, api_hook_entry& entry, const mapped_module& module)
@@ -346,11 +367,20 @@ namespace sogen::py
             return;
         }
 
-        auto& backend = this->win_emu->emu();
+        auto& cpu = this->win_emu->active_cpu();
         uint64_t return_address{};
-        if (!backend.try_read_memory(backend.reg<uint64_t>(x86_register::rsp), &return_address, sizeof(return_address)))
+        if (auto* arm64 = dynamic_cast<arm64_cpu*>(&cpu))
         {
-            return;
+            return_address = arm64->reg(arm64_register::lr);
+        }
+        else
+        {
+            auto* x64 = dynamic_cast<x86_64_cpu*>(&cpu);
+            const auto pointer_size = (x64 && is_32bit_code_segment(*x64)) ? sizeof(uint32_t) : sizeof(uint64_t);
+            if (!cpu.try_read_memory(cpu.read_stack_pointer(), &return_address, pointer_size))
+            {
+                return;
+            }
         }
 
         auto hits = it->second;

@@ -4,9 +4,11 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.RemoteException
 import dev.sogen.app.runtime.ISogenCallback
 import dev.sogen.app.runtime.ISogenSession
@@ -29,6 +31,10 @@ class SessionController(
     private var connection: ServiceConnection? = null
     private var exited = false
     private var stopRequested = false
+    private var consoleSize: Pair<Int, Int>? = null
+    private var frameLimit = 0
+    private var statsInterval = 0
+    private val power = context.getSystemService(PowerManager::class.java)
 
     /** Window that receives hardware key events, set by the game view. */
     var inputWindow: Long = 0
@@ -50,6 +56,9 @@ class SessionController(
                 binder.linkToDeath({ mainHandler.post { onExit(null) } }, 0)
                 call {
                     remote.start(config.toBundle(), callback)
+                    consoleSize?.let { (columns, rows) -> remote.consoleResize(columns, rows) }
+                    remote.setFrameLimit(frameLimit)
+                    remote.setStatsInterval(statsInterval)
                     // The service creates the session synchronously in start, and a stopped session exits as soon
                     // as it runs, reporting its exit code as usual.
                     if (stopRequested) {
@@ -68,7 +77,14 @@ class SessionController(
         }
 
         connection = serviceConnection
-        return context.bindService(Intent(context, SogenService::class.java), serviceConnection, Context.BIND_AUTO_CREATE)
+        if (!context.bindService(Intent(context, SogenService::class.java), serviceConnection, Context.BIND_AUTO_CREATE)) {
+            // Android keeps the connection registered even when binding fails.
+            context.unbindService(serviceConnection)
+            connection = null
+            return false
+        }
+
+        return true
     }
 
     fun stop() {
@@ -76,7 +92,18 @@ class SessionController(
         call { session?.stop() }
     }
 
+    fun suspend(destination: String) = call { session?.suspend(destination) }
+
+    fun consoleInput(data: ByteArray) = call { session?.consoleInput(data) }
+
+    /** Takes effect once the session starts when it is not running yet. */
+    fun consoleResize(columns: Int, rows: Int) {
+        consoleSize = columns to rows
+        call { session?.consoleResize(columns, rows) }
+    }
+
     fun mouseMove(window: Long, x: Int, y: Int) = call { session?.mouseMove(window, x, y) }
+    fun mouseMotion(window: Long, dx: Int, dy: Int) = call { session?.mouseMotion(window, dx, dy) }
 
     fun mouseButton(window: Long, button: Int, down: Boolean, x: Int, y: Int) =
         call { session?.mouseButton(window, button, down, x, y) }
@@ -89,9 +116,22 @@ class SessionController(
 
     fun close(window: Long) = call { session?.close(window) }
 
+    /** Takes effect once the session starts when it is not running yet, like [statsInterval]. */
+    fun setFrameLimit(framesPerSecond: Int) {
+        frameLimit = framesPerSecond
+        call { session?.setFrameLimit(framesPerSecond) }
+    }
+
+    fun setStatsInterval(milliseconds: Int) {
+        statsInterval = milliseconds
+        call { session?.setStatsInterval(milliseconds) }
+    }
+
     private val callback = object : ISogenCallback.Stub() {
         override fun onOutput(text: String, color: Int) =
             post { emit(mapOf("event" to "output", "text" to text, "color" to color)) }
+
+        override fun onConsoleOutput(data: ByteArray) = post { emit(mapOf("event" to "console", "data" to data)) }
 
         override fun onWindowCreated(window: Long, width: Int, height: Int, title: String, visible: Boolean) = post {
             val producer = textures.createSurfaceProducer()
@@ -141,7 +181,31 @@ class SessionController(
             emit(mapOf("event" to "windowTitle", "window" to window, "title" to title))
         }
 
+        override fun onRelativeMouseChanged(window: Long, relative: Boolean) = post {
+            emit(mapOf("event" to "relativeMouse", "window" to window, "relative" to relative))
+        }
+
+        override fun onCursorMoved(window: Long, x: Int, y: Int) = post {
+            emit(mapOf("event" to "cursorMoved", "window" to window, "x" to x, "y" to y))
+        }
+
+        override fun onSnapshot(path: String, error: String) = post {
+            emit(mapOf("event" to "snapshot", "path" to path, "error" to error))
+        }
+
         override fun onExit(exitCode: Int) = post { this@SessionController.onExit(exitCode) }
+
+        override fun onStats(frames: Long, worstPresentIntervalNs: Long, residentBytes: Long) = post {
+            emit(
+                mapOf(
+                    "event" to "stats",
+                    "frames" to frames,
+                    "worstPresentIntervalNs" to worstPresentIntervalNs,
+                    "residentBytes" to residentBytes,
+                    "thermalStatus" to if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) power.currentThermalStatus else null,
+                ),
+            )
+        }
     }
 
     /** [exitCode] is null when the service process died without reporting one, i.e. it crashed. */
@@ -155,6 +219,9 @@ class SessionController(
         windows.clear()
         session = null
         inputWindow = 0
+        consoleSize = null
+        frameLimit = 0
+        statsInterval = 0
 
         connection?.let { context.unbindService(it) }
         connection = null

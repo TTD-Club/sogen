@@ -16,6 +16,24 @@ namespace sogen
             constexpr USHORT executable_large_address_aware_image = 0x0022;
             constexpr ULONG process_create_flags_inherit_handles = 4;
 
+            // The defaults of a process without a job: unlimited pools, page file and time. GlobalMemoryStatusEx caps the
+            // available page file at PagefileLimit, so zero would report no memory at all.
+            template <typename Traits>
+            EMU_QUOTA_LIMITS<Traits> default_quota_limits()
+            {
+                using size_type = Traits::SIZE_T;
+                constexpr auto unlimited = static_cast<size_type>(~0ULL);
+
+                return {
+                    .PagedPoolLimit = unlimited,
+                    .NonPagedPoolLimit = unlimited,
+                    .MinimumWorkingSetSize = 0xC8000,
+                    .MaximumWorkingSetSize = 0x159000,
+                    .PagefileLimit = unlimited,
+                    .TimeLimit = -1,
+                };
+            }
+
             std::vector<std::u16string> parse_command_line(const std::u16string_view command_line)
             {
                 std::vector<std::u16string> arguments{};
@@ -294,9 +312,8 @@ namespace sogen
                 return STATUS_INVALID_PARAMETER;
             }
 
-            const auto image_arch = winpe::get_pe_arch(c.win_emu.file_sys.translate(application_path));
-            const auto* pe_arch = std::get_if<winpe::pe_arch>(&image_arch);
-            const auto child_is_wow64 = pe_arch && *pe_arch == winpe::pe_arch::pe32;
+            const auto image = pe_architecture_detector::detect_from_file(c.win_emu.file_sys, application_path);
+            const auto child_is_wow64 = image.is_valid() && image.architecture == winpe::pe_arch::pe32;
 
             const auto result = manager->create_process(std::move(request));
             if (!result)
@@ -490,7 +507,7 @@ namespace sogen
                 // so a larger buffer is valid.
                 if (process_information_length < required_length)
                 {
-                    return STATUS_INFO_LENGTH_MISMATCH;
+                    return STATUS_BUFFER_TOO_SMALL;
                 }
 
                 const emulator_object<USHORT> info{c.emu, process_information};
@@ -728,8 +745,8 @@ namespace sogen
                     });
 
             case ProcessQuotaLimits: {
-                constexpr uint32_t quota_limits32_size = 0x20;
-                constexpr uint32_t quota_limits64_size = 0x30;
+                constexpr uint32_t quota_limits32_size = sizeof(EMU_QUOTA_LIMITS<EmulatorTraits<Emu32>>);
+                constexpr uint32_t quota_limits64_size = sizeof(EMU_QUOTA_LIMITS<EmulatorTraits<Emu64>>);
 
                 if (process_information_length != quota_limits32_size && process_information_length != quota_limits64_size)
                 {
@@ -740,8 +757,16 @@ namespace sogen
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
 
-                const std::vector<std::byte> zeroed(process_information_length, std::byte{0});
-                c.emu.write_memory(process_information, zeroed.data(), zeroed.size());
+                if (process_information_length == quota_limits64_size)
+                {
+                    const auto limits = default_quota_limits<EmulatorTraits<Emu64>>();
+                    c.emu.write_memory(process_information, &limits, sizeof(limits));
+                }
+                else
+                {
+                    const auto limits = default_quota_limits<EmulatorTraits<Emu32>>();
+                    c.emu.write_memory(process_information, &limits, sizeof(limits));
+                }
 
                 if (return_length)
                 {
@@ -857,6 +882,7 @@ namespace sogen
                 || info_class == ProcessQuotaLimits                          //
                 || info_class == ProcessPriorityClass                        //
                 || info_class == ProcessAffinityMask                         //
+                || info_class == ProcessMitigationPolicy                     //
                 || info_class == ProcessTelemetryCoverage)
             {
                 return STATUS_SUCCESS;
