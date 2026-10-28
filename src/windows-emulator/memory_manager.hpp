@@ -1,5 +1,6 @@
 #pragma once
 #include "std_include.hpp"
+#include <functional>
 #include <map>
 #include <atomic>
 #include <cstdint>
@@ -149,13 +150,29 @@ namespace sogen
         bool allocate_host_memory_at(uint64_t address, size_t size, void* host_pointer, nt_memory_permission permissions);
         // Chooses a compatible guest address and aliases it onto caller-owned host memory (e.g. a host Vulkan
         // mapping). The region is treated like MMIO: not serialized, host_pointer not owned. Returns 0 on failure.
-        uint64_t allocate_host_memory(size_t size, void* host_pointer, nt_memory_permission permissions);
+        uint64_t allocate_host_memory(size_t size, void* host_pointer, nt_memory_permission permissions,
+                                      uint64_t highest_address = MAX_ALLOCATION_END_EXCL - 1);
+        bool can_alias_host_memory_anywhere() const;
+        // Maps host memory into the guest on backends that need it at a fixed host address (see
+        // memory_interface::host_placement_address): picks a free guest range below highest_address, and place maps the
+        // memory at the host address backing it. Returns the guest address, or 0 if the backend has no such addresses or
+        // place fails.
+        uint64_t allocate_placed_host_memory(size_t size, nt_memory_permission permissions, uint64_t highest_address,
+                                             const std::function<bool(void* host_address)>& place);
+        // The same at a given free guest address, such as one a restored process had memory placed at.
+        bool allocate_placed_host_memory_at(uint64_t address, size_t size, nt_memory_permission permissions,
+                                            const std::function<bool(void* host_address)>& place);
+        uint64_t host_placement_address(uint64_t address) const override;
 
         // Backend coherency hooks for host-aliased memory (see memory_interface). Device emulation such as
         // the GPU bridge uses these to make guest writes visible to the host GPU on backends (e.g. KVM) that
         // alias host memory into the guest non-coherently.
         bool host_memory_aliasing_is_coherent() const override;
         void flush_host_memory_cache(const void* host_pointer, size_t size) override;
+        bool track_access(uint64_t address, size_t size) override;
+        void take_written_ranges(uint64_t address, size_t size,
+                                 const std::function<void(uint64_t written_address, size_t written_size)>& f) override;
+        void invalidate_cache_on_access(uint64_t address, size_t size) override;
         bool allocate_memory(uint64_t address, uint64_t size, nt_memory_permission permissions, bool reserve_only = false,
                              memory_region_kind kind = memory_region_kind::private_allocation);
 
@@ -175,6 +192,9 @@ namespace sogen
         uint64_t allocate_memory(uint64_t size, nt_memory_permission permissions, bool reserve_only = false, uint64_t start = 0,
                                  memory_region_kind kind = memory_region_kind::private_allocation);
 
+        uint64_t allocate_memory(uint64_t size, nt_memory_permission permissions, bool reserve_only, uint64_t start,
+                                 memory_region_kind kind, uint64_t highest_address);
+
         uint64_t find_free_allocation_base(uint64_t size, uint64_t start = 0) const;
         uint64_t find_free_allocation_base(uint64_t size, uint64_t start, uint64_t alignment, uint64_t lowest_address,
                                            uint64_t highest_address) const;
@@ -190,6 +210,7 @@ namespace sogen
         uint64_t find_free_host_allocation_base(uint64_t size, uint64_t start, uint64_t highest_address);
 
         region_info get_region_info(uint64_t address);
+        std::vector<basic_memory_region<nt_memory_permission>> get_committed_regions(uint64_t region_base) const;
         std::optional<std::u16string> get_region_mapped_filename(uint64_t address) const;
         void set_region_mapped_filename(uint64_t address, std::u16string filename);
 
@@ -210,6 +231,11 @@ namespace sogen
         {
             return this->layout_version_.load(std::memory_order_relaxed);
         }
+
+        // The highest address the guest can allocate at, which the backend can lower below the end of the user address
+        // space. The guest is still told about the whole user address space: V8 refuses to run in one smaller than its
+        // 1 TB sandbox, but copes with failing to reserve the sandbox.
+        std::uint64_t get_maximum_allocation_address() const;
 
         std::uint64_t get_default_allocation_address() const
         {
@@ -251,7 +277,7 @@ namespace sogen
 
         void map_mmio(uint64_t address, size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) final;
         void map_memory(uint64_t address, size_t size, memory_permission permissions) final;
-        void map_host_memory(uint64_t address, size_t size, void* host_pointer, memory_permission permissions) final;
+        bool map_host_memory(uint64_t address, size_t size, void* host_pointer, memory_permission permissions) final;
         void unmap_memory(uint64_t address, size_t size) final;
         void apply_memory_protection(uint64_t address, size_t size, memory_permission permissions) final;
 
@@ -267,6 +293,7 @@ namespace sogen
 
         void reserve_host_range_gaps(uint64_t address, uint64_t size);
         void carve_host_reserved_hole(uint64_t address, uint64_t size);
+        bool register_host_memory(uint64_t address, size_t size, void* host_pointer, nt_memory_permission permissions);
         void release_host_claims(uint64_t released_end);
     };
 

@@ -1,6 +1,7 @@
 package dev.sogen.app
 
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -13,6 +14,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 
 class MainActivity : FlutterActivity() {
     private var events: EventChannel.EventSink? = null
@@ -36,6 +38,35 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(messenger, "dev.sogen.app/session").setMethodCallHandler { call, result ->
             handleSessionCall(call, result)
+        }
+
+        // Flutter's preferred orientations respect the system rotation lock, which a game should not.
+        MethodChannel(messenger, "dev.sogen.app/orientation").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "set" -> {
+                    requestedOrientation = when (call.argument<String>("orientation")) {
+                        "sensor" -> ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+                        "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        "portrait" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                        else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    }
+                    result.success(null)
+                }
+
+                else -> result.notImplemented()
+            }
+        }
+
+        // Trades peak speed for clocks the device can hold, so long sessions do not slow down once it heats up.
+        MethodChannel(messenger, "dev.sogen.app/performance").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "sustained" -> {
+                    window.setSustainedPerformanceMode(call.argument<Boolean>("enabled") == true)
+                    result.success(null)
+                }
+
+                else -> result.notImplemented()
+            }
         }
 
         MethodChannel(messenger, "dev.sogen.app/storage").setMethodCallHandler { call, result ->
@@ -76,12 +107,16 @@ class MainActivity : FlutterActivity() {
         when (call.method) {
             "start" -> result.success(session.start(parseRunConfig(call)))
             "stop" -> session.stop().also { result.success(null) }
+            "suspend" -> session.suspend(call.argument<String>("destination").orEmpty()).also { result.success(null) }
+            "consoleInput" -> session.consoleInput(call.argument<ByteArray>("data") ?: ByteArray(0)).also { result.success(null) }
+            "consoleResize" -> session.consoleResize(int("columns"), int("rows")).also { result.success(null) }
             "setInputWindow" -> {
                 session.inputWindow = window
                 result.success(null)
             }
 
             "mouseMove" -> session.mouseMove(window, int("x"), int("y")).also { result.success(null) }
+            "mouseMotion" -> session.mouseMotion(window, int("dx"), int("dy")).also { result.success(null) }
             "mouseButton" -> session.mouseButton(
                 window,
                 int("button"),
@@ -93,6 +128,8 @@ class MainActivity : FlutterActivity() {
             "mouseWheel" -> session.mouseWheel(window, int("delta"), int("x"), int("y")).also { result.success(null) }
             "key" -> session.key(window, int("keyCode"), call.argument<Boolean>("down") == true).also { result.success(null) }
             "text" -> session.text(window, call.argument<String>("text").orEmpty()).also { result.success(null) }
+            "setFrameLimit" -> session.setFrameLimit(int("framesPerSecond")).also { result.success(null) }
+            "setStatsInterval" -> session.setStatsInterval(int("milliseconds")).also { result.success(null) }
             "close" -> session.close(window).also { result.success(null) }
             else -> result.notImplemented()
         }
@@ -107,6 +144,8 @@ class MainActivity : FlutterActivity() {
         workingDirectory = call.argument<String>("workingDirectory").orEmpty(),
         backend = call.argument<String>("backend").orEmpty(),
         liveNetwork = call.argument<Boolean>("liveNetwork") == true,
+        snapshotDirectory = File(filesDir, "snapshots").path,
+        resumeFile = call.argument<String>("resumeFile").orEmpty(),
     )
 
     // Games are run in place from shared storage, and native code needs plain file paths for that.

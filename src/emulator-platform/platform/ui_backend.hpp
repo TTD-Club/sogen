@@ -88,6 +88,11 @@ namespace sogen
         virtual void set_event_sink(event_sink sink) = 0;
         virtual void pump_events() = 0;
 
+        // Called when the user asks the host to save the process, with input the guest never receives.
+        virtual void set_snapshot_request_sink(const std::function<void()>& /*sink*/)
+        {
+        }
+
         virtual void reset()
         {
         }
@@ -124,6 +129,8 @@ namespace sogen
         {
         }
 
+        // These two wait for the UI thread, which takes the emulator's kernel lock to deliver input. Callers must not
+        // hold it.
         virtual std::vector<std::string> vulkan_instance_extensions()
         {
             return {};
@@ -139,6 +146,13 @@ namespace sogen
         virtual std::optional<ui_extent> vulkan_surface_extent(const hwnd /*window*/)
         {
             return std::nullopt;
+        }
+
+        // The vkGetInstanceProcAddr the GPU bridge should use, when the backend loads its own Vulkan driver.
+        // Null means the platform's default Vulkan loader.
+        virtual void* vulkan_get_instance_proc_addr()
+        {
+            return nullptr;
         }
 
         // Warp the host cursor so it tracks a guest SetCursorPos. Without this, the next host mouse-motion

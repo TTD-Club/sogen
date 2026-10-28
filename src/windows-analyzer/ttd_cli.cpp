@@ -5,7 +5,7 @@
 #include "ttd_string_scan.hpp"
 #include "ttd_session.hpp"
 #include "ttd_trace.hpp"
-#include "snapshot.hpp"
+#include "emulator_state.hpp"
 
 #include <CLI/CLI.hpp>
 
@@ -462,7 +462,7 @@ namespace sogen::ttd
                             static_cast<unsigned long long>(result.substituted_inputs));
             win_emu.log.log("TTD checkpoint %llx:0\n", static_cast<unsigned long long>(result.checkpoint));
             win_emu.log.log("TTD position %llx:0 RIP %llx\n", static_cast<unsigned long long>(options.seek),
-                            static_cast<unsigned long long>(win_emu.emu().read_instruction_pointer()));
+                            static_cast<unsigned long long>(win_emu.active_cpu().read_instruction_pointer()));
             if (options.read)
             {
                 const auto value = win_emu.emu().read_memory<uint64_t>(*options.read);

@@ -130,4 +130,5 @@ namespace sogen::py
     void register_linux_runtime_bindings(nb::module_& m);
     void register_runtime_bindings(nb::module_& m);
     void register_ttd_bindings(nb::module_& m);
+    void register_arm64_runtime_bindings(nb::module_& root);
 }

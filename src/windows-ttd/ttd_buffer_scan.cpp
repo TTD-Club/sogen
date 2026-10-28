@@ -203,7 +203,7 @@ namespace sogen::ttd
                     return;
                 }
                 const auto step = emu_.get_executed_instructions();
-                const auto ip = emu_.emu().read_instruction_pointer();
+                const auto ip = emu_.active_cpu().read_instruction_pointer();
                 if (expected->step != step || expected->ip != ip || expected->address != address || expected->size != size)
                 {
                     error_ = "TTD buffer scan replay diverged at write event " + std::to_string(expected_writes_.last_number());

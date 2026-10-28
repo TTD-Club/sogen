@@ -6,6 +6,12 @@ IF %ERRORLEVEL% NEQ 0 (
 	EXIT /B 1
 )
 
+REM WinSxS names the native architecture: amd64 on x64 hosts, arm64 on ARM64 hosts. SysWOW64 is x86 on both.
+SET NATIVE_ARCH=%PROCESSOR_ARCHITECTURE%
+IF DEFINED PROCESSOR_ARCHITEW6432 SET NATIVE_ARCH=%PROCESSOR_ARCHITEW6432%
+SET SXS_NATIVE=amd64
+IF /I "%NATIVE_ARCH%"=="ARM64" SET SXS_NATIVE=arm64
+
 SET SYSDIR="%WINDIR%\System32"
 SET SYSDIR_WOW64="%WINDIR%\SysWOW64"
 
@@ -16,6 +22,7 @@ SET EMU_SYSDIR=%EMU_WINDIR%\system32
 SET EMU_SYSDIR_WOW64=%EMU_WINDIR%\syswow64
 SET EMU_SYSTEMRESOURCESDIR=%EMU_WINDIR%\systemresources
 SET EMU_CURSORDIR=%EMU_WINDIR%\cursors
+SET EMU_FONTDIR=%EMU_WINDIR%\fonts
 SET EMU_SORTDIR=%EMU_WINDIR%\globalization\sorting
 SET EMU_WINSXSDIR=%EMU_WINDIR%\winsxs
 SET EMU_WINSXSMANIFESTDIR=%EMU_WINSXSDIR%\manifests
@@ -26,6 +33,7 @@ SET EMU_STEAMDIR=%EMU_FILESYS%\c\steam
 MKDIR %EMU_SYSDIR%
 MKDIR %EMU_SYSDIR_WOW64%
 MKDIR %EMU_CURSORDIR%
+MKDIR %EMU_FONTDIR%
 MKDIR %EMU_SYSDIR%\en-us
 MKDIR %EMU_SYSDIR_WOW64%\en-us
 MKDIR %EMU_SYSTEMRESOURCESDIR%
@@ -43,8 +51,10 @@ REM (which writes SYSTEM/SECURITY/SOFTWARE/HARDWARE/SAM + NTUSER.DAT into the gi
 CALL "%~dp0grab-registry.bat" "%EMU_REGDIR%"
 
 CALL :collect advapi32.dll
+CALL :collect apisetschema.dll
 CALL :collect audioeng.dll
 CALL :collect audiokse.dll
+CALL :collect authz.dll
 CALL :collect avifil32.dll
 CALL :collect bcrypt.dll
 CALL :collect bcryptprimitives.dll
@@ -52,6 +62,9 @@ CALL :collect cabinet.dll
 CALL :collect cfgmgr32.dll
 CALL :collect ci.dll
 CALL :collect clbcatq.dll
+CALL :collect cmd.exe
+CALL :collect_file "%WINDIR%\System32\en-US", cmd.exe.mui, %EMU_SYSDIR%\en-us
+CALL :collect_file "%WINDIR%\SysWOW64\en-US", cmd.exe.mui, %EMU_SYSDIR_WOW64%\en-us
 CALL :collect coloradapterclient.dll
 CALL :collect combase.dll
 CALL :collect comctl32.dll
@@ -82,7 +95,9 @@ CALL :collect dnsapi.dll
 CALL :collect dpapi.dll
 CALL :collect dsparse.dll
 CALL :collect dsound.dll
+CALL :collect dsparse.dll
 CALL :collect dwmapi.dll
+CALL :collect dwrite.dll
 CALL :collect dxcore.dll
 CALL :collect dxgi.dll
 CALL :collect dxva2.dll
@@ -93,9 +108,11 @@ CALL :collect gdiplus.dll
 CALL :collect glu32.dll
 CALL :collect hal.dll
 CALL :collect hid.dll
+CALL :collect imageres.dll
 CALL :collect imm32.dll
 CALL :collect imagehlp.dll
 CALL :collect inputhost.dll
+CALL :collect iertutil.dll
 CALL :collect iphlpapi.dll
 CALL :collect kdcom.dll
 CALL :collect kernel.appcore.dll
@@ -120,6 +137,8 @@ CALL :collect mscoree.dll
 CALL :collect msdmo.dll
 CALL :collect mskeyprotect.dll
 CALL :collect msvcp140.dll
+CALL :collect msvcp140_1.dll
+CALL :collect msvcp140_2.dll
 CALL :collect msvcp140_atomic_wait.dll
 CALL :collect msvcp140d.dll
 CALL :collect msvcp60.dll
@@ -148,7 +167,10 @@ CALL :collect pdh.dll
 CALL :collect powrprof.dll
 CALL :collect profapi.dll
 CALL :collect propsys.dll
-CALL :collect_file "%WINDIR%\SystemResources", PROPSYS.dll.mun, %EMU_SYSTEMRESOURCESDIR%
+CALL :collect_file "%WINDIR%\SystemResources", propsys.dll.mun, %EMU_SYSTEMRESOURCESDIR%
+CALL :collect_file "%WINDIR%\SystemResources", imageres.dll.mun, %EMU_SYSTEMRESOURCESDIR%
+CALL :collect_file "%WINDIR%\SystemResources", shell32.dll.mun, %EMU_SYSTEMRESOURCESDIR%
+CALL :collect_file "%WINDIR%", WindowsShell.Manifest, %EMU_WINDIR%
 CALL :collect psapi.dll
 CALL :collect rasadhlp.dll
 CALL :collect resampledmo.dll
@@ -156,6 +178,7 @@ CALL :collect rpcrt4.dll
 CALL :collect rpcss.dll
 CALL :collect rstrtmgr.dll
 CALL :collect rsaenh.dll
+CALL :collect samcli.dll
 CALL :collect samlib.dll
 CALL :collect schannel.dll
 CALL :collect sechost.dll
@@ -170,6 +193,7 @@ CALL :collect slwga.dll
 CALL :collect sppc.dll
 CALL :collect srvcli.dll
 CALL :collect sspicli.dll
+CALL :collect tdh.dll
 CALL :collect textshaping.dll
 CALL :collect twinapi.appcore.dll
 CALL :collect ucrtbase.dll
@@ -190,6 +214,8 @@ CALL :collect wer.dll
 CALL :collect win32u.dll
 CALL :collect windows.internal.graphics.display.displaycolormanagement.dll
 CALL :collect windows.storage.dll
+CALL :collect windows.ui.dll
+CALL :collect windows.ui.immersive.dll
 CALL :collect windowscodecs.dll
 CALL :collect winhttp.dll
 CALL :collect wininet.dll
@@ -198,8 +224,10 @@ CALL :collect winmmbase.dll
 CALL :collect winnlsres.dll
 CALL :collect wintrust.dll
 CALL :collect wintypes.dll
+CALL :collect wkscli.dll
 CALL :collect wlanapi.dll
 CALL :collect wldap32.dll
+CALL :collect wldp.dll
 CALL :collect wmasf.dll
 CALL :collect wmvcore.dll
 CALL :collect wow64.dll
@@ -212,9 +240,6 @@ CALL :collect wshbth.dll
 CALL :collect wsock32.dll
 CALL :collect wtsapi32.dll
 CALL :collect xmllite.dll
-CALL :collect x3daudio1_7.dll
-CALL :collect xapofx1_5.dll
-CALL :collect xaudio2_9.dll
 CALL :collect xinput1_3.dll
 CALL :collect xinput1_4.dll
 CALL :collect xinput9_1_0.dll
@@ -225,6 +250,9 @@ CALL :collect_matching d3dx9_*.dll
 CALL :collect_matching d3dx10_*.dll
 CALL :collect_matching d3dx11_*.dll
 CALL :collect_matching d3dcompiler_*.dll
+CALL :collect_matching xaudio2_*.dll
+CALL :collect_matching x3daudio1_*.dll
+CALL :collect_matching xapofx1_*.dll
 CALL :collect_file "%WINDIR%\System32\en-US", user32.dll.mui, %EMU_SYSDIR%\en-us
 CALL :collect_file "%WINDIR%\SysWOW64\en-US", user32.dll.mui, %EMU_SYSDIR_WOW64%\en-us
 
@@ -236,24 +264,28 @@ CALL :collect c_850.nls
 CALL :collect_file "%WINDIR%\Globalization\Sorting", sortdefault.nls, %EMU_SORTDIR%
 
 CALL :collect wdmaud.drv
+CALL :collect winspool.drv
 
 CALL :collect_file "%WINDIR%\Cursors", aero_arrow.cur, %EMU_CURSORDIR%
 
-CALL :collect_winsxs_directories amd64_microsoft.windows.common-controls_*
+REM DirectWrite cannot reach the font cache service in the emulator and reads these files instead.
+FOR %%F IN ("%WINDIR%\Fonts\segoeui*.ttf" "%WINDIR%\Fonts\consola*.ttf" "%WINDIR%\Fonts\cour*.ttf") DO CALL :collect_file "%WINDIR%\Fonts", %%~nxF, %EMU_FONTDIR%
+
+CALL :collect_winsxs_directories %SXS_NATIVE%_microsoft.windows.common-controls_*
 CALL :collect_winsxs_directories x86_microsoft.windows.common-controls_*
-CALL :collect_winsxs_directories amd64_microsoft.windows.c..-controls.resources_*
+CALL :collect_winsxs_directories %SXS_NATIVE%_microsoft.windows.c..-controls.resources_*
 CALL :collect_winsxs_directories x86_microsoft.windows.c..-controls.resources_*
-CALL :collect_winsxs_policy_directories amd64_policy.*.microsoft.windows.common-controls_*
+CALL :collect_winsxs_policy_directories %SXS_NATIVE%_policy.*.microsoft.windows.common-controls_*
 CALL :collect_winsxs_policy_directories x86_policy.*.microsoft.windows.common-controls_*
-CALL :collect_winsxs_policy_directories amd64_policy.*.microsoft.windows.c..-controls.resources_*
+CALL :collect_winsxs_policy_directories %SXS_NATIVE%_policy.*.microsoft.windows.c..-controls.resources_*
 CALL :collect_winsxs_policy_directories x86_policy.*.microsoft.windows.c..-controls.resources_*
-CALL :collect_winsxs_manifests amd64_microsoft.windows.common-controls_*
+CALL :collect_winsxs_manifests %SXS_NATIVE%_microsoft.windows.common-controls_*
 CALL :collect_winsxs_manifests x86_microsoft.windows.common-controls_*
-CALL :collect_winsxs_manifests amd64_microsoft.windows.c..-controls.resources_*
+CALL :collect_winsxs_manifests %SXS_NATIVE%_microsoft.windows.c..-controls.resources_*
 CALL :collect_winsxs_manifests x86_microsoft.windows.c..-controls.resources_*
-CALL :collect_winsxs_manifests amd64_policy.*.microsoft.windows.common-controls_*
+CALL :collect_winsxs_manifests %SXS_NATIVE%_policy.*.microsoft.windows.common-controls_*
 CALL :collect_winsxs_manifests x86_policy.*.microsoft.windows.common-controls_*
-CALL :collect_winsxs_manifests amd64_policy.*.microsoft.windows.c..-controls.resources_*
+CALL :collect_winsxs_manifests %SXS_NATIVE%_policy.*.microsoft.windows.c..-controls.resources_*
 CALL :collect_winsxs_manifests x86_policy.*.microsoft.windows.c..-controls.resources_*
 
 REM Visual C++ 2005/2008 runtimes (CRT, MFC, ATL), present only when the host has them installed.

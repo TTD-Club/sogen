@@ -110,6 +110,9 @@ assert test_sample.exists()
 
 with tempfile.TemporaryDirectory(prefix="sogen-python-") as temp_dir:
     mapped_file = Path(temp_dir) / "a.txt"
+    # The sample creates its files in C:\sogen-test-scratch when that exists; the emulation root is read-only.
+    scratch_dir = Path(temp_dir) / "scratch"
+    scratch_dir.mkdir()
     filesys_root = Path(emulator_root) / "filesys" / "c"
     filesys_root.mkdir(parents=True, exist_ok=True)
     sample_copy = filesys_root / "test-sample.exe"
@@ -119,7 +122,7 @@ with tempfile.TemporaryDirectory(prefix="sogen-python-") as temp_dir:
     app = win.create_application(
         r"C:\test-sample.exe",
         emulation_root=emulator_root,
-        mounts=[(mapped_file, r"C:\a.txt", "rw")],
+        mounts=[(mapped_file, r"C:\a.txt", "rw"), (scratch_dir, r"C:\sogen-test-scratch", "rw")],
         network="live",
         port_mappings={28970: 28980},
     )

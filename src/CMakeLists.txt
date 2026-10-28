@@ -50,7 +50,7 @@ if(_SOGEN_BUILD_STANDALONE_TARGETS)
   add_subdirectory(linux-emulator-test)
   add_subdirectory(windows-ttd/inspect)
 
-  if((WIN32 OR LINUX) AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+  if((WIN32 OR LINUX OR ANDROID) AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     sogen_add_subdirectory_and_get_targets("tools" TOOL_TARGETS)
     sogen_targets_set_folder("tools" ${TOOL_TARGETS})
   endif()
@@ -61,10 +61,10 @@ if(_SOGEN_BUILD_STANDALONE_TARGETS)
   endif()
 
   # The tools baked into the emulation root, grouped so CI builds one target. Each is included only when it
-  # exists for the current arch/config (dump-apiset is 64-bit; steam-shim needs the Steam bridge enabled).
+  # exists for the current arch/config (steam-shim needs the Steam bridge enabled).
   if(WIN32)
     add_custom_target(emulation-root-tools)
-    foreach(_root_tool vulkan-shim steam-shim dump-apiset)
+    foreach(_root_tool vulkan-shim steam-shim)
       if(TARGET ${_root_tool})
         add_dependencies(emulation-root-tools ${_root_tool})
       endif()

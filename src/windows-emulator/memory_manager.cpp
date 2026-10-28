@@ -468,12 +468,40 @@ namespace sogen
     bool memory_manager::allocate_host_memory_at(const uint64_t address, const size_t size, void* host_pointer,
                                                  const nt_memory_permission permissions)
     {
-        if (this->overlaps_reserved_region(address, size))
+        const bool uses_existing_host_mapping = this->memory_->host_memory_mapping_requires_identity();
+        if (this->overlaps_reserved_region(address, size, uses_existing_host_mapping))
         {
             return false;
         }
 
-        this->map_host_memory(address, size, host_pointer, this->get_effective_permissions(permissions));
+        if (uses_existing_host_mapping)
+        {
+            this->carve_host_reserved_hole(address, size);
+        }
+        else
+        {
+            this->memory_->reserve_guest_address_range(address, size);
+        }
+
+        if (!this->register_host_memory(address, size, host_pointer, permissions))
+        {
+            if (!uses_existing_host_mapping)
+            {
+                this->release_host_claims(address + size);
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    bool memory_manager::register_host_memory(const uint64_t address, const size_t size, void* host_pointer,
+                                              const nt_memory_permission permissions)
+    {
+        if (!this->map_host_memory(address, size, host_pointer, this->get_effective_permissions(permissions)))
+        {
+            return false;
+        }
 
         const auto entry = this->reserved_regions_
                                .try_emplace(address,
@@ -493,7 +521,8 @@ namespace sogen
         return true;
     }
 
-    uint64_t memory_manager::allocate_host_memory(const size_t size, void* host_pointer, const nt_memory_permission permissions)
+    uint64_t memory_manager::allocate_host_memory(const size_t size, void* host_pointer, const nt_memory_permission permissions,
+                                                  const uint64_t highest_address)
     {
         if (size == 0 || host_pointer == nullptr)
         {
@@ -501,38 +530,89 @@ namespace sogen
         }
 
         const bool uses_existing_host_mapping = this->memory_->host_memory_mapping_requires_identity();
-        const uint64_t address =
-            uses_existing_host_mapping ? get_untagged_pointer_address(host_pointer) : this->find_free_host_allocation_base(size, 0);
+        const uint64_t address = uses_existing_host_mapping ? get_untagged_pointer_address(host_pointer)
+                                                            : this->find_free_host_allocation_base(size, 0, highest_address);
 
-        if (address < MIN_ALLOCATION_ADDRESS || address >= MAX_ALLOCATION_END_EXCL || size > MAX_ALLOCATION_END_EXCL - address)
+        if (address < MIN_ALLOCATION_ADDRESS || address >= MAX_ALLOCATION_END_EXCL || size > MAX_ALLOCATION_END_EXCL - address ||
+            address + size - 1 > highest_address)
         {
             return 0;
-        }
-
-        if (this->overlaps_reserved_region(address, size, uses_existing_host_mapping))
-        {
-            return 0;
-        }
-
-        if (uses_existing_host_mapping)
-        {
-            this->carve_host_reserved_hole(address, size);
-        }
-        else
-        {
-            this->memory_->reserve_guest_address_range(address, size);
         }
 
         if (!this->allocate_host_memory_at(address, size, host_pointer, permissions))
         {
-            if (!uses_existing_host_mapping)
-            {
-                this->release_host_claims(address + size);
-            }
             return 0;
         }
 
         return address;
+    }
+
+    std::vector<basic_memory_region<nt_memory_permission>> memory_manager::get_committed_regions(const uint64_t region_base) const
+    {
+        std::vector<basic_memory_region<nt_memory_permission>> regions{};
+        const auto entry = this->reserved_regions_.find(region_base);
+        if (entry == this->reserved_regions_.end())
+        {
+            return regions;
+        }
+
+        for (const auto& [address, region] : entry->second.committed_regions)
+        {
+            regions.push_back({.start = address, .length = region.length, .permissions = region.permissions});
+        }
+        return regions;
+    }
+
+    bool memory_manager::can_alias_host_memory_anywhere() const
+    {
+        return this->memory_->supports_host_memory_mapping() && !this->memory_->host_memory_mapping_requires_identity();
+    }
+
+    uint64_t memory_manager::allocate_placed_host_memory(const size_t size, const nt_memory_permission permissions,
+                                                         const uint64_t highest_address,
+                                                         const std::function<bool(void* host_address)>& place)
+    {
+        if (size == 0 || this->memory_->host_placement_address(MIN_ALLOCATION_ADDRESS) == 0)
+        {
+            return 0;
+        }
+
+        const uint64_t address = this->find_free_host_allocation_base(size, 0, highest_address);
+        if (address == 0 || !this->allocate_placed_host_memory_at(address, size, permissions, place))
+        {
+            return 0;
+        }
+
+        return address;
+    }
+
+    bool memory_manager::allocate_placed_host_memory_at(const uint64_t address, const size_t size, const nt_memory_permission permissions,
+                                                        const std::function<bool(void* host_address)>& place)
+    {
+        if (size == 0 || this->memory_->host_placement_address(address) == 0 || this->overlaps_reserved_region(address, size, false))
+        {
+            return false;
+        }
+
+        auto* host_address = reinterpret_cast<void*>(this->memory_->host_placement_address(address));
+        this->memory_->reserve_guest_address_range(address, size);
+        if (!place(host_address))
+        {
+            this->release_host_claims(address + size);
+            return false;
+        }
+
+        if (!this->register_host_memory(address, size, host_address, permissions))
+        {
+            throw std::runtime_error("Failed to register placed host memory in a free guest range");
+        }
+
+        return true;
+    }
+
+    uint64_t memory_manager::host_placement_address(const uint64_t address) const
+    {
+        return this->memory_->host_placement_address(address);
     }
 
     void memory_manager::reserve_host_memory_ranges()
@@ -702,7 +782,9 @@ namespace sogen
     bool memory_manager::allocate_memory_raw(const uint64_t address, const uint64_t size, const nt_memory_permission permissions,
                                              const bool reserve_only, const memory_region_kind kind)
     {
-        if ((!reserve_only && !fits_host_mapping(size)) || this->overlaps_reserved_region(address, size))
+        const auto maximum_address = this->get_maximum_allocation_address();
+        if ((!reserve_only && !fits_host_mapping(size)) || size > maximum_address || address > maximum_address - size + 1 ||
+            this->overlaps_reserved_region(address, size))
         {
             return false;
         }
@@ -1118,7 +1200,13 @@ namespace sogen
     }
 
     uint64_t memory_manager::allocate_memory(const uint64_t size, const nt_memory_permission permissions, const bool reserve_only,
-                                             uint64_t start, const memory_region_kind kind)
+                                             const uint64_t start, const memory_region_kind kind)
+    {
+        return this->allocate_memory(size, permissions, reserve_only, start, kind, MAX_ALLOCATION_END_EXCL - 1);
+    }
+
+    uint64_t memory_manager::allocate_memory(const uint64_t size, const nt_memory_permission permissions, const bool reserve_only,
+                                             const uint64_t start, const memory_region_kind kind, const uint64_t highest_address)
     {
         // Backends sharing the address space with the guest (e.g. FEX) allocate their own host memory
         // (JIT code buffers, thread and GCD worker stacks, a framework's lazy vm_allocate) at any point
@@ -1126,7 +1214,7 @@ namespace sogen
         // the reserve_guest_address_range below would mmap(MAP_FIXED) over it. find_free_host_allocation_base
         // confirms the pick against the host instead of paying for an unconditional full rescan, which
         // costs O(host VM regions) Mach IPC syscalls and grows without bound over a session.
-        const uint64_t allocation_base = this->find_free_host_allocation_base(size, start);
+        const uint64_t allocation_base = this->find_free_host_allocation_base(size, start, highest_address);
         if (!allocation_base)
         {
             return 0;
@@ -1221,7 +1309,8 @@ namespace sogen
         }
 
         lowest_address = std::max<uint64_t>(lowest_address, MIN_ALLOCATION_ADDRESS);
-        highest_address = std::min<uint64_t>(highest_address ? highest_address : MAX_ALLOCATION_END_EXCL - 1, MAX_ALLOCATION_END_EXCL - 1);
+        const auto maximum_address = this->get_maximum_allocation_address();
+        highest_address = std::min<uint64_t>(highest_address ? highest_address : maximum_address, maximum_address);
         if (lowest_address > highest_address)
         {
             return 0;
@@ -1309,6 +1398,13 @@ namespace sogen
         }
 
         return 0;
+    }
+
+    uint64_t memory_manager::get_maximum_allocation_address() const
+    {
+        // Like Windows, keep the last 64 KB below the end of the user address space unallocated.
+        const auto backend_end = this->memory_->guest_address_end();
+        return std::min(MAX_ALLOCATION_ADDRESS, backend_end - ALLOCATION_GRANULARITY - 1);
     }
 
     region_info memory_manager::get_region_info(const uint64_t address)
@@ -1556,13 +1652,19 @@ namespace sogen
         }
     }
 
-    void memory_manager::map_host_memory(const uint64_t address, const size_t size, void* host_pointer, const memory_permission permissions)
+    bool memory_manager::map_host_memory(const uint64_t address, const size_t size, void* host_pointer, const memory_permission permissions)
     {
-        this->memory_->map_host_memory(address, size, host_pointer, permissions);
+        if (!this->memory_->map_host_memory(address, size, host_pointer, permissions))
+        {
+            return false;
+        }
+
         if (mapping_change_callback_)
         {
             mapping_change_callback_(address, size);
         }
+
+        return true;
     }
 
     bool memory_manager::host_memory_aliasing_is_coherent() const
@@ -1573,6 +1675,22 @@ namespace sogen
     void memory_manager::flush_host_memory_cache(const void* host_pointer, const size_t size)
     {
         this->memory_->flush_host_memory_cache(host_pointer, size);
+    }
+
+    bool memory_manager::track_access(const uint64_t address, const size_t size)
+    {
+        return this->memory_->track_access(address, size);
+    }
+
+    void memory_manager::take_written_ranges(const uint64_t address, const size_t size,
+                                             const std::function<void(uint64_t written_address, size_t written_size)>& f)
+    {
+        this->memory_->take_written_ranges(address, size, f);
+    }
+
+    void memory_manager::invalidate_cache_on_access(const uint64_t address, const size_t size)
+    {
+        this->memory_->invalidate_cache_on_access(address, size);
     }
 
     void memory_manager::unmap_memory(const uint64_t address, const size_t size)

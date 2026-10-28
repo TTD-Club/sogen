@@ -1,14 +1,12 @@
 #include "../std_include.hpp"
 
 #include "apiset.hpp"
-#include "default_apiset.hpp"
 
 #include "../emulator_utils.hpp"
 
 #include <arch_emulator.hpp>
 
 #include <utils/io.hpp>
-#include <utils/compression.hpp>
 
 namespace sogen
 {
@@ -17,7 +15,7 @@ namespace sogen
     {
         namespace
         {
-            uint64_t copy_string(x86_64_emulator& emu, emulator_allocator& allocator, const void* base_ptr, const uint64_t offset,
+            uint64_t copy_string(memory_interface& emu, emulator_allocator& allocator, const void* base_ptr, const uint64_t offset,
                                  const size_t length)
             {
                 if (!length)
@@ -32,7 +30,7 @@ namespace sogen
                 return str_obj;
             }
 
-            ULONG copy_string_as_relative(x86_64_emulator& emu, emulator_allocator& allocator, const uint64_t result_base,
+            ULONG copy_string_as_relative(memory_interface& emu, emulator_allocator& allocator, const uint64_t result_base,
                                           const void* base_ptr, const uint64_t offset, const size_t length)
             {
                 const auto address = copy_string(emu, allocator, base_ptr, offset, length);
@@ -45,85 +43,72 @@ namespace sogen
                 return static_cast<ULONG>(address - result_base);
             }
 
-            std::vector<std::byte> decompress_apiset(const std::vector<std::byte>& apiset)
+            template <typename T>
+            T read_schema_value(const std::vector<std::byte>& file, const uint64_t offset)
             {
-                auto buffer = utils::compression::zstd::decompress(apiset);
-                if (buffer.empty())
+                if (offset > file.size() || file.size() - offset < sizeof(T))
                 {
-                    throw std::runtime_error("Failed to decompress API-SET");
+                    throw std::runtime_error("Truncated apisetschema.dll");
                 }
 
-                return buffer;
+                T value{};
+                memcpy(&value, file.data() + offset, sizeof(value));
+                return value;
             }
 
-            std::vector<std::byte> obtain_data(const location location, const std::filesystem::path& root)
+            // Windows maps the .apiset section of apisetschema.dll as the process API set map.
+            std::vector<std::byte> read_schema_dll(const std::vector<std::byte>& file)
             {
-                switch (location)
+                if (file.empty())
                 {
-#ifdef OS_WINDOWS_64
-                case location::host: {
-                    const auto* teb = NtCurrentTeb64();
-                    const auto* peb = reinterpret_cast<PEB64*>(teb->ProcessEnvironmentBlock);
-                    const auto* api_set_map = reinterpret_cast<const API_SET_NAMESPACE*>(peb->ApiSetMap);
-                    const auto* data_ptr = reinterpret_cast<const std::byte*>(api_set_map);
-                    return {data_ptr, data_ptr + api_set_map->Size};
+                    throw std::runtime_error("Failed to read apisetschema.dll");
                 }
-#else
-                case location::host:
-                    throw std::runtime_error("The APISET host location is not supported on this platform");
-#endif
-                case location::file: {
-                    const auto apiset = utils::io::read_file(root / "api-set.bin");
-                    if (apiset.empty())
+
+                const auto dos = read_schema_value<PEDosHeader_t>(file, 0);
+                if (dos.e_magic != PEDosHeader_t::k_Magic ||
+                    read_schema_value<uint32_t>(file, dos.e_lfanew) != PENTHeaders_t<uint64_t>::k_Signature)
+                {
+                    throw std::runtime_error("apisetschema.dll is not a PE image");
+                }
+
+                const uint64_t file_header_offset = dos.e_lfanew + sizeof(uint32_t);
+                const auto file_header = read_schema_value<PEFileHeader_t>(file, file_header_offset);
+                const auto first_section = file_header_offset + sizeof(PEFileHeader_t) + file_header.SizeOfOptionalHeader;
+
+                for (uint16_t i = 0; i < file_header.NumberOfSections; ++i)
+                {
+                    const auto section = read_schema_value<IMAGE_SECTION_HEADER>(file, first_section + i * sizeof(IMAGE_SECTION_HEADER));
+                    if (memcmp(section.Name, ".apiset", 8) != 0)
                     {
-                        throw std::runtime_error("Failed to read file api-set.bin");
+                        continue;
                     }
 
-                    return decompress_apiset(apiset);
+                    const auto api_set = read_schema_value<API_SET_NAMESPACE>(file, section.PointerToRawData);
+                    if (api_set.Size < sizeof(API_SET_NAMESPACE) || api_set.Size > section.SizeOfRawData ||
+                        section.PointerToRawData + static_cast<uint64_t>(api_set.Size) > file.size())
+                    {
+                        throw std::runtime_error("Invalid API set in apisetschema.dll");
+                    }
+
+                    const auto* begin = file.data() + section.PointerToRawData;
+                    return {begin, begin + api_set.Size};
                 }
-                case location::default_windows_10: {
-                    const auto* byte_apiset = reinterpret_cast<const std::byte*>(apiset_w10);
-                    const std::vector<std::byte> apiset{byte_apiset, byte_apiset + sizeof(apiset_w10)};
-                    return decompress_apiset(apiset);
-                }
-                case location::default_windows_11: {
-                    const auto* byte_apiset = reinterpret_cast<const std::byte*>(apiset_w11);
-                    const std::vector<std::byte> apiset{byte_apiset, byte_apiset + sizeof(apiset_w11)};
-                    return decompress_apiset(apiset);
-                }
-                default:
-                    throw std::runtime_error("Bad API set location");
-                }
+
+                throw std::runtime_error("apisetschema.dll has no .apiset section");
             }
         }
 
-        container obtain(const location location, const std::filesystem::path& root)
+        container obtain(const std::vector<std::byte>& schema_dll)
         {
-            return {.data = obtain_data(location, root)};
+            return {.data = read_schema_dll(schema_dll)};
         }
 
-        container obtain(const std::filesystem::path& root)
-        {
-            auto apiset_loc = location::file;
-
-            if (root.empty())
-            {
-#ifdef OS_WINDOWS
-                apiset_loc = location::host;
-#else
-                apiset_loc = location::default_windows_11;
-#endif
-            }
-
-            return obtain(apiset_loc, root);
-        }
-
-        emulator_object<API_SET_NAMESPACE> clone(x86_64_emulator& emu, emulator_allocator& allocator, const container& container)
+        emulator_object<API_SET_NAMESPACE> clone(memory_interface& emu, emulator_allocator& allocator, const container& container)
         {
             return clone(emu, allocator, container.get());
         }
 
-        emulator_object<API_SET_NAMESPACE> clone(x86_64_emulator& emu, emulator_allocator& allocator,
+        emulator_object<API_SET_NAMESPACE> clone(memory_interface& emu, emulator_allocator& allocator,
                                                  const API_SET_NAMESPACE& orig_api_set_map)
         {
             const auto api_set_map_obj = allocator.reserve<API_SET_NAMESPACE>();

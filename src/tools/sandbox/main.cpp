@@ -3,11 +3,14 @@
 #include <emulator_process_target.hpp>
 #include <inherited_pipes.hpp>
 #include <registry/registry_file.hpp>
+#include <snapshot.hpp>
 #include <utils/finally.hpp>
 #include <utils/executable_path.hpp>
 #ifdef _WIN32
 #include <whp_x86_64_emulator.hpp>
 #include <utils/win.hpp>
+#elif defined(__ANDROID__)
+#include <backend_selection.hpp>
 #else
 #include <kvm_x86_64_emulator.hpp>
 #endif
@@ -19,9 +22,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -39,15 +45,6 @@ namespace sogen::sandbox
             return utils::get_current_executable_path().parent_path();
         }
 
-        std::filesystem::path get_sandbox_executable()
-        {
-#ifdef _WIN32
-            return get_current_binary_dir() / "sandbox.exe";
-#else
-            return get_current_binary_dir() / "sandbox";
-#endif
-        }
-
         std::vector<std::u16string> parse_arguments(const std::span<const std::string_view> args)
         {
             std::vector<std::u16string> wide_args{};
@@ -62,14 +59,43 @@ namespace sogen::sandbox
             return wide_args;
         }
 
+        // Without an emulation root the path is empty, which absolute() rejects on Windows.
+        std::string describe_path(const std::filesystem::path& path)
+        {
+            return path.empty() ? std::string{} : std::filesystem::absolute(path).string();
+        }
+
+        std::string describe_configuration(const emulator_settings& settings, const std::vector<std::filesystem::path>& registry_files)
+        {
+            std::string configuration{};
+            configuration += "emulation-root=" + describe_path(settings.emulation_root) + "\n";
+            configuration += "root-mode=" + std::string{to_string(settings.root_mode)} + "\n";
+            configuration += "registry=" + describe_path(settings.registry_directory) + "\n";
+            configuration += "network=" + std::string{network::to_string(settings.network)} + "\n";
+            configuration += std::string{"spoof-gpu-features="} + (settings.spoof_gpu_features ? "on" : "off") + "\n";
+
+            for (const auto& mount : settings.mounts)
+            {
+                configuration += "mount=" + render_mount_spec(mount) + "\n";
+            }
+
+            for (const auto& file : registry_files)
+            {
+                configuration += "reg-file=" + describe_path(file) + "\n";
+            }
+
+            return configuration;
+        }
+
         int run(const std::span<const std::string_view> args, const filesystem_mode root_mode, std::vector<mount_spec> mounts,
                 const std::filesystem::path& emulation_root, const std::filesystem::path& registry_directory,
                 const std::vector<std::filesystem::path>& registry_files,
                 const std::vector<std::pair<std::string, std::string>>& environment, const network::network_mode network_mode,
+                const bool spoof_gpu_features, const std::filesystem::path& snapshot_directory, const std::filesystem::path& resume_file,
                 managed_process_connection* managed_connection)
         {
             application_settings app_settings{
-                .application = std::u8string(args[0].begin(), args[0].end()),
+                .application = args.empty() ? std::u8string{} : std::u8string(args[0].begin(), args[0].end()),
                 .arguments = parse_arguments(args),
             };
             for (const auto& [name, value] : environment)
@@ -94,11 +120,18 @@ namespace sogen::sandbox
             }
 
 #ifdef _WIN32
-            // One vCPU per host core; WHP supports at most 64 per partition. EMULATOR_VCPU_COUNT overrides.
-            auto vcpu_count = std::clamp(std::thread::hardware_concurrency(), 1u, 64u);
+            // One vCPU per host core; WHP supports at most 64 per partition. EMULATOR_VCPU_COUNT overrides. Snapshots only
+            // support a single vCPU so far.
+            const auto resumes = !resume_file.empty();
+            auto vcpu_count = resumes ? 1u : std::clamp(std::thread::hardware_concurrency(), 1u, 64u);
             if (const char* env = std::getenv("EMULATOR_VCPU_COUNT"); env != nullptr && env[0] != '\0')
             {
                 vcpu_count = std::clamp(static_cast<uint32_t>(std::strtoul(env, nullptr, 10)), 1u, 64u);
+            }
+
+            if (resumes && vcpu_count != 1)
+            {
+                throw std::runtime_error("Resuming supports only one vCPU");
             }
 #endif
 
@@ -109,6 +142,7 @@ namespace sogen::sandbox
                 .intercept_kusd = false,
                 .registry_directory = registry_directory.empty() ? get_current_binary_dir() / "registry" : registry_directory,
                 .network = network_mode,
+                .spoof_gpu_features = spoof_gpu_features,
             };
 
             if (!emulation_root.empty())
@@ -123,7 +157,7 @@ namespace sogen::sandbox
             settings.root_mode = root_mode;
             settings.mounts = std::move(mounts);
 
-            subprocess_process_manager process_manager{get_sandbox_executable(), [&](const auto port, const auto& token) {
+            subprocess_process_manager process_manager{utils::get_current_executable_path(), [&](const auto port, const auto& token) {
                                                            std::vector<std::string> arguments{"--managed-process-port",
                                                                                               std::to_string(port),
                                                                                               "--managed-process-token",
@@ -132,6 +166,10 @@ namespace sogen::sandbox
                                                                                               settings.registry_directory.string()};
                                                            arguments.emplace_back("--network");
                                                            arguments.emplace_back(network::to_string(network_mode));
+                                                           if (spoof_gpu_features)
+                                                           {
+                                                               arguments.emplace_back("--spoof-gpu-features");
+                                                           }
                                                            if (!settings.emulation_root.empty())
                                                            {
                                                                arguments.emplace_back("--emulation");
@@ -160,17 +198,35 @@ namespace sogen::sandbox
 
 #ifdef _WIN32
             auto emulator = whp::create_x86_64_emulator(vcpu_count);
+#elif defined(__ANDROID__) && defined(__aarch64__)
+            auto emulator = create_x86_64_emulator(backend_type::fex);
+#elif defined(__ANDROID__)
+            auto emulator = create_x86_64_emulator(backend_type::unicorn);
 #else
             auto emulator = kvm::create_x86_64_emulator();
 #endif
 
-            windows_emulator win_emu{std::move(emulator), std::move(app_settings), settings, std::move(callbacks),
-                                     emulator_interfaces{.processes = &process_manager}};
-            for (const auto& file : registry_files)
-            {
-                import_registry_file(win_emu.registry, file);
-            }
+            auto win_emu_ptr = resume_file.empty() ? std::make_unique<windows_emulator>(std::move(emulator), std::move(app_settings),
+                                                                                        settings, std::move(callbacks),
+                                                                                        emulator_interfaces{.processes = &process_manager})
+                                                   : std::make_unique<windows_emulator>(std::move(emulator), settings, std::move(callbacks),
+                                                                                        emulator_interfaces{.processes = &process_manager});
+            auto& win_emu = *win_emu_ptr;
             win_emu.log.disable_output(true);
+
+            const auto configuration = describe_configuration(settings, registry_files);
+            if (resume_file.empty())
+            {
+                for (const auto& file : registry_files)
+                {
+                    import_registry_file(win_emu.registry, file);
+                }
+            }
+            else
+            {
+                // The snapshot carries the registry values the files were imported into.
+                snapshot::load_emulator_snapshot(win_emu, resume_file, configuration);
+            }
 
             std::unique_ptr<emulator_process_target> managed_target{};
             if (managed_connection)
@@ -190,18 +246,58 @@ namespace sogen::sandbox
                 }
             });
 
+            snapshot::controller snapshots{win_emu, configuration, snapshot_directory, [](const snapshot::snapshot_outcome& outcome) {
+                                               if (outcome.error.empty())
+                                               {
+                                                   fprintf(stderr, "Saved the process to %s\n", outcome.path.string().c_str());
+                                               }
+                                               else
+                                               {
+                                                   fprintf(stderr, "Saving the process failed, it keeps running: %s\n",
+                                                           outcome.error.c_str());
+                                               }
+                                           }};
+            win_emu.ui().set_snapshot_request_sink([&] { snapshots.request(); });
+            const auto snapshot_sink_guard = utils::finally([&] { win_emu.ui().set_snapshot_request_sink({}); });
+
             std::atomic_uint32_t signals_received{0};
             utils::interupt_handler interrupt_guard{[&] {
-                const auto value = signals_received++;
-                if (value >= 2)
+                if (signals_received++ >= 2)
                 {
                     _Exit(1);
                 }
-
-                win_emu.stop();
             }};
 
-            win_emu.start();
+            // A signal handler cannot take the locks stopping the process needs, so a thread watching the interrupts does.
+            std::mutex signal_mutex{};
+            std::condition_variable signal_changed{};
+            bool watching = true;
+            std::thread signal_watcher([&] {
+                std::unique_lock lock(signal_mutex);
+                while (watching)
+                {
+                    signal_changed.wait_for(lock, std::chrono::milliseconds(50));
+                    if (signals_received > 0)
+                    {
+                        snapshots.stop();
+                        return;
+                    }
+                }
+            });
+
+            const auto signal_watcher_guard = utils::finally([&] {
+                {
+                    const std::scoped_lock lock(signal_mutex);
+                    watching = false;
+                }
+                signal_changed.notify_all();
+                signal_watcher.join();
+            });
+
+            if (snapshots.run())
+            {
+                return 0;
+            }
 
             const auto exit_status = win_emu.process.exit_status;
             if (!exit_status.has_value())
@@ -255,6 +351,15 @@ namespace sogen::sandbox
             app.add_option("--network", network_name, "Guest network access: offline (no host network) or live")
                 ->capture_default_str()
                 ->check(CLI::IsMember({"offline", "live"}));
+            bool spoof_gpu_features{};
+            app.add_flag("--spoof-gpu-features", spoof_gpu_features,
+                         "Report Vulkan features DXVK requires even if the GPU lacks them (e.g. Mali)");
+            std::filesystem::path snapshot_directory{"snapshots"};
+            std::filesystem::path resume_file{};
+            app.add_option("--snapshot-dir", snapshot_directory, "Where Ctrl+Alt+Shift+S saves the process")
+                ->capture_default_str()
+                ->type_name("DIR");
+            app.add_option("--resume", resume_file, "Continue a saved process")->type_name("FILE");
             app.add_option("--managed-process-port", managed_process_port)->group("");
             app.add_option("--managed-process-token", managed_process_token)->group("");
 
@@ -280,10 +385,15 @@ namespace sogen::sandbox
                     application.push_back(request.application);
                     application.insert(application.end(), request.arguments.begin(), request.arguments.end());
                 }
-                if (application.empty())
+                if (application.empty() && resume_file.empty())
                 {
                     puts(app.help().c_str());
                     return 1;
+                }
+
+                if (!application.empty() && !resume_file.empty())
+                {
+                    throw std::runtime_error("--resume continues the saved application and takes no other");
                 }
 
                 std::vector<mount_spec> mounts{};
@@ -305,8 +415,8 @@ namespace sogen::sandbox
 
                 const std::vector<std::string_view> views{application.begin(), application.end()};
                 return run(views, parse_filesystem_mode(root_mode).value(), std::move(mounts), emulation_root, registry_directory,
-                           registry_files, environment, network::parse_network_mode(network_name),
-                           managed_process ? &*managed_process : nullptr);
+                           registry_files, environment, network::parse_network_mode(network_name), spoof_gpu_features, snapshot_directory,
+                           resume_file, managed_process ? &*managed_process : nullptr);
             }
             catch (const std::exception& e)
             {

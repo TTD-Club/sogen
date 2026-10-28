@@ -18,9 +18,18 @@ set_target_properties(android-runtime PROPERTIES OUTPUT_NAME sogen)
 target_link_libraries(android-runtime PRIVATE
   windows-emulator
   backend-selection
+  process-manager
   vulkan-headers
   android
   log
 )
+
+if(TARGET adrenotools)
+  target_link_libraries(android-runtime PRIVATE adrenotools)
+  target_compile_definitions(android-runtime PRIVATE SOGEN_HAS_ADRENOTOOLS=1)
+  # adrenotools dlopens its hooks at runtime from the app's native library directory, so they have to ship
+  # next to libsogen.so even though nothing links them.
+  add_dependencies(android-runtime main_hook file_redirect_hook gsl_alloc_hook)
+endif()
 
 sogen_strip_target(android-runtime)

@@ -427,22 +427,6 @@ namespace sogen
             return {.left = insets.left, .top = insets.top, .right = insets.right, .bottom = insets.bottom};
         }
 
-        void sync_guest_window_rects(window& win)
-        {
-            const auto window_rect = get_window_rect(win);
-            const RECT client_rect{
-                .left = win.client_x(),
-                .top = win.client_y(),
-                .right = win.client_x() + win.client_width(),
-                .bottom = win.client_y() + win.client_height(),
-            };
-
-            win.guest.access([&](USER_WINDOW& guest_win) {
-                guest_win.rcWindow = window_rect;
-                guest_win.rcClient = client_rect;
-            });
-        }
-
         void update_window_geometry(const syscall_context& c, window& win, const int x, const int y, const int width, const int height,
                                     const bool repaint)
         {
@@ -451,7 +435,7 @@ namespace sogen
             win.y = y;
             win.width = width;
             win.height = height;
-            sync_guest_window_rects(win);
+            win.sync_guest_rects();
 
             if (win.host_surface_window)
             {
@@ -2500,7 +2484,8 @@ namespace sogen
                 return FALSE;
             }
 
-            RECT rect{.left = 0, .top = 0, .right = 1920, .bottom = 1080};
+            RECT rect{
+                .left = 0, .top = 0, .right = static_cast<LONG>(c.proc.display_width), .bottom = static_cast<LONG>(c.proc.display_height)};
             if (c.proc.cursor_clip)
             {
                 rect = *c.proc.cursor_clip;
@@ -3398,6 +3383,12 @@ namespace sogen
             else
             {
                 win.name = read_large_string(window_name);
+            }
+
+            if (c.win_emu.callbacks.on_generic_activity && !win.name.empty())
+            {
+                c.win_emu.callbacks.on_generic_activity("CreateWindowEx class='" + u16_to_u8(cls_name) + "' name='" + u16_to_u8(win.name) +
+                                                        "'");
             }
             win.wnd_proc = wnd_class->lpfnWndProc;
 
@@ -4375,7 +4366,7 @@ namespace sogen
             }
 
             t.await_msg = {message, hwnd, msg_filter_min, msg_filter_max};
-            t.remember_message_wait(c.emu);
+            t.remember_message_wait(c.emu, c.win_emu.abi());
 
             c.win_emu.yield_thread(c.vcpu, false);
             return {};
@@ -4433,7 +4424,7 @@ namespace sogen
             }
 
             t.await_msg_mask = QS_ALLINPUT;
-            t.remember_message_wait(c.emu);
+            t.remember_message_wait(c.emu, c.win_emu.abi());
             c.win_emu.yield_thread(c.vcpu, false);
             return {};
         }
@@ -4689,6 +4680,28 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        struct display_mode
+        {
+            uint32_t width;
+            uint32_t height;
+        };
+
+        // The single virtual display advertises a list of common modes so callers (e.g. DXVK's mode enumeration, which
+        // the game uses to validate available resolutions) see real entries.
+        constexpr std::array<display_mode, 8> k_display_modes = {{
+            {.width = 640, .height = 480},
+            {.width = 800, .height = 600},
+            {.width = 1024, .height = 768},
+            {.width = 1280, .height = 720},
+            {.width = 1280, .height = 1024},
+            {.width = 1600, .height = 900},
+            {.width = 1680, .height = 1050},
+            {.width = 1920, .height = 1080},
+        }};
+
+        constexpr uint32_t k_display_bits_per_pixel = 32;
+        constexpr uint32_t k_display_frequency = 60;
+
         NTSTATUS handle_NtUserEnumDisplaySettings(const syscall_context& c,
                                                   const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> device_name,
                                                   const DWORD mode_num, const emulator_object<EMU_DEVMODEW> dev_mode, const DWORD /*flags*/)
@@ -4705,25 +4718,6 @@ namespace sogen
                 return STATUS_UNSUCCESSFUL;
             }
 
-            // The single virtual display advertises a list of common modes so callers (e.g. DXVK's
-            // mode enumeration, which the game uses to validate available resolutions) see real entries.
-            struct display_mode
-            {
-                uint32_t width;
-                uint32_t height;
-            };
-
-            static constexpr std::array<display_mode, 8> modes = {{
-                {.width = 640, .height = 480},
-                {.width = 800, .height = 600},
-                {.width = 1024, .height = 768},
-                {.width = 1280, .height = 720},
-                {.width = 1280, .height = 1024},
-                {.width = 1600, .height = 900},
-                {.width = 1680, .height = 1050},
-                {.width = 1920, .height = 1080},
-            }};
-
             const auto fill_mode = [&](const uint32_t width, const uint32_t height) {
                 dev_mode.access([&](EMU_DEVMODEW& dm) {
                     // Real EnumDisplaySettings fills the whole structure. Clear it first so fields the
@@ -4735,34 +4729,96 @@ namespace sogen
                     dm.dmFields = 0x5C0000; // DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY
                     dm.dmPelsWidth = width;
                     dm.dmPelsHeight = height;
-                    dm.dmBitsPerPel = 32;
-                    dm.dmDisplayFrequency = 60;
+                    dm.dmBitsPerPel = k_display_bits_per_pixel;
+                    dm.dmDisplayFrequency = k_display_frequency;
                 });
             };
 
-            if (mode_num == ENUM_CURRENT_SETTINGS || mode_num == ENUM_REGISTRY_SETTINGS)
+            if (mode_num == ENUM_CURRENT_SETTINGS)
             {
-                fill_mode(1920, 1080);
+                fill_mode(c.proc.display_width, c.proc.display_height);
                 return STATUS_SUCCESS;
             }
 
-            if (mode_num < modes.size())
+            if (mode_num == ENUM_REGISTRY_SETTINGS)
             {
-                fill_mode(modes[mode_num].width, modes[mode_num].height);
+                fill_mode(c.proc.registry_display_width, c.proc.registry_display_height);
+                return STATUS_SUCCESS;
+            }
+
+            if (mode_num < k_display_modes.size())
+            {
+                fill_mode(k_display_modes[mode_num].width, k_display_modes[mode_num].height);
                 return STATUS_SUCCESS;
             }
 
             return STATUS_UNSUCCESSFUL;
         }
 
-        // The emulator owns a single virtual display whose mode never actually changes; accept any requested mode
-        // (including CDS_TEST probes) by reporting DISP_CHANGE_SUCCESSFUL so the renderer proceeds to window setup.
-        LONG handle_NtUserChangeDisplaySettings(const syscall_context& /*c*/,
-                                                const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> /*device_name*/,
-                                                const emulator_object<EMU_DEVMODEW> /*dev_mode*/, const hwnd /*window*/,
-                                                const DWORD /*flags*/, const uint64_t /*param*/)
+        // Fullscreen games switch the display to their resolution and take the screen size from then on, e.g. to convert
+        // screen coordinates of the cursor. A null mode returns to the registry mode.
+        LONG handle_NtUserChangeDisplaySettings(const syscall_context& c,
+                                                const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> device_name,
+                                                const emulator_object<EMU_DEVMODEW> dev_mode, const hwnd /*window*/, const DWORD flags,
+                                                const uint64_t /*param*/)
         {
-            return 0; // DISP_CHANGE_SUCCESSFUL
+            constexpr LONG disp_change_successful = 0;
+            constexpr LONG disp_change_badmode = -2;
+            constexpr LONG disp_change_badparam = -5;
+            constexpr DWORD cds_updateregistry = 0x1;
+            constexpr DWORD cds_test = 0x2;
+            constexpr DWORD cds_noreset = 0x10000000;
+            constexpr DWORD dm_bitsperpel = 0x40000;
+            constexpr DWORD dm_pelswidth = 0x80000;
+            constexpr DWORD dm_pelsheight = 0x100000;
+            constexpr DWORD dm_displayfrequency = 0x400000;
+
+            if (const auto name = device_name ? read_unicode_string(c.emu, device_name) : u""; !name.empty() && name != u"\\\\.\\DISPLAY1")
+            {
+                return disp_change_badparam;
+            }
+
+            auto width = c.proc.registry_display_width;
+            auto height = c.proc.registry_display_height;
+            if (dev_mode)
+            {
+                const auto mode = dev_mode.read();
+                width = (mode.dmFields & dm_pelswidth) != 0 ? mode.dmPelsWidth : c.proc.display_width;
+                height = (mode.dmFields & dm_pelsheight) != 0 ? mode.dmPelsHeight : c.proc.display_height;
+
+                // A frequency of 0 or 1 asks for the display's default.
+                if (((mode.dmFields & dm_bitsperpel) != 0 && mode.dmBitsPerPel != k_display_bits_per_pixel) ||
+                    ((mode.dmFields & dm_displayfrequency) != 0 && mode.dmDisplayFrequency > 1 &&
+                     mode.dmDisplayFrequency != k_display_frequency))
+                {
+                    return disp_change_badmode;
+                }
+            }
+
+            if (std::ranges::none_of(k_display_modes,
+                                     [&](const display_mode& mode) { return mode.width == width && mode.height == height; }))
+            {
+                return disp_change_badmode;
+            }
+
+            if ((flags & cds_test) != 0)
+            {
+                return disp_change_successful;
+            }
+
+            if ((flags & cds_updateregistry) != 0)
+            {
+                c.proc.registry_display_width = width;
+                c.proc.registry_display_height = height;
+            }
+
+            if ((flags & cds_noreset) == 0)
+            {
+                c.proc.set_display_mode(c.win_emu, width, height);
+                c.win_emu.apply_cursor_capture();
+            }
+
+            return disp_change_successful;
         }
 
         BOOL handle_NtUserEnumDisplayMonitors(const syscall_context& c, const hdc hdc_in, const uint64_t clip_rect_ptr,
@@ -5281,6 +5337,14 @@ namespace sogen
                 set_thread_window_context(c, hwnd);
             }
             return previous;
+        }
+
+        BOOL handle_NtUserZapActiveAndFocus(const syscall_context& c)
+        {
+            auto& thread = c.thread();
+            thread.set_active_window(0);
+            thread.set_focus_window(0);
+            return TRUE;
         }
 
         emulator_pointer handle_NtUserSetClassLongPtr(const syscall_context& c, handle hWnd, int nIndex, emulator_pointer dwNewLong,
@@ -5856,14 +5920,14 @@ namespace sogen
                 internal_path.targetSignalInfo.pixelRate = 148500000;
                 internal_path.targetSignalInfo.hSyncFreq = {.Numerator = 67500, .Denominator = 1};
                 internal_path.targetSignalInfo.vSyncFreq = {.Numerator = 60, .Denominator = 1};
-                internal_path.targetSignalInfo.activeSize = {.cx = 1920, .cy = 1080};
+                internal_path.targetSignalInfo.activeSize = {.cx = c.proc.display_width, .cy = c.proc.display_height};
                 internal_path.targetSignalInfo.totalSize = {.cx = 2200, .cy = 1125};
                 internal_path.targetSignalInfo.scanLineOrdering = 1; // PROGRESSIVE
                 internal_path.targetSignalInfo.u.videoStandard = 0;
                 internal_path.outputTechnology = 5; // HDMI
                 internal_path.padding2[17] = 1;
-                internal_path.sourceWidth = 1920;
-                internal_path.sourceHeight = 1080;
+                internal_path.sourceWidth = c.proc.display_width;
+                internal_path.sourceHeight = c.proc.display_height;
 
                 c.emu.write_memory(path_array, &internal_path, sizeof(internal_path));
             }
@@ -5991,7 +6055,7 @@ namespace sogen
 
                 const emulator_object<EMU_GET_DISPLAY_INFO_EX> display_info{c.emu, packet};
 
-                display_info.access([](EMU_GET_DISPLAY_INFO_EX& info) {
+                display_info.access([&](EMU_GET_DISPLAY_INFO_EX& info) {
                     const bool known_adapter =
                         info.adapterId.LowPart == 0x1000 && info.adapterId.HighPart == 0; // Must match k_dxgk_adapter_luid!
                     const bool known_source = info.sourceId == 0;
@@ -6014,8 +6078,8 @@ namespace sogen
 
                     info.DisplayLeft = 0;
                     info.DisplayTop = 0;
-                    info.DisplayWidth = 1920;
-                    info.DisplayHeight = 1080;
+                    info.DisplayWidth = static_cast<INT32>(c.proc.display_width);
+                    info.DisplayHeight = static_cast<INT32>(c.proc.display_height);
 
                     utils::string::copy(info.DeviceName, u"\\\\.\\DISPLAY1");
 
@@ -6912,6 +6976,51 @@ namespace sogen
             return c.proc.foreground_window;
         }
 
+        hwnd handle_NtUserChildWindowFromPointEx(const syscall_context& c, const hwnd parent, const uint64_t point, const uint32_t flags)
+        {
+            constexpr uint32_t cwp_skip_invisible = 1;
+            constexpr uint32_t cwp_skip_disabled = 2;
+            constexpr uint32_t cwp_skip_transparent = 4;
+
+            const auto* parent_window = c.proc.windows.get(parent);
+            if (!parent_window)
+            {
+                return 0;
+            }
+
+            const auto x = static_cast<int32_t>(point);
+            const auto y = static_cast<int32_t>(point >> 32);
+            if (x < 0 || y < 0 || x >= parent_window->client_width() || y >= parent_window->client_height())
+            {
+                return 0;
+            }
+
+            // The guest's child list runs from the top of the Z order down, so the first match is the one in front.
+            uint64_t next = 0;
+            parent_window->guest.access([&](const USER_WINDOW& guest_parent) { next = guest_parent.spwndChild; });
+            for (size_t guard = 0; next != 0 && guard < c.proc.windows.size(); ++guard)
+            {
+                USER_WINDOW guest_child{};
+                c.emu.read_memory(next, &guest_child, sizeof(guest_child));
+                next = guest_child.spwndNext;
+
+                const auto* child = c.proc.windows.get(guest_child.hWnd);
+                if (!child || ((flags & cwp_skip_invisible) && !(child->style & WS_VISIBLE)) ||
+                    ((flags & cwp_skip_disabled) && (child->style & WS_DISABLED)) ||
+                    ((flags & cwp_skip_transparent) && (child->ex_style & WS_EX_TRANSPARENT)))
+                {
+                    continue;
+                }
+
+                if (x >= child->x && x < child->x + child->width && y >= child->y && y < child->y + child->height)
+                {
+                    return child->handle;
+                }
+            }
+
+            return parent;
+        }
+
         BOOL handle_NtUserGetKeyboardState(const syscall_context& c, const emulator_pointer key_state)
         {
             if (key_state == 0)
@@ -6930,6 +7039,16 @@ namespace sogen
         uint32_t handle_NtUserGetDoubleClickTime()
         {
             return 500;
+        }
+
+        uint32_t handle_NtUserGetCaretBlinkTime()
+        {
+            return 530;
+        }
+
+        BOOL handle_NtUserFlashWindowEx()
+        {
+            return FALSE;
         }
 
         BOOL handle_NtUserModifyWindowTouchCapability()
@@ -7069,6 +7188,76 @@ namespace sogen
         BOOL handle_NtUserSetProcessDpiAwarenessContext()
         {
             return TRUE;
+        }
+
+        // The US layout, which the rest of the keyboard emulation assumes as well.
+        char16_t us_layout_character(const uint32_t virtual_key, const bool shift, const bool caps_lock)
+        {
+            if (virtual_key >= 'A' && virtual_key <= 'Z')
+            {
+                return static_cast<char16_t>(shift != caps_lock ? virtual_key : virtual_key - 'A' + 'a');
+            }
+
+            if (virtual_key >= '0' && virtual_key <= '9')
+            {
+                constexpr std::u16string_view shifted_digits = u")!@#$%^&*(";
+                return shift ? shifted_digits[virtual_key - '0'] : static_cast<char16_t>(virtual_key);
+            }
+
+            if (virtual_key >= VK_NUMPAD0 && virtual_key <= VK_NUMPAD9)
+            {
+                return static_cast<char16_t>(u'0' + (virtual_key - VK_NUMPAD0));
+            }
+
+            const auto pick = [shift](const char16_t normal, const char16_t shifted) { return shift ? shifted : normal; };
+
+            switch (virtual_key)
+            {
+            case VK_SPACE:
+                return u' ';
+            case VK_RETURN:
+                return u'\r';
+            case VK_BACK:
+                return u'\b';
+            case VK_TAB:
+                return u'\t';
+            case VK_ESCAPE:
+                return 0x1B;
+            case VK_MULTIPLY:
+                return u'*';
+            case VK_ADD:
+                return u'+';
+            case VK_SUBTRACT:
+                return u'-';
+            case VK_DIVIDE:
+                return u'/';
+            case VK_DECIMAL:
+                return u'.';
+            case VK_OEM_1:
+                return pick(u';', u':');
+            case VK_OEM_PLUS:
+                return pick(u'=', u'+');
+            case VK_OEM_COMMA:
+                return pick(u',', u'<');
+            case VK_OEM_MINUS:
+                return pick(u'-', u'_');
+            case VK_OEM_PERIOD:
+                return pick(u'.', u'>');
+            case VK_OEM_2:
+                return pick(u'/', u'?');
+            case VK_OEM_3:
+                return pick(u'`', u'~');
+            case VK_OEM_4:
+                return pick(u'[', u'{');
+            case VK_OEM_5:
+                return pick(u'\\', u'|');
+            case VK_OEM_6:
+                return pick(u']', u'}');
+            case VK_OEM_7:
+                return pick(u'\'', u'"');
+            default:
+                return 0;
+            }
         }
 
         uint32_t handle_NtUserMapVirtualKeyEx(const syscall_context& /*c*/, const uint32_t code, const uint32_t map_type,
@@ -7211,38 +7400,7 @@ namespace sogen
 
             if (map_type == 2)
             {
-                if ((code >= '0' && code <= '9') || (code >= 'A' && code <= 'Z') || code == VK_SPACE)
-                {
-                    return code;
-                }
-
-                switch (code)
-                {
-                case VK_OEM_1:
-                    return ';';
-                case VK_OEM_PLUS:
-                    return '=';
-                case VK_OEM_COMMA:
-                    return ',';
-                case VK_OEM_MINUS:
-                    return '-';
-                case VK_OEM_PERIOD:
-                    return '.';
-                case VK_OEM_2:
-                    return '/';
-                case VK_OEM_3:
-                    return '`';
-                case VK_OEM_4:
-                    return '[';
-                case VK_OEM_5:
-                    return '\\';
-                case VK_OEM_6:
-                    return ']';
-                case VK_OEM_7:
-                    return '\'';
-                default:
-                    return 0;
-                }
+                return us_layout_character(code, false, true);
             }
 
             if (map_type == 1 || map_type == 3)
@@ -7297,9 +7455,60 @@ namespace sogen
             return 0;
         }
 
-        NTSTATUS handle_NtUserToUnicodeEx()
+        int32_t handle_NtUserToUnicodeEx(const syscall_context& c, const uint32_t virtual_key, const uint32_t scan_code,
+                                         const emulator_pointer key_state, const emulator_pointer buffer, const int32_t buffer_size,
+                                         const uint32_t flags, const uint64_t /*keyboard_layout*/)
         {
-            return 0;
+            constexpr uint32_t key_up = 0x8000;
+            constexpr uint32_t translate_key_up = 0x2;
+            const auto ignored_key_up = (scan_code & key_up) != 0 && (flags & translate_key_up) == 0;
+            if (buffer == 0 || buffer_size <= 0 || ignored_key_up || virtual_key >= 0x100)
+            {
+                return 0;
+            }
+
+            std::array<uint8_t, 256> keys{};
+            if (key_state != 0 && !c.win_emu.memory.try_read_memory(key_state, keys.data(), keys.size()))
+            {
+                return 0;
+            }
+
+            const auto down = [&keys](const uint32_t key) { return (keys[key] & 0x80) != 0; };
+
+            char16_t character = 0;
+            if (down(VK_CONTROL) && !down(VK_MENU))
+            {
+                if (virtual_key >= 'A' && virtual_key <= 'Z')
+                {
+                    character = static_cast<char16_t>(virtual_key - 'A' + 1);
+                }
+                else if (virtual_key == VK_BACK)
+                {
+                    character = 0x7F;
+                }
+                else if (virtual_key == VK_RETURN)
+                {
+                    character = u'\n';
+                }
+            }
+            else if (!down(VK_CONTROL))
+            {
+                character = us_layout_character(virtual_key, down(VK_SHIFT), (keys[VK_CAPITAL] & 0x01) != 0);
+            }
+
+            if (character == 0)
+            {
+                return 0;
+            }
+
+            const std::array<char16_t, 2> text{character, u'\0'};
+            const auto length = buffer_size > 1 ? text.size() : 1;
+            if (!c.win_emu.memory.try_write_memory(buffer, text.data(), length * sizeof(char16_t)))
+            {
+                return 0;
+            }
+
+            return 1;
         }
 
         uint64_t handle_NtUserSetKeyboardState()
@@ -7414,6 +7623,11 @@ namespace sogen
         int16_t handle_NtUserVkKeyScanEx()
         {
             return -1;
+        }
+
+        BOOL handle_NtUserSetWindowFeedbackSetting()
+        {
+            return TRUE;
         }
 
         BOOL handle_NtUserSetLayeredWindowAttributes()

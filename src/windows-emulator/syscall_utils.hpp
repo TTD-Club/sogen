@@ -1,6 +1,9 @@
 ﻿#pragma once
 
 #include "windows_emulator.hpp"
+#include "arch/syscall_abi.hpp"
+#include <algorithm>
+#include <bit>
 #include <ctime>
 #include <platform/primitives.hpp>
 #include "devices/named_pipe.hpp"
@@ -25,7 +28,7 @@ namespace sogen
         windows_emulator& win_emu;
         // The virtual CPU that issued this syscall. Register and memory access must go
         // through this CPU, not windows_emulator::emu() (which always resolves vCPU 0).
-        x86_64_cpu& emu;
+        guest_cpu& emu;
         vcpu_context& vcpu;
         process_context& proc;
         mutable bool write_status{true};
@@ -39,6 +42,17 @@ namespace sogen
         emulator_thread& thread() const
         {
             return this->vcpu.thread();
+        }
+
+        x86_64_cpu& x64_cpu() const
+        {
+            auto* cpu = dynamic_cast<x86_64_cpu*>(&this->emu);
+            if (!cpu)
+            {
+                throw std::runtime_error("This operation is only implemented for x86-64 guest CPUs");
+            }
+
+            return *cpu;
         }
 
         template <typename T>
@@ -75,9 +89,41 @@ namespace sogen
         }
     };
 
-    inline uint64_t get_syscall_argument(x86_64_cpu& emu, const size_t index)
+    // The ZeroBits of NtAllocateVirtualMemory/NtMapViewOfSection as the highest address an allocator-chosen range may end at.
+    // Below 32 it counts zero bits on top of the 32 high-order bits that are always zero, so 1 keeps a range below 2 GB,
+    // which 64-bit LuaJIT relies on (checked on Windows 11). From 32 it is a mask, of which only the leading zero bits
+    // count (Wine's tests confirm this on Windows with 0x1aaaaaaa). The WoW64 thunks pass 0xFFFEFFFF for every request of
+    // 32-bit code, which keeps that code's memory where its pointers reach.
+    inline uint64_t highest_address_for_zero_bits(const uint64_t zero_bits)
     {
-        return get_function_argument(emu, index, true);
+        constexpr uint64_t unrestricted = MAX_ALLOCATION_END_EXCL - 1;
+        if (zero_bits == 0)
+        {
+            return unrestricted;
+        }
+
+        const auto high_zero_bits = zero_bits < 32 ? 32 + static_cast<int>(zero_bits) : std::countl_zero(zero_bits);
+        return std::min(~uint64_t{0} >> high_zero_bits, unrestricted);
+    }
+
+    // What NtAllocateVirtualMemory answers, when it chooses the address, a ZeroBits that leaves no room below the first 64 KiB:
+    // a ceiling of exactly 64 KiB finds no free range, anything lower is rejected outright (measured on Windows 11 for every
+    // value up to 0x30000). With an explicit base address Windows ignores most of these values.
+    inline NTSTATUS check_zero_bits_of_allocation(const uint64_t zero_bits)
+    {
+        constexpr uint64_t lowest_allocation_end = 0x10000;
+        const auto highest_address = highest_address_for_zero_bits(zero_bits);
+        if (highest_address + 1 < lowest_allocation_end)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        return highest_address + 1 == lowest_allocation_end ? STATUS_CONFLICTING_ADDRESSES : STATUS_SUCCESS;
+    }
+
+    inline uint64_t get_syscall_argument(const syscall_context& context, const size_t index)
+    {
+        return context.win_emu.abi().syscall_argument(context.emu, index);
     }
 
     inline bool is_uppercase(const char character)
@@ -98,37 +144,17 @@ namespace sogen
 
     inline std::optional<uint32_t> extract_syscall_id(const exported_symbol& symbol, std::span<const std::byte> data)
     {
-        if (!is_syscall(symbol.name))
-        {
-            return std::nullopt;
-        }
-
-        constexpr auto instruction_size = 5;
-        constexpr auto instruction_offset = 3;
-        constexpr auto instruction_operand_offset = 1;
-        constexpr auto instruction_opcode = static_cast<std::byte>(0xB8);
-
-        const auto instruction_rva = symbol.rva + instruction_offset;
-
-        if (data.size() < (instruction_rva + instruction_size) || data[static_cast<size_t>(instruction_rva)] != instruction_opcode)
-        {
-            return std::nullopt;
-        }
-
-        uint32_t syscall_id{0};
-        static_assert(sizeof(syscall_id) <= (instruction_size - instruction_operand_offset));
-        memcpy(&syscall_id, data.data() + instruction_rva + instruction_operand_offset, sizeof(syscall_id));
-
-        return syscall_id;
+        return x86_64_syscall_abi_instance().scan_syscall_id(symbol, data);
     }
 
-    inline std::map<uint64_t, std::string> find_syscalls(const exported_symbols& exports, std::span<const std::byte> data)
+    inline std::map<uint64_t, std::string> find_syscalls(const exported_symbols& exports, std::span<const std::byte> data,
+                                                         const arch_syscall_abi& abi = x86_64_syscall_abi_instance())
     {
         std::map<uint64_t, std::string> syscalls{};
 
         for (const auto& symbol : exports)
         {
-            const auto id = extract_syscall_id(symbol, data);
+            const auto id = abi.scan_syscall_id(symbol, data);
             if (id)
             {
                 auto& entry = syscalls[*id];
@@ -165,46 +191,46 @@ namespace sogen
 
     template <typename T>
         requires(std::is_integral_v<T> || std::is_enum_v<T>)
-    T resolve_argument(x86_64_cpu& emu, const size_t index)
+    T resolve_argument(const syscall_context& context, const size_t index)
     {
-        const auto arg = get_syscall_argument(emu, index);
+        const auto arg = get_syscall_argument(context, index);
         return static_cast<T>(arg);
     }
 
     template <typename T>
         requires(std::is_same_v<std::remove_cvref_t<T>, handle>)
-    handle resolve_argument(x86_64_cpu& emu, const size_t index)
+    handle resolve_argument(const syscall_context& context, const size_t index)
     {
         handle h{};
-        h.bits = resolve_argument<uint64_t>(emu, index);
+        h.bits = resolve_argument<uint64_t>(context, index);
         return canonical_console_handle(h);
     }
 
     template <typename T>
         requires(std::is_same_v<T, emulator_object<typename T::value_type>>)
-    T resolve_argument(x86_64_cpu& emu, const size_t index)
+    T resolve_argument(const syscall_context& context, const size_t index)
     {
-        const auto arg = get_syscall_argument(emu, index);
-        return T(emu, arg);
+        const auto arg = get_syscall_argument(context, index);
+        return T(context.emu.memory(), arg);
     }
 
     template <typename T>
-    T resolve_indexed_argument(x86_64_cpu& emu, size_t& index)
+    T resolve_indexed_argument(const syscall_context& context, size_t& index)
     {
-        return resolve_argument<T>(emu, index++);
+        return resolve_argument<T>(context, index++);
     }
 
     inline void write_syscall_result(const syscall_context& c, const uint64_t result, const uint64_t initial_ip)
     {
         if (c.write_status && !c.retrigger_syscall && !c.run_callback)
         {
-            c.emu.reg<uint64_t>(x86_register::rax, result);
+            c.win_emu.abi().return_value(c.emu, result);
         }
 
         const auto new_ip = c.emu.read_instruction_pointer();
         if ((initial_ip != new_ip || c.retrigger_syscall || c.run_callback) && !c.is_callback_completion)
         {
-            c.emu.reg(x86_register::rip, new_ip - 2);
+            c.win_emu.abi().rewind_syscall(c.emu, new_ip);
         }
     }
 
@@ -224,7 +250,7 @@ namespace sogen
 
         size_t index = 0;
         std::tuple<const syscall_context&, Args...> func_args{
-            c, resolve_indexed_argument<std::remove_cv_t<std::remove_reference_t<Args>>>(c.emu, index)...};
+            c, resolve_indexed_argument<std::remove_cv_t<std::remove_reference_t<Args>>>(c, index)...};
 
         (void)index;
 
@@ -253,7 +279,7 @@ namespace sogen
     }
 
     template <typename ResponseType, typename Action, typename ReturnLengthSetter>
-    NTSTATUS handle_query_internal(x86_64_cpu& emu, const uint64_t buffer, const uint32_t length,
+    NTSTATUS handle_query_internal(guest_cpu& emu, const uint64_t buffer, const uint32_t length,
                                    const ReturnLengthSetter& return_length_setter, const Action& action)
     {
         constexpr auto required_size = sizeof(ResponseType);
@@ -288,7 +314,7 @@ namespace sogen
 
     template <typename ResponseType, typename Action, typename LengthType>
         requires(std::is_integral_v<LengthType>)
-    NTSTATUS handle_query(x86_64_cpu& emu, const uint64_t buffer, const uint32_t length, const emulator_object<LengthType> return_length,
+    NTSTATUS handle_query(guest_cpu& emu, const uint64_t buffer, const uint32_t length, const emulator_object<LengthType> return_length,
                           const Action& action)
     {
         const auto length_setter = [&](const size_t required_size) {
@@ -302,7 +328,7 @@ namespace sogen
     }
 
     template <typename ResponseType, typename Action>
-    NTSTATUS handle_query(x86_64_cpu& emu, const uint64_t buffer, const uint32_t length,
+    NTSTATUS handle_query(guest_cpu& emu, const uint64_t buffer, const uint32_t length,
                           const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const Action& action)
     {
         IO_STATUS_BLOCK<EmulatorTraits<Emu64>> status_block{};

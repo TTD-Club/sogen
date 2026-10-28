@@ -36,6 +36,25 @@ namespace sogen
         }
     };
 
+    // Suspensions made through a thread state-change object are undone when the object is closed.
+    struct thread_state_change : ref_counted_object
+    {
+        uint32_t thread_id{};
+        uint32_t suspend_count{};
+
+        void serialize_object(utils::buffer_serializer& buffer) const override
+        {
+            buffer.write(this->thread_id);
+            buffer.write(this->suspend_count);
+        }
+
+        void deserialize_object(utils::buffer_deserializer& buffer) override
+        {
+            buffer.read(this->thread_id);
+            buffer.read(this->suspend_count);
+        }
+    };
+
     struct timer : ref_counted_object
     {
         std::u16string name{};
@@ -361,6 +380,22 @@ namespace sogen
             const auto client_top = std::min<int>(outer_height, insets.top);
             const auto client_bottom = std::max<int>(client_top, outer_height - insets.bottom);
             return client_bottom - client_top;
+        }
+
+        void sync_guest_rects()
+        {
+            const RECT window_rect{.left = this->x, .top = this->y, .right = this->x + this->width, .bottom = this->y + this->height};
+            const RECT client_rect{
+                .left = this->client_x(),
+                .top = this->client_y(),
+                .right = this->client_x() + this->client_width(),
+                .bottom = this->client_y() + this->client_height(),
+            };
+
+            this->guest.access([&](USER_WINDOW& guest_win) {
+                guest_win.rcWindow = window_rect;
+                guest_win.rcClient = client_rect;
+            });
         }
 
         void serialize_object(utils::buffer_serializer& buffer) const override
@@ -802,6 +837,13 @@ namespace sogen
         }
     };
 
+    struct directory_change_watch
+    {
+        uint32_t thread_id{};
+        uint64_t event{};
+        uint64_t io_status_block{};
+    };
+
     struct file : ref_counted_object
     {
         guest_file handle{};
@@ -816,6 +858,7 @@ namespace sogen
         std::u16string renamed_to{};
         // Where the open resolved on the host, empty for opens no mount resolves.
         std::filesystem::path host_path{};
+        std::vector<directory_change_watch> change_watches{};
 
         bool is_file() const
         {
@@ -838,6 +881,7 @@ namespace sogen
             buffer.write(this->renamed_to);
             buffer.write(this->host_path.u16string());
             buffer.write(this->handle);
+            buffer.write_vector(this->change_watches);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -851,6 +895,7 @@ namespace sogen
             buffer.read(this->renamed_to);
             this->host_path = buffer.read<std::u16string>();
             buffer.read(this->handle);
+            buffer.read_vector(this->change_watches);
         }
     };
 
@@ -863,8 +908,11 @@ namespace sogen
         uint32_t allocation_attributes{};
         // Shared backing for a pagefile-backed section: allocated once (lazily, on first map) and reused by
         // every view, so all views of the section see the same memory and section offsets resolve correctly.
-        // 0 until allocated. Freed when last section handle is closed.
+        // 0 until allocated. Freed once the last section handle is closed and no mapped view remains.
         uint64_t backing_address{};
+        uint32_t mapped_view_count{};
+        // Set instead of backing_address for a section whose views each get their own guest range (see section_views).
+        uint64_t view_storage_id{};
         std::optional<winpe::pe_image_basic_info> cached_image_info{};
 
         bool is_image() const
@@ -914,6 +962,8 @@ namespace sogen
             buffer.write(this->section_page_protection);
             buffer.write(this->allocation_attributes);
             buffer.write(this->backing_address);
+            buffer.write(this->mapped_view_count);
+            buffer.write(this->view_storage_id);
             buffer.write_optional<winpe::pe_image_basic_info>(this->cached_image_info);
         }
 
@@ -925,6 +975,8 @@ namespace sogen
             buffer.read(this->section_page_protection);
             buffer.read(this->allocation_attributes);
             buffer.read(this->backing_address);
+            buffer.read(this->mapped_view_count);
+            buffer.read(this->view_storage_id);
             buffer.read_optional(this->cached_image_info);
         }
     };

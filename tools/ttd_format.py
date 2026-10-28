@@ -15,7 +15,9 @@ CODE = struct.Struct("<2Q16s")
 CHUNK_HEADER = struct.Struct("<9Q")
 BULK = struct.Struct("<2Q")
 BULK_REFERENCE = struct.Struct("<2Q")
-MAGIC = b"SOGTTD8\0"
+MAGIC = b"SOGTTD9\0"
+# Version 8 differs only in how checkpoint states store strings, which this module does not read.
+MAGIC_V8 = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
 CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS, SYSCALLS = 1, 2, 3, 4, 5, 6, 7, 8
 MODULES, THREADS, EXPORTS, EXPORT_FORWARDERS = 9, 10, 11, 12
@@ -429,8 +431,8 @@ class Trace:
         with open(path, "rb") as file:
             self.bytes = file.read()
         magic, self.instruction_count, self.event_count, self.access_mask, count, table = HEADER.unpack_from(self.bytes)
-        if magic not in (MAGIC, MAGIC_V7):
-            raise ValueError("not a v7 or v8 TTD trace")
+        if magic not in (MAGIC, MAGIC_V8, MAGIC_V7):
+            raise ValueError("not a v7, v8 or v9 TTD trace")
         self.magic = magic
         if not table:
             raise ValueError("TTD trace was not finalized")
@@ -474,7 +476,7 @@ class Trace:
         if index not in self._bulk_cache:
             offset, size = self.bulk_table[index]
             block = zstandard.ZstdDecompressor().decompress(self.bytes[offset:offset + size]) if size else b""
-            self._bulk_cache = {index: convert_displacements(block, False) if self.magic == MAGIC else block}
+            self._bulk_cache = {index: convert_displacements(block, False) if self.magic != MAGIC_V7 else block}
         return self._bulk_cache[index]
 
     def chunk_events(self, index):
