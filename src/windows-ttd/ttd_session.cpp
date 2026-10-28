@@ -1,5 +1,5 @@
 #include "ttd_session.hpp"
-#include "snapshot.hpp"
+#include "emulator_state.hpp"
 #include "ttd_build_info.hpp"
 
 #include <address_utils.hpp>
@@ -215,9 +215,9 @@ namespace sogen::ttd
 
     void install_cpuid_overrides(windows_emulator& win_emu)
     {
-        win_emu.emu().hook_instruction(x86_hookable_instructions::cpuid, [&win_emu](cpu_interface& cpu, uint64_t) {
+        win_emu.x64_emu().hook_instruction(x86_hookable_instructions::cpuid, [&win_emu](cpu_interface& cpu, uint64_t) {
             return win_emu.dispatch_on_cpu(cpu, [&] {
-                auto& emu = win_emu.active_cpu();
+                auto& emu = win_emu.active_x64_cpu();
                 const auto result = cpuid_override(emu.reg<uint32_t>(x86_register::eax), true);
                 if (!result)
                 {

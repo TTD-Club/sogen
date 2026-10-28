@@ -1,5 +1,18 @@
-set(UNICORN_ARCH "x86" CACHE STRING "")
-add_subdirectory(unicorn)
+set(UNICORN_ARCH "x86;aarch64" CACHE STRING "Enabled Unicorn guest architectures")
+
+if(SOGEN_ENABLE_UNICORN)
+  add_subdirectory(unicorn)
+
+  if(MSVC)
+    # /sdl promotes C4703 to an error, which LTCG reports for QEMU's flow-dependent initialization
+    # in the ARM translators.
+    foreach(_unicorn_arm_target arm-softmmu aarch64-softmmu)
+      if(TARGET ${_unicorn_arm_target})
+        target_compile_options(${_unicorn_arm_target} PRIVATE $<$<COMPILE_LANGUAGE:C>:/wd4703>)
+      endif()
+    endforeach()
+  endif()
+endif()
 
 if(NOT EMSCRIPTEN)
   set(REPROC++ ON CACHE BOOL "" FORCE)
@@ -94,6 +107,14 @@ endif()
 
 ##########################################
 
+# On Adreno GPUs the Android app swaps the stock Vulkan driver, which lacks features DXVK requires, for
+# Mesa's Turnip. libadrenotools loads it into the system Vulkan loader, which keeps Android's WSI working.
+if(ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+  add_subdirectory(libadrenotools)
+endif()
+
+##########################################
+
 if(SOGEN_ENABLE_PYTHON_BINDINGS)
   if (NOT TARGET Python::Module)
     if(CMAKE_VERSION VERSION_LESS 3.18)
@@ -122,6 +143,7 @@ endif()
 option(CAPSTONE_BUILD_MACOS_THIN "" ON)
 option(CAPSTONE_X86_SUPPORT "" ON)
 option(CAPSTONE_X86_ATT_DISABLE "" ON)
+option(CAPSTONE_AARCH64_SUPPORT "" ON)
 option(CAPSTONE_ARCHITECTURE_DEFAULT "" OFF)
 option(CAPSTONE_BUILD_STATIC_MSVC_RUNTIME "" OFF)
 add_subdirectory(capstone)

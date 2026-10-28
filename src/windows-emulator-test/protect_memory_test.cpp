@@ -48,7 +48,7 @@ namespace sogen::test
                 bytes.write(size);
                 old.write(unwritten_protection);
                 const syscall_context context{
-                    .win_emu = *this->emu, .emu = this->emu->emu(), .vcpu = this->emu->vcpu(0), .proc = this->emu->process};
+                    .win_emu = *this->emu, .emu = this->emu->vcpu(0).cpu, .vcpu = this->emu->vcpu(0), .proc = this->emu->process};
                 const auto status = syscalls::handle_NtProtectVirtualMemory(context, CURRENT_PROCESS, base, bytes, PAGE_READONLY, old);
                 return {.status = status, .base = base.read(), .size = bytes.read(), .old_protection = old.read()};
             }

@@ -54,13 +54,14 @@ namespace sogen::ttd
 
     constexpr size_t inline_data_limit = sizeof(access_event::payload);
 
-    // Version 8 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
+    // Version 9 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
     // section table points to. Unknown section types are ignored, so sections can be added without a new version.
-    // Version 7 differs only in storing bulk blocks without the x86-64 filter.
+    // Version 8 differs only in its checkpoint states storing each character of a string as a field of its own, and
+    // version 7 also in storing bulk blocks without the x86-64 filter.
     struct file_header
     {
         // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '8', '\0'};
+        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '9', '\0'};
         uint64_t instruction_count{};
         uint64_t event_count{};
         uint64_t access_mask{};

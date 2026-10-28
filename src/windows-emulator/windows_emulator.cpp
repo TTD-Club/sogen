@@ -7,6 +7,7 @@
 #include <utils/timer.hpp>
 #include <utils/finally.hpp>
 #include <utils/lazy_object.hpp>
+#include <utils/string.hpp>
 
 #include "exception_dispatch.hpp"
 #include "apiset/apiset.hpp"
@@ -306,6 +307,8 @@ namespace sogen
                 return 0x2A;
             case VK_CONTROL:
                 return 0x1D;
+            case VK_MENU:
+                return 0x38;
             case VK_UP:
                 return 0x48;
             case VK_DOWN:
@@ -506,7 +509,6 @@ namespace sogen
         {
             assert(vcpu.active_thread == &thread);
 
-            auto& emu = vcpu.cpu;
             auto& apcs = thread.pending_apcs;
             if (apcs.empty())
             {
@@ -514,6 +516,7 @@ namespace sogen
             }
 
             thread.setup_if_necessary(vcpu.cpu, win_emu.process);
+            auto& cpu = vcpu.cpu;
 
             win_emu.callbacks.on_generic_activity("APC Dispatch");
 
@@ -528,9 +531,39 @@ namespace sogen
                 // queued -- so any value the guest left in that buffer while the async request was pending
                 // (e.g. reusing it for an intervening synchronous call) is correctly superseded.
                 const auto status32 = static_cast<uint32_t>(next_apx.io_status);
-                emu.write_memory(next_apx.apc_argument2, &status32, sizeof(status32));
-                emu.write_memory(next_apx.apc_argument2 + sizeof(status32), &next_apx.io_information, sizeof(next_apx.io_information));
+                cpu.write_memory(next_apx.apc_argument2, &status32, sizeof(status32));
+                cpu.write_memory(next_apx.apc_argument2 + sizeof(status32), &next_apx.io_information, sizeof(next_apx.io_information));
             }
+
+            if (auto* arm64 = dynamic_cast<arm64_cpu*>(&cpu))
+            {
+                // KiUserApcDispatcher frame: routine, three arguments, flags (bit 0: test alert), then CONTEXT at +0x30.
+                struct
+                {
+                    uint64_t routine{};
+                    std::array<uint64_t, 3> arguments{};
+                    uint32_t flags{};
+                    uint32_t reserved{};
+                    uint64_t padding{};
+                    arm64_context context{};
+                } arm64_layout;
+
+                static_assert(offsetof(decltype(arm64_layout), context) == 0x30);
+
+                arm64_layout.routine = next_apx.apc_routine;
+                arm64_layout.arguments = {next_apx.apc_argument1, next_apx.apc_argument2, next_apx.apc_argument3};
+                arm64_layout.flags = 1;
+                arm64_layout.context.ContextFlags = arm64_context_all;
+                cpu_context::save(*arm64, arm64_layout.context);
+
+                const auto new_sp = align_down(arm64->read_stack_pointer() - sizeof(arm64_layout), 0x10);
+                arm64->write_memory(new_sp, arm64_layout);
+                arm64->reg(arm64_register::sp, new_sp);
+                arm64->reg(arm64_register::pc, win_emu.process.ki_user_apc_dispatcher);
+                return;
+            }
+
+            auto& emu = vcpu.x64_cpu();
 
             struct
             {
@@ -600,7 +633,7 @@ namespace sogen
             const auto has_pending_status = thread.pending_status.has_value();
             const auto can_dispatch_apcs = thread.apc_alertable && !thread.pending_apcs.empty();
             const auto can_run_low_level_hook =
-                !is_ready && thread.message_wait_syscall_id.has_value() && win_emu.has_low_level_hook_work(thread.id);
+                !is_ready && thread.message_wait_return_register.has_value() && win_emu.has_low_level_hook_work(thread.id);
 
             if (!is_ready && !force && !can_dispatch_apcs && !can_run_low_level_hook)
             {
@@ -631,7 +664,7 @@ namespace sogen
             else if (can_run_low_level_hook)
             {
                 // The message syscall runs the hook first when it executes again.
-                thread.restart_message_wait(emu);
+                thread.restart_message_wait(emu, win_emu.abi());
             }
 
             thread.apc_alertable = false;
@@ -789,7 +822,44 @@ namespace sogen
         }
     }
 
-    windows_emulator::windows_emulator(std::unique_ptr<x86_64_emulator> emu, application_settings app_settings,
+    PEMachineType get_application_machine(const emulator_settings& settings, application_settings app_settings)
+    {
+        fixup_application_settings(app_settings);
+        const auto& application = app_settings.application;
+
+        const auto root = settings.emulation_root.empty() ? settings.emulation_root : absolute(settings.emulation_root);
+        file_system file_sys{root.empty() ? root : root / "filesys", settings.root_mode};
+        for (const auto& mount : settings.mounts)
+        {
+            file_sys.map(mount.guest_path, mount.host_path, mount.mode);
+        }
+
+        const auto detection = pe_architecture_detector::detect_from_file(file_sys, application);
+        if (!detection.is_valid())
+        {
+            throw std::runtime_error("Cannot determine the machine type of " + application.string() + ": " + detection.error_message);
+        }
+
+        return detection.machine;
+    }
+
+    machine_type get_machine_type(const PEMachineType machine)
+    {
+        switch (machine)
+        {
+        case PEMachineType::AMD64:
+        case PEMachineType::ARM64EC:
+        case PEMachineType::I386:
+            return machine_type::x86_64;
+        case PEMachineType::ARM64:
+            return machine_type::arm64;
+        default:
+            throw std::runtime_error("Unsupported executable machine type: 0x" +
+                                     utils::string::to_hex_number(static_cast<uint16_t>(machine)));
+        }
+    }
+
+    windows_emulator::windows_emulator(std::unique_ptr<guest_machine> emu, application_settings app_settings,
                                        const emulator_settings& settings, emulator_callbacks callbacks, emulator_interfaces interfaces)
         : windows_emulator(std::move(emu), settings, std::move(callbacks), std::move(interfaces))
     {
@@ -797,8 +867,8 @@ namespace sogen
         this->application_settings_ = std::move(app_settings);
     }
 
-    windows_emulator::windows_emulator(std::unique_ptr<x86_64_emulator> emu, const emulator_settings& settings,
-                                       emulator_callbacks callbacks, emulator_interfaces interfaces)
+    windows_emulator::windows_emulator(std::unique_ptr<guest_machine> emu, const emulator_settings& settings, emulator_callbacks callbacks,
+                                       emulator_interfaces interfaces)
         : emu_(std::move(emu)),
           use_native_timestamp_counter_(!interfaces.clock && !settings.use_relative_time &&
                                         this->emu_->supports_native_timestamp_counter()),
@@ -821,12 +891,16 @@ namespace sogen
           registry(settings.load_registry
                        ? registry_manager{emulation_root.empty() ? settings.registry_directory : emulation_root / "registry"}
                        : registry_manager{}),
-          mod_manager(memory, file_sys, this->callbacks),
-          process(*this->emu_, memory, *this->clock_, this->callbacks),
+          mod_manager(memory, file_sys, this->callbacks, guest_architecture_of(*this->emu_)),
+          process(*this->emu_, memory, *this->clock_, this->callbacks, settings.intercept_kusd, guest_architecture_of(*this->emu_)),
           use_relative_time_(settings.use_relative_time),
-          instruction_precision_(settings.use_instruction_precision && this->emu_->supports_instruction_counting()),
+          // Instruction precision runs through a global execution hook; backends that only count instructions
+          // (single-stepping) cannot provide it.
+          instruction_precision_(settings.use_instruction_precision && this->emu_->get_guest_cpu(0).supports_instruction_counting() &&
+                                 this->emu_->supports_global_memory_execution_hooks()),
           intercept_rdtsc_(settings.intercept_rdtsc),
           intercept_kusd_(settings.intercept_kusd),
+          spoof_gpu_features_(settings.spoof_gpu_features),
           vcpu_count_(static_cast<uint32_t>(this->emu_->vcpu_count()))
     {
         if (this->vcpu_count_ == 0)
@@ -856,7 +930,7 @@ namespace sogen
         this->vcpus_.reserve(this->vcpu_count_);
         for (uint32_t i = 0; i < this->vcpu_count_; ++i)
         {
-            this->vcpus_.push_back(std::make_unique<vcpu_context>(this->emu_->get_cpu(i)));
+            this->vcpus_.push_back(std::make_unique<vcpu_context>(this->emu_->get_guest_cpu(i)));
         }
 
         this->ui_backend_->set_event_sink([this](const ui_event& event) { this->handle_ui_event(event); });
@@ -901,22 +975,22 @@ namespace sogen
 
         this->version.load_from_registry(this->registry, this->log);
 
-        this->mod_manager.map_main_modules(this->emu(), this->application_settings_.application, this->version, context, this->log);
+        this->mod_manager.map_main_modules(this->vcpu(0).cpu, this->application_settings_.application, this->version, context, this->log);
         this->install_section_first_execution_hooks();
 
         const auto* executable = this->mod_manager.executable;
         const auto* ntdll = this->mod_manager.ntdll;
         const auto* win32u = this->mod_manager.win32u;
 
-        const auto apiset_data = apiset::obtain(this->emulation_root);
+        const auto apiset_data =
+            apiset::obtain(this->file_sys.read_file(this->version.get_system_root() / "System32" / "apisetschema.dll"));
 
-        this->process.setup(*this, this->application_settings_, *executable, *ntdll, apiset_data, this->mod_manager.wow64_modules_.ntdll32,
-                            this->intercept_kusd_);
+        this->process.setup(*this, this->application_settings_, *executable, *ntdll, apiset_data, this->mod_manager.wow64_modules_.ntdll32);
 
         const auto ntdll_data = emu.read_memory(ntdll->image_base, static_cast<size_t>(ntdll->size_of_image));
         const auto win32u_data = emu.read_memory(win32u->image_base, static_cast<size_t>(win32u->size_of_image));
 
-        this->dispatcher.setup(ntdll->exports, ntdll_data, win32u->exports, win32u_data);
+        this->dispatcher.setup(ntdll->exports, ntdll_data, win32u->exports, win32u_data, this->abi().syscall_abi());
 
         const auto initial_argument = this->process.is_wow64_process ? this->process.peb32->value() : this->process.peb64.value();
         const auto main_thread_id = context.create_thread(this->memory, this->mod_manager.executable->entry_point, initial_argument,
@@ -1143,7 +1217,7 @@ namespace sogen
 
         if (!thread.callback_stack.empty() && address == this->process.zw_callback_return)
         {
-            thread.callback_return_rax = vcpu.cpu.reg<uint64_t>(x86_register::rax);
+            thread.callback_return_rax = this->abi().return_value(vcpu.cpu);
         }
 
         // Yielding stops the CPU before this instruction runs; it executes (and is counted) when the thread resumes.
@@ -1305,11 +1379,200 @@ namespace sogen
             }
         });
 
-        this->emu().hook_instruction(x86_hookable_instructions::syscall, [&](cpu_interface& cpu, uint64_t) {
+        if (auto* x64 = dynamic_cast<x86_64_emulator*>(this->emu_.get()))
+        {
+            this->setup_x64_hooks(*x64);
+        }
+        else if (auto* arm64 = dynamic_cast<arm64_emulator*>(this->emu_.get()))
+        {
+            this->setup_arm64_hooks(*arm64);
+        }
+        else
+        {
+            throw std::runtime_error("Unsupported Windows guest machine: " + this->emu().get_name());
+        }
+
+        this->emu().hook_memory_violation([&](cpu_interface& cpu, const uint64_t address, const size_t size,
+                                              const memory_operation operation, const memory_violation_type type) {
             const std::scoped_lock lock(this->kernel_lock_);
             auto& vcpu = this->vcpu(cpu.index());
             const scoped_dispatch dispatch(*this, vcpu);
-            const auto syscall_id = vcpu.cpu.reg<uint32_t>(x86_register::eax) & 0x3FFF;
+            auto* x64 = dynamic_cast<x86_64_cpu*>(&vcpu.cpu);
+            if (x64 && x64->reg<uint16_t>(x86_register::cs) == 0x33)
+            {
+                // loading gs selector only works in 64-bit mode
+                const auto required_gs_base = vcpu.thread().gs_segment->get_base();
+                const auto actual_gs_base = x64->get_segment_base(x86_register::gs);
+                if (actual_gs_base != required_gs_base)
+                {
+                    x64->set_segment_base(x86_register::gs, required_gs_base);
+                    return memory_violation_continuation::restart;
+                }
+            }
+
+            auto region = this->memory.get_region_info(address);
+            if (region.permissions.is_guarded())
+            {
+                // Unset the GUARD_PAGE flag and dispatch a STATUS_GUARD_PAGE_VIOLATION
+                this->memory.protect_memory(region.allocation_base, region.length, region.permissions & ~memory_permission_ext::guard);
+                dispatch_guard_page_violation(*this, vcpu, address, operation);
+            }
+            else
+            {
+                // A fault on a null/near-null address is almost always a call through a null function
+                // pointer (e.g. a Vulkan entry point the shim doesn't implement). Log the caller's
+                // return address so the missing function's call site can be identified.
+                if (x64 && address < 0x1000)
+                {
+                    const auto sp = x64->reg<uint32_t>(x86_register::esp);
+                    uint32_t return_address = 0;
+                    if (x64->try_read_memory(sp, &return_address, sizeof(return_address)))
+                    {
+                        const auto* mod = this->mod_manager.find_by_address(return_address);
+                        this->log.error("Null-pointer call to 0x%llx; caller return address 0x%x (%s+0x%llx)\n",
+                                        static_cast<unsigned long long>(address), return_address, mod ? mod->name.c_str() : "?",
+                                        mod ? static_cast<unsigned long long>(return_address - mod->image_base) : return_address);
+                    }
+                }
+
+                this->callbacks.on_memory_violate(address, size, operation, type);
+                dispatch_access_violation(*this, vcpu, address, operation);
+            }
+
+            return memory_violation_continuation::resume;
+        });
+
+        if (this->uses_instruction_precision())
+        {
+            const auto on_instruction = [&](cpu_interface& cpu, const uint64_t address, const size_t size) {
+                const std::scoped_lock lock(this->kernel_lock_);
+                auto& vcpu = this->vcpu(cpu.index());
+                const scoped_dispatch dispatch(*this, vcpu);
+                this->on_instruction_execution(vcpu, address, size); //
+            };
+            // The metadata hook also gives instruction sizes to on_instruction_executed; backends without one report 0.
+            try
+            {
+                this->emu().hook_memory_execution_metadata(on_instruction);
+            }
+            catch (const std::runtime_error&)
+            {
+                this->emu().hook_memory_execution(
+                    [on_instruction](cpu_interface& cpu, const uint64_t address) { on_instruction(cpu, address, 0); });
+            }
+        }
+        else if (!this->emu().get_guest_cpu(0).is_stop_thread_safe())
+        {
+            // The backend cannot be stopped safely from another thread, so the interrupt thread in start()
+            // is not available for time-slicing. Preempt cooperatively from the CPU thread via a basic-block
+            // hook instead.
+            this->emu().hook_basic_block([&](cpu_interface& cpu, const basic_block& block) {
+                const std::scoped_lock lock(this->kernel_lock_);
+                this->on_basic_block_execution(this->vcpu(cpu.index()), block); //
+            });
+        }
+    }
+
+    void windows_emulator::setup_arm64_hooks(arm64_emulator& emu)
+    {
+        // Handlers that move PC rewind it by the SVC size, so skipping the SVC lands on their target.
+        emu.hook_instruction(arm64_hookable_instructions::svc, [&](cpu_interface& cpu, uint64_t) {
+            const std::scoped_lock lock(this->kernel_lock_);
+            auto& vcpu = this->vcpu(cpu.index());
+            const scoped_dispatch dispatch(*this, vcpu);
+            this->dispatcher.dispatch(*this, vcpu);
+            return instruction_hook_continuation::skip_instruction;
+        });
+
+        emu.hook_instruction(arm64_hookable_instructions::read_counter, [&](cpu_interface& cpu, const uint64_t destination) {
+            const std::scoped_lock lock(this->kernel_lock_);
+            auto& vcpu = this->vcpu(cpu.index());
+            const scoped_dispatch dispatch(*this, vcpu);
+            this->callbacks.on_rdtsc();
+
+            const auto ticks = this->clock_->timestamp_counter();
+            dynamic_cast<arm64_cpu&>(vcpu.cpu).reg(static_cast<arm64_register>(destination), ticks);
+            return instruction_hook_continuation::skip_instruction;
+        });
+
+        emu.hook_interrupt([&](cpu_interface& cpu, const int exception_class) {
+            const std::scoped_lock lock(this->kernel_lock_);
+            auto& vcpu = this->vcpu(cpu.index());
+            const scoped_dispatch dispatch(*this, vcpu);
+            this->callbacks.on_exception();
+
+            switch (static_cast<arm64_exception_class>(exception_class))
+            {
+            case arm64_exception_class::undefined_instruction:
+                this->callbacks.on_suspicious_activity("Illegal instruction");
+                dispatch_illegal_instruction_violation(*this, vcpu);
+                return;
+            case arm64_exception_class::breakpoint_instruction:
+                this->handle_arm64_breakpoint(vcpu);
+                return;
+            case arm64_exception_class::software_step:
+                // The step completed, so it is reported at the next instruction.
+                vcpu.thread().current_ip = vcpu.cpu.read_instruction_pointer();
+                dispatch_single_step(*this, vcpu);
+                return;
+            default:
+                throw std::runtime_error("Unsupported ARM64 guest exception class " + std::to_string(exception_class));
+            }
+        });
+    }
+
+    // Windows on ARM selects the kernel action by the BRK immediate; unassigned immediates are illegal instructions.
+    void windows_emulator::handle_arm64_breakpoint(vcpu_context& vcpu)
+    {
+        auto& cpu = dynamic_cast<arm64_cpu&>(vcpu.cpu);
+        const auto pc = cpu.read_instruction_pointer();
+
+        switch ((cpu.read_memory<uint32_t>(pc) >> 5) & 0xFFFF)
+        {
+        case 0xF000:
+            this->callbacks.on_suspicious_activity("Breakpoint");
+            dispatch_breakpoint(*this, vcpu);
+            return;
+        case 0xF001:
+            dispatch_exception(*this, vcpu, STATUS_ASSERTION_FAILURE, {});
+            return;
+        case 0xF002: {
+            this->callbacks.on_suspicious_activity("DbgPrint");
+            const auto service = cpu.reg(arm64_register::x16);
+            if (service == BREAKPOINT_PRINT || service == BREAKPOINT_LOAD_SYMBOLS || service == BREAKPOINT_UNLOAD_SYMBOLS ||
+                service == BREAKPOINT_COMMAND_STRING)
+            {
+                // ntdll follows the debug service BRK with BRK #0xF000 for an attached debugger to stop on.
+                cpu.reg(arm64_register::pc, pc + 8);
+            }
+            else
+            {
+                dispatch_breakpoint(*this, vcpu);
+            }
+            return;
+        }
+        case 0xF003:
+            this->callbacks.on_fast_fail(cpu.reg<uint32_t>(arm64_register::w0));
+            this->process.exit_status = STATUS_FAIL_FAST_EXCEPTION;
+            this->stop();
+            return;
+        case 0xF004:
+            dispatch_integer_division_by_zero(*this, vcpu);
+            return;
+        default:
+            this->callbacks.on_suspicious_activity("Illegal instruction");
+            dispatch_illegal_instruction_violation(*this, vcpu);
+            return;
+        }
+    }
+
+    void windows_emulator::setup_x64_hooks(x86_64_emulator& emu)
+    {
+        emu.hook_instruction(x86_hookable_instructions::syscall, [&](cpu_interface& cpu, uint64_t) {
+            const std::scoped_lock lock(this->kernel_lock_);
+            auto& vcpu = this->vcpu(cpu.index());
+            const scoped_dispatch dispatch(*this, vcpu);
+            const auto syscall_id = vcpu.x64_cpu().reg<uint32_t>(x86_register::eax) & 0x3FFF;
             this->callbacks.on_syscall_enter(syscall_id);
             this->dispatcher.dispatch(*this, vcpu);
             this->callbacks.on_syscall_exit(syscall_id);
@@ -1321,11 +1584,11 @@ namespace sogen
         // kernel lock - removing a hot VM-exit path for games.
         if (this->intercept_rdtsc_ || !this->use_native_timestamp_counter_)
         {
-            this->emu().hook_instruction(x86_hookable_instructions::rdtscp, [&](cpu_interface& cpu, uint64_t) {
+            emu.hook_instruction(x86_hookable_instructions::rdtscp, [&](cpu_interface& cpu, uint64_t) {
                 const std::scoped_lock lock(this->kernel_lock_);
                 auto& vcpu = this->vcpu(cpu.index());
                 const scoped_dispatch dispatch(*this, vcpu);
-                auto& acting = vcpu.cpu;
+                auto& acting = vcpu.x64_cpu();
                 this->callbacks.on_rdtscp();
 
                 if (this->use_native_timestamp_counter_)
@@ -1344,11 +1607,11 @@ namespace sogen
                 return instruction_hook_continuation::skip_instruction;
             });
 
-            this->emu().hook_instruction(x86_hookable_instructions::rdtsc, [&](cpu_interface& cpu, uint64_t) {
+            emu.hook_instruction(x86_hookable_instructions::rdtsc, [&](cpu_interface& cpu, uint64_t) {
                 const std::scoped_lock lock(this->kernel_lock_);
                 auto& vcpu = this->vcpu(cpu.index());
                 const scoped_dispatch dispatch(*this, vcpu);
-                auto& acting = vcpu.cpu;
+                auto& acting = vcpu.x64_cpu();
                 this->callbacks.on_rdtsc();
 
                 if (this->use_native_timestamp_counter_)
@@ -1365,18 +1628,18 @@ namespace sogen
         }
 
         // TODO: Unicorn needs this - This should be handled in the backend
-        this->emu().hook_instruction(x86_hookable_instructions::invalid, [&](cpu_interface& cpu, uint64_t) {
+        emu.hook_instruction(x86_hookable_instructions::invalid, [&](cpu_interface& cpu, uint64_t) {
             const std::scoped_lock lock(this->kernel_lock_);
             // TODO: Unify icicle & unicorn handling
             dispatch_illegal_instruction_violation(*this, this->vcpu(cpu.index()));
             return instruction_hook_continuation::skip_instruction; //
         });
 
-        this->emu().hook_interrupt([&](cpu_interface& cpu, const int interrupt) {
+        emu.hook_interrupt([&](cpu_interface& cpu, const int interrupt) {
             const std::scoped_lock lock(this->kernel_lock_);
             auto& vcpu = this->vcpu(cpu.index());
             const scoped_dispatch dispatch(*this, vcpu);
-            auto& acting = vcpu.cpu;
+            auto& acting = vcpu.x64_cpu();
             this->callbacks.on_exception();
             const auto eflags = acting.reg<uint32_t>(x86_register::eflags);
 
@@ -1438,86 +1701,6 @@ namespace sogen
                 break;
             }
         });
-
-        this->emu().hook_memory_violation([&](cpu_interface& cpu, const uint64_t address, const size_t size,
-                                              const memory_operation operation, const memory_violation_type type) {
-            const std::scoped_lock lock(this->kernel_lock_);
-            auto& vcpu = this->vcpu(cpu.index());
-            const scoped_dispatch dispatch(*this, vcpu);
-            auto& acting = vcpu.cpu;
-            if (acting.reg<uint16_t>(x86_register::cs) == 0x33)
-            {
-                // loading gs selector only works in 64-bit mode
-                const auto required_gs_base = vcpu.thread().gs_segment->get_base();
-                const auto actual_gs_base = acting.get_segment_base(x86_register::gs);
-                if (actual_gs_base != required_gs_base)
-                {
-                    acting.set_segment_base(x86_register::gs, required_gs_base);
-                    return memory_violation_continuation::restart;
-                }
-            }
-
-            auto region = this->memory.get_region_info(address);
-            if (region.permissions.is_guarded())
-            {
-                // Unset the GUARD_PAGE flag and dispatch a STATUS_GUARD_PAGE_VIOLATION
-                this->memory.protect_memory(region.allocation_base, region.length, region.permissions & ~memory_permission_ext::guard);
-                dispatch_guard_page_violation(*this, vcpu, address, operation);
-            }
-            else
-            {
-                // A fault on a null/near-null address is almost always a call through a null function
-                // pointer (e.g. a Vulkan entry point the shim doesn't implement). Log the caller's
-                // return address so the missing function's call site can be identified.
-                if (address < 0x1000)
-                {
-                    const auto sp = acting.reg<uint32_t>(x86_register::esp);
-                    uint32_t return_address = 0;
-                    if (acting.try_read_memory(sp, &return_address, sizeof(return_address)))
-                    {
-                        const auto* mod = this->mod_manager.find_by_address(return_address);
-                        this->log.error("Null-pointer call to 0x%llx; caller return address 0x%x (%s+0x%llx)\n",
-                                        static_cast<unsigned long long>(address), return_address, mod ? mod->name.c_str() : "?",
-                                        mod ? static_cast<unsigned long long>(return_address - mod->image_base) : return_address);
-                    }
-                }
-
-                this->callbacks.on_memory_violate(address, size, operation, type);
-                dispatch_access_violation(*this, vcpu, address, operation);
-            }
-
-            return memory_violation_continuation::resume;
-        });
-
-        if (this->uses_instruction_precision())
-        {
-            const auto on_instruction = [&](cpu_interface& cpu, const uint64_t address, const size_t size) {
-                const std::scoped_lock lock(this->kernel_lock_);
-                auto& vcpu = this->vcpu(cpu.index());
-                const scoped_dispatch dispatch(*this, vcpu);
-                this->on_instruction_execution(vcpu, address, size); //
-            };
-            // The metadata hook also gives instruction sizes to on_instruction_executed; backends without one report 0.
-            try
-            {
-                this->emu().hook_memory_execution_metadata(on_instruction);
-            }
-            catch (const std::runtime_error&)
-            {
-                this->emu().hook_memory_execution(
-                    [on_instruction](cpu_interface& cpu, const uint64_t address) { on_instruction(cpu, address, 0); });
-            }
-        }
-        else if (!this->emu().is_stop_thread_safe())
-        {
-            // The backend cannot be stopped safely from another thread, so the interrupt thread in start()
-            // is not available for time-slicing. Preempt cooperatively from the CPU thread via a basic-block
-            // hook instead.
-            this->emu().hook_basic_block([&](cpu_interface& cpu, const basic_block& block) {
-                const std::scoped_lock lock(this->kernel_lock_);
-                this->on_basic_block_execution(this->vcpu(cpu.index()), block); //
-            });
-        }
     }
 
     void windows_emulator::on_basic_block_execution(vcpu_context& vcpu, const basic_block&)
@@ -1584,7 +1767,7 @@ namespace sogen
             }
         });
 
-        const bool preempt_vcpus = !this->uses_instruction_precision() && this->emu().is_stop_thread_safe();
+        const bool preempt_vcpus = !this->uses_instruction_precision() && this->emu().get_guest_cpu(0).is_stop_thread_safe();
         const bool refresh_kusd = !this->intercept_kusd_;
         if (preempt_vcpus || refresh_kusd)
         {
@@ -1892,8 +2075,9 @@ namespace sogen
         return {};
     }
 
-    // Windows passes input on when a low-level hook does not return within LowLevelHooksTimeout, and ignores the
-    // result of a hook that returns later.
+    // Windows passes input on to the next hook when a low-level hook does not return within LowLevelHooksTimeout, and
+    // ignores the result of a hook that returns later. Since Windows 7 it also silently removes that hook, so a thread
+    // that installs one and never pumps messages delays only the first input, not every one.
     emulator_thread* windows_emulator::drain_low_level_input()
     {
         constexpr auto low_level_hooks_timeout = std::chrono::seconds(1);
@@ -1914,7 +2098,25 @@ namespace sogen
                 front.hooks.erase(front.hooks.begin());
             }
 
-            if (front.hooks.empty() || timed_out)
+            if (timed_out && !front.hooks.empty())
+            {
+                const auto stalled = front.hooks.front();
+                for (auto& thread : this->process.threads | std::views::values)
+                {
+                    if (std::erase_if(thread.low_level_hooks,
+                                      [stalled](const user_low_level_hook& hook) { return hook.handle == stalled; }) != 0)
+                    {
+                        std::erase(thread.running_low_level_inputs, front.id);
+                    }
+                }
+
+                front.hooks.erase(front.hooks.begin());
+                front.in_progress = false;
+                front.waiting_since = now;
+                continue;
+            }
+
+            if (front.hooks.empty())
             {
                 const auto event = front.event;
                 pending.erase(pending.begin());
@@ -2045,6 +2247,12 @@ namespace sogen
 
     void windows_emulator::deliver_ui_event(const ui_event& event)
     {
+        if (event.message == WM_SIZE)
+        {
+            this->resize_window_from_host(event.window, event.wParam == SIZE_MAXIMIZED, point_x(event.lParam), point_y(event.lParam));
+            return;
+        }
+
         const auto* win = this->process.windows.get(event.window);
         if (!win)
         {
@@ -2205,6 +2413,48 @@ namespace sogen
         }
     }
 
+    void windows_emulator::resize_window_from_host(const hwnd window_handle, const bool maximized, const int32_t client_width,
+                                                   const int32_t client_height)
+    {
+        auto* win = this->process.windows.get(window_handle);
+        if (!win)
+        {
+            return;
+        }
+
+        const bool was_maximized = (win->style & WS_MAXIMIZE) != 0;
+        if (win->client_width() == client_width && win->client_height() == client_height && was_maximized == maximized)
+        {
+            return;
+        }
+
+        auto* thread = get_thread_by_id(this->process, win->thread_id);
+        if (!thread)
+        {
+            return;
+        }
+
+        const auto insets = win->nonclient_insets();
+        win->width = client_width + insets.left + insets.right;
+        win->height = client_height + insets.top + insets.bottom;
+        win->style = maximized ? (win->style | WS_MAXIMIZE) : (win->style & ~WS_MAXIMIZE);
+        win->guest.access([&](USER_WINDOW& guest_win) { guest_win.dwStyle = win->style; });
+        win->sync_guest_rects();
+
+        win->update_rect = RECT{.left = 0, .top = 0, .right = win->client_width(), .bottom = win->client_height()};
+        win->update_pending = true;
+        win->erase_pending = true;
+        thread->mark_queue_status_changed(QS_PAINT);
+
+        msg m{};
+        m.window = window_handle;
+        m.message = WM_SIZE;
+        m.wParam = maximized ? SIZE_MAXIMIZED : SIZE_RESTORED;
+        m.lParam = pack_point(win->client_width(), win->client_height());
+        thread->post_message(*this, m, true);
+        this->wake_thread(*thread);
+    }
+
     void windows_emulator::dump_exception_trace()
     {
         // Opt-in post-mortem aid for multi-vCPU debugging (see docs/multi-vcpu-design.md).
@@ -2363,8 +2613,8 @@ namespace sogen
             return module_manager_wrapper{this->mod_manager}; //
         });
 
-        buffer.register_factory<x64_emulator_wrapper>([this] {
-            return x64_emulator_wrapper{this->emu()}; //
+        buffer.register_factory<guest_machine_wrapper>([this] {
+            return guest_machine_wrapper{this->emu()}; //
         });
 
         buffer.register_factory<windows_emulator_wrapper>([this] {
@@ -2389,6 +2639,49 @@ namespace sogen
 
         buffer.register_factory<menu>([this] { return menu{this->emu()}; });
         buffer.register_factory<accelerator_table>([this] { return accelerator_table{this->emu()}; });
+    }
+
+    void windows_emulator::request_suspend()
+    {
+        const std::scoped_lock lock(this->kernel_lock_);
+        if (std::ranges::any_of(this->process.devices | std::views::values,
+                                [](const io_device_container& device) { return device.suspends_at_frame_end(); }))
+        {
+            this->suspend_requested_ = true;
+            return;
+        }
+
+        this->stop();
+    }
+
+    bool windows_emulator::take_suspend_request()
+    {
+        return this->suspend_requested_.exchange(false);
+    }
+
+    void windows_emulator::cancel_suspend_request()
+    {
+        this->suspend_requested_ = false;
+    }
+
+    void windows_emulator::ensure_serialization_support() const
+    {
+        for (const auto& device : this->process.devices | std::views::values)
+        {
+            if (!device.supports_serialization())
+            {
+                throw std::runtime_error("The device " + u16_to_u8(device.get_device_path()) + " does not support snapshots");
+            }
+        }
+    }
+
+    void windows_emulator::prepare_serialization()
+    {
+        this->ensure_serialization_support();
+        for (auto& device : this->process.devices | std::views::values)
+        {
+            device.prepare_serialization(*this);
+        }
     }
 
     void windows_emulator::serialize(utils::buffer_serializer& buffer) const
@@ -2418,6 +2711,8 @@ namespace sogen
 
     void windows_emulator::serialize_state(utils::buffer_serializer& buffer, const bool memory_contents, size_t* memory_offset) const
     {
+        this->ensure_serialization_support();
+
         buffer.write(this->application_settings_);
         buffer.write(this->setup_completed_);
         buffer.write(this->executed_instructions_);
@@ -2438,6 +2733,7 @@ namespace sogen
         this->mod_manager.serialize(buffer);
         this->dispatcher.serialize(buffer);
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
+        this->process.section_views.serialize(buffer, this->memory);
     }
 
     void windows_emulator::deserialize_state(utils::buffer_deserializer& buffer, const std::function<void()>& restore_memory)
@@ -2474,8 +2770,42 @@ namespace sogen
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
         this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
+        this->process.section_views.deserialize(buffer);
         this->process.restore_after_state_restore(*this);
+        this->ui().set_cursor_visibility(this->process.cursor_show_count >= 0 && this->process.cursor_shape_visible);
         this->apply_cursor_capture();
+        this->release_held_input();
+    }
+
+    // Nothing is held when a saved process continues, so what was held when it was saved is released, the way the guest
+    // would have seen it happen.
+    void windows_emulator::release_held_input()
+    {
+        for (uint32_t key = 0; key < this->process.key_state.size(); ++key)
+        {
+            if ((this->process.key_state[key] & 0x80) == 0)
+            {
+                continue;
+            }
+
+            if (key == VK_LBUTTON || key == VK_RBUTTON || key == VK_MBUTTON || key == VK_XBUTTON1 || key == VK_XBUTTON2)
+            {
+                this->process.key_state[key] = 0;
+                continue;
+            }
+
+            const bool alt_held = (this->process.key_state[VK_MENU] & 0x80) != 0;
+            constexpr uint64_t release_flags = 0xC0000001;
+            this->handle_ui_event(ui_event{
+                .window = this->process.foreground_window,
+                .message = static_cast<uint32_t>(alt_held ? WM_SYSKEYUP : WM_KEYUP),
+                .wParam = key,
+                .lParam = release_flags | (static_cast<uint64_t>(vk_to_scan_code(static_cast<uint16_t>(key))) << 16),
+            });
+
+            // Delivering the release does not clear the key when there is no window to deliver it to.
+            this->process.key_state[key] = 0;
+        }
     }
 
     // The guest's ClipCursor is process-wide; the host confines whichever window is in the foreground, in relative mode while
@@ -2494,6 +2824,8 @@ namespace sogen
 
     void windows_emulator::save_snapshot()
     {
+        this->prepare_serialization();
+
         utils::buffer_serializer buffer{};
 
         buffer.write(this->setup_completed_);
@@ -2511,6 +2843,7 @@ namespace sogen
         this->mod_manager.serialize(buffer);
         this->dispatcher.serialize(buffer);
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
+        this->process.section_views.serialize(buffer, this->memory);
 
         this->process_snapshot_ = buffer.move_buffer();
     }
@@ -2546,7 +2879,9 @@ namespace sogen
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
         this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
+        this->process.section_views.deserialize(buffer);
         this->process.restore_after_state_restore(*this);
+        this->ui().set_cursor_visibility(this->process.cursor_show_count >= 0 && this->process.cursor_shape_visible);
         this->apply_cursor_capture();
     }
 

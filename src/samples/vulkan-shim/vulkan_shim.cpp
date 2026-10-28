@@ -2206,6 +2206,35 @@ extern "C"
         record_set_dynamic_u32(commandBuffer, gb::dynamic_state_u32::depth_clip_enable, depthClipEnable);
     }
 
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetAlphaToCoverageEnableEXT(VkCommandBuffer commandBuffer,
+                                                                                      VkBool32 alphaToCoverageEnable)
+    {
+        record_set_dynamic_u32(commandBuffer, gb::dynamic_state_u32::alpha_to_coverage_enable, alphaToCoverageEnable);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetRasterizationSamplesEXT(VkCommandBuffer commandBuffer,
+                                                                                     VkSampleCountFlagBits rasterizationSamples)
+    {
+        record_set_dynamic_u32(commandBuffer, gb::dynamic_state_u32::rasterization_samples, static_cast<uint32_t>(rasterizationSamples));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetLineRasterizationModeEXT(VkCommandBuffer commandBuffer,
+                                                                                      VkLineRasterizationModeEXT lineRasterizationMode)
+    {
+        record_set_dynamic_u32(commandBuffer, gb::dynamic_state_u32::line_rasterization_mode, static_cast<uint32_t>(lineRasterizationMode));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetSampleMaskEXT(VkCommandBuffer commandBuffer, VkSampleCountFlagBits samples,
+                                                                           const VkSampleMask* pSampleMask)
+    {
+        gb::cmd_set_sample_mask_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        request.samples = static_cast<uint32_t>(samples);
+        const size_t words = std::min<size_t>((request.samples + 31u) / 32u, request.mask.size());
+        std::copy_n(pSampleMask, words, request.mask.begin());
+        record_command(request.command_buffer, gb::command::cmd_set_sample_mask, &request, sizeof(request));
+    }
+
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilTestEnable(VkCommandBuffer commandBuffer, VkBool32 stencilTestEnable)
     {
         record_set_dynamic_u32(commandBuffer, gb::dynamic_state_u32::stencil_test_enable, stencilTestEnable);
@@ -3912,6 +3941,28 @@ extern "C"
     {
     }
 
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkQueueBeginDebugUtilsLabelEXT(VkQueue, const VkDebugUtilsLabelEXT*)
+    {
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkQueueEndDebugUtilsLabelEXT(VkQueue)
+    {
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkQueueInsertDebugUtilsLabelEXT(VkQueue, const VkDebugUtilsLabelEXT*)
+    {
+    }
+
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkSetDebugUtilsObjectNameEXT(VkDevice, const VkDebugUtilsObjectNameInfoEXT*)
+    {
+        return VK_SUCCESS;
+    }
+
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkSetDebugUtilsObjectTagEXT(VkDevice, const VkDebugUtilsObjectTagInfoEXT*)
+    {
+        return VK_SUCCESS;
+    }
+
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateDebugUtilsMessengerEXT(VkInstance,
                                                                                         const VkDebugUtilsMessengerCreateInfoEXT*,
                                                                                         const VkAllocationCallbacks*,
@@ -4582,17 +4633,11 @@ extern "C"
         }
     }
 
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
-                                                                            const VkWriteDescriptorSet* pDescriptorWrites,
-                                                                            uint32_t descriptorCopyCount,
-                                                                            const VkCopyDescriptorSet* pDescriptorCopies)
+    namespace
     {
-        std::vector<gb::descriptor_write> writes;
-        std::vector<gb::descriptor_copy> copies;
-        std::vector<uint8_t> inline_uniform_data;
-        for (uint32_t w = 0; w < descriptorWriteCount; ++w)
+        void serialize_descriptor_write(const VkWriteDescriptorSet& src, std::vector<gb::descriptor_write>& writes,
+                                        std::vector<uint8_t>& inline_uniform_data)
         {
-            const VkWriteDescriptorSet& src = pDescriptorWrites[w];
             if (src.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
             {
                 const VkWriteDescriptorSetInlineUniformBlock* inline_uniform_block = nullptr;
@@ -4608,7 +4653,7 @@ extern "C"
                     (inline_uniform_block->dataSize != 0 && !inline_uniform_block->pData) ||
                     inline_uniform_data.size() > UINT32_MAX - inline_uniform_block->dataSize)
                 {
-                    continue;
+                    return;
                 }
 
                 gb::descriptor_write wire{};
@@ -4624,7 +4669,7 @@ extern "C"
                     inline_uniform_data.insert(inline_uniform_data.end(), data, data + inline_uniform_block->dataSize);
                 }
                 writes.push_back(wire);
-                continue;
+                return;
             }
 
             for (uint32_t e = 0; e < src.descriptorCount; ++e)
@@ -4652,6 +4697,20 @@ extern "C"
                 }
                 writes.push_back(wire);
             }
+        }
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
+                                                                            const VkWriteDescriptorSet* pDescriptorWrites,
+                                                                            uint32_t descriptorCopyCount,
+                                                                            const VkCopyDescriptorSet* pDescriptorCopies)
+    {
+        std::vector<gb::descriptor_write> writes;
+        std::vector<gb::descriptor_copy> copies;
+        std::vector<uint8_t> inline_uniform_data;
+        for (uint32_t w = 0; w < descriptorWriteCount; ++w)
+        {
+            serialize_descriptor_write(pDescriptorWrites[w], writes, inline_uniform_data);
         }
 
         copies.reserve(descriptorCopyCount);
@@ -4702,7 +4761,81 @@ extern "C"
         struct shim_descriptor_update_template
         {
             std::vector<VkDescriptorUpdateTemplateEntry> entries;
+            // Only meaningful for push-descriptor templates.
+            VkPipelineBindPoint bind_point{};
         };
+
+        struct template_writes
+        {
+            std::vector<VkWriteDescriptorSet> writes;
+            std::vector<std::vector<VkDescriptorImageInfo>> image_infos;
+            std::vector<std::vector<VkDescriptorBufferInfo>> buffer_infos;
+            std::vector<std::vector<VkBufferView>> texel_views;
+            std::vector<VkWriteDescriptorSetInlineUniformBlock> inline_uniform_blocks;
+        };
+
+        void expand_template(const shim_descriptor_update_template& tmpl, const VkDescriptorSet descriptor_set, const void* pData,
+                             template_writes& out)
+        {
+            out.writes.reserve(tmpl.entries.size());
+            out.image_infos.reserve(tmpl.entries.size());
+            out.buffer_infos.reserve(tmpl.entries.size());
+            out.texel_views.reserve(tmpl.entries.size());
+            out.inline_uniform_blocks.reserve(tmpl.entries.size());
+
+            const auto* base = static_cast<const uint8_t*>(pData);
+            for (const auto& entry : tmpl.entries)
+            {
+                VkWriteDescriptorSet write{};
+                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet = descriptor_set;
+                write.dstBinding = entry.dstBinding;
+                write.dstArrayElement = entry.dstArrayElement;
+                write.descriptorCount = entry.descriptorCount;
+                write.descriptorType = entry.descriptorType;
+
+                if (entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+                {
+                    auto& inline_uniform_block = out.inline_uniform_blocks.emplace_back();
+                    inline_uniform_block.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK;
+                    inline_uniform_block.dataSize = entry.descriptorCount;
+                    inline_uniform_block.pData = base + entry.offset;
+                    write.pNext = &inline_uniform_block;
+                }
+                else if (is_image_descriptor(entry.descriptorType))
+                {
+                    auto& arr = out.image_infos.emplace_back();
+                    arr.reserve(entry.descriptorCount);
+                    for (uint32_t e = 0; e < entry.descriptorCount; ++e)
+                    {
+                        arr.push_back(*reinterpret_cast<const VkDescriptorImageInfo*>(base + entry.offset + e * entry.stride));
+                    }
+                    write.pImageInfo = arr.data();
+                }
+                else if (is_texel_buffer_descriptor(entry.descriptorType))
+                {
+                    auto& arr = out.texel_views.emplace_back();
+                    arr.reserve(entry.descriptorCount);
+                    for (uint32_t e = 0; e < entry.descriptorCount; ++e)
+                    {
+                        arr.push_back(*reinterpret_cast<const VkBufferView*>(base + entry.offset + e * entry.stride));
+                    }
+                    write.pTexelBufferView = arr.data();
+                }
+                else
+                {
+                    auto& arr = out.buffer_infos.emplace_back();
+                    arr.reserve(entry.descriptorCount);
+                    for (uint32_t e = 0; e < entry.descriptorCount; ++e)
+                    {
+                        arr.push_back(*reinterpret_cast<const VkDescriptorBufferInfo*>(base + entry.offset + e * entry.stride));
+                    }
+                    write.pBufferInfo = arr.data();
+                }
+
+                out.writes.push_back(write);
+            }
+        }
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL
@@ -4721,6 +4854,7 @@ extern "C"
         }
         tmpl->entries.assign(pCreateInfo->pDescriptorUpdateEntries,
                              pCreateInfo->pDescriptorUpdateEntries + pCreateInfo->descriptorUpdateEntryCount);
+        tmpl->bind_point = pCreateInfo->pipelineBindPoint;
         *pDescriptorUpdateTemplate = reinterpret_cast<VkDescriptorUpdateTemplate>(tmpl);
         return VK_SUCCESS;
     }
@@ -4742,71 +4876,96 @@ extern "C"
             return;
         }
 
-        std::vector<VkWriteDescriptorSet> writes;
-        std::vector<std::vector<VkDescriptorImageInfo>> image_infos;
-        std::vector<std::vector<VkDescriptorBufferInfo>> buffer_infos;
-        std::vector<std::vector<VkBufferView>> texel_views;
-        std::vector<VkWriteDescriptorSetInlineUniformBlock> inline_uniform_blocks;
-        writes.reserve(tmpl->entries.size());
-        image_infos.reserve(tmpl->entries.size());
-        buffer_infos.reserve(tmpl->entries.size());
-        texel_views.reserve(tmpl->entries.size());
-        inline_uniform_blocks.reserve(tmpl->entries.size());
+        template_writes expanded{};
+        expand_template(*tmpl, descriptorSet, pData, expanded);
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(expanded.writes.size()), expanded.writes.data(), 0, nullptr);
+    }
 
-        const auto* base = static_cast<const uint8_t*>(pData);
-        for (const auto& entry : tmpl->entries)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
+                                                                               VkPipelineBindPoint pipelineBindPoint,
+                                                                               VkPipelineLayout layout, uint32_t set,
+                                                                               uint32_t descriptorWriteCount,
+                                                                               const VkWriteDescriptorSet* pDescriptorWrites)
+    {
+        std::vector<gb::descriptor_write> writes;
+        std::vector<uint8_t> inline_uniform_data;
+        for (uint32_t w = 0; w < descriptorWriteCount; ++w)
         {
-            VkWriteDescriptorSet write{};
-            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            write.dstSet = descriptorSet;
-            write.dstBinding = entry.dstBinding;
-            write.dstArrayElement = entry.dstArrayElement;
-            write.descriptorCount = entry.descriptorCount;
-            write.descriptorType = entry.descriptorType;
-
-            if (entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
-            {
-                auto& inline_uniform_block = inline_uniform_blocks.emplace_back();
-                inline_uniform_block.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK;
-                inline_uniform_block.dataSize = entry.descriptorCount;
-                inline_uniform_block.pData = base + entry.offset;
-                write.pNext = &inline_uniform_block;
-            }
-            else if (is_image_descriptor(entry.descriptorType))
-            {
-                auto& arr = image_infos.emplace_back();
-                arr.reserve(entry.descriptorCount);
-                for (uint32_t e = 0; e < entry.descriptorCount; ++e)
-                {
-                    arr.push_back(*reinterpret_cast<const VkDescriptorImageInfo*>(base + entry.offset + e * entry.stride));
-                }
-                write.pImageInfo = arr.data();
-            }
-            else if (is_texel_buffer_descriptor(entry.descriptorType))
-            {
-                auto& arr = texel_views.emplace_back();
-                arr.reserve(entry.descriptorCount);
-                for (uint32_t e = 0; e < entry.descriptorCount; ++e)
-                {
-                    arr.push_back(*reinterpret_cast<const VkBufferView*>(base + entry.offset + e * entry.stride));
-                }
-                write.pTexelBufferView = arr.data();
-            }
-            else
-            {
-                auto& arr = buffer_infos.emplace_back();
-                arr.reserve(entry.descriptorCount);
-                for (uint32_t e = 0; e < entry.descriptorCount; ++e)
-                {
-                    arr.push_back(*reinterpret_cast<const VkDescriptorBufferInfo*>(base + entry.offset + e * entry.stride));
-                }
-                write.pBufferInfo = arr.data();
-            }
-
-            writes.push_back(write);
+            serialize_descriptor_write(pDescriptorWrites[w], writes, inline_uniform_data);
         }
 
-        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        const gb::object_id command_buffer = to_object_id(commandBuffer);
+        gb::cmd_push_descriptor_set_request header{};
+        header.command_buffer = command_buffer;
+        header.pipeline_layout = to_object_id(layout);
+        header.bind_point = static_cast<uint32_t>(pipelineBindPoint);
+        header.set = set;
+        header.write_count = static_cast<uint32_t>(writes.size());
+        header.inline_uniform_data_size = static_cast<uint32_t>(inline_uniform_data.size());
+
+        const size_t writes_bytes = writes.size() * sizeof(gb::descriptor_write);
+        std::vector<uint8_t> message(sizeof(header) + writes_bytes + inline_uniform_data.size());
+        std::memcpy(message.data(), &header, sizeof(header));
+        if (!writes.empty())
+        {
+            std::memcpy(message.data() + sizeof(header), writes.data(), writes_bytes);
+        }
+        if (!inline_uniform_data.empty())
+        {
+            std::memcpy(message.data() + sizeof(header) + writes_bytes, inline_uniform_data.data(), inline_uniform_data.size());
+        }
+        record_command(command_buffer, gb::command::cmd_push_descriptor_set, message.data(), message.size());
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL
+    vkCmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer commandBuffer, VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+                                          VkPipelineLayout layout, uint32_t set, const void* pData)
+    {
+        const auto* tmpl = reinterpret_cast<const shim_descriptor_update_template*>(descriptorUpdateTemplate);
+        if (!tmpl || !pData)
+        {
+            return;
+        }
+
+        template_writes expanded{};
+        expand_template(*tmpl, VK_NULL_HANDLE, pData, expanded);
+        vkCmdPushDescriptorSetKHR(commandBuffer, tmpl->bind_point, layout, set, static_cast<uint32_t>(expanded.writes.size()),
+                                  expanded.writes.data());
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSet2KHR(VkCommandBuffer commandBuffer,
+                                                                                const VkPushDescriptorSetInfo* pPushDescriptorSetInfo)
+    {
+        if (!pPushDescriptorSetInfo)
+        {
+            return;
+        }
+
+        const auto push = [&](const VkPipelineBindPoint bind_point) {
+            vkCmdPushDescriptorSetKHR(commandBuffer, bind_point, pPushDescriptorSetInfo->layout, pPushDescriptorSetInfo->set,
+                                      pPushDescriptorSetInfo->descriptorWriteCount, pPushDescriptorSetInfo->pDescriptorWrites);
+        };
+        if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
+        {
+            push(VK_PIPELINE_BIND_POINT_GRAPHICS);
+        }
+        if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+        {
+            push(VK_PIPELINE_BIND_POINT_COMPUTE);
+        }
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplate2KHR(
+        VkCommandBuffer commandBuffer, const VkPushDescriptorSetWithTemplateInfo* pPushDescriptorSetWithTemplateInfo)
+    {
+        if (!pPushDescriptorSetWithTemplateInfo)
+        {
+            return;
+        }
+
+        vkCmdPushDescriptorSetWithTemplateKHR(commandBuffer, pPushDescriptorSetWithTemplateInfo->descriptorUpdateTemplate,
+                                              pPushDescriptorSetWithTemplateInfo->layout, pPushDescriptorSetWithTemplateInfo->set,
+                                              pPushDescriptorSetWithTemplateInfo->pData);
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCreateInfo,
@@ -5280,7 +5439,7 @@ extern "C"
                     vkDestroyShaderModule(device, source.owned_module, nullptr);
                 }
             }
-            stages_valid = stages_valid && vertex_shader.valid && fragment_shader.valid;
+            stages_valid = stages_valid && vertex_shader.valid;
             if (!stages_valid)
             {
                 if (vertex_shader.owned_module != VK_NULL_HANDLE)
@@ -6081,6 +6240,11 @@ extern "C"
             {.name = "vkCmdBeginDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginDebugUtilsLabelEXT)},
             {.name = "vkCmdEndDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndDebugUtilsLabelEXT)},
             {.name = "vkCmdInsertDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdInsertDebugUtilsLabelEXT)},
+            {.name = "vkQueueBeginDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueueBeginDebugUtilsLabelEXT)},
+            {.name = "vkQueueEndDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueueEndDebugUtilsLabelEXT)},
+            {.name = "vkQueueInsertDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueueInsertDebugUtilsLabelEXT)},
+            {.name = "vkSetDebugUtilsObjectNameEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSetDebugUtilsObjectNameEXT)},
+            {.name = "vkSetDebugUtilsObjectTagEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSetDebugUtilsObjectTagEXT)},
             {.name = "vkCreateDebugUtilsMessengerEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateDebugUtilsMessengerEXT)},
             {.name = "vkDestroyDebugUtilsMessengerEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyDebugUtilsMessengerEXT)},
             {.name = "vkSubmitDebugUtilsMessageEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSubmitDebugUtilsMessageEXT)},
@@ -6268,6 +6432,12 @@ extern "C"
             {.name = "vkUpdateDescriptorSetWithTemplateKHR",
              .func = reinterpret_cast<PFN_vkVoidFunction>(vkUpdateDescriptorSetWithTemplate)},
             {.name = "vkCmdBindDescriptorSets", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBindDescriptorSets)},
+            {.name = "vkCmdPushDescriptorSetKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdPushDescriptorSetKHR)},
+            {.name = "vkCmdPushDescriptorSetWithTemplateKHR",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdPushDescriptorSetWithTemplateKHR)},
+            {.name = "vkCmdPushDescriptorSet2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdPushDescriptorSet2KHR)},
+            {.name = "vkCmdPushDescriptorSetWithTemplate2KHR",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdPushDescriptorSetWithTemplate2KHR)},
             {.name = "vkCreatePipelineCache", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreatePipelineCache)},
             {.name = "vkDestroyPipelineCache", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyPipelineCache)},
             {.name = "vkGetPipelineCacheData", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetPipelineCacheData)},
@@ -6338,6 +6508,10 @@ extern "C"
             {.name = "vkCmdSetDepthBoundsTestEnable", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDepthBoundsTestEnable)},
             {.name = "vkCmdSetDepthBoundsTestEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDepthBoundsTestEnable)},
             {.name = "vkCmdSetDepthClipEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDepthClipEnableEXT)},
+            {.name = "vkCmdSetAlphaToCoverageEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetAlphaToCoverageEnableEXT)},
+            {.name = "vkCmdSetRasterizationSamplesEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetRasterizationSamplesEXT)},
+            {.name = "vkCmdSetLineRasterizationModeEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetLineRasterizationModeEXT)},
+            {.name = "vkCmdSetSampleMaskEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetSampleMaskEXT)},
             {.name = "vkCmdSetStencilTestEnable", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetStencilTestEnable)},
             {.name = "vkCmdSetStencilTestEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetStencilTestEnable)},
             {.name = "vkCmdSetRasterizerDiscardEnable", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetRasterizerDiscardEnable)},

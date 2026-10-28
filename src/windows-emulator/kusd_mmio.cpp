@@ -50,8 +50,8 @@ namespace sogen
             kusd.DismountCount = 0x00000006;
             kusd.ComPlusPackage = 0x00000001;
             kusd.LastSystemRITEventTickCount = 0x01ec1fd3;
-            kusd.NumberOfPhysicalPages = 0x00bf0958;
-            kusd.FullNumberOfPhysicalPages = 0x0000000000bf0958;
+            kusd.NumberOfPhysicalPages = simulated_physical_page_count;
+            kusd.FullNumberOfPhysicalPages = simulated_physical_page_count;
             kusd.TickCount.TickCount.LowPart = 0x001f7f05;
             kusd.TickCount.TickCountQuad = 0x00000000001f7f05;
             kusd.Cookie = 0;
@@ -106,6 +106,34 @@ namespace sogen
         }
     }
 
+    void apply_arm64_processor(KUSER_SHARED_DATA64& kusd, const uint64_t isar0, const uint64_t isar1)
+    {
+        const auto field = [](const uint64_t value, const unsigned shift) { return (value >> shift) & 0xF; };
+
+        kusd.ImageNumberLow = IMAGE_FILE_MACHINE_ARM64;
+        kusd.ImageNumberHigh = IMAGE_FILE_MACHINE_ARM64;
+        kusd.NativeProcessorArchitecture = PROCESSOR_ARCHITECTURE_ARM64;
+        kusd.XState = {};
+
+        auto& features = kusd.ProcessorFeatures.arr;
+        std::ranges::fill(features, std::remove_cvref_t<decltype(features[0])>{});
+        for (const auto feature : {PF_COMPARE_EXCHANGE_DOUBLE, PF_NX_ENABLED, PF_ARM_VFP_32_REGISTERS_AVAILABLE,
+                                   PF_ARM_NEON_INSTRUCTIONS_AVAILABLE, PF_FASTFAIL_AVAILABLE, PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE,
+                                   PF_ARM_64BIT_LOADSTORE_ATOMIC, PF_ARM_FMAC_INSTRUCTIONS_AVAILABLE, PF_ARM_V8_INSTRUCTIONS_AVAILABLE})
+        {
+            features[feature] = 1;
+        }
+
+        // ID_AA64ISAR0_EL1: AES [7:4], SHA1 [11:8], SHA2 [15:12], CRC32 [19:16], Atomic [23:20], DP [47:44].
+        // ID_AA64ISAR1_EL1: JSCVT [15:12], LRCPC [23:20].
+        features[PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE] = field(isar0, 4) && field(isar0, 8) && field(isar0, 12);
+        features[PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE] = field(isar0, 16) != 0;
+        features[PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE] = field(isar0, 20) >= 2;
+        features[PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE] = field(isar0, 44) != 0;
+        features[PF_ARM_V83_JSCVT_INSTRUCTIONS_AVAILABLE] = field(isar1, 12) != 0;
+        features[PF_ARM_V83_LRCPC_INSTRUCTIONS_AVAILABLE] = field(isar1, 20) != 0;
+    }
+
     namespace utils
     {
         static void serialize(buffer_serializer& buffer, const KUSER_SHARED_DATA64& kusd)
@@ -120,9 +148,10 @@ namespace sogen
         }
     }
 
-    kusd_mmio::kusd_mmio(memory_manager& memory, utils::clock& clock)
+    kusd_mmio::kusd_mmio(memory_manager& memory, utils::clock& clock, const bool intercept)
         : memory_(&memory),
-          clock_(&clock)
+          clock_(&clock),
+          intercept_(intercept)
     {
     }
 
@@ -131,14 +160,8 @@ namespace sogen
         this->deregister_mmio();
     }
 
-    kusd_mmio::kusd_mmio(utils::buffer_deserializer& buffer)
-        : kusd_mmio(buffer.read<memory_manager_wrapper>(), buffer.read<clock_wrapper>())
+    void kusd_mmio::setup(const windows_version_manager& version, const fake_environment_config& fake_env)
     {
-    }
-
-    void kusd_mmio::setup(const windows_version_manager& version, const fake_environment_config& fake_env, const bool intercept)
-    {
-        this->intercept_ = intercept;
         setup_kusd(this->kusd_, version, fake_env);
         this->register_mmio();
     }

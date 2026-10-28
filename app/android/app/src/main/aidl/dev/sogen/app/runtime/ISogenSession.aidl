@@ -8,13 +8,26 @@ oneway interface ISogenSession {
     void start(in Bundle config, ISogenCallback callback);
     void stop();
 
+    /** Saves the process to [destination], or to a new file when it is empty, and ends the session. */
+    void suspend(String destination);
+
+    void consoleInput(in byte[] data);
+    void consoleResize(int columns, int rows);
+
     void attachSurface(long window, in Surface surface);
     void detachSurface(long window);
 
     void mouseMove(long window, int x, int y);
+    void mouseMotion(long window, int dx, int dy);
     void mouseButton(long window, int button, boolean down, int x, int y);
     void mouseWheel(long window, int delta, int x, int y);
     void key(long window, int keyCode, boolean down);
     void text(long window, String text);
     void close(long window);
+
+    /** 0 turns the limit off. */
+    void setFrameLimit(int framesPerSecond);
+
+    /** While [milliseconds] is above 0, [ISogenCallback.onStats] reports that often. */
+    void setStatsInterval(int milliseconds);
 }

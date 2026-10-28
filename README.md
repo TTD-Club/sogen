@@ -1,11 +1,10 @@
 <h1 align="center">
-	<a href="https://github.com/momo5502/sogen"><img src="https://momo5502.com/sogen/banner.png" height="300" /></a>
+	<a href="https://github.com/momo5502/sogen"><img src="https://momo5502.com/sogen/sogen.svg" height="200" /></a>
 	<br>
-	<a href="https://github.com/momo5502/sogen?tab=GPL-2.0-1-ov-file"><img src="https://img.shields.io/github/license/momo5502/sogen?color=00B0F8"/></a>
+	<a href="https://discord.sogen.dev"><img src="https://img.shields.io/badge/discord-come%20chat-00B0F8?logo=discord&logoColor=white"/></a>
 	<a href="https://github.com/momo5502/sogen/actions"><img src="https://img.shields.io/github/actions/workflow/status/momo5502/sogen/build.yml?branch=main&label=build"/></a>
 	<a href="https://github.com/momo5502/sogen/issues"><img src="https://img.shields.io/github/issues/momo5502/sogen?color=F8B000"/></a>
 	<img src="https://img.shields.io/github/commit-activity/m/momo5502/sogen?color=FF3131"/>
-	<a href="https://inspect.software/software/momo5502/sogen"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Finspect.software%2Fbadge%2Fv1%2Fmomo5502%2Fsogen.json" alt="inspect.software score badge for momo5502/sogen" /></a>
 </h1>
 
 Sogen runs Windows and Linux programs without a real operating system: It lets you see and control everything they do.
@@ -23,6 +22,7 @@ Built in C++ and powered by the CPU backend of your choice:
 - [FEX](https://fex-emu.com)
 
 Try it out: <a href="https://sogen.dev">sogen.dev</a>  
+Join the community: <a href="https://discord.sogen.dev">Discord</a>  
 &nbsp;  
 
 ## Key Features
@@ -137,3 +137,7 @@ The guest file system is read-only by default, and guest writes fail with `STATU
 `--root-mode rw` to let the guest change the emulation root, or the host drives when no root is set. Use
 `--mount HOST:GUEST[:MODE]` to add a host file or directory at a guest path, for example
 `--mount .\out:C:\out:rw`. See [docs/filesystem.md](docs/filesystem.md) for the details of mounts and modes.
+
+Windows ARM64 executables run the same way, from an emulation root created with [create-root.bat](https://github.com/momo5502/sogen/blob/main/src/tools/create-root.bat) on a Windows ARM64 machine. They run on WHP on Windows ARM64, on Hypervisor.framework on Apple Silicon and on Unicorn elsewhere.
+
+`--backend` overrides environment-based selection. Outside Windows ARM64, where Unicorn's ARM64 backend is not built, `EMULATOR_UNICORN=1` runs ARM64 guests on Unicorn instead of the hypervisor.

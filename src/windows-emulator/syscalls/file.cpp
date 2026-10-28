@@ -693,7 +693,13 @@ namespace sogen
                 const auto existing = c.win_emu.file_sys.stat(new_path);
                 if (!info.ReplaceIfExists && existing && !onto_itself)
                 {
-                    return STATUS_OBJECT_NAME_EXISTS;
+                    return STATUS_OBJECT_NAME_COLLISION;
+                }
+
+                const auto parent_stat = c.win_emu.file_sys.stat(new_path.parent());
+                if (!parent_stat || (parent_stat->st_mode & S_IFMT) != S_IFDIR)
+                {
+                    return STATUS_OBJECT_PATH_NOT_FOUND;
                 }
 
                 // A directory is not replaced (os.replace onto a directory fails; a file may be replaced by a
@@ -1366,6 +1372,18 @@ namespace sogen
                 return ret(STATUS_INVALID_PARAMETER);
             }
 
+            if (info_class == FileCaseSensitiveInformation)
+            {
+                constexpr auto required_length = sizeof(FILE_CASE_SENSITIVE_INFORMATION);
+                if (length < required_length)
+                {
+                    return ret(STATUS_INFO_LENGTH_MISMATCH);
+                }
+
+                c.emu.write_memory(file_information, FILE_CASE_SENSITIVE_INFORMATION{});
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
             if (info_class == FileIdInformation)
             {
                 constexpr auto required_length = sizeof(FILE_ID_INFORMATION);
@@ -1933,6 +1951,52 @@ namespace sogen
             return existing.offset < end && offset < existing_end;
         }
 
+        // WoW64 hands the native syscall a scratch status block of its own and keeps the address of the caller's
+        // 32-bit block in its Pointer field. That 32-bit block is what an overlapped caller and its completion routine
+        // read, so it has to be fetched before the scratch block is written. Only calls through the WoW64 thunks follow
+        // this convention; 64-bit code in the same process leaves Pointer undefined. wow64.dll does not export its
+        // NtReadFile/NtWriteFile thunks, so a call counts as thunked when the 64-bit syscall stub returns into wow64.dll,
+        // and the 32-bit block must still be writable memory the 32-bit side can reach.
+        uint64_t wow64_io_status_block_address(const syscall_context& c,
+                                               const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block)
+        {
+            auto* cpu = dynamic_cast<x86_64_cpu*>(&c.emu);
+            if (!c.proc.is_wow64_process || !io_status_block || !cpu)
+            {
+                return 0;
+            }
+
+            uint64_t return_address{};
+            if (!cpu->try_read_memory(cpu->read_stack_pointer(), &return_address, sizeof(return_address)))
+            {
+                return 0;
+            }
+
+            // wow64cpu's turbo thunks issue NtReadFile/NtWriteFile without an APC directly, with the same convention.
+            const auto* caller = c.win_emu.mod_manager.find_by_address(return_address);
+            if (!caller || (!utils::string::equals_ignore_case(std::string_view{caller->name}, std::string_view{"wow64.dll"}) &&
+                            !utils::string::equals_ignore_case(std::string_view{caller->name}, std::string_view{"wow64cpu.dll"})))
+            {
+                return 0;
+            }
+
+            const uint64_t address = io_status_block.read().Pointer;
+            constexpr uint64_t status_block_size = sizeof(IO_STATUS_BLOCK<EmulatorTraits<Emu32>>);
+            if (address == 0 || address > std::numeric_limits<uint32_t>::max() - status_block_size + 1)
+            {
+                return 0;
+            }
+
+            const auto region = c.win_emu.memory.get_region_info(address);
+            if (!region.is_committed || region.start + region.length < address + status_block_size ||
+                !is_writable(region.permissions.common))
+            {
+                return 0;
+            }
+
+            return address;
+        }
+
         // Completion of an asynchronous (overlapped) file operation: signal the optional completion event and,
         // for an APC-based request (ReadFileEx/WriteFileEx), queue the I/O completion APC on the issuing thread.
         // The APC routine follows the PIO_APC_ROUTINE contract (ApcContext, IoStatusBlock, Reserved); it is
@@ -1940,8 +2004,16 @@ namespace sogen
         void deliver_file_io_completion(const syscall_context& c, const uint64_t event, const uint64_t apc_routine,
                                         const uint64_t apc_context,
                                         const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
-                                        const NTSTATUS status, const uint64_t information)
+                                        const uint64_t wow64_io_status_block, const NTSTATUS status, const uint64_t information)
         {
+            const auto status32 = static_cast<uint32_t>(static_cast<ULONG>(status));
+            const auto information32 = static_cast<uint32_t>(information);
+            if (wow64_io_status_block)
+            {
+                c.emu.write_memory(wow64_io_status_block, &status32, sizeof(status32));
+                c.emu.write_memory(wow64_io_status_block + sizeof(status32), &information32, sizeof(information32));
+            }
+
             if (event)
             {
                 if (auto* e = c.proc.events.get(event))
@@ -1953,27 +2025,15 @@ namespace sogen
 
             if (apc_routine)
             {
-                // A WoW64 completion routine (kernel32!BasepIoCompletion) reads the I/O status block with the
-                // 32-bit layout (NTSTATUS Status @0, ULONG Information @4). Our 64-bit block keeps Information at
-                // @8, so the 32-bit reader would see 0 bytes transferred. Mirror Status/Information into the
-                // 32-bit slots so the completion routine reports the correct byte count.
-                if (c.proc.is_wow64_process && io_status_block)
-                {
-                    const auto status32 = static_cast<uint32_t>(static_cast<ULONG>(status));
-                    const auto information32 = static_cast<uint32_t>(information);
-                    c.emu.write_memory(io_status_block.value(), &status32, sizeof(status32));
-                    c.emu.write_memory(io_status_block.value() + sizeof(status32), &information32, sizeof(information32));
-                }
-
                 c.thread().pending_apcs.push_back({
                     .flags = 0,
                     .apc_routine = apc_routine,
                     .apc_argument1 = apc_context,
-                    .apc_argument2 = io_status_block.value(),
+                    .apc_argument2 = wow64_io_status_block ? wow64_io_status_block : io_status_block.value(),
                     .apc_argument3 = 0,
-                    .restamp_io_status_block = c.proc.is_wow64_process && io_status_block,
-                    .io_status = static_cast<int32_t>(static_cast<ULONG>(status)),
-                    .io_information = static_cast<uint32_t>(information),
+                    .restamp_io_status_block = wow64_io_status_block != 0,
+                    .io_status = static_cast<int32_t>(status32),
+                    .io_information = information32,
                 });
                 c.win_emu.wake_idle_vcpu();
             }
@@ -1981,7 +2041,7 @@ namespace sogen
 
         NTSTATUS handle_pipe_io(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
                                 const uint64_t apc_context, const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
-                                const uint64_t buffer, const ULONG length, const bool reading)
+                                const uint64_t wow64_io_status_block, const uint64_t buffer, const ULONG length, const bool reading)
         {
             auto* container = c.proc.devices.get(file_handle);
             auto* pipe = container ? container->get_internal_device<named_pipe>() : nullptr;
@@ -2000,9 +2060,9 @@ namespace sogen
             context.output_buffer = buffer;
             context.output_buffer_length = length;
             context.vcpu = &c.vcpu;
-            if (c.proc.is_wow64_process && io_status_block)
+            if (wow64_io_status_block)
             {
-                context.wow64_io_status_block.set_address(io_status_block.read().Pointer);
+                context.wow64_io_status_block.set_address(wow64_io_status_block);
             }
             return pipe->start_io(c.win_emu, container->prepare_io_context(context), reading);
         }
@@ -2013,6 +2073,8 @@ namespace sogen
                                    const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset,
                                    const emulator_object<ULONG> /*key*/)
         {
+            const auto wow64_io_status_block = wow64_io_status_block_address(c, io_status_block);
+
             if (file_handle == STDIN_HANDLE)
             {
                 const auto data = c.win_emu.console().read_input(length);
@@ -2037,7 +2099,8 @@ namespace sogen
 
             if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
             {
-                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, buffer, length, true);
+                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, buffer,
+                                      length, true);
             }
 
             const auto* f = c.proc.files.get(file_handle);
@@ -2070,7 +2133,8 @@ namespace sogen
             if (bytes_read > 0)
             {
                 commit_file_data(std::string_view(temp_buffer.data(), bytes_read), c.emu, io_status_block, buffer);
-                deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, STATUS_SUCCESS, bytes_read);
+                deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, STATUS_SUCCESS,
+                                           bytes_read);
                 return STATUS_SUCCESS;
             }
 
@@ -2084,8 +2148,55 @@ namespace sogen
                 io_status_block.write(block);
             }
 
-            deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, status, 0);
+            deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, status, 0);
             return status;
+        }
+
+        namespace
+        {
+            void write_io_status_block(const syscall_context& c, const uint64_t address, const NTSTATUS status)
+            {
+                if (c.proc.is_wow64_process)
+                {
+                    emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu32>>>{c.emu, address}.write({.Status = status, .Information = 0});
+                }
+                else
+                {
+                    emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>{c.emu, address}.write({.Status = status, .Information = 0});
+                }
+            }
+
+            // Completes the matching change watches the way cancelled requests complete, so that waits on their events or
+            // on the directory itself end.
+            template <typename Predicate>
+            size_t cancel_change_watches(const syscall_context& c, file& directory, const Predicate& matches)
+            {
+                const auto cancelled = std::erase_if(directory.change_watches, [&](const directory_change_watch& watch) {
+                    if (!matches(watch))
+                    {
+                        return false;
+                    }
+
+                    if (watch.io_status_block != 0)
+                    {
+                        write_io_status_block(c, watch.io_status_block, STATUS_CANCELLED);
+                    }
+
+                    if (auto* event = c.proc.events.get(watch.event))
+                    {
+                        event->signaled = true;
+                    }
+
+                    return true;
+                });
+
+                if (cancelled != 0)
+                {
+                    c.win_emu.wake_idle_vcpu();
+                }
+
+                return cancelled;
+            }
         }
 
         NTSTATUS handle_NtCancelIoFile(const syscall_context& c, const handle file_handle,
@@ -2100,8 +2211,11 @@ namespace sogen
             {
                 device->cancel_io(c.win_emu, 0, c.thread().id);
             }
-            else if (!c.proc.files.get(resolved) && resolved != STDIN_HANDLE && resolved != STDOUT_HANDLE && resolved != CONSOLE_HANDLE &&
-                     resolved != NUL_HANDLE)
+            else if (auto* f = c.proc.files.get(resolved))
+            {
+                cancel_change_watches(c, *f, [&](const directory_change_watch& watch) { return watch.thread_id == c.thread().id; });
+            }
+            else if (resolved != STDIN_HANDLE && resolved != STDOUT_HANDLE && resolved != CONSOLE_HANDLE && resolved != NUL_HANDLE)
             {
                 return STATUS_INVALID_HANDLE;
             }
@@ -2129,17 +2243,23 @@ namespace sogen
             auto* device = c.proc.devices.get(resolved_handle);
             if (!device)
             {
-                return STATUS_INVALID_HANDLE;
+                auto* f = c.proc.files.get(resolved_handle);
+                if (!f)
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+
+                const auto request = io_request_to_cancel.value();
+                const auto cancelled = cancel_change_watches(
+                    c, *f, [&](const directory_change_watch& watch) { return request == 0 || watch.io_status_block == request; });
+                const auto status = cancelled != 0 ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+                write_io_status_block(c, io_status_block.value(), status);
+                return status;
             }
 
-            if (!device->cancel_io(c.win_emu, io_request_to_cancel.value()))
-            {
-                io_status_block.write(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>{.Status = STATUS_NOT_FOUND, .Information = 0});
-                return STATUS_NOT_FOUND;
-            }
-
-            io_status_block.write(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>{.Status = STATUS_SUCCESS, .Information = 0});
-            return STATUS_SUCCESS;
+            const auto status = device->cancel_io(c.win_emu, io_request_to_cancel.value()) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+            write_io_status_block(c, io_status_block.value(), status);
+            return status;
         }
 
         NTSTATUS handle_NtWriteFile(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
@@ -2148,6 +2268,8 @@ namespace sogen
                                     const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset,
                                     const emulator_object<ULONG> /*key*/)
         {
+            const auto wow64_io_status_block = wow64_io_status_block_address(c, io_status_block);
+
             std::string temp_buffer{};
             temp_buffer.resize(length);
             c.emu.read_memory(buffer, temp_buffer.data(), temp_buffer.size());
@@ -2180,7 +2302,8 @@ namespace sogen
 
             if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
             {
-                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, buffer, length, false);
+                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, buffer,
+                                      length, false);
             }
 
             const auto* f = c.proc.files.get(file_handle);
@@ -2233,6 +2356,7 @@ namespace sogen
                 io_status_block.write(block);
             }
 
+            deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, status, bytes_written);
             return status;
         }
 
@@ -3427,6 +3551,7 @@ namespace sogen
             auto* device = c.proc.devices.get(file_handle);
             if (!device)
             {
+                constexpr ULONG FSCTL_IS_VOLUME_MOUNTED = 0x90028;
                 if (const auto* f = c.proc.files.get(file_handle))
                 {
                     if (const auto status = reparse_point_control(c, *f, io_status_block, fs_control_code, input_buffer,
@@ -3438,6 +3563,14 @@ namespace sogen
                         }
                         return *status;
                     }
+                }
+
+                if (fs_control_code == FSCTL_IS_VOLUME_MOUNTED && c.proc.files.get(file_handle))
+                {
+                    IO_STATUS_BLOCK<EmulatorTraits<Emu64>> iosb{};
+                    iosb.Status = STATUS_SUCCESS;
+                    io_status_block.write(iosb);
+                    return STATUS_SUCCESS;
                 }
 
                 c.win_emu.log.warn("NtFsControlFile on non-device handle (control code 0x%X)\n", static_cast<uint32_t>(fs_control_code));

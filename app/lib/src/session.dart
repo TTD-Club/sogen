@@ -1,8 +1,9 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:xterm/xterm.dart';
 
 import 'game_library.dart';
 
@@ -26,6 +27,34 @@ class GuestWindow {
 
 enum MouseButton { left, right, middle }
 
+class SessionStats {
+  const SessionStats({
+    required this.framesPerSecond,
+    required this.worstPresentInterval,
+    required this.residentBytes,
+    this.thermalStatus,
+  });
+
+  final double framesPerSecond;
+
+  /// The longest time between two presented frames since the previous report; not the GPU's render time.
+  final Duration worstPresentInterval;
+
+  final int residentBytes;
+
+  /// Android's PowerManager.THERMAL_STATUS_*, null where the device does not report it.
+  final int? thermalStatus;
+}
+
+/// Where the guest put the cursor itself, in client coordinates of [window].
+class GuestCursor {
+  const GuestCursor(this.window, this.x, this.y);
+
+  final int window;
+  final int x;
+  final int y;
+}
+
 class OutputLine {
   const OutputLine(this.text, this.color);
 
@@ -41,16 +70,22 @@ enum SessionState { idle, starting, running, exited }
 class GameSession extends ChangeNotifier {
   GameSession() {
     _subscription = _events.receiveBroadcastStream().listen((event) => _handle(event as Map<Object?, Object?>));
+    terminal
+      ..onOutput = consoleInput
+      ..onResize = (columns, rows, _, _) => _methods.invokeMethod('consoleResize', {'columns': columns, 'rows': rows});
   }
 
   static const _methods = MethodChannel('dev.sogen.app/session');
   static const _events = EventChannel('dev.sogen.app/session/events');
   static const _maxOutputLines = 2000;
-  static const _loggerColorRed = 1;
+  static const _maxTerminalLines = 10000;
+  static const _stdoutColor = -1;
 
   late final StreamSubscription<dynamic> _subscription;
   final Map<int, GuestWindow> _windows = {};
   final List<OutputLine> _output = [];
+  late final ByteConversionSink _console = const Utf8Decoder(allowMalformed: true)
+      .startChunkedConversion(_ConsoleSink(this));
   bool _stopRequested = false;
   bool _disposed = false;
 
@@ -62,32 +97,48 @@ class GameSession extends ChangeNotifier {
   /// Why the game could not be started, if it never ran.
   String? error;
 
+  String? savedTo;
+
+  String? saveError;
+
+  /// When the game started running, or null if it never did.
+  DateTime? startedAt;
+
   List<GuestWindow> get windows => _windows.values.toList(growable: false);
+
+  /// Windows whose cursor the guest confined and hid, so that input moves the mouse by deltas, as for mouse-look.
+  final Set<int> relativeMouseWindows = {};
 
   /// The window that is shown and receives input: the most recently created visible top-level window.
   GuestWindow? get primaryWindow => _windows.values.where((window) => window.visible).lastOrNull;
 
   List<OutputLine> get output => List.unmodifiable(_output);
 
+  /// What the guest and its child processes write to their console, and where the user types into it.
+  final Terminal terminal = Terminal(maxLines: _maxTerminalLines);
+
+  /// Updated separately from the other session state, since games may move the cursor every frame.
+  final ValueNotifier<GuestCursor?> guestCursor = ValueNotifier(null);
+
+  /// The latest cursor position, whether the guest moved the cursor or the player did.
+  GuestCursor? get pointer => _pointer;
+  GuestCursor? _pointer;
+
+  /// Reported while [setStatsInterval] is above zero.
+  final ValueNotifier<SessionStats?> stats = ValueNotifier(null);
+  int? _reportedFrames;
+  final Stopwatch _sinceReport = Stopwatch();
+
   /// Returns false if another game is still running. Any other failure ends the session with [error] set.
-  Future<bool> start(Game game, {required String emulationRoot}) async {
+  Future<bool> start(Game game, {required String emulationRoot, String? resumeFile}) async {
     _windows.clear();
     _output.clear();
     exitCode = null;
     error = null;
+    savedTo = null;
+    saveError = null;
+    startedAt = null;
     state = SessionState.starting;
-
-    final String backend;
-    try {
-      // FEX, the default backend on arm64, cannot run WoW64 processes yet; Unicorn can.
-      backend = switch (game.backend) {
-        CpuBackend.automatic when await game.isThirtyTwoBit() => CpuBackend.unicorn.id,
-        final selected => selected.id,
-      };
-    } on FileSystemException catch (e) {
-      _fail('Could not read ${game.hostExecutable}: ${e.osError?.message ?? e.message}');
-      return true;
-    }
 
     if (_stopRequested) {
       return true;
@@ -98,11 +149,12 @@ class GameSession extends ChangeNotifier {
           'emulationRoot': emulationRoot,
           'application': game.guestExecutable,
           'arguments': game.arguments,
-          'environment': <String, String>{},
+          'environment': game.environment,
           'pathMappings': {guestGameDirectory: game.directory},
           'workingDirectory': game.guestWorkingDirectory,
-          'backend': backend,
+          'backend': 'fex',
           'liveNetwork': game.liveNetwork,
+          'resumeFile': resumeFile ?? '',
         }) ??
         false;
 
@@ -111,6 +163,9 @@ class GameSession extends ChangeNotifier {
     }
 
     state = started ? SessionState.running : SessionState.idle;
+    if (started) {
+      startedAt = DateTime.now();
+    }
     notifyListeners();
     return started;
   }
@@ -120,29 +175,35 @@ class GameSession extends ChangeNotifier {
     return _methods.invokeMethod('stop');
   }
 
-  void _fail(String message) {
-    error = message;
-    state = SessionState.exited;
-    _output.add(OutputLine(message, _loggerColorRed));
-    if (!_disposed) {
-      notifyListeners();
-    }
+  /// Saves the game to [destination] and ends the session; a failure leaves it running and sets [saveError].
+  Future<void> suspend(String destination) {
+    saveError = null;
+    return _methods.invokeMethod('suspend', {'destination': destination});
   }
+
+  void consoleInput(String data) => _methods.invokeMethod('consoleInput', {'data': utf8.encode(data)});
 
   Future<void> setInputWindow(GuestWindow? window) =>
       _methods.invokeMethod('setInputWindow', {'window': window?.handle ?? 0});
 
-  void mouseMove(GuestWindow window, int x, int y) =>
-      _methods.invokeMethod('mouseMove', {'window': window.handle, 'x': x, 'y': y});
+  void mouseMove(GuestWindow window, int x, int y) {
+    _pointer = GuestCursor(window.handle, x, y);
+    _methods.invokeMethod('mouseMove', {'window': window.handle, 'x': x, 'y': y});
+  }
 
-  void mouseButton(GuestWindow window, MouseButton button, {required bool down, required int x, required int y}) =>
-      _methods.invokeMethod('mouseButton', {
-        'window': window.handle,
-        'button': button.index,
-        'down': down,
-        'x': x,
-        'y': y,
-      });
+  void mouseMotion(GuestWindow window, int dx, int dy) =>
+      _methods.invokeMethod('mouseMotion', {'window': window.handle, 'dx': dx, 'dy': dy});
+
+  void mouseButton(GuestWindow window, MouseButton button, {required bool down, required int x, required int y}) {
+    _pointer = GuestCursor(window.handle, x, y);
+    _methods.invokeMethod('mouseButton', {
+      'window': window.handle,
+      'button': button.index,
+      'down': down,
+      'x': x,
+      'y': y,
+    });
+  }
 
   void mouseWheel(GuestWindow window, int delta, int x, int y) =>
       _methods.invokeMethod('mouseWheel', {'window': window.handle, 'delta': delta, 'x': x, 'y': y});
@@ -157,13 +218,21 @@ class GameSession extends ChangeNotifier {
   void _handle(Map<Object?, Object?> event) {
     final window = (event['window'] as num?)?.toInt();
 
+    if (event['event'] == 'stats') {
+      _onStats(event);
+      return;
+    }
+
+    if (event['event'] == 'cursorMoved') {
+      _pointer = guestCursor.value = GuestCursor(window!, event['x'] as int, event['y'] as int);
+      return;
+    }
+
     switch (event['event']) {
       case 'output':
-        final color = (event['color'] as num?)?.toInt() ?? -1;
-        _output.addAll((event['text'] as String).trimRight().split('\n').map((line) => OutputLine(line, color)));
-        if (_output.length > _maxOutputLines) {
-          _output.removeRange(0, _output.length - _maxOutputLines);
-        }
+        _addOutput(event['text'] as String, (event['color'] as num).toInt());
+      case 'console':
+        _console.add(event['data'] as Uint8List);
       case 'windowCreated':
         _windows[window!] = GuestWindow(
           handle: window,
@@ -175,6 +244,13 @@ class GameSession extends ChangeNotifier {
         );
       case 'windowDestroyed':
         _windows.remove(window);
+        relativeMouseWindows.remove(window);
+      case 'relativeMouse':
+        if (event['relative'] as bool) {
+          relativeMouseWindows.add(window!);
+        } else {
+          relativeMouseWindows.remove(window);
+        }
       case 'windowResized':
         _windows[window]
           ?..width = event['width'] as int
@@ -183,19 +259,84 @@ class GameSession extends ChangeNotifier {
         _windows[window]?.visible = event['visible'] as bool;
       case 'windowTitle':
         _windows[window]?.title = event['title'] as String;
+      case 'snapshot':
+        final saveFailure = event['error'] as String;
+        if (saveFailure.isEmpty) {
+          savedTo = event['path'] as String;
+        } else {
+          saveError = saveFailure;
+        }
       case 'exit':
         _windows.clear();
+        relativeMouseWindows.clear();
         exitCode = event['exitCode'] as int?;
         state = SessionState.exited;
+        terminal.write(exitCode == null ? '\r\n[Crashed]\r\n' : '\r\n[Exited with code $exitCode]\r\n');
     }
 
     notifyListeners();
+  }
+
+  void _addOutput(String text, int color) {
+    _output.addAll(text.trimRight().split('\n').map((line) => OutputLine(line, color)));
+    if (_output.length > _maxOutputLines) {
+      _output.removeRange(0, _output.length - _maxOutputLines);
+    }
+  }
+
+  void _addConsoleText(String text) {
+    terminal.write(text);
+    _addOutput(text, _stdoutColor);
+  }
+
+  void setFrameLimit(int framesPerSecond) =>
+      _methods.invokeMethod('setFrameLimit', {'framesPerSecond': framesPerSecond});
+
+  void setStatsInterval(Duration interval) {
+    _reportedFrames = null;
+    stats.value = null;
+    _methods.invokeMethod('setStatsInterval', {'milliseconds': interval.inMilliseconds});
+  }
+
+  void _onStats(Map<Object?, Object?> event) {
+    final frames = (event['frames'] as num).toInt();
+    final previousFrames = _reportedFrames;
+    final elapsed = _sinceReport.elapsedMicroseconds;
+    _reportedFrames = frames;
+    _sinceReport
+      ..reset()
+      ..start();
+    if (previousFrames == null) {
+      return;
+    }
+
+    stats.value = SessionStats(
+      framesPerSecond: elapsed > 0 ? (frames - previousFrames) * Duration.microsecondsPerSecond / elapsed : 0,
+      worstPresentInterval: Duration(microseconds: (event['worstPresentIntervalNs'] as num).toInt() ~/ 1000),
+      residentBytes: (event['residentBytes'] as num).toInt(),
+      thermalStatus: (event['thermalStatus'] as num?)?.toInt(),
+    );
   }
 
   @override
   void dispose() {
     _disposed = true;
     _subscription.cancel();
+    _console.close();
+    guestCursor.dispose();
+    stats.dispose();
     super.dispose();
   }
+}
+
+class _ConsoleSink implements Sink<String> {
+  _ConsoleSink(this._session);
+
+  final GameSession _session;
+
+  @override
+  void add(String data) => _session._addConsoleText(data);
+
+  @override
+  void close() {}
 }

@@ -589,7 +589,7 @@ found through the section table (24-byte entries `type, offset, size`):
   fails the test.
 
 Unknown section types are ignored, so sections can be added without a new
-version. The library reads versions 1-4 and 7-8 (`ttd::is_supported_trace_version`;
+version. The library reads versions 1-4 and 7-9 (`ttd::is_supported_trace_version`;
 5 and 6 were development formats) and refuses others; `ttd::is_trace_file` and
 `ttd::trace_file_version` recognize any version from the first 8 bytes. A file of a
 supported version with sections this build does not know opens without them.
@@ -629,8 +629,11 @@ blocks it refers to:
 Decoded accesses up to 16 bytes carry their data inline; larger ones carry
 their bulk offset (payload bytes 0-7) and block (bytes 8-15).
 
-Version 7 is identical except that bulk blocks are stored without the x86-64
-filter; it remains readable. Versions 1 to 4 stored fixed-size event records
+Version 8 is identical except that its checkpoint states store each character of
+a string as a field of its own, where version 9 stores the string as one field
+(the memory part's mapped file names are read either way). Version 7 is also
+identical except that bulk blocks are stored without the x86-64 filter. Both
+remain readable. Versions 1 to 4 stored fixed-size event records
 with full checkpoint snapshots and a per-event page index; they remain readable
 (1 and 2 as write-only traces, 3 without instruction bytes, 4 without access
 data). Development versions 5 and 6 were never published and are rejected.

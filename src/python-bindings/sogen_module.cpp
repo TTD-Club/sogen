@@ -20,6 +20,7 @@ namespace sogen::py
             register_runtime_bindings(m);
             auto ttd = m.def_submodule("ttd", "Time travel debugging: record, query, and replay Windows emulation traces");
             register_ttd_bindings(ttd);
+            register_arm64_runtime_bindings(m);
         }
     }
 }

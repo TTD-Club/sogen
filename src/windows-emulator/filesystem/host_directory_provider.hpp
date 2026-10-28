@@ -52,10 +52,12 @@ namespace sogen
         NTSTATUS create_directory(const windows_path& path, std::u16string_view spelled_leaf) override;
         NTSTATUS rename(const windows_path& from, const windows_path& to, std::u16string_view spelled_leaf) override;
         NTSTATUS remove(const windows_path& path) override;
-        std::optional<std::filesystem::path> get_host_path(const windows_path& path) const override;
 
       private:
+        std::optional<std::filesystem::path> get_host_path(const windows_path& path) const override;
+
         std::filesystem::path target_{};
+        bool lookup_ignores_case_{};
 
         std::optional<std::filesystem::path> get_creation_path(const windows_path& path, std::u16string_view spelled_leaf,
                                                                bool renamed) const;

@@ -13,6 +13,12 @@
 
 namespace sogen
 {
+    namespace utils
+    {
+        class buffer_serializer;
+        class buffer_deserializer;
+    }
+
     // Thin host-side wrapper around the real Vulkan driver. Owns the dynamically loaded loader and
     // the mapping from opaque object ids (handed to the guest) to live Vulkan handles, so raw host
     // pointers never cross the bridge.
@@ -24,6 +30,13 @@ namespace sogen
     class vulkan_host
     {
       public:
+        struct memory_range
+        {
+            uint64_t memory{};
+            uint64_t offset{};
+            uint64_t size{};
+        };
+
         vulkan_host();
         ~vulkan_host();
 
@@ -32,8 +45,43 @@ namespace sogen
         vulkan_host(vulkan_host&&) = delete;
         vulkan_host& operator=(vulkan_host&&) = delete;
 
+        // Binds the host Vulkan loader on first use. A null get_instance_proc_addr loads the platform's
+        // default loader; otherwise the given vkGetInstanceProcAddr is used, e.g. for a custom driver the
+        // embedder loaded. Later calls have no effect.
+        void load(void* get_instance_proc_addr);
+
+        void set_conserve_guest_address_space(bool conserve);
+
         // False if no Vulkan driver could be loaded on the host.
         bool available() const;
+
+        // Saves the live objects so that deserialize can re-create them under the same ids. Waits for every device to go
+        // idle first. Throws for object types snapshots do not support yet. Imported memory aliases guest memory, which
+        // the snapshot does not contain: imported_host_pointer hands out where that memory lives after the restore.
+        struct restore_callbacks
+        {
+            std::function<void*(uint64_t memory)> imported_host_pointer{};
+            // A native surface for the window the surface was created for.
+            std::function<uint64_t(uint64_t surface, uint64_t instance)> create_native_surface{};
+            // Re-records what was recorded into a command buffer since it was last begun or reset, with what each command
+            // returned then. A command buffer invalidated by a destroyed object may fail where it did not before.
+            std::function<void(uint64_t command_buffer, std::span<const std::byte> commands, std::span<const int32_t> results,
+                               bool invalidated)>
+                replay_commands{};
+        };
+
+        // Waits for all submitted GPU work, which serialize requires. It throws if that work waits for later guest work.
+        void quiesce();
+        void serialize(utils::buffer_serializer& buffer) const;
+        void deserialize(utils::buffer_deserializer& buffer, const restore_callbacks& callbacks);
+
+        // Keeps a recorded command, in the bridge's record format, so that snapshots can re-record the command buffer.
+        // While a command recorded into command_buffer runs, the objects it looks up are noted. 0 stops noting them.
+        void capture_references(uint64_t command_buffer);
+        std::vector<std::byte> recorded_commands(uint64_t command_buffer) const;
+        std::vector<int32_t> recorded_results(uint64_t command_buffer) const;
+        bool can_reset_command_buffer(uint64_t command_buffer) const;
+        void append_recorded_command(uint64_t command_buffer, std::span<const std::byte> command, int32_t result);
 
         int32_t create_instance(std::span<const std::string> extensions, uint64_t& out_instance);
         bool get_native_instance_handle(uint64_t instance, uint64_t& out_handle) const;
@@ -88,8 +136,9 @@ namespace sogen
         // packed array of `struct_count` feature_chain_record {sType, body_size} (guest-supplied,
         // pad-free body sizes). out_blob receives, in the same order, one record + body bytes per entry
         // with the device's real feature values (body_size 0 for structs the host does not know).
+        // spoof_missing_features additionally reports the features DXVK requires as supported.
         int32_t get_physical_device_features2(uint64_t physical_device, const void* in_records, size_t in_records_size,
-                                              uint32_t struct_count, std::vector<std::byte>& out_blob);
+                                              uint32_t struct_count, bool spoof_missing_features, std::vector<std::byte>& out_blob);
 
         // Same chain convention as get_physical_device_features2, but for the property structs chained on
         // VkPhysicalDeviceProperties2 (e.g. VkPhysicalDeviceRobustness2PropertiesEXT). The base
@@ -101,9 +150,10 @@ namespace sogen
         // enabling the given device extensions (extension_blob = `extension_count` NUL-terminated names)
         // and features (feature_blob = `feature_struct_count` feature_chain_record + body entries, same
         // format as get_physical_device_features2). out_device receives a fresh object id, or 0 on failure.
+        // spoof_missing_features must match the feature query the guest's request is based on.
         int32_t create_device(uint64_t physical_device, const void* queue_entries, size_t queue_entry_count, const void* extension_blob,
                               size_t extension_blob_size, uint32_t extension_count, const void* feature_blob, size_t feature_blob_size,
-                              uint32_t feature_struct_count, uint64_t& out_device);
+                              uint32_t feature_struct_count, bool spoof_missing_features, uint64_t& out_device);
         void destroy_device(uint64_t device);
 
         // Resolves a queue created with the device; out_queue receives a stable object id.
@@ -149,13 +199,16 @@ namespace sogen
 
         // Submits one VkSubmitInfo. wait_entries/signal_entries are submit_semaphore_entry arrays;
         // command_buffer_ids is an object_id array. fence 0 = none.
+        // rerecord records a command buffer again whose recording depended on state a snapshot restored that changed since.
         int32_t queue_submit(uint64_t queue, uint64_t fence, const void* wait_entries, uint32_t wait_count, const void* command_buffer_ids,
-                             uint32_t command_buffer_count, const void* signal_entries, uint32_t signal_count, bool has_timeline_info);
+                             uint32_t command_buffer_count, const void* signal_entries, uint32_t signal_count, bool has_timeline_info,
+                             const std::function<bool(uint64_t command_buffer)>& rerecord = {});
 
         // synchronization2 submit. wait_entries/signal_entries are submit2_semaphore_entry arrays;
         // command_buffer_ids is an object_id array. fence 0 = none.
         int32_t queue_submit2(uint64_t queue, uint64_t fence, const void* wait_entries, uint32_t wait_count, const void* command_buffer_ids,
-                              uint32_t command_buffer_count, const void* signal_entries, uint32_t signal_count);
+                              uint32_t command_buffer_count, const void* signal_entries, uint32_t signal_count,
+                              const std::function<bool(uint64_t command_buffer)>& rerecord = {});
 
         // Writes up to out_size bytes of the device's VkPhysicalDeviceMemoryProperties into out.
         int32_t get_physical_device_memory_properties(uint64_t physical_device, void* out, size_t out_size);
@@ -193,6 +246,24 @@ namespace sogen
         // allocation size. Mapping the whole object lets a single coherent alias back every guest sub-range
         // mapping of it. Reuses the existing mapping if already mapped (a memory object must not map twice).
         int32_t map_memory(uint64_t device, uint64_t memory, void*& out_host_pointer, uint64_t& out_size);
+        // The alignment map_memory_placed needs for its address, or 0 if the device cannot place mappings.
+        uint64_t placed_map_alignment(uint64_t device) const;
+        bool has_device(uint64_t device) const;
+        bool has_swapchains() const;
+        uint64_t host_import_alignment(uint64_t device) const;
+        bool is_host_visible_memory_type(uint64_t device, uint32_t memory_type_index) const;
+        int32_t import_host_memory(uint64_t device, uint64_t size, uint32_t memory_type_index, uint32_t flags, uint32_t device_mask,
+                                   void* host_pointer, uint64_t& out_memory);
+        // Imported memory may only be importable as a non-coherent type, while the guest asked for coherent memory and never
+        // flushes. These make guest writes visible to the device and device writes visible to the guest. Ranges of coherent
+        // memory are skipped, and ranges the host wrote must be flushed before invalidating.
+        bool is_non_coherent_import(uint64_t memory) const;
+        int32_t flush_imported_memory(std::span<const memory_range> ranges);
+        int32_t invalidate_imported_memory(std::span<const memory_range> ranges);
+        uint64_t allocation_size(uint64_t memory) const;
+        // Maps the whole memory object at address, a range the caller has reserved. Unmapping leaves the range reserved
+        // unless the driver fails to, in which case it is unmapped.
+        int32_t map_memory_placed(uint64_t device, uint64_t memory, void* address);
         // Unmaps a mapping previously returned by map_memory.
         void unmap_memory(uint64_t device, uint64_t memory);
 
@@ -646,6 +717,8 @@ namespace sogen
                                         uint64_t count_buffer_offset, uint32_t max_draw_count, uint32_t stride);
         int32_t cmd_bind_descriptor_sets(uint64_t command_buffer, uint64_t pipeline_layout, uint32_t first_set,
                                          std::span<const uint64_t> sets, uint32_t bind_point, std::span<const uint32_t> dynamic_offsets);
+        int32_t cmd_push_descriptor_set(uint64_t command_buffer, uint64_t pipeline_layout, uint32_t bind_point, uint32_t set,
+                                        std::span<const descriptor_write> writes);
         int32_t cmd_end_render_pass(uint64_t command_buffer);
         int32_t cmd_next_subpass(uint64_t command_buffer, uint32_t contents);
         // Dynamic rendering (VK_KHR_dynamic_rendering / core 1.3). depth/stencil are null when absent.
@@ -660,6 +733,7 @@ namespace sogen
         int32_t cmd_set_scissor(uint64_t command_buffer, uint32_t first, bool with_count, std::span<const scissor_entry> scissors);
         int32_t cmd_set_depth_bias(uint64_t command_buffer, float constant_factor, float clamp, float slope_factor);
         int32_t cmd_set_blend_constants(uint64_t command_buffer, const std::array<float, 4>& constants);
+        int32_t cmd_set_sample_mask(uint64_t command_buffer, uint32_t samples, const std::array<uint32_t, 2>& mask);
         int32_t cmd_set_depth_bounds(uint64_t command_buffer, float min_depth_bounds, float max_depth_bounds);
         int32_t cmd_set_line_width(uint64_t command_buffer, float line_width);
         int32_t cmd_set_stencil(uint64_t command_buffer, uint32_t which, uint32_t face_mask, uint32_t value);

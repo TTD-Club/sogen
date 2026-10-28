@@ -168,9 +168,14 @@ namespace sogen
                     return win_emu.console().input_available() ? wait_state::signaled : wait_state::not_signaled;
                 }
 
-                if (h.value.is_pseudo || c.files.get(h))
+                if (h.value.is_pseudo)
                 {
                     return wait_state::signaled;
+                }
+
+                if (const auto* f = c.files.get(h))
+                {
+                    return f->change_watches.empty() ? wait_state::signaled : wait_state::not_signaled;
                 }
 
                 break;
@@ -305,7 +310,13 @@ namespace sogen
             }
 
             case handle_types::file: {
-                if (!h.value.is_pseudo && !c.files.get(h))
+                if (h.value.is_pseudo)
+                {
+                    return wait_state::signaled;
+                }
+
+                const auto* f = c.files.get(h);
+                if (!f || !f->change_watches.empty())
                 {
                     return std::nullopt;
                 }
@@ -497,6 +508,10 @@ namespace sogen
           create_flags(create_flags),
           last_registers(context.default_register_set)
     {
+        if (context.is_wow64_process && context.native_architecture != windows_guest_architecture::x86_64)
+        {
+            throw std::invalid_argument("WoW64 thread setup requires an x86-64 Windows guest");
+        }
         this->suspended = create_flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED;
 
         // native 64-bit
@@ -779,29 +794,28 @@ namespace sogen
         }
     }
 
-    void emulator_thread::remember_message_wait(x86_64_cpu& emu)
+    void emulator_thread::remember_message_wait(cpu_interface& emu, const windows_arch_abi& abi)
     {
-        this->message_wait_syscall_id = emu.reg<uint64_t>(x86_register::rax);
+        // Syscall returns overwrite RAX's service ID on x64, but X0's first argument on ARM64.
+        this->message_wait_return_register = abi.return_value(emu);
     }
 
     // A parked thread resumes right after its syscall instruction.
-    void emulator_thread::restart_message_wait(x86_64_cpu& emu)
+    void emulator_thread::restart_message_wait(cpu_interface& emu, const windows_arch_abi& abi)
     {
-        constexpr uint64_t syscall_instruction_size = 2;
-
-        const auto syscall_id = *this->message_wait_syscall_id;
+        const auto return_register = *this->message_wait_return_register;
         this->message_wait_deadline = this->await_time;
         this->mark_as_ready(STATUS_SUCCESS);
         this->pending_status.reset();
 
-        emu.reg(x86_register::rip, emu.read_instruction_pointer() - syscall_instruction_size);
-        emu.reg(x86_register::rax, syscall_id);
+        abi.rewind_syscall(emu, abi.instruction_pointer(emu));
+        abi.return_value(emu, return_register);
     }
 
     void emulator_thread::mark_as_ready(const NTSTATUS status)
     {
         this->pending_status = status;
-        this->message_wait_syscall_id.reset();
+        this->message_wait_return_register.reset();
         this->await_time = {};
         this->await_objects = {};
         this->await_msg = {};
@@ -1476,7 +1490,50 @@ namespace sogen
         return true;
     }
 
-    void emulator_thread::setup_registers(x86_64_cpu& emu, const process_context& context) const
+    void emulator_thread::setup_if_necessary(cpu_interface& emu, const process_context& context)
+    {
+        if (!this->setup_done)
+        {
+            this->setup_registers(emu, context);
+            this->setup_done = true;
+        }
+        if (this->pending_status.has_value())
+        {
+            context.abi().return_value(emu, static_cast<uint64_t>(*this->pending_status));
+            this->pending_status.reset();
+        }
+    }
+
+    void emulator_thread::setup_registers(cpu_interface& emu, const process_context& context) const
+    {
+        if (context.is_wow64_process)
+        {
+            auto* x64 = dynamic_cast<x86_64_cpu*>(&emu);
+            if (!x64 || context.native_architecture != windows_guest_architecture::x86_64)
+            {
+                throw std::invalid_argument("WoW64 thread bootstrap does not match the guest CPU");
+            }
+            this->setup_wow64_registers(*x64, context);
+            return;
+        }
+        if (!this->teb64 || !this->gs_segment)
+        {
+            throw std::runtime_error("Missing native thread environment");
+        }
+        const native_thread_bootstrap bootstrap{
+            .stack_base = this->stack_base,
+            .stack_size = this->stack_size,
+            .teb = this->teb64->value(),
+            .start_address = this->start_address,
+            .argument = this->argument,
+            .rtl_user_thread_start = context.rtl_user_thread_start,
+            .ldr_initialize_thunk = context.ldr_initialize_thunk,
+            .ntdll_image_base = context.ntdll_image_base,
+        };
+        context.abi().initialize_native_thread(emu, bootstrap);
+    }
+
+    void emulator_thread::setup_wow64_registers(x86_64_cpu& emu, const process_context& context) const
     {
         if (!this->gs_segment)
         {
@@ -1535,8 +1592,18 @@ namespace sogen
         emu.reg(x86_register::rip, context.ldr_initialize_thunk);
     }
 
-    void emulator_thread::refresh_execution_context(x86_64_cpu& emu) const
+    void emulator_thread::refresh_execution_context(cpu_interface& cpu) const
     {
+        if (dynamic_cast<arm64_cpu*>(&cpu))
+        {
+            return;
+        }
+        auto* x64 = dynamic_cast<x86_64_cpu*>(&cpu);
+        if (!x64)
+        {
+            throw std::invalid_argument("Unsupported Windows thread CPU architecture");
+        }
+        auto& emu = *x64;
         // Point this vCPU's GDTR at its own per-vCPU GDT. The saved thread context restores whatever
         // GDTR the thread last ran with (possibly another vCPU's GDT), so re-assert it here on every
         // switch. Cheap and keeps each vCPU reading its own descriptors.
@@ -1564,12 +1631,23 @@ namespace sogen
 
     callback_frame::~callback_frame() = default;
 
-    void callback_frame::save_registers(x86_64_cpu& emu)
+    void callback_frame::save_registers(guest_cpu& cpu)
     {
-        if (this->rip != 0)
+        if (this->rip != 0 || this->arm64_registers)
         {
             throw std::runtime_error("Attempt to overwrite callback frame register snapshot");
         }
+
+        if (auto* arm64 = dynamic_cast<arm64_cpu*>(&cpu))
+        {
+            arm64_context context{};
+            context.ContextFlags = arm64_context_all;
+            cpu_context::save(*arm64, context);
+            this->arm64_registers = context;
+            return;
+        }
+
+        auto& emu = dynamic_cast<x86_64_cpu&>(cpu);
 
         this->rip = emu.reg(x86_register::rip);
         this->rbp = emu.reg(x86_register::rbp);
@@ -1596,12 +1674,25 @@ namespace sogen
         this->gs = emu.reg<uint16_t>(x86_register::gs);
     }
 
-    void callback_frame::restore_registers(x86_64_cpu& emu) const
+    void callback_frame::restore_registers(guest_cpu& cpu) const
     {
+        if (auto* arm64 = dynamic_cast<arm64_cpu*>(&cpu))
+        {
+            if (!this->arm64_registers)
+            {
+                throw std::runtime_error("Attempt to restore registers from an uninitialized callback frame");
+            }
+
+            cpu_context::restore(*arm64, *this->arm64_registers);
+            return;
+        }
+
         if (this->rip == 0)
         {
             throw std::runtime_error("Attempt to restore registers from an uninitialized callback frame");
         }
+
+        auto& emu = dynamic_cast<x86_64_cpu&>(cpu);
 
         emu.reg<uint16_t>(x86_register::cs, this->cs);
         emu.reg<uint16_t>(x86_register::ss, this->ss);
@@ -1654,6 +1745,7 @@ namespace sogen
         buffer.write(this->es);
         buffer.write(this->fs);
         buffer.write(this->gs);
+        buffer.write_optional(this->arm64_registers);
 
         buffer.write(static_cast<bool>(this->state));
         if (this->state)
@@ -1688,6 +1780,7 @@ namespace sogen
         buffer.read(this->es);
         buffer.read(this->fs);
         buffer.read(this->gs);
+        buffer.read_optional(this->arm64_registers);
 
         bool has_state{};
         buffer.read(has_state);

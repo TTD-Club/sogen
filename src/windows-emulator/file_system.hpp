@@ -7,6 +7,8 @@
 namespace sogen
 {
 
+    struct file_system_test_access;
+
     class file_system
     {
       public:
@@ -24,9 +26,15 @@ namespace sogen
 
         // `spelled` is the guest's spelling of the path (or of its last component): a new entry keeps it.
         open_result open(const windows_path& path, const std::u16string& mode, std::u16string_view spelled = {});
+        open_result open_read(const windows_path& path) const;
         NTSTATUS create_directory(const windows_path& path, std::u16string_view spelled = {});
         NTSTATUS rename(const windows_path& from, const windows_path& to, std::u16string_view spelled = {});
         NTSTATUS remove(const windows_path& path);
+
+        bool read_file(const windows_path& path, std::vector<std::byte>* data) const;
+        std::vector<std::byte> read_file(const windows_path& path) const;
+
+        friend struct file_system_test_access;
 
         // Returns an empty path if no mount resolves the guest path.
         std::filesystem::path translate(const windows_path& path) const;

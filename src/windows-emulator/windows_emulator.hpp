@@ -2,6 +2,7 @@
 #include "std_include.hpp"
 
 #include <arch_emulator.hpp>
+#include <machine_type.hpp>
 #include "process_manager.hpp"
 
 #include <stop_reason.hpp>
@@ -14,6 +15,7 @@
 #include "scheduler_clock.hpp"
 #include "logger.hpp"
 #include "file_system.hpp"
+#include "frame_pacer.hpp"
 #include "filesystem/mount_spec.hpp"
 #include "memory_manager.hpp"
 #include "module/module_manager.hpp"
@@ -144,6 +146,10 @@ namespace sogen
         fake_environment_config fake_env{};
 
         network::network_mode network{network::network_mode::offline};
+
+        // Report Vulkan features DXVK requires to games even where the host GPU lacks them (Mali, older Adreno), so
+        // DXVK accepts the adapter. A game that really uses one of them renders incorrectly there.
+        bool spoof_gpu_features{false};
     };
 
     struct emulator_interfaces
@@ -163,7 +169,7 @@ namespace sogen
     // (docs/multi-vcpu-design.md, section 5.1).
     struct vcpu_context
     {
-        x86_64_cpu& cpu;
+        guest_cpu& cpu;
         emulator_thread* active_thread{};
         std::atomic_bool switch_thread{false};
 
@@ -176,7 +182,25 @@ namespace sogen
 
             return *this->active_thread;
         }
+
+        x86_64_cpu& x64_cpu() const
+        {
+            auto* x64 = dynamic_cast<x86_64_cpu*>(&this->cpu);
+            if (!x64)
+            {
+                throw std::runtime_error("This operation is only implemented for x86-64 guest CPUs");
+            }
+
+            return *x64;
+        }
     };
+
+    // The COFF machine of an application, resolved through its working directory and the settings' emulation
+    // root and path mappings as the emulator will resolve it. Selects which guest CPU to create for the application.
+    PEMachineType get_application_machine(const emulator_settings& settings, application_settings app_settings);
+
+    // AMD64, ARM64EC and I386 (WoW64) images run on an x86-64 CPU, ARM64 images on an ARM64 CPU.
+    machine_type get_machine_type(PEMachineType machine);
 
     class windows_emulator
     {
@@ -184,18 +208,28 @@ namespace sogen
         uint64_t idle_ticks_{0};
         application_settings application_settings_{};
 
-        std::unique_ptr<x86_64_emulator> emu_{};
+        std::unique_ptr<guest_machine> emu_{};
         bool use_native_timestamp_counter_{};
         std::unique_ptr<scheduler_clock> clock_{};
         network::network_mode network_mode_{};
         std::unique_ptr<network::dns_lookup> dns_lookup_{};
         std::unique_ptr<network::socket_factory> socket_factory_{};
         std::unique_ptr<ui_backend> ui_backend_{};
+        frame_pacer frame_pacer_{};
         std::unique_ptr<audio_backend> audio_backend_{};
         std::unique_ptr<crypt_protect_backend> crypt_protect_backend_{};
         process_manager* process_manager_{};
         std::unique_ptr<console_backend> console_backend_{};
         bool setup_completed_{false};
+
+        // Host threads owned by the process, such as audio streams, signal the guest through these, so they have to
+        // outlive it.
+        std::mutex idle_wakeup_mutex_{};
+        std::condition_variable idle_wakeup_cv_{};
+        uint32_t pending_idle_wakeups_{};
+        std::atomic<uint32_t> idle_vcpus_{0};
+        std::mutex pending_event_signals_mutex_{};
+        std::map<uint64_t, uint32_t> pending_event_signals_{};
 
       public:
         const std::filesystem::path emulation_root{};
@@ -210,9 +244,9 @@ namespace sogen
         process_context process;
         syscall_dispatcher dispatcher;
 
-        windows_emulator(std::unique_ptr<x86_64_emulator> emu, const emulator_settings& settings = {}, emulator_callbacks callbacks = {},
+        windows_emulator(std::unique_ptr<guest_machine> emu, const emulator_settings& settings = {}, emulator_callbacks callbacks = {},
                          emulator_interfaces interfaces = {});
-        windows_emulator(std::unique_ptr<x86_64_emulator> emu, application_settings app_settings, const emulator_settings& settings = {},
+        windows_emulator(std::unique_ptr<guest_machine> emu, application_settings app_settings, const emulator_settings& settings = {},
                          emulator_callbacks callbacks = {}, emulator_interfaces interfaces = {});
 
         windows_emulator(windows_emulator&&) = delete;
@@ -222,14 +256,30 @@ namespace sogen
 
         ~windows_emulator();
 
-        x86_64_emulator& emu()
+        guest_machine& emu()
         {
             return *this->emu_;
         }
 
-        const x86_64_emulator& emu() const
+        const guest_machine& emu() const
         {
             return *this->emu_;
+        }
+
+        x86_64_emulator& x64_emu() const
+        {
+            auto* x64 = dynamic_cast<x86_64_emulator*>(this->emu_.get());
+            if (!x64)
+            {
+                throw std::runtime_error("This operation is only implemented for x86-64 guest machines");
+            }
+
+            return *x64;
+        }
+
+        const windows_arch_abi& abi() const
+        {
+            return this->process.abi();
         }
 
         utils::clock& clock()
@@ -277,6 +327,11 @@ namespace sogen
             return *this->ui_backend_;
         }
 
+        frame_pacer& frames()
+        {
+            return this->frame_pacer_;
+        }
+
         const ui_backend& ui() const
         {
             return *this->ui_backend_;
@@ -319,6 +374,7 @@ namespace sogen
 
         void handle_ui_event(const ui_event& event);
         void apply_cursor_capture();
+        void release_held_input();
 
         // Input held for low-level hooks: the next hook the given thread has to run, marked as running.
         std::optional<std::pair<process_context::low_level_input, user_low_level_hook>> begin_low_level_hook(emulator_thread& thread);
@@ -336,15 +392,20 @@ namespace sogen
         // race-free. Falls back to vCPU 0 when no handler is active (e.g. setup).
         emulator_thread& current_thread() const
         {
-            return (this->dispatch_vcpu_ ? this->dispatch_vcpu_ : this->vcpus_[0].get())->thread();
+            return this->active_vcpu().thread();
         }
 
         // The CPU of the vCPU currently dispatching a handler on the calling host thread (see
         // scoped_dispatch). emu() is only the facade/vCPU 0, so handlers that inspect the faulting
         // register state must go through here to observe the right vCPU when vcpu_count > 1.
-        x86_64_cpu& active_cpu() const
+        guest_cpu& active_cpu() const
         {
-            return (this->dispatch_vcpu_ ? this->dispatch_vcpu_ : this->vcpus_[0].get())->cpu;
+            return this->active_vcpu().cpu;
+        }
+
+        x86_64_cpu& active_x64_cpu() const
+        {
+            return this->active_vcpu().x64_cpu();
         }
 
         // Run fn as a dispatched handler for the CPU that triggered a hook: takes the kernel lock and
@@ -432,6 +493,12 @@ namespace sogen
         void request_guest_event_signal(handle event_handle, uint32_t maximum_pending);
         void apply_pending_guest_event_signals();
 
+        // For state restored from outside (a minidump): the process already exists, so it is not bootstrapped.
+        void mark_process_setup_completed()
+        {
+            this->setup_completed_ = true;
+        }
+
         void wake_idle_vcpu();
 
         uint64_t get_executed_instructions() const
@@ -447,6 +514,11 @@ namespace sogen
         bool uses_relative_time() const
         {
             return this->use_relative_time_;
+        }
+
+        bool spoofs_gpu_features() const
+        {
+            return this->spoof_gpu_features_;
         }
 
         uint32_t vcpu_count() const
@@ -478,6 +550,13 @@ namespace sogen
         void start(size_t count = 0);
         void stop();
 
+        // Stops the process for a snapshot: right away, or at the end of the next frame of a device that waits for one.
+        void request_suspend();
+        // Called by such a device at the end of a frame.
+        bool take_suspend_request();
+        void cancel_suspend_request();
+
+        void prepare_serialization();
         void serialize(utils::buffer_serializer& buffer) const;
         // Also tells where in the buffer the memory manager's state (serialize_memory_state) begins.
         void serialize(utils::buffer_serializer& buffer, size_t& memory_offset) const;
@@ -564,6 +643,7 @@ namespace sogen
       private:
         void set_foreground_window(hwnd window);
         void deliver_ui_event(const ui_event& event);
+        void resize_window_from_host(hwnd window_handle, bool maximized, int32_t client_width, int32_t client_height);
         std::pair<int32_t, int32_t> cursor_after_pointer_event(const ui_event& event) const;
         std::pair<emulator_thread*, const user_low_level_hook*> find_low_level_hook(uint64_t handle);
         void wake_thread(emulator_thread& thread);
@@ -572,22 +652,17 @@ namespace sogen
         bool instruction_precision_{true};
         bool intercept_rdtsc_{true};
         bool intercept_kusd_{true};
+        bool spoof_gpu_features_{false};
         uint32_t vcpu_count_{1};
+        std::atomic_bool suspend_requested_{false};
         std::atomic_bool should_stop{false};
 
         // The emulator kernel lock: held by all code touching shared kernel state,
         // released while guest code executes (docs/multi-vcpu-design.md, section 7).
         kernel_lock kernel_lock_{};
-        std::mutex idle_wakeup_mutex_{};
-        std::condition_variable idle_wakeup_cv_{};
-        uint32_t pending_idle_wakeups_{};
-        std::atomic<uint32_t> idle_vcpus_{0};
 
         void credit_idle_wakeup();
         bool wait_for_idle_wakeup(std::chrono::milliseconds timeout);
-
-        std::mutex pending_event_signals_mutex_{};
-        std::map<uint64_t, uint32_t> pending_event_signals_{};
 
         // The vCPU currently running a handler under the kernel lock; drives
         // current_thread(). See scoped_dispatch.
@@ -598,6 +673,11 @@ namespace sogen
 
         // unique_ptr because vcpu_context contains an atomic and must stay address-stable.
         std::vector<std::unique_ptr<vcpu_context>> vcpus_{};
+
+        vcpu_context& active_vcpu() const
+        {
+            return this->dispatch_vcpu_ ? *this->dispatch_vcpu_ : *this->vcpus_[0];
+        }
 
         std::unordered_map<uint16_t, uint16_t> port_mappings_{};
 
@@ -618,6 +698,9 @@ namespace sogen
         }
 
         void setup_hooks();
+        void setup_x64_hooks(x86_64_emulator& emu);
+        void setup_arm64_hooks(arm64_emulator& emu);
+        void handle_arm64_breakpoint(vcpu_context& vcpu);
         void setup_process();
         void vcpu_worker(vcpu_context& vcpu);
         void on_instruction_execution(vcpu_context& vcpu, uint64_t address, size_t size);
@@ -632,6 +715,7 @@ namespace sogen
         void register_factories(utils::buffer_deserializer& buffer);
         void serialize_state(utils::buffer_serializer& buffer, bool memory_contents, size_t* memory_offset = nullptr) const;
         void deserialize_state(utils::buffer_deserializer& buffer, const std::function<void()>& restore_memory);
+        void ensure_serialization_support() const;
     };
 
 } // namespace sogen

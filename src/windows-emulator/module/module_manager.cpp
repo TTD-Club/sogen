@@ -96,6 +96,7 @@ namespace sogen
             buffer.write(mod.entry_point);
 
             buffer.write(mod.machine);
+            buffer.write(mod.characteristics);
             buffer.write(mod.dll_characteristics);
             buffer.write(mod.size_of_stack_reserve);
             buffer.write(mod.size_of_stack_commit);
@@ -130,6 +131,7 @@ namespace sogen
             buffer.read(mod.entry_point);
 
             buffer.read(mod.machine);
+            buffer.read(mod.characteristics);
             buffer.read(mod.dll_characteristics);
             buffer.read(mod.size_of_stack_reserve);
             buffer.read(mod.size_of_stack_commit);
@@ -161,7 +163,7 @@ namespace sogen
 
     pe_detection_result pe_architecture_detector::detect_from_file(const std::filesystem::path& file)
     {
-        auto variant_result = winpe::get_pe_arch(file);
+        const auto variant_result = winpe::get_pe_format(file);
 
         if (std::holds_alternative<std::error_code>(variant_result))
         {
@@ -171,19 +173,78 @@ namespace sogen
             return result;
         }
 
-        auto arch = std::get<winpe::pe_arch>(variant_result);
+        const auto format = std::get<winpe::pe_format>(variant_result);
         pe_detection_result result;
-        result.architecture = arch;
-        result.suggested_mode = determine_execution_mode(arch);
+        result.architecture = format.architecture;
+        result.machine = format.machine;
+        result.suggested_mode = determine_execution_mode(format);
+        return result;
+    }
+
+    pe_detection_result pe_architecture_detector::detect_from_data(const std::span<const std::byte> data)
+    {
+        const auto variant_result = winpe::get_pe_format(
+            [&](const uint64_t offset, void* destination, const size_t length) {
+                std::memcpy(destination, data.data() + offset, length);
+                return true;
+            },
+            0, data.size());
+
+        if (std::holds_alternative<std::error_code>(variant_result))
+        {
+            pe_detection_result result;
+            result.error_message = std::get<std::error_code>(variant_result).message();
+            return result;
+        }
+
+        const auto format = std::get<winpe::pe_format>(variant_result);
+        pe_detection_result result;
+        result.architecture = format.architecture;
+        result.machine = format.machine;
+        result.suggested_mode = determine_execution_mode(format);
+        return result;
+    }
+
+    pe_detection_result pe_architecture_detector::detect_from_file(const file_system& file_sys, const windows_path& path)
+    {
+        const auto input = file_sys.open_read(path);
+        if (!input.file)
+        {
+            pe_detection_result result;
+            result.error_message = "Cannot open file";
+            return result;
+        }
+
+        const auto size = input.file->size();
+        const auto variant_result = winpe::get_pe_format(
+            [&](const uint64_t offset, void* destination, const size_t length) {
+                return input.file->seek(static_cast<int64_t>(offset), SEEK_SET) &&
+                       input.file->read({static_cast<std::byte*>(destination), length}) == length;
+            },
+            0, size < 0 ? 0 : static_cast<uint64_t>(size));
+
+        if (std::holds_alternative<std::error_code>(variant_result))
+        {
+            pe_detection_result result;
+            result.error_message = std::get<std::error_code>(variant_result).message();
+            return result;
+        }
+
+        const auto format = std::get<winpe::pe_format>(variant_result);
+        pe_detection_result result;
+        result.architecture = format.architecture;
+        result.machine = format.machine;
+        result.suggested_mode = determine_execution_mode(format);
         return result;
     }
 
     pe_detection_result pe_architecture_detector::detect_from_memory(const memory_interface& memory, uint64_t base_address,
                                                                      uint64_t image_size)
     {
-        auto variant_result = winpe::get_pe_arch([&](const uint64_t address, void* destination,
-                                                     const size_t size) { return memory.try_read_memory(address, destination, size); },
-                                                 base_address, image_size);
+        const auto variant_result =
+            winpe::get_pe_format([&](const uint64_t address, void* destination,
+                                     const size_t size) { return memory.try_read_memory(address, destination, size); },
+                                 base_address, image_size);
 
         if (std::holds_alternative<std::error_code>(variant_result))
         {
@@ -192,31 +253,35 @@ namespace sogen
             return result;
         }
 
-        auto arch = std::get<winpe::pe_arch>(variant_result);
+        const auto format = std::get<winpe::pe_format>(variant_result);
         pe_detection_result result;
-        result.architecture = arch;
-        result.suggested_mode = determine_execution_mode(arch);
+        result.architecture = format.architecture;
+        result.machine = format.machine;
+        result.suggested_mode = determine_execution_mode(format);
         return result;
     }
 
-    execution_mode pe_architecture_detector::determine_execution_mode(winpe::pe_arch executable_arch)
+    execution_mode pe_architecture_detector::determine_execution_mode(const winpe::pe_format format)
     {
-        switch (executable_arch)
+        switch (format.machine)
         {
-        case winpe::pe_arch::pe32:
-            return execution_mode::wow64_32bit;
-        case winpe::pe_arch::pe64:
-            return execution_mode::native_64bit;
+        case PEMachineType::I386:
+            return format.architecture == winpe::pe_arch::pe32 ? execution_mode::wow64_32bit : execution_mode::unknown;
+        case PEMachineType::AMD64:
+        case PEMachineType::ARM64EC:
+        case PEMachineType::ARM64:
+            return format.architecture == winpe::pe_arch::pe64 ? execution_mode::native_64bit : execution_mode::unknown;
         default:
             return execution_mode::unknown;
         }
     }
 
     // PE32 Mapping Strategy Implementation
-    mapped_module pe32_mapping_strategy::map_from_file(memory_manager& memory, std::filesystem::path file, windows_path module_path,
+    mapped_module pe32_mapping_strategy::map_from_data(memory_manager& memory, const std::span<const std::byte> data,
+                                                       std::filesystem::path identity, windows_path module_path,
                                                        const uint64_t relocation_base)
     {
-        return map_module_from_file<std::uint32_t>(memory, std::move(file), std::move(module_path), relocation_base);
+        return map_module_from_data<std::uint32_t>(memory, data, std::move(identity), std::move(module_path), relocation_base);
     }
 
     mapped_module pe32_mapping_strategy::map_from_memory(memory_manager& memory, uint64_t base_address, uint64_t image_size,
@@ -226,10 +291,11 @@ namespace sogen
     }
 
     // PE64 Mapping Strategy Implementation
-    mapped_module pe64_mapping_strategy::map_from_file(memory_manager& memory, std::filesystem::path file, windows_path module_path,
+    mapped_module pe64_mapping_strategy::map_from_data(memory_manager& memory, const std::span<const std::byte> data,
+                                                       std::filesystem::path identity, windows_path module_path,
                                                        const uint64_t relocation_base)
     {
-        return map_module_from_file<std::uint64_t>(memory, std::move(file), std::move(module_path), relocation_base);
+        return map_module_from_data<std::uint64_t>(memory, data, std::move(identity), std::move(module_path), relocation_base);
     }
 
     mapped_module pe64_mapping_strategy::map_from_memory(memory_manager& memory, uint64_t base_address, uint64_t image_size,
@@ -257,11 +323,28 @@ namespace sogen
         }
     }
 
-    module_manager::module_manager(memory_manager& memory, file_system& file_sys, callbacks& cb)
+    module_manager::module_manager(memory_manager& memory, file_system& file_sys, callbacks& cb,
+                                   const windows_guest_architecture architecture)
         : memory_(&memory),
           file_sys_(&file_sys),
-          callbacks_(&cb)
+          callbacks_(&cb),
+          native_architecture_(architecture)
     {
+        (void)windows_abi_for(architecture);
+    }
+
+    bool module_manager::supports_image(const pe_detection_result& detection_result) const
+    {
+        if (!detection_result.is_valid() || detection_result.suggested_mode == execution_mode::unknown)
+        {
+            return false;
+        }
+        if (this->native_architecture_ == windows_guest_architecture::arm64)
+        {
+            return detection_result.machine == PEMachineType::ARM64;
+        }
+        return detection_result.machine == PEMachineType::I386 || detection_result.machine == PEMachineType::AMD64 ||
+               detection_result.machine == PEMachineType::ARM64EC;
     }
 
     mapped_module* module_manager::map_module_core(const pe_detection_result& detection_result,
@@ -270,6 +353,13 @@ namespace sogen
         if (!detection_result.is_valid())
         {
             logger.error("Cannot map module: %s\n", detection_result.error_message.c_str());
+            return nullptr;
+        }
+
+        if (!this->supports_image(detection_result))
+        {
+            logger.error("Cannot map PE machine 0x%04x into guest architecture %u\n", static_cast<unsigned>(detection_result.machine),
+                         static_cast<unsigned>(this->native_architecture_));
             return nullptr;
         }
 
@@ -299,13 +389,19 @@ namespace sogen
 
     execution_mode module_manager::detect_execution_mode(const windows_path& executable_path, const logger& logger)
     {
-        const auto local_file = this->file_sys_->translate(executable_path);
-        auto detection_result = pe_architecture_detector::detect_from_file(local_file);
+        auto detection_result = pe_architecture_detector::detect_from_file(*this->file_sys_, executable_path);
 
         if (!detection_result.is_valid())
         {
-            logger.error("Failed to detect executable architecture of file %s: %s\n", local_file.string().c_str(),
+            logger.error("Failed to detect executable architecture of file %s: %s\n", executable_path.string().c_str(),
                          detection_result.error_message.c_str());
+            return execution_mode::unknown;
+        }
+
+        if (!this->supports_image(detection_result))
+        {
+            logger.error("Executable PE machine 0x%04x is incompatible with guest architecture %u\n",
+                         static_cast<unsigned>(detection_result.machine), static_cast<unsigned>(this->native_architecture_));
             return execution_mode::unknown;
         }
 
@@ -482,20 +578,33 @@ namespace sogen
         }
     }
 
-    void module_manager::map_main_modules(x86_64_emulator& emu, const windows_path& executable_path, windows_version_manager& version,
+    void module_manager::map_main_modules(cpu_interface& cpu, const windows_path& executable_path, windows_version_manager& version,
                                           process_context& context, const logger& logger)
     {
+        if (context.native_architecture != this->native_architecture_)
+        {
+            throw std::invalid_argument("Module manager and process architectures differ");
+        }
+        (void)context.abi().instruction_pointer(cpu);
+
         const auto& system_root = version.get_system_root();
         const auto system32_path = system_root / "System32";
         const auto syswow64_path = system_root / "SysWOW64";
 
         current_execution_mode_ = detect_execution_mode(executable_path, logger);
+        if (current_execution_mode_ == execution_mode::unknown)
+        {
+            throw std::runtime_error("Unknown or unsupported execution mode detected");
+        }
         context.is_wow64_process = (current_execution_mode_ == execution_mode::wow64_32bit);
 
         // Must precede any module mapping: a fixed-bitness JIT backend rejects unsupported execution
         // modes here, before its first block would be mis-decoded. Host-range reservations are
         // re-derived afterwards so mapping starts from a fresh view of the backend's host layout.
-        emu.notify_process_bitness(context.is_wow64_process);
+        if (auto* x64_cpu = dynamic_cast<x86_64_cpu*>(&cpu))
+        {
+            x64_cpu->notify_process_bitness(context.is_wow64_process);
+        }
         this->memory_->reset_host_memory_ranges();
 
         switch (current_execution_mode_)
@@ -515,17 +624,14 @@ namespace sogen
         }
     }
 
+    std::filesystem::path module_manager::module_identity(const windows_path& path)
+    {
+        return std::filesystem::path{utils::string::to_lower(path.lexically_normal().to_portable_path().u16string())};
+    }
+
     std::optional<uint64_t> module_manager::get_module_load_count_by_path(const windows_path& path)
     {
-        const auto host_path = this->file_sys_->translate(path);
-        if (host_path.empty())
-        {
-            return {};
-        }
-
-        auto local_file = std::filesystem::weakly_canonical(std::filesystem::absolute(host_path));
-
-        if (auto load_count_entry = modules_load_count.find(local_file); load_count_entry != modules_load_count.end())
+        if (auto load_count_entry = modules_load_count.find(module_identity(path)); load_count_entry != modules_load_count.end())
         {
             return load_count_entry->second;
         }
@@ -536,19 +642,40 @@ namespace sogen
     mapped_module* module_manager::map_module(windows_path file, const logger& logger, const bool is_static, bool allow_duplicate,
                                               const uint64_t relocation_base)
     {
-        auto local_file = this->file_sys_->translate(file);
-        if (local_file.empty())
+        if (utils::string::to_lower(file.leaf()) == u"win32u.dll")
+        {
+            allow_duplicate = false;
+        }
+
+        auto identity = module_identity(file);
+
+        if (!allow_duplicate)
+        {
+            for (auto& mod : this->modules_ | std::views::values)
+            {
+                if (mod.path == identity)
+                {
+                    return &mod;
+                }
+            }
+        }
+
+        std::vector<std::byte> data{};
+        if (!this->file_sys_->read_file(file, &data) || data.empty())
         {
             logger.error("Failed to map module: %s does not resolve to a file\n", file.string().c_str());
             return nullptr;
         }
 
-        if (local_file.filename() == "win32u.dll")
-        {
-            return this->map_local_module(local_file, std::move(file), logger, is_static, false, relocation_base);
-        }
+        auto detection_result = pe_architecture_detector::detect_from_data(data);
 
-        return this->map_local_module(local_file, std::move(file), logger, is_static, allow_duplicate, relocation_base);
+        return map_module_core(
+            detection_result,
+            [&]() {
+                auto& strategy = strategy_factory_.get_strategy(detection_result.architecture);
+                return strategy.map_from_data(*this->memory_, data, std::move(identity), std::move(file), relocation_base);
+            },
+            logger, is_static);
     }
 
     mapped_module* module_manager::map_module_or_throw(const windows_path& file, const logger& logger, const bool is_static,
@@ -561,33 +688,6 @@ namespace sogen
         }
 
         return mapped_module;
-    }
-
-    mapped_module* module_manager::map_local_module(const std::filesystem::path& file, windows_path module_path, const logger& logger,
-                                                    const bool is_static, bool allow_duplicate, const uint64_t relocation_base)
-    {
-        auto local_file = weakly_canonical(absolute(file));
-
-        if (!allow_duplicate)
-        {
-            for (auto& mod : this->modules_ | std::views::values)
-            {
-                if (mod.path == local_file)
-                {
-                    return &mod;
-                }
-            }
-        }
-
-        auto detection_result = pe_architecture_detector::detect_from_file(local_file);
-
-        return map_module_core(
-            detection_result,
-            [&]() {
-                auto& strategy = strategy_factory_.get_strategy(detection_result.architecture);
-                return strategy.map_from_file(*this->memory_, std::move(local_file), std::move(module_path), relocation_base);
-            },
-            logger, is_static);
     }
 
     mapped_module* module_manager::map_memory_module(uint64_t base_address, uint64_t image_size, windows_path module_path,
@@ -617,6 +717,7 @@ namespace sogen
 
     void module_manager::serialize(utils::buffer_serializer& buffer) const
     {
+        buffer.write(this->native_architecture_);
         buffer.write_map(this->modules_);
         buffer.write_map(this->modules_load_count);
 
@@ -635,6 +736,10 @@ namespace sogen
 
     void module_manager::deserialize(utils::buffer_deserializer& buffer)
     {
+        if (buffer.read<windows_guest_architecture>() != this->native_architecture_)
+        {
+            throw std::runtime_error("Module snapshot architecture does not match the guest");
+        }
         auto previous = std::move(this->modules_);
         this->modules_.clear();
         const auto module_count = buffer.read<uint64_t>();

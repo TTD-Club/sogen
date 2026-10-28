@@ -460,12 +460,12 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtAllocateVirtualMemoryEx(const syscall_context& c, const handle process_handle,
-                                                  const emulator_object<uint64_t> base_address,
-                                                  const emulator_object<uint64_t> bytes_to_allocate, const uint32_t allocation_type,
-                                                  const uint32_t page_protection,
-                                                  const emulator_object<MEM_EXTENDED_PARAMETER64> extended_parameters,
-                                                  const ULONG extended_parameter_count)
+        static NTSTATUS allocate_virtual_memory(const syscall_context& c, const handle process_handle,
+                                                const emulator_object<uint64_t> base_address,
+                                                const emulator_object<uint64_t> bytes_to_allocate, const uint32_t allocation_type,
+                                                const uint32_t page_protection,
+                                                const emulator_object<MEM_EXTENDED_PARAMETER64> extended_parameters,
+                                                const ULONG extended_parameter_count, const uint64_t highest_address)
         {
             if (allocation_type & MEM_WRITE_WATCH)
             {
@@ -550,7 +550,8 @@ namespace sogen
 
                 const auto region_info = c.win_emu.memory.get_region_info(reset_base);
                 const auto is_valid_kind = region_info.kind == memory_region_kind::private_allocation ||
-                                           region_info.kind == memory_region_kind::pagefile_section_view;
+                                           region_info.kind == memory_region_kind::pagefile_section_view ||
+                                           c.proc.section_views.contains(reset_base, reset_size);
                 if (!region_info.is_reserved || !is_valid_kind || region_info.allocation_base > reset_base)
                 {
                     return STATUS_MEMORY_NOT_ALLOCATED;
@@ -580,6 +581,11 @@ namespace sogen
             if (requested_base != 0 && address_requirements.present && address_requirements.has_non_default_values)
             {
                 return STATUS_INVALID_PARAMETER;
+            }
+
+            if (requested_base == 0)
+            {
+                address_requirements.highest_address = std::min(address_requirements.highest_address, highest_address);
             }
 
             auto potential_base = requested_base;
@@ -672,13 +678,33 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        NTSTATUS handle_NtAllocateVirtualMemoryEx(const syscall_context& c, const handle process_handle,
+                                                  const emulator_object<uint64_t> base_address,
+                                                  const emulator_object<uint64_t> bytes_to_allocate, const uint32_t allocation_type,
+                                                  const uint32_t page_protection,
+                                                  const emulator_object<MEM_EXTENDED_PARAMETER64> extended_parameters,
+                                                  const ULONG extended_parameter_count)
+        {
+            return allocate_virtual_memory(c, process_handle, base_address, bytes_to_allocate, allocation_type, page_protection,
+                                           extended_parameters, extended_parameter_count, MAX_ALLOCATION_END_EXCL - 1);
+        }
+
         NTSTATUS handle_NtAllocateVirtualMemory(const syscall_context& c, const handle process_handle,
-                                                const emulator_object<uint64_t> base_address, const uint64_t /*zero_bits*/,
+                                                const emulator_object<uint64_t> base_address, const uint64_t zero_bits,
                                                 const emulator_object<uint64_t> bytes_to_allocate, const uint32_t allocation_type,
                                                 const uint32_t page_protection)
         {
-            return handle_NtAllocateVirtualMemoryEx(c, process_handle, base_address, bytes_to_allocate, allocation_type, page_protection,
-                                                    emulator_object<MEM_EXTENDED_PARAMETER64>{c.emu.memory()}, 0);
+            if (base_address.read() == 0)
+            {
+                if (const auto status = check_zero_bits_of_allocation(zero_bits); status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+            }
+
+            return allocate_virtual_memory(c, process_handle, base_address, bytes_to_allocate, allocation_type, page_protection,
+                                           emulator_object<MEM_EXTENDED_PARAMETER64>{c.emu.memory()}, 0,
+                                           highest_address_for_zero_bits(zero_bits));
         }
 
         NTSTATUS handle_NtFreeVirtualMemory(const syscall_context& c, const handle process_handle,

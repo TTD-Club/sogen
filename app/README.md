@@ -9,7 +9,7 @@ textures, and touch, mouse and keyboard input is forwarded to the guest.
 
 The emulator itself is `libsogen.so` (`src/android-runtime`), built by the regular CMake build for Android, together
 with the shared libraries it links (the CPU backends and, on arm64, FEXCore). All `.so` files from the build's
-artifacts directory go into `android/app/src/main/jniLibs/<abi>/`, which is not checked in. CI does this in the `build-android-app` job from the `Android arm64` and `Android x86_64` build artifacts.
+artifacts directory go into `android/app/src/main/jniLibs/<abi>/`, which is not checked in. CI does this in the `build-android-app` job from the `Android arm64` build artifacts.
 
 Building them locally needs a Linux host, since parts of the dependency tree configure through shell scripts:
 
@@ -23,6 +23,13 @@ mkdir -p app/android/app/src/main/jniLibs/arm64-v8a
 cp build/release/artifacts/*.so app/android/app/src/main/jniLibs/arm64-v8a/
 ```
 
+## Turnip
+
+Adreno's stock Vulkan drivers often lack features DXVK requires. On Adreno GPUs the runtime therefore loads Mesa's
+Turnip driver through libadrenotools when the APK carries one at `android/app/src/main/assets/turnip/vulkan.ad07xx.so`.
+CI takes it from a pinned [AdrenoToolsDrivers](https://github.com/K11MCH1/AdrenoToolsDrivers) release; see the
+`build-android-app` job.
+
 ## Building the app
 
 ```sh
@@ -30,4 +37,4 @@ cd app
 flutter build apk
 ```
 
-arm64 devices run games through FEX, x86_64 devices and emulators through Unicorn.
+The app supports arm64 devices only, since games run through FEX.
