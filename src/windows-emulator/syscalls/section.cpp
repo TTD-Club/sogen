@@ -256,6 +256,29 @@ namespace sogen
                     c.win_emu.memory.release_memory(backing, 0);
                 }
             }
+
+            std::optional<std::filesystem::path> get_mapped_file_identity(const syscall_context& c, const region_info& region,
+                                                                          const uint64_t address)
+            {
+                if (region.kind == memory_region_kind::file_section_view)
+                {
+                    if (const auto filename = c.win_emu.memory.get_region_mapped_filename(address))
+                    {
+                        return module_manager::module_identity(windows_path{*filename});
+                    }
+                }
+
+                if (region.kind == memory_region_kind::section_image)
+                {
+                    const auto* mod = c.win_emu.mod_manager.find_by_address(address);
+                    if (mod && !mod->module_path.empty())
+                    {
+                        return module_manager::module_identity(mod->module_path);
+                    }
+                }
+
+                return std::nullopt;
+            }
         }
 
         NTSTATUS handle_NtCreateSection(const syscall_context& c, const emulator_object<handle> section_handle,
@@ -349,9 +372,12 @@ namespace sogen
             {
                 constexpr auto shared_section_size = 0x10000;
 
-                const auto address = c.win_emu.memory.find_free_allocation_base(shared_section_size);
-                c.win_emu.memory.allocate_memory(address, shared_section_size, memory_permission::read_write, false,
-                                                 memory_region_kind::pagefile_section_view);
+                const auto address = c.win_emu.memory.allocate_memory(shared_section_size, memory_permission::read_write, false, 0,
+                                                                      memory_region_kind::pagefile_section_view);
+                if (!address)
+                {
+                    return STATUS_NO_MEMORY;
+                }
                 c.proc.shared_section_address = address;
                 c.proc.shared_section_size = shared_section_size;
 
@@ -363,9 +389,12 @@ namespace sogen
             {
                 constexpr auto dbwin_buffer_section_size = 0x1000;
 
-                const auto address = c.win_emu.memory.find_free_allocation_base(dbwin_buffer_section_size);
-                c.win_emu.memory.allocate_memory(address, dbwin_buffer_section_size, memory_permission::read_write, false,
-                                                 memory_region_kind::pagefile_section_view);
+                const auto address = c.win_emu.memory.allocate_memory(dbwin_buffer_section_size, memory_permission::read_write, false, 0,
+                                                                      memory_region_kind::pagefile_section_view);
+                if (!address)
+                {
+                    return STATUS_NO_MEMORY;
+                }
                 c.proc.dbwin_buffer = address;
                 c.proc.dbwin_buffer_size = dbwin_buffer_section_size;
 
@@ -553,7 +582,8 @@ namespace sogen
             }
 
             const auto protection = map_nt_to_emulator_protection(section_entry->section_page_protection);
-            const auto highest_address = highest_address_for_zero_bits(zero_bits);
+            // Views of host-backed sections otherwise go above 4 GiB, where 32-bit code cannot reach them.
+            const auto highest_address = std::min(highest_address_for_zero_bits(zero_bits), c.win_emu.highest_user_address());
 
             if (section_entry->file_name.empty())
             {
@@ -811,7 +841,7 @@ namespace sogen
 
             if (!base_address)
             {
-                return STATUS_INVALID_PARAMETER;
+                return STATUS_NOT_MAPPED_VIEW;
             }
 
             if (c.proc.shared_section_address && base_address >= c.proc.shared_section_address &&
@@ -872,14 +902,44 @@ namespace sogen
         }
 
         NTSTATUS handle_NtUnmapViewOfSectionEx(const syscall_context& c, const handle process_handle, const uint64_t base_address,
-                                               const ULONG /*flags*/)
+                                               const ULONG flags)
         {
+            if (flags & ~(MEM_UNMAP_WITH_TRANSIENT_BOOST | MEM_PRESERVE_PLACEHOLDER))
+            {
+                return STATUS_INVALID_PARAMETER_3;
+            }
+
             return handle_NtUnmapViewOfSection(c, process_handle, base_address);
         }
 
-        NTSTATUS handle_NtAreMappedFilesTheSame()
+        NTSTATUS handle_NtAreMappedFilesTheSame(const syscall_context& c, const uint64_t file1_mapped_as_an_image,
+                                                const uint64_t file2_mapped_as_file)
         {
-            return STATUS_NOT_SUPPORTED;
+            const auto first = c.win_emu.memory.get_region_info(file1_mapped_as_an_image);
+            const auto second = c.win_emu.memory.get_region_info(file2_mapped_as_file);
+            if (!first.is_reserved || !second.is_reserved)
+            {
+                return STATUS_INVALID_ADDRESS;
+            }
+
+            if (first.allocation_base == second.allocation_base)
+            {
+                return STATUS_SUCCESS;
+            }
+
+            const auto first_file = get_mapped_file_identity(c, first, file1_mapped_as_an_image);
+            const auto second_file = get_mapped_file_identity(c, second, file2_mapped_as_file);
+            if (!first_file || !second_file)
+            {
+                return STATUS_CONFLICTING_ADDRESSES;
+            }
+
+            if (first.kind == memory_region_kind::section_image && *first_file == *second_file)
+            {
+                return STATUS_SUCCESS;
+            }
+
+            return STATUS_NOT_SAME_DEVICE;
         }
 
         NTSTATUS handle_NtQuerySection(const syscall_context& c, const handle section_handle,
@@ -947,16 +1007,16 @@ namespace sogen
             }
 
             case SECTION_INFORMATION_CLASS::SectionImageInformation: {
-                // Only image sections support this query
-                if (!section_entry->is_image())
-                {
-                    return STATUS_SECTION_NOT_IMAGE;
-                }
-
                 // Check buffer size
                 if (section_information_length < sizeof(SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>))
                 {
                     return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                // Only image sections support this query
+                if (!section_entry->is_image())
+                {
+                    return STATUS_SECTION_NOT_IMAGE;
                 }
 
                 SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>> info{};
@@ -1091,12 +1151,20 @@ namespace sogen
 
             case SECTION_INFORMATION_CLASS::SectionRelocationInformation:
             case SECTION_INFORMATION_CLASS::SectionOriginalBaseInformation:
-            case SECTION_INFORMATION_CLASS::SectionInternalImageInformation:
-                // These information classes are not implemented
+                if (section_information_length < sizeof(EmulatorTraits<Emu64>::ULONG_PTR))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                if (!section_entry->is_image())
+                {
+                    return STATUS_SECTION_NOT_IMAGE;
+                }
+
                 return STATUS_NOT_SUPPORTED;
 
             default:
-                return STATUS_NOT_SUPPORTED;
+                return STATUS_INVALID_INFO_CLASS;
             }
         }
     }

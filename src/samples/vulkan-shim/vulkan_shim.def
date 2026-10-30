@@ -16,6 +16,7 @@ EXPORTS
     vkBindImageMemory
     vkBindImageMemory2
     vkCmdBeginRenderPass
+    vkCmdBeginRenderPass2
     vkCmdBeginTransformFeedbackEXT
     vkCmdBeginRendering
     vkCmdBindDescriptorSets
@@ -44,8 +45,10 @@ EXPORTS
     vkCmdCopyImage2
     vkCmdCopyImageToBuffer
     vkCmdCopyImageToBuffer2
+    vkCmdDispatchBase
     vkCmdResolveImage
     vkCmdResolveImage2
+    vkCmdSetDeviceMask
     vkCmdUpdateBuffer
     vkCmdDispatch
     vkCmdDispatchIndirect
@@ -73,7 +76,9 @@ EXPORTS
     vkCmdWriteTimestamp2KHR
     vkCmdEndDebugUtilsLabelEXT
     vkCmdEndRenderPass
+    vkCmdEndRenderPass2
     vkCmdNextSubpass
+    vkCmdNextSubpass2
     vkCmdEndRendering
     vkCmdExecuteCommands
     vkCmdFillBuffer
@@ -114,6 +119,7 @@ EXPORTS
     vkCreateBufferView
     vkCreateCommandPool
     vkCreateComputePipelines
+    vkCreatePrivateDataSlot
     vkCreateQueryPool
     vkCreateDebugUtilsMessengerEXT
     vkCreateDescriptorPool
@@ -130,7 +136,9 @@ EXPORTS
     vkCreatePipelineLayout
     vkCreatePipelineCache
     vkCreateRenderPass
+    vkCreateRenderPass2
     vkCreateSampler
+    vkCreateSamplerYcbcrConversion
     vkCreateSemaphore
     vkCreateShaderModule
     vkCreateSwapchainKHR
@@ -138,6 +146,7 @@ EXPORTS
     vkDestroyBuffer
     vkDestroyBufferView
     vkDestroyCommandPool
+    vkDestroyPrivateDataSlot
     vkDestroyQueryPool
     vkDestroyDebugUtilsMessengerEXT
     vkDestroyDescriptorPool
@@ -155,6 +164,7 @@ EXPORTS
     vkDestroyPipelineLayout
     vkDestroyRenderPass
     vkDestroySampler
+    vkDestroySamplerYcbcrConversion
     vkDestroySemaphore
     vkDestroyShaderModule
     vkDestroySurfaceKHR
@@ -163,7 +173,17 @@ EXPORTS
     vkEndCommandBuffer
     vkEnumerateDeviceExtensionProperties
     vkEnumerateDeviceLayerProperties
+    vkEnumeratePhysicalDeviceGroups
     vkFlushMappedMemoryRanges
+    vkGetBufferOpaqueCaptureAddress
+    vkGetDeviceGroupPeerMemoryFeatures
+    vkGetDeviceMemoryOpaqueCaptureAddress
+    vkGetDeviceQueue2
+    vkGetPhysicalDeviceExternalBufferProperties
+    vkGetPhysicalDeviceExternalFenceProperties
+    vkGetPhysicalDeviceToolProperties
+    vkGetPrivateData
+    vkGetRenderAreaGranularity
     vkInvalidateMappedMemoryRanges
     vkEnumerateInstanceExtensionProperties
     vkEnumerateInstanceLayerProperties
@@ -232,6 +252,9 @@ EXPORTS
     vkGetSwapchainImagesKHR
     vkMapMemory
     vkMergePipelineCaches
+    vkQueueBeginDebugUtilsLabelEXT
+    vkQueueEndDebugUtilsLabelEXT
+    vkQueueInsertDebugUtilsLabelEXT
     vkQueuePresentKHR
     vkQueueBindSparse
     vkQueueSubmit
@@ -244,9 +267,13 @@ EXPORTS
     vkResetEvent
     vkResetQueryPool
     vkResetFences
+    vkSetDebugUtilsObjectNameEXT
+    vkSetDebugUtilsObjectTagEXT
     vkSetEvent
+    vkSetPrivateData
     vkSignalSemaphore
     vkSubmitDebugUtilsMessageEXT
+    vkTrimCommandPool
     vkUnmapMemory
     vkUpdateDescriptorSets
     vkUpdateDescriptorSetWithTemplate

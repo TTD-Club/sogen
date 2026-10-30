@@ -318,6 +318,8 @@ namespace sogen
 
     constexpr auto WORKER_FACTORY_FLAG_LOADER_POOL = 0x1; // real name is unknown
 
+    constexpr auto MAXIMUM_HARDERROR_PARAMETERS = 5;
+
     using HARDERROR_RESPONSE_OPTION = enum _HARDERROR_RESPONSE_OPTION
     {
         OptionAbortRetryIgnore,
@@ -466,6 +468,16 @@ namespace sogen
         BOOLEAN DeletePending;
         BOOLEAN Directory;
     } FILE_STANDARD_INFORMATION, *PFILE_STANDARD_INFORMATION;
+
+    typedef struct _FILE_COMPRESSION_INFORMATION
+    {
+        LARGE_INTEGER CompressedFileSize;
+        USHORT CompressionFormat;
+        UCHAR CompressionUnitShift;
+        UCHAR ChunkShift;
+        UCHAR ClusterShift;
+        UCHAR Reserved[3];
+    } FILE_COMPRESSION_INFORMATION, *PFILE_COMPRESSION_INFORMATION;
 
     typedef struct _FILE_NAME_INFORMATION
     {

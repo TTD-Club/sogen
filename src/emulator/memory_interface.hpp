@@ -24,6 +24,16 @@ namespace sogen
         size_t size;
     };
 
+    // Thrown by a backend sharing the address space with the host when a range it has to claim was mapped by the host
+    // after the caller found it free. The caller can release the range and pick another address.
+    struct EMULATOR_INTERFACE host_memory_collision : std::runtime_error
+    {
+        host_memory_collision()
+            : std::runtime_error("Guest memory range is already mapped on the host")
+        {
+        }
+    };
+
     class memory_manager;
     class linux_memory_manager;
 
@@ -64,6 +74,13 @@ namespace sogen
         }
 
         virtual bool host_memory_mapping_requires_identity() const
+        {
+            return false;
+        }
+
+        // Whether host memory can also appear in the guest at its own address, for memory the backend cannot map a
+        // second time elsewhere.
+        virtual bool host_memory_can_stay_in_place() const
         {
             return false;
         }
@@ -137,6 +154,12 @@ namespace sogen
         // reserved_host_ranges) must claim it at the host OS level here, otherwise an unconstrained
         // host allocation (e.g. a JIT code buffer) can land inside a reserved-but-uncommitted range.
         virtual void reserve_guest_address_range(uint64_t /*address*/, uint64_t /*size*/)
+        {
+        }
+
+        // A range every process maps at the same guest address, such as KUSER_SHARED_DATA. A snapshot may keep
+        // memory there, since restoring one maps the range like every other start does.
+        virtual void register_fixed_guest_range(uint64_t /*address*/, size_t /*size*/)
         {
         }
 

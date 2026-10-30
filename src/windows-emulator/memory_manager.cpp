@@ -465,10 +465,22 @@ namespace sogen
         return true;
     }
 
+    namespace
+    {
+        // Host memory for a native process goes above 4 GiB even where an older executable moves its default allocation
+        // address down: backends sharing the address space with the guest can only hand memory there to a new process.
+        uint64_t host_memory_start(const uint64_t highest_address)
+        {
+            return highest_address >= DEFAULT_ALLOCATION_ADDRESS_64BIT ? DEFAULT_ALLOCATION_ADDRESS_64BIT : 0;
+        }
+    }
+
     bool memory_manager::allocate_host_memory_at(const uint64_t address, const size_t size, void* host_pointer,
                                                  const nt_memory_permission permissions)
     {
-        const bool uses_existing_host_mapping = this->memory_->host_memory_mapping_requires_identity();
+        const bool uses_existing_host_mapping =
+            this->memory_->host_memory_mapping_requires_identity() ||
+            (this->memory_->host_memory_can_stay_in_place() && address == get_untagged_pointer_address(host_pointer));
         if (this->overlaps_reserved_region(address, size, uses_existing_host_mapping))
         {
             return false;
@@ -530,8 +542,9 @@ namespace sogen
         }
 
         const bool uses_existing_host_mapping = this->memory_->host_memory_mapping_requires_identity();
-        const uint64_t address = uses_existing_host_mapping ? get_untagged_pointer_address(host_pointer)
-                                                            : this->find_free_host_allocation_base(size, 0, highest_address);
+        const uint64_t address = uses_existing_host_mapping
+                                     ? get_untagged_pointer_address(host_pointer)
+                                     : this->find_free_host_allocation_base(size, host_memory_start(highest_address), highest_address);
 
         if (address < MIN_ALLOCATION_ADDRESS || address >= MAX_ALLOCATION_END_EXCL || size > MAX_ALLOCATION_END_EXCL - address ||
             address + size - 1 > highest_address)
@@ -541,7 +554,13 @@ namespace sogen
 
         if (!this->allocate_host_memory_at(address, size, host_pointer, permissions))
         {
-            return 0;
+            const uint64_t in_place = get_untagged_pointer_address(host_pointer);
+            if (uses_existing_host_mapping || !this->memory_->host_memory_can_stay_in_place() ||
+                !this->allocate_host_memory_at(in_place, size, host_pointer, permissions))
+            {
+                return 0;
+            }
+            return in_place;
         }
 
         return address;
@@ -563,6 +582,11 @@ namespace sogen
         return regions;
     }
 
+    bool memory_manager::host_memory_can_stay_in_place() const
+    {
+        return this->memory_->host_memory_can_stay_in_place();
+    }
+
     bool memory_manager::can_alias_host_memory_anywhere() const
     {
         return this->memory_->supports_host_memory_mapping() && !this->memory_->host_memory_mapping_requires_identity();
@@ -577,7 +601,7 @@ namespace sogen
             return 0;
         }
 
-        const uint64_t address = this->find_free_host_allocation_base(size, 0, highest_address);
+        const uint64_t address = this->find_free_host_allocation_base(size, host_memory_start(highest_address), highest_address);
         if (address == 0 || !this->allocate_placed_host_memory_at(address, size, permissions, place))
         {
             return 0;
@@ -763,17 +787,25 @@ namespace sogen
         // full-address-space rescan grows costlier as the host map does, for no added safety.
         this->reserve_host_memory_ranges_in(address, size);
 
-        if (!this->allocate_memory_raw(address, size, permissions, reserve_only, kind))
+        try
         {
-            return false;
-        }
+            if (!this->allocate_memory_raw(address, size, permissions, reserve_only, kind))
+            {
+                return false;
+            }
 
-        // A reserve-only range never reaches map_memory, so nothing else claims it at the host level:
-        // the host allocator would stay free to hand the address out until the guest commits, and the
-        // commit's MAP_FIXED would then clobber whatever landed there.
-        if (reserve_only)
+            // A reserve-only range never reaches map_memory, so nothing else claims it at the host level:
+            // the host allocator would stay free to hand the address out until the guest commits, and the
+            // commit's MAP_FIXED would then clobber whatever landed there.
+            if (reserve_only)
+            {
+                this->memory_->reserve_guest_address_range(address, size);
+            }
+        }
+        catch (const host_memory_collision&)
         {
-            this->memory_->reserve_guest_address_range(address, size);
+            this->release_memory(address, 0);
+            return false;
         }
 
         return true;
@@ -1196,7 +1228,7 @@ namespace sogen
     {
         // Backstop only: every non-settling iteration of the pick/confirm loop below records at least
         // one more foreign range, so find_free_allocation_base is guaranteed to make progress.
-        constexpr int max_host_reserved_retries = 8;
+        constexpr size_t max_host_reserved_retries = 8;
     }
 
     uint64_t memory_manager::allocate_memory(const uint64_t size, const nt_memory_permission permissions, const bool reserve_only,
@@ -1214,27 +1246,43 @@ namespace sogen
         // the reserve_guest_address_range below would mmap(MAP_FIXED) over it. find_free_host_allocation_base
         // confirms the pick against the host instead of paying for an unconditional full rescan, which
         // costs O(host VM regions) Mach IPC syscalls and grows without bound over a session.
-        const uint64_t allocation_base = this->find_free_host_allocation_base(size, start, highest_address);
-        if (!allocation_base)
+        for (size_t attempt = 0;; ++attempt)
         {
-            return 0;
+            const uint64_t allocation_base = this->find_free_host_allocation_base(size, start, highest_address);
+            if (!allocation_base)
+            {
+                return 0;
+            }
+
+            // Claimed at the host level immediately, even when the guest range is only reserved and not yet
+            // backed by map_memory - see reserve_guest_address_range's doc comment. A host mapping can still
+            // land between the confirm and this claim; the next pick's confirm then sees it and moves on.
+            try
+            {
+                this->memory_->reserve_guest_address_range(allocation_base, size);
+            }
+            catch (const host_memory_collision&)
+            {
+                this->release_host_claims(allocation_base + size);
+                if (attempt >= max_host_reserved_retries)
+                {
+                    return 0;
+                }
+                continue;
+            }
+
+            // Not the public allocate_memory(address, ...): its rescan would re-discover the
+            // reserve_guest_address_range mmap just made as a foreign host allocation - reserved_regions_
+            // does not know about it yet - and mark allocation_base host_reserved, making the call below
+            // self-conflict. The confirm inside find_free_host_allocation_base already covers this window.
+            if (!this->allocate_memory_raw(allocation_base, size, permissions, reserve_only, kind))
+            {
+                this->release_host_claims(allocation_base + size);
+                return 0;
+            }
+
+            return allocation_base;
         }
-
-        // Claimed at the host level immediately, even when the guest range is only reserved and not yet
-        // backed by map_memory - see reserve_guest_address_range's doc comment.
-        this->memory_->reserve_guest_address_range(allocation_base, size);
-
-        // Not the public allocate_memory(address, ...): its rescan would re-discover the
-        // reserve_guest_address_range mmap just made as a foreign host allocation - reserved_regions_
-        // does not know about it yet - and mark allocation_base host_reserved, making the call below
-        // self-conflict. The confirm inside find_free_host_allocation_base already covers this window.
-        if (!this->allocate_memory_raw(allocation_base, size, permissions, reserve_only, kind))
-        {
-            this->release_host_claims(allocation_base + size);
-            return 0;
-        }
-
-        return allocation_base;
     }
 
     uint64_t memory_manager::find_free_host_allocation_base(const uint64_t size, const uint64_t start)
@@ -1253,7 +1301,7 @@ namespace sogen
         // step; the windowed record retires exactly the flagged window, covering backends whose full
         // reserved_host_ranges() omits ranges their windowed query still reports occupied - otherwise
         // the same pick would be rejected every iteration while the full rescan recorded nothing new.
-        for (int attempt = 0;; ++attempt)
+        for (size_t attempt = 0;; ++attempt)
         {
             const uint64_t allocation_base =
                 this->find_free_allocation_base(size, start, ALLOCATION_GRANULARITY, MIN_ALLOCATION_ADDRESS, highest_address);
@@ -1275,6 +1323,11 @@ namespace sogen
             this->reserve_host_memory_ranges();
             this->reserve_host_memory_ranges_in(allocation_base, size);
         }
+    }
+
+    void memory_manager::register_fixed_guest_range(const uint64_t address, const size_t size)
+    {
+        this->memory_->register_fixed_guest_range(address, size);
     }
 
     uint64_t memory_manager::find_free_allocation_base(const uint64_t size, const uint64_t start) const
