@@ -25,6 +25,12 @@ namespace sogen
                     thread.teb32->access([&](TEB32& teb) { teb.IsImpersonating = token != 0; });
                 }
             }
+
+            NTSTATUS get_unresolved_handle_status(const handle h, const handle_types::type expected_type)
+            {
+                return h.value.type == expected_type || h.value.type == handle_types::reserved ? STATUS_INVALID_HANDLE
+                                                                                               : STATUS_OBJECT_TYPE_MISMATCH;
+            }
         }
 
         NTSTATUS handle_NtSetInformationThread(const syscall_context& c, const handle thread_handle, const THREADINFOCLASS info_class,
@@ -59,6 +65,20 @@ namespace sogen
 
                 const emulator_object<WOW64_CONTEXT> context_obj{c.emu, thread_information};
                 const auto new_wow64_context = context_obj.read();
+
+                const bool sets_debug_registers =
+                    (new_wow64_context.ContextFlags & CONTEXT_DEBUG_REGISTERS_32) == CONTEXT_DEBUG_REGISTERS_32;
+                const bool needs_switch = sets_debug_registers && thread != c.vcpu.active_thread;
+                if (needs_switch)
+                {
+                    c.vcpu.active_thread->save(c.emu);
+                    if (!c.win_emu.wait_for_thread_registers(c.vcpu, *thread))
+                    {
+                        c.vcpu.active_thread->restore(c.emu, c.proc.gdt_base);
+                        c.retrigger_syscall = true;
+                        return STATUS_UNSUCCESSFUL;
+                    }
+                }
 
                 // Update the persistent context for future queries
                 thread->wow64_cpu_reserved->access([&](WOW64_CPURESERVED& ctx) {
@@ -129,14 +149,11 @@ namespace sogen
                 // WOW64_CPURESERVED block that wow64cpu reloads on resume. They must be programmed into
                 // the VP directly, otherwise a 32-bit hardware breakpoint armed via the thread context
                 // (e.g. t6r's CEG single-step trick) never arms and never fires.
-                if ((new_wow64_context.ContextFlags & CONTEXT_DEBUG_REGISTERS_32) == CONTEXT_DEBUG_REGISTERS_32)
+                if (sets_debug_registers)
                 {
-                    const bool needs_switch = thread != c.vcpu.active_thread;
                     if (needs_switch)
                     {
-                        c.win_emu.wait_for_register_transfer(*thread);
-                        c.vcpu.active_thread->save(c.emu);
-                        thread->restore(c.emu);
+                        thread->restore(c.emu, c.proc.gdt_base);
                     }
 
                     c.x64_cpu().reg(x86_register::dr0, static_cast<uint64_t>(new_wow64_context.Dr0));
@@ -149,7 +166,7 @@ namespace sogen
                     if (needs_switch)
                     {
                         thread->save(c.emu);
-                        c.vcpu.active_thread->restore(c.emu);
+                        c.vcpu.active_thread->restore(c.emu, c.proc.gdt_base);
                     }
                 }
 
@@ -166,7 +183,7 @@ namespace sogen
             {
                 BOOLEAN hide = true;
 
-                if (thread_information != 0 && thread_information % 4 != 0)
+                if (thread_information_length != 0 && thread_information != 0 && thread_information % 4 != 0)
                 {
                     return STATUS_DATATYPE_MISALIGNMENT;
                 }
@@ -209,7 +226,7 @@ namespace sogen
             {
                 if (thread_information_length != sizeof(handle))
                 {
-                    return STATUS_BUFFER_OVERFLOW;
+                    return STATUS_INFO_LENGTH_MISMATCH;
                 }
 
                 const emulator_object<handle> info{c.emu, thread_information};
@@ -313,8 +330,7 @@ namespace sogen
             }
 
             c.win_emu.log.error("Unsupported thread set info class: %X\n", info_class);
-            c.emu.stop();
-            return STATUS_NOT_SUPPORTED;
+            return STATUS_INVALID_INFO_CLASS;
         }
 
         NTSTATUS handle_NtQueryInformationThread(const syscall_context& c, const handle thread_handle, const uint32_t info_class,
@@ -650,10 +666,39 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            c.win_emu.log.error("Unsupported thread query info class: 0x%X\n", info_class);
-            c.emu.stop();
+            if (info_class == ThreadNameInformation)
+            {
+                const auto name_bytes = static_cast<uint32_t>(thread->name.size() * sizeof(char16_t));
+                const auto total_size = static_cast<uint32_t>(sizeof(THREAD_NAME_INFORMATION<EmulatorTraits<Emu64>>)) + name_bytes;
 
-            return STATUS_NOT_SUPPORTED;
+                if (return_length)
+                {
+                    return_length.write(total_size);
+                }
+
+                if (thread_information_length < total_size)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                const auto name_buffer = thread_information + sizeof(THREAD_NAME_INFORMATION<EmulatorTraits<Emu64>>);
+                if (name_bytes != 0)
+                {
+                    c.emu.write_memory(name_buffer, thread->name.data(), name_bytes);
+                }
+
+                const emulator_object<THREAD_NAME_INFORMATION<EmulatorTraits<Emu64>>> info{c.emu, thread_information};
+                info.access([&](THREAD_NAME_INFORMATION<EmulatorTraits<Emu64>>& value) {
+                    value.ThreadName.Length = static_cast<uint16_t>(name_bytes);
+                    value.ThreadName.MaximumLength = static_cast<uint16_t>(name_bytes);
+                    value.ThreadName.Buffer = name_buffer;
+                });
+
+                return STATUS_SUCCESS;
+            }
+
+            c.win_emu.log.error("Unsupported thread query info class: 0x%X\n", info_class);
+            return STATUS_INVALID_INFO_CLASS;
         }
 
         NTSTATUS handle_NtOpenThread(const syscall_context& c, const emulator_object<handle> thread_handle, ACCESS_MASK /*desired_access*/,
@@ -1043,23 +1088,26 @@ namespace sogen
                                         const ACCESS_MASK /*desired_access*/, const ULONG /*handle_attributes*/, const ULONG flags,
                                         const emulator_object<handle> new_thread_handle)
         {
+            if (!new_thread_handle.try_write(NULL_HANDLE))
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            if (flags != 0)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
             if (!c.proc.is_current_process_handle(process_handle))
             {
-                return STATUS_INVALID_HANDLE;
+                return get_unresolved_handle_status(process_handle, handle_types::process);
             }
 
             const auto resolved_thread_handle = c.proc.resolve_object_pseudo_handle(thread_handle, c.vcpu.active_thread);
 
             if (resolved_thread_handle != NULL_HANDLE && resolved_thread_handle.value.type != handle_types::thread)
             {
-                return STATUS_INVALID_HANDLE;
-            }
-
-            if (flags != 0)
-            {
-                c.win_emu.log.error("NtGetNextThread flags %X not supported\n", static_cast<uint32_t>(flags));
-                c.emu.stop();
-                return STATUS_NOT_SUPPORTED;
+                return get_unresolved_handle_status(resolved_thread_handle, handle_types::thread);
             }
 
             bool return_next_thread = resolved_thread_handle == NULL_HANDLE;
@@ -1078,7 +1126,6 @@ namespace sogen
                 }
             }
 
-            new_thread_handle.write(NULL_HANDLE);
             return STATUS_NO_MORE_ENTRIES;
         }
 
@@ -1102,26 +1149,45 @@ namespace sogen
             cpu_context::save(dynamic_cast<arm64_cpu&>(cpu), context);
         }
 
+        bool is_saved_in_syscall(windows_emulator& win_emu, const emulator_thread& thread)
+        {
+            for (uint32_t i = 0; i < win_emu.vcpu_count(); ++i)
+            {
+                const auto& vcpu = win_emu.vcpu(i);
+                if (vcpu.active_thread == &thread)
+                {
+                    return vcpu.active_thread_saved;
+                }
+            }
+
+            return false;
+        }
+
         // Runs access with the thread's user-mode registers on the calling vCPU and keeps any change it
         // reports. A thread that has not run yet is described, as on Windows, by its initial context
         // (RtlUserThreadStart with the start routine and argument) that LdrInitializeThunk continues into.
         template <typename Context, typename Access>
-        void access_thread_context(const syscall_context& c, emulator_thread& thread, Access&& access)
+        bool access_thread_context(const syscall_context& c, emulator_thread& thread, Access&& access)
         {
             auto& active = *c.vcpu.active_thread;
             if (&thread == &active)
             {
                 access();
-                return;
+                return true;
             }
 
-            c.win_emu.wait_for_register_transfer(thread);
             active.save(c.emu);
             const auto _ = utils::finally([&] {
-                active.restore(c.emu); //
+                active.restore(c.emu, c.proc.gdt_base); //
             });
 
-            thread.restore(c.emu);
+            if (!c.win_emu.wait_for_thread_registers(c.vcpu, thread))
+            {
+                c.retrigger_syscall = true;
+                return false;
+            }
+
+            thread.restore(c.emu, c.proc.gdt_base);
             if (!thread.setup_done && !c.proc.is_wow64_process)
             {
                 thread.setup_if_necessary(c.emu, c.proc);
@@ -1136,9 +1202,25 @@ namespace sogen
                 load_context(c.emu, c.emu.read_memory<Context>(*initial_context));
             }
 
+            // Windows shows a thread inside a syscall after the syscall instruction. Its saved registers keep the
+            // instruction itself, which its vCPU continues after and a retriggered syscall rewinds to.
+            const auto& abi = c.win_emu.abi();
+            const auto in_syscall = is_saved_in_syscall(c.win_emu, thread);
+            const auto syscall_ip = abi.instruction_pointer(c.emu);
+            const auto return_ip = syscall_ip + abi.syscall_abi().syscall_instruction_size();
+            if (in_syscall)
+            {
+                abi.instruction_pointer(c.emu, return_ip);
+            }
+
             if (!access())
             {
-                return;
+                return true;
+            }
+
+            if (in_syscall && abi.instruction_pointer(c.emu) == return_ip)
+            {
+                abi.instruction_pointer(c.emu, syscall_ip);
             }
 
             if (initial_context)
@@ -1151,6 +1233,8 @@ namespace sogen
             {
                 thread.save(c.emu);
             }
+
+            return true;
         }
 
         NTSTATUS handle_NtGetContextThread(const syscall_context& c, const handle thread_handle,
@@ -1176,26 +1260,35 @@ namespace sogen
                     c.win_emu.callbacks.on_suspicious_activity("Reading debug registers");
                 }
 
-                access_thread_context<arm64_context>(c, *thread, [&] {
+                const auto accessed = access_thread_context<arm64_context>(c, *thread, [&] {
                     store_context(c.emu, context);
                     return false;
                 });
+                if (!accessed)
+                {
+                    return STATUS_UNSUCCESSFUL;
+                }
+
                 c.emu.write_memory(thread_context.value(), context);
                 return STATUS_SUCCESS;
             }
 
-            thread_context.access([&](CONTEXT64& context) {
-                if ((context.ContextFlags & CONTEXT_DEBUG_REGISTERS_64) == CONTEXT_DEBUG_REGISTERS_64)
-                {
-                    c.win_emu.callbacks.on_suspicious_activity("Reading debug registers");
-                }
+            auto context = thread_context.read();
+            if ((context.ContextFlags & CONTEXT_DEBUG_REGISTERS_64) == CONTEXT_DEBUG_REGISTERS_64)
+            {
+                c.win_emu.callbacks.on_suspicious_activity("Reading debug registers");
+            }
 
-                access_thread_context<CONTEXT64>(c, *thread, [&] {
-                    store_context(c.emu, context);
-                    return false;
-                });
+            const auto accessed = access_thread_context<CONTEXT64>(c, *thread, [&] {
+                store_context(c.emu, context);
+                return false;
             });
+            if (!accessed)
+            {
+                return STATUS_UNSUCCESSFUL;
+            }
 
+            thread_context.write(context);
             return STATUS_SUCCESS;
         }
 
@@ -1217,12 +1310,16 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
 
-                access_thread_context<arm64_context>(c, *thread, [&] {
+                const auto accessed = access_thread_context<arm64_context>(c, *thread, [&] {
                     load_context(c.emu, context);
                     // X18 always addresses the thread's TEB; the kernel does not take it from a user context.
                     c.win_emu.abi().install_thread_environment(c.emu, thread->teb64->value());
                     return true;
                 });
+                if (!accessed)
+                {
+                    return STATUS_UNSUCCESSFUL;
+                }
 
                 if ((context.ContextFlags & arm64_context_debug_registers) == arm64_context_debug_registers)
                 {
@@ -1233,10 +1330,14 @@ namespace sogen
             }
 
             const auto context = thread_context.read();
-            access_thread_context<CONTEXT64>(c, *thread, [&] {
+            const auto accessed = access_thread_context<CONTEXT64>(c, *thread, [&] {
                 load_context(c.emu, context);
                 return true;
             });
+            if (!accessed)
+            {
+                return STATUS_UNSUCCESSFUL;
+            }
 
             if ((context.ContextFlags & CONTEXT_DEBUG_REGISTERS_64) == CONTEXT_DEBUG_REGISTERS_64)
             {
@@ -1255,6 +1356,12 @@ namespace sogen
                                          const EmulatorTraits<Emu64>::SIZE_T maximum_stack_size,
                                          const emulator_object<PS_ATTRIBUTE_LIST<EmulatorTraits<Emu64>>> attribute_list)
         {
+            constexpr ULONG valid_create_flags = 0x7F;
+            if (create_flags & ~valid_create_flags)
+            {
+                return STATUS_INVALID_PARAMETER_7;
+            }
+
             if (!c.proc.is_current_process_handle(process_handle))
             {
                 return STATUS_NOT_SUPPORTED;
@@ -1368,11 +1475,19 @@ namespace sogen
                                             const uint32_t apc_flags, const uint64_t apc_routine, const uint64_t apc_argument1,
                                             const uint64_t apc_argument2, const uint64_t apc_argument3)
         {
+            // QUEUE_USER_APC_CALLBACK_DATA_CONTEXT, which older MinGW headers do not define.
+            constexpr uint32_t apc_callback_data_context = 0x00010000;
+            constexpr uint32_t valid_apc_flags = QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC | apc_callback_data_context;
+            if (apc_flags & ~valid_apc_flags)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
             auto* thread = thread_handle == CURRENT_THREAD ? c.vcpu.active_thread : c.proc.threads.get(thread_handle);
 
             if (!thread)
             {
-                return STATUS_INVALID_HANDLE;
+                return get_unresolved_handle_status(thread_handle, handle_types::thread);
             }
 
             if (apc_flags)

@@ -598,6 +598,11 @@ namespace sogen
 
             if (object_information_class == ObjectBasicInformation)
             {
+                if (object_information_length != sizeof(OBJECT_BASIC_INFORMATION))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
                 return handle_query<OBJECT_BASIC_INFORMATION>(c.emu, object_information, object_information_length, return_length,
                                                               [&](OBJECT_BASIC_INFORMATION& info) {
                                                                   info.GrantedAccess = GENERIC_ALL;
@@ -1025,7 +1030,7 @@ namespace sogen
                 return STATUS_OBJECT_TYPE_MISMATCH;
             }
 
-            if (!NT_SUCCESS(signal_status))
+            if (signal_status != STATUS_SUCCESS)
             {
                 return signal_status;
             }
@@ -1068,10 +1073,11 @@ namespace sogen
                                               const emulator_pointer security_descriptor, const ULONG length,
                                               const emulator_object<ULONG> length_needed)
         {
-            if ((security_information &
-                 (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION)) == 0)
+            // Reading a SACL requires ACCESS_SYSTEM_SECURITY on the handle, which Windows only grants once
+            // SeSecurityPrivilege is enabled, and the emulator never enables it.
+            if (security_information & (SACL_SECURITY_INFORMATION | BACKUP_SECURITY_INFORMATION))
             {
-                return STATUS_INVALID_PARAMETER;
+                return STATUS_ACCESS_DENIED;
             }
 
             const auto& owner_sid = c.proc.sid;
@@ -1172,8 +1178,18 @@ namespace sogen
         }
 
         NTSTATUS handle_NtSetSecurityObject(const syscall_context& c, const handle h, const SECURITY_INFORMATION /*security_information*/,
-                                            const emulator_pointer /*security_descriptor*/)
+                                            const emulator_pointer security_descriptor)
         {
+            if (!security_descriptor)
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            if (h.value.type == handle_types::reserved)
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+
             if (const auto* file = c.proc.files.get(h); file && !c.win_emu.file_sys.is_writable(file->handle.path()))
             {
                 return STATUS_ACCESS_DENIED;

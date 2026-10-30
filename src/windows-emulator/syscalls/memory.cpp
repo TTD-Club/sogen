@@ -28,7 +28,7 @@ namespace sogen
 
             // Backstop only: every non-settling iteration of the pick/confirm loop below rescans, which
             // is guaranteed to make the next pick skip the offending range.
-            constexpr int max_host_reserved_retries = 8;
+            constexpr size_t max_host_reserved_retries = 8;
 
             const emulator_process* get_managed_process(const syscall_context& c, const handle process_handle)
             {
@@ -389,17 +389,22 @@ namespace sogen
                                                const emulator_object<uint64_t> bytes_to_protect, const uint32_t protection,
                                                const emulator_object<uint32_t> old_protection)
         {
-            const auto orig_start = base_address.read();
-            const auto orig_length = bytes_to_protect.read();
-
-            const auto aligned_start = page_align_down(orig_start);
-            const auto aligned_length = page_align_up(orig_start + orig_length) - aligned_start;
-
             const auto requested_protection = try_map_nt_to_emulator_protection(protection);
             if (!requested_protection.has_value())
             {
                 return STATUS_INVALID_PAGE_PROTECTION;
             }
+
+            const auto orig_start = base_address.read();
+            const auto orig_length = bytes_to_protect.read();
+
+            if (orig_length == 0 || orig_start > MAX_ALLOCATION_ADDRESS || orig_length > MAX_ALLOCATION_END_EXCL - orig_start)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            const auto aligned_start = page_align_down(orig_start);
+            const auto aligned_length = page_align_up(orig_start + orig_length) - aligned_start;
 
             if (c.proc.is_current_process_handle(process_handle))
             {
@@ -444,7 +449,10 @@ namespace sogen
 
             try
             {
-                c.win_emu.memory.protect_memory(aligned_start, aligned_length, *requested_protection, &old_protection_value);
+                if (!c.win_emu.memory.protect_memory(aligned_start, aligned_length, *requested_protection, &old_protection_value))
+                {
+                    return STATUS_CONFLICTING_ADDRESSES;
+                }
             }
             catch (...)
             {
@@ -598,7 +606,7 @@ namespace sogen
                 // re-checks it and takes the binding host-level claim, so a mapping landing in between
                 // makes that call fail cleanly instead of clobbering. Both rescan forms are needed; see
                 // memory_manager::find_free_host_allocation_base.
-                for (int attempt = 0;; ++attempt)
+                for (size_t attempt = 0;; ++attempt)
                 {
                     potential_base = c.win_emu.memory.find_free_allocation_base(allocation_bytes, 0, address_requirements.alignment,
                                                                                 address_requirements.lowest_address,

@@ -76,10 +76,9 @@ namespace sogen
         {
             uint64_t default_allocation_base =
                 (is_wow64_process == true) ? DEFAULT_ALLOCATION_ADDRESS_32BIT : DEFAULT_ALLOCATION_ADDRESS_64BIT;
-            uint64_t base = memory.find_free_allocation_base(size, default_allocation_base);
-            bool allocated = memory.allocate_memory(base, size, memory_permission::read_write);
+            const uint64_t base = memory.allocate_memory(size, memory_permission::read_write, false, default_allocation_base);
 
-            if (!allocated)
+            if (!base)
             {
                 throw std::runtime_error("Failed to allocate memory for process structure");
             }
@@ -119,22 +118,22 @@ namespace sogen
             command_line.push_back(u'"');
         }
 
-        void setup_gdt(x86_64_emulator& emu, memory_manager& memory)
+        // Above 4 GiB, where backends sharing the address space with the guest keep memory they can claim again in a
+        // new process; nothing reads the GDT through a 32-bit address.
+        uint64_t setup_gdt(x86_64_emulator& emu, memory_manager& memory)
         {
             const auto vcpu_count = emu.vcpu_count();
 
-            // One GDT page per vCPU (see gdt_base_for_vcpu): the WOW64 FS descriptor holds a per-thread
-            // TEB base, so a shared GDT cannot serve WOW64 threads on different vCPUs at the same time.
-            const bool allocated =
-                memory.allocate_memory(GDT_ADDR, static_cast<size_t>(page_align_up(vcpu_count * GDT_LIMIT)), memory_permission::read_write);
-            if (!allocated)
+            const auto base = memory.allocate_memory(static_cast<size_t>(page_align_up(vcpu_count * GDT_LIMIT)),
+                                                     memory_permission::read_write, false, DEFAULT_ALLOCATION_ADDRESS_64BIT);
+            if (base == 0)
             {
                 throw std::runtime_error("Failed to allocate memory for GDT");
             }
 
             for (size_t i = 0; i < vcpu_count; ++i)
             {
-                const auto gdt_base = gdt_base_for_vcpu(i);
+                const auto gdt_base = base + i * GDT_LIMIT;
 
                 // Index 1 (0x08) - 64-bit kernel code (Ring 0): P=1, DPL=0, S=1, Type=0xA, L=1
                 emu.write_memory<uint64_t>(gdt_base + (1 * sizeof(uint64_t)), 0x00AF9B000000FFFF);
@@ -162,6 +161,7 @@ namespace sogen
             emu.reg<uint16_t>(x86_register::gs, 0x2B);
             emu.reg<uint16_t>(x86_register::cs, 0x33);
             emu.reg<uint16_t>(x86_register::fs, 0x53);
+            return base;
         }
 
         std::u16string expand_environment_string(const std::u16string& input,
@@ -345,7 +345,7 @@ namespace sogen
 
         if (this->native_architecture == windows_guest_architecture::x86_64)
         {
-            setup_gdt(win_emu.x64_emu(), win_emu.memory);
+            this->gdt_base = setup_gdt(win_emu.x64_emu(), win_emu.memory);
         }
 
         this->kusd.setup(version, fake_env);
@@ -823,6 +823,7 @@ namespace sogen
         buffer.write(this->kusd);
 
         buffer.write(this->is_wow64_process);
+        buffer.write(this->gdt_base);
         buffer.write(this->hard_error_mode);
         buffer.write(this->native_architecture);
         buffer.write(this->ntdll_image_base);
@@ -946,6 +947,7 @@ namespace sogen
         buffer.read(this->kusd);
 
         buffer.read(this->is_wow64_process);
+        buffer.read(this->gdt_base);
         buffer.read(this->hard_error_mode);
         buffer.read(this->native_architecture);
         (void)windows_abi_for(this->native_architecture);

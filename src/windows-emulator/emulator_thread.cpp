@@ -1238,6 +1238,18 @@ namespace sogen
         return this->exit_status.has_value();
     }
 
+    bool emulator_thread::can_be_deleted(const vcpu_context* unloading_vcpu) const
+    {
+        const auto loaded = this->last_vcpu && this->last_vcpu != unloading_vcpu && this->last_vcpu->active_thread == this;
+        return this->ref_count == 0 && this->is_terminated() && !loaded && !this->registers_in_transit &&
+               this->pending_register_accesses == 0;
+    }
+
+    bool emulator_thread::deleter(emulator_thread& t)
+    {
+        return ref_counted_object::deleter(t) && t.can_be_deleted();
+    }
+
     bool emulator_thread::is_thread_ready(windows_emulator& win_emu)
     {
         if (this->is_terminated() || this->suspended > 0)
@@ -1592,7 +1604,7 @@ namespace sogen
         emu.reg(x86_register::rip, context.ldr_initialize_thunk);
     }
 
-    void emulator_thread::refresh_execution_context(cpu_interface& cpu) const
+    void emulator_thread::refresh_execution_context(cpu_interface& cpu, const uint64_t gdt_base) const
     {
         if (dynamic_cast<arm64_cpu*>(&cpu))
         {
@@ -1607,14 +1619,14 @@ namespace sogen
         // Point this vCPU's GDTR at its own per-vCPU GDT. The saved thread context restores whatever
         // GDTR the thread last ran with (possibly another vCPU's GDT), so re-assert it here on every
         // switch. Cheap and keeps each vCPU reading its own descriptors.
-        const auto gdt_base = gdt_base_for_vcpu(emu.index());
-        emu.load_gdt(gdt_base, GDT_LIMIT);
+        const auto vcpu_gdt_base = gdt_base + emu.index() * GDT_LIMIT;
+        emu.load_gdt(vcpu_gdt_base, GDT_LIMIT);
 
         if (this->teb32.has_value())
         {
             // Refresh this vCPU's WOW64 FS descriptor with this thread's 32-bit TEB base, so a 64<->32
             // transition that reloads FS reads the correct base regardless of which vCPU runs the thread.
-            setup_wow64_fs_segment(*this->memory_ptr, this->teb32->value(), gdt_base);
+            setup_wow64_fs_segment(*this->memory_ptr, this->teb32->value(), vcpu_gdt_base);
         }
     }
 

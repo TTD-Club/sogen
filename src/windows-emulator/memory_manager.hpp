@@ -153,6 +153,7 @@ namespace sogen
         uint64_t allocate_host_memory(size_t size, void* host_pointer, nt_memory_permission permissions,
                                       uint64_t highest_address = MAX_ALLOCATION_END_EXCL - 1);
         bool can_alias_host_memory_anywhere() const;
+        bool host_memory_can_stay_in_place() const override;
         // Maps host memory into the guest on backends that need it at a fixed host address (see
         // memory_interface::host_placement_address): picks a free guest range below highest_address, and place maps the
         // memory at the host address backing it. Returns the guest address, or 0 if the backend has no such addresses or
@@ -194,6 +195,8 @@ namespace sogen
 
         uint64_t allocate_memory(uint64_t size, nt_memory_permission permissions, bool reserve_only, uint64_t start,
                                  memory_region_kind kind, uint64_t highest_address);
+
+        void register_fixed_guest_range(uint64_t address, size_t size) override;
 
         uint64_t find_free_allocation_base(uint64_t size, uint64_t start = 0) const;
         uint64_t find_free_allocation_base(uint64_t size, uint64_t start, uint64_t alignment, uint64_t lowest_address,
