@@ -1,5 +1,6 @@
 #include "std_include.hpp"
 #include "windows_emulator.hpp"
+#include "keyboard_layout.hpp"
 
 #include "cpu_context.hpp"
 
@@ -449,33 +450,19 @@ namespace sogen
 
             for (auto it = threads.begin(); it != threads.end();)
             {
-                if (!it->second.is_terminated() || it->second.ref_count > 0 || it->second.registers_in_transit)
+                auto& thread = it->second;
+                if (!thread.can_be_deleted(&vcpu))
                 {
                     ++it;
                     continue;
                 }
 
-                if (auto* running_on = find_vcpu_running_thread(win_emu, it->second))
+                if (vcpu.active_thread == &thread)
                 {
-                    if (running_on != &vcpu)
-                    {
-                        // Another vCPU still has this thread loaded; it will detach it soon.
-                        ++it;
-                        continue;
-                    }
-
-                    running_on->active_thread = nullptr;
+                    vcpu.active_thread = nullptr;
                 }
 
-                const auto [new_it, deleted] = threads.erase(it);
-                if (!deleted)
-                {
-                    ++it;
-                }
-                else
-                {
-                    it = new_it;
-                }
+                it = threads.erase(it).first;
             }
 
             auto& devices = win_emu.process.devices;
@@ -621,7 +608,7 @@ namespace sogen
                 return false;
             }
 
-            if (thread.registers_in_transit)
+            if (thread.registers_in_transit || thread.pending_register_accesses != 0)
             {
                 return false;
             }
@@ -649,7 +636,7 @@ namespace sogen
                     win_emu.callbacks.on_thread_switch(*active_thread, thread);
                 }
 
-                vcpu.active_thread = &thread;
+                vcpu.set_active_thread(&thread);
 
                 win_emu.transfer_thread_registers(vcpu, active_thread, thread);
             }
@@ -1038,6 +1025,7 @@ namespace sogen
                 // vCPU can pick it up once it becomes ready.
                 vcpu.active_thread->save(vcpu.cpu);
                 vcpu.active_thread = nullptr;
+                this->thread_registers_saved_.notify_all();
             }
 
             const auto host_wait_pending = has_pending_host_wait(this->process);
@@ -1154,7 +1142,7 @@ namespace sogen
                 outgoing->save(vcpu.cpu);
             }
 
-            incoming.restore(vcpu.cpu);
+            incoming.restore(vcpu.cpu, this->process.gdt_base);
             return;
         }
 
@@ -1173,6 +1161,7 @@ namespace sogen
                     outgoing->registers_in_transit = false;
                 }
                 incoming.registers_in_transit = false;
+                this->thread_registers_saved_.notify_all();
             });
 
             if (outgoing)
@@ -1183,19 +1172,71 @@ namespace sogen
             incoming.load_registers(vcpu.cpu);
         }
 
-        incoming.refresh_execution_context(vcpu.cpu);
+        incoming.refresh_execution_context(vcpu.cpu, this->process.gdt_base);
     }
 
-    void windows_emulator::wait_for_register_transfer(const emulator_thread& thread)
+    bool windows_emulator::wait_for_thread_registers(vcpu_context& vcpu, emulator_thread& thread)
     {
         this->kernel_lock_.assert_held();
 
-        while (thread.registers_in_transit)
+        const auto loaded_elsewhere = [&]() -> vcpu_context* {
+            auto* owner = find_vcpu_running_thread(*this, thread);
+            return owner && owner != &vcpu && !owner->active_thread_saved ? owner : nullptr;
+        };
+
+        if (!thread.registers_in_transit && !loaded_elsewhere())
         {
-            this->kernel_lock_.unlock();
-            std::this_thread::yield();
-            this->kernel_lock_.lock();
+            return true;
         }
+
+        const auto was_saved = std::exchange(vcpu.active_thread_saved, true);
+        ++thread.pending_register_accesses;
+        this->thread_registers_saved_.notify_all();
+        const auto _ = utils::finally([&] {
+            vcpu.active_thread_saved = was_saved;
+            --thread.pending_register_accesses;
+            this->wake_idle_vcpu();
+        });
+
+        while (thread.registers_in_transit || loaded_elsewhere())
+        {
+            if (this->should_stop)
+            {
+                return false;
+            }
+
+            if (auto* owner = thread.registers_in_transit ? nullptr : loaded_elsewhere())
+            {
+                owner->switch_thread = true;
+                owner->cpu.stop();
+            }
+
+            // Bounded, so that the kick is repeated: a stop that reaches a vCPU just before it enters guest code is
+            // lost on WHP.
+            auto* dispatch_vcpu = std::exchange(this->dispatch_vcpu_, nullptr);
+            this->thread_registers_saved_.wait_for(this->kernel_lock_, std::chrono::milliseconds(1));
+            this->dispatch_vcpu_ = dispatch_vcpu;
+        }
+
+        return true;
+    }
+
+    bool windows_emulator::save_dispatching_thread(vcpu_context* vcpu)
+    {
+        if (this->vcpu_count_ == 1 || !vcpu || !vcpu->active_thread || vcpu->active_thread_saved)
+        {
+            return false;
+        }
+
+        vcpu->active_thread->save(vcpu->cpu);
+        vcpu->active_thread_saved = true;
+        this->thread_registers_saved_.notify_all();
+        return true;
+    }
+
+    void windows_emulator::reload_dispatching_thread(vcpu_context& vcpu) const
+    {
+        vcpu.thread().restore(vcpu.cpu, this->process.gdt_base);
     }
 
     bool windows_emulator::activate_thread(vcpu_context& vcpu, const uint32_t id)
@@ -1987,6 +2028,12 @@ namespace sogen
     void windows_emulator::handle_ui_event(const ui_event& event)
     {
         const std::scoped_lock lock(this->kernel_lock_);
+        this->handle_ui_event_locked(event);
+    }
+
+    void windows_emulator::handle_ui_event_locked(const ui_event& event)
+    {
+        this->kernel_lock_.assert_held();
 
         const auto hook_id = low_level_hook_id(event.message);
         auto& pending = this->process.pending_low_level_input;
@@ -2224,10 +2271,17 @@ namespace sogen
     {
         int32_t cursor_x = this->process.cursor_x;
         int32_t cursor_y = this->process.cursor_y;
-        if (event.relative_motion)
+        if (event.relative_motion || event.cursor_target)
         {
-            cursor_x += event.relative_motion->first;
-            cursor_y += event.relative_motion->second;
+            if (event.cursor_target)
+            {
+                std::tie(cursor_x, cursor_y) = *event.cursor_target;
+            }
+            else
+            {
+                cursor_x += event.relative_motion->first;
+                cursor_y += event.relative_motion->second;
+            }
             if (const auto& clip = this->process.cursor_clip)
             {
                 const auto left = static_cast<int32_t>(clip->left);
@@ -2245,8 +2299,99 @@ namespace sogen
         return {cursor_x, cursor_y};
     }
 
-    void windows_emulator::deliver_ui_event(const ui_event& event)
+    void windows_emulator::update_key_state(const ui_event& event)
     {
+        const auto virtual_key = static_cast<uint8_t>(event.wParam & 0xFF);
+        if (virtual_key == VK_PACKET)
+        {
+            return;
+        }
+
+        const bool down = event.message == WM_KEYDOWN || event.message == WM_SYSKEYDOWN;
+        const auto set = [&](const uint8_t key) {
+            auto& state = this->process.key_state[key];
+            if (down && (state & 0x80) == 0)
+            {
+                this->process.async_key_state[key] = 1;
+                if (key == VK_CAPITAL || key == VK_NUMLOCK || key == VK_SCROLL)
+                {
+                    state ^= 0x01;
+                }
+            }
+            state = static_cast<uint8_t>((down ? 0x80 : 0) | (state & 0x01));
+        };
+
+        const auto side = side_virtual_key(static_cast<uint32_t>(event.wParam & 0xFF), event.lParam);
+        set(side);
+        for (const auto& [generic, left, right] : modifier_sides)
+        {
+            if (side == left || side == right)
+            {
+                const bool any_down = ((this->process.key_state[left] | this->process.key_state[right]) & 0x80) != 0;
+                if (any_down && (this->process.key_state[generic] & 0x80) == 0)
+                {
+                    this->process.async_key_state[generic] = 1;
+                }
+                this->process.key_state[generic] = any_down ? 0x80 : 0;
+            }
+        }
+    }
+
+    ui_event windows_emulator::resolve_injected_event(const ui_event& event) const
+    {
+        if (!event.injected)
+        {
+            return event;
+        }
+
+        auto resolved = event;
+        const auto down = [&](const uint32_t key) { return (this->process.key_state[key] & 0x80) != 0; };
+
+        if (is_keyboard_message(event.message))
+        {
+            const auto virtual_key = static_cast<uint32_t>(event.wParam & 0xFF);
+            const bool up = event.message == WM_KEYUP || event.message == WM_SYSKEYUP;
+            const bool alt = virtual_key == VK_MENU || down(VK_MENU);
+            const bool system_key = (alt || virtual_key == VK_F10) && !down(VK_CONTROL);
+            if (system_key)
+            {
+                resolved.message = up ? WM_SYSKEYUP : WM_SYSKEYDOWN;
+            }
+            else
+            {
+                resolved.message = up ? WM_KEYUP : WM_KEYDOWN;
+            }
+
+            constexpr uint64_t context_bit = 1ull << 29;
+            constexpr uint64_t previous_state_bit = 1ull << 30;
+            resolved.lParam &= ~(context_bit | previous_state_bit);
+            resolved.lParam |= (alt && system_key) ? context_bit : 0;
+            resolved.lParam |=
+                (up || (virtual_key != VK_PACKET && down(side_virtual_key(virtual_key, event.lParam)))) ? previous_state_bit : 0;
+            return resolved;
+        }
+
+        if (is_pointer_message(event.message))
+        {
+            uint64_t flags = 0;
+            for (const auto& [key, flag] :
+                 {std::pair{VK_LBUTTON, MK_LBUTTON}, std::pair{VK_RBUTTON, MK_RBUTTON}, std::pair{VK_SHIFT, MK_SHIFT},
+                  std::pair{VK_CONTROL, MK_CONTROL}, std::pair{VK_MBUTTON, MK_MBUTTON}, std::pair{VK_XBUTTON1, MK_XBUTTON1},
+                  std::pair{VK_XBUTTON2, MK_XBUTTON2}})
+            {
+                const bool pressed =
+                    mouse_button_virtual_key(event.message, event.wParam) == key ? is_mouse_button_down_message(event.message) : down(key);
+                flags |= pressed ? static_cast<uint64_t>(flag) : 0;
+            }
+            resolved.wParam = (event.wParam & 0xFFFF0000) | flags;
+        }
+
+        return resolved;
+    }
+
+    void windows_emulator::deliver_ui_event(const ui_event& queued_event)
+    {
+        const auto event = this->resolve_injected_event(queued_event);
         if (event.message == WM_SIZE)
         {
             this->resize_window_from_host(event.window, event.wParam == SIZE_MAXIMIZED, point_x(event.lParam), point_y(event.lParam));
@@ -2273,6 +2418,14 @@ namespace sogen
         m.wParam = event.wParam;
         m.lParam = event.lParam;
 
+        if (event.injected && is_keyboard_message(event.message) && thread->focus_window != 0)
+        {
+            if (const auto* focus = this->process.windows.get(thread->focus_window); focus && focus->thread_id == win->thread_id)
+            {
+                m.window = thread->focus_window;
+            }
+        }
+
         if (is_pointer_message(event.message))
         {
             // Track the cursor in screen coordinates (client origin + client-local position) so GetCursorPos
@@ -2282,12 +2435,15 @@ namespace sogen
             const auto [new_cursor_x, new_cursor_y] = this->cursor_after_pointer_event(event);
             int32_t raw_dx = new_cursor_x - this->process.cursor_x;
             int32_t raw_dy = new_cursor_y - this->process.cursor_y;
-            if (event.relative_motion)
+            if (event.relative_motion || event.cursor_target)
             {
                 // Like a ClipCursor-confined cursor on Windows: the position stops at the clip rectangle while the
                 // raw motion keeps flowing.
-                raw_dx = event.relative_motion->first;
-                raw_dy = event.relative_motion->second;
+                if (event.relative_motion)
+                {
+                    raw_dx = event.relative_motion->first;
+                    raw_dy = event.relative_motion->second;
+                }
                 if (origin)
                 {
                     l_param = pack_point(new_cursor_x - origin->x, new_cursor_y - origin->y);
@@ -2353,18 +2509,10 @@ namespace sogen
         switch (event.message)
         {
         case WM_KEYDOWN:
-        case WM_SYSKEYDOWN: {
-            const auto virtual_key = static_cast<uint8_t>(event.wParam & 0xFF);
-            if ((this->process.key_state[virtual_key] & 0x80) == 0)
-            {
-                this->process.async_key_state[virtual_key] = 1;
-            }
-            this->process.key_state[virtual_key] = 0x80;
-            break;
-        }
+        case WM_SYSKEYDOWN:
         case WM_KEYUP:
         case WM_SYSKEYUP:
-            this->process.key_state[static_cast<uint8_t>(event.wParam & 0xFF)] = 0;
+            this->update_key_state(event);
             break;
         default:
             if (const auto virtual_key = mouse_button_virtual_key(event.message, event.wParam); virtual_key != 0)
@@ -2400,6 +2548,20 @@ namespace sogen
         }
 
         thread->post_message(*this, m, true);
+
+        if (event.injected && is_key_down_message(event.message))
+        {
+            const auto virtual_key = static_cast<uint32_t>(event.wParam & 0xFF);
+            const auto character =
+                virtual_key == VK_PACKET ? event.injected_character : key_character(virtual_key, this->process.key_state);
+            if (character != 0)
+            {
+                msg character_message = m;
+                character_message.message = event.message == WM_SYSKEYDOWN ? WM_SYSCHAR : WM_CHAR;
+                character_message.wParam = character;
+                thread->post_message(*this, character_message, true);
+            }
+        }
 
         if (event.message == WM_CLOSE || event.message == WM_COMMAND || is_key_down_message(event.message) ||
             is_mouse_button_message(event.message) || is_mouse_wheel_message(event.message))
@@ -2564,6 +2726,7 @@ namespace sogen
         }
 
         this->idle_wakeup_cv_.notify_all();
+        this->thread_registers_saved_.notify_all();
 
         for (uint32_t i = 0; i < this->vcpu_count_; ++i)
         {
@@ -2769,7 +2932,9 @@ namespace sogen
         this->mod_manager.deserialize(buffer);
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
-        this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
+        emulator_thread* restored_thread{};
+        this->process.deserialize(buffer, restored_thread);
+        this->vcpus_[0]->set_active_thread(restored_thread);
         this->process.section_views.deserialize(buffer);
         this->process.restore_after_state_restore(*this);
         this->ui().set_cursor_visibility(this->process.cursor_show_count >= 0 && this->process.cursor_shape_visible);
@@ -2804,8 +2969,18 @@ namespace sogen
             });
 
             // Delivering the release does not clear the key when there is no window to deliver it to.
-            this->process.key_state[key] = 0;
+            this->process.key_state[key] &= 0x01;
         }
+    }
+
+    uint64_t windows_emulator::highest_user_address() const
+    {
+        if (!this->process.is_wow64_process)
+        {
+            return MAX_ALLOCATION_END_EXCL - 1;
+        }
+        const auto* executable = this->mod_manager.executable;
+        return (executable && (executable->characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE)) ? 0xFFFEFFFF : 0x7FFEFFFF;
     }
 
     // The guest's ClipCursor is process-wide; the host confines whichever window is in the foreground, in relative mode while
@@ -2818,8 +2993,11 @@ namespace sogen
             clip = ui_rect{.left = rect->left, .top = rect->top, .right = rect->right, .bottom = rect->bottom};
         }
 
+        // SDL's relative mode pins the cursor to a pixel in the window's center but may leave it visible. Only raw motion
+        // reaches the guest then, just as with a hidden cursor.
         const bool hidden = this->process.cursor_show_count < 0 || !this->process.cursor_shape_visible;
-        this->ui().set_cursor_clip(this->process.foreground_window, clip, clip.has_value() && hidden);
+        const bool pinned = clip && clip->right - clip->left <= 2 && clip->bottom - clip->top <= 2;
+        this->ui().set_cursor_clip(this->process.foreground_window, clip, clip.has_value() && (hidden || pinned));
     }
 
     void windows_emulator::save_snapshot()
@@ -2878,7 +3056,9 @@ namespace sogen
         this->mod_manager.deserialize(buffer);
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
-        this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
+        emulator_thread* restored_thread{};
+        this->process.deserialize(buffer, restored_thread);
+        this->vcpus_[0]->set_active_thread(restored_thread);
         this->process.section_views.deserialize(buffer);
         this->process.restore_after_state_restore(*this);
         this->ui().set_cursor_visibility(this->process.cursor_show_count >= 0 && this->process.cursor_shape_visible);

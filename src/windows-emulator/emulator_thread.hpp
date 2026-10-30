@@ -15,6 +15,7 @@ namespace sogen
 
     struct completion_state;
     struct process_context;
+    struct vcpu_context;
     struct windows_arch_abi;
 
     struct user_timer_key
@@ -405,6 +406,14 @@ namespace sogen
         // Set while a vCPU moves this thread's registers in or out with the kernel lock released. The thread must not
         // be scheduled, deleted or have its registers accessed until the transfer is done.
         bool registers_in_transit{false};
+        // Counts syscalls on other vCPUs waiting in wait_for_thread_registers for this thread. The thread must not be
+        // loaded onto a vCPU or deleted while it is non-zero.
+        uint32_t pending_register_accesses{0};
+        // The vCPU that loaded this thread last. The thread is still loaded while it is that vCPU's active thread.
+        vcpu_context* last_vcpu{};
+        // The address of a syscall that was retriggered and runs again when the thread continues, so that it is
+        // reported once.
+        std::optional<uint64_t> retriggered_syscall_ip{};
         bool alerted{false};
         uint32_t create_flags{0};
         uint32_t suspended{0};
@@ -517,10 +526,10 @@ namespace sogen
             this->last_registers = emu.save_registers();
         }
 
-        void restore(cpu_interface& emu) const
+        void restore(cpu_interface& emu, const uint64_t gdt_base) const
         {
             this->load_registers(emu);
-            this->refresh_execution_context(emu);
+            this->refresh_execution_context(emu, gdt_base);
         }
 
         void load_registers(cpu_interface& emu) const
@@ -528,7 +537,7 @@ namespace sogen
             emu.restore_registers(this->last_registers);
         }
 
-        void refresh_execution_context(cpu_interface& cpu) const;
+        void refresh_execution_context(cpu_interface& cpu, uint64_t gdt_base) const;
 
         void setup_if_necessary(cpu_interface& emu, const process_context& context);
 
@@ -697,10 +706,10 @@ namespace sogen
             this->marker.mark_as_moved();
         }
 
-        static bool deleter(emulator_thread& t)
-        {
-            return ref_counted_object::deleter(t) && t.is_terminated();
-        }
+        // A thread loaded on unloading_vcpu counts as unloaded, since that vCPU is about to unload it. The scheduler's
+        // deletion and the handle deleter share this, so that the scheduler never erases a thread the deleter keeps.
+        bool can_be_deleted(const vcpu_context* unloading_vcpu = nullptr) const;
+        static bool deleter(emulator_thread& t);
 
       private:
         bool can_coalesce_message(const msg& msg) const;

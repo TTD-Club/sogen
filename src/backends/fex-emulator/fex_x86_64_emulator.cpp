@@ -1719,7 +1719,10 @@ namespace sogen::fex
                 const bool in_low_window = this->low_guest_window_ != 0 && address + size <= low_guest_window_size;
                 const bool in_arena =
                     this->guest_arena_ != 0 && address >= this->guest_arena_ && address + size <= this->guest_arena_ + guest_arena_size;
-                if (!in_low_window && !in_arena)
+                const bool fixed = std::ranges::any_of(this->fixed_guest_ranges_, [&](const auto& range) {
+                    return address >= range.first && address + size <= range.first + range.second;
+                });
+                if (!in_low_window && !in_arena && !fixed)
                 {
                     std::array<char, 128> message{};
                     snprintf(message.data(), message.size(), "Guest memory at 0x%llx lies where a new process may not get it back",
@@ -2214,6 +2217,24 @@ namespace sogen::fex
                 throw std::runtime_error("FEX MMIO mappings must be page aligned");
             }
 
+#ifndef __APPLE__
+            // Claimed PROT_NONE so the host cannot place an accessible mapping here and accesses keep faulting into the MMIO
+            // handler. Darwin's __PAGEZERO already keeps the host out.
+            if (!this->host_range_is_claimed(address, size))
+            {
+                try
+                {
+                    this->reserve_guest_address_range(address, size);
+                }
+                catch (const std::runtime_error&)
+                {
+                    std::array<char, 128> message{};
+                    snprintf(message.data(), message.size(), "Failed to reserve guest MMIO at 0x%llx on the host",
+                             static_cast<unsigned long long>(address));
+                    throw std::runtime_error(message.data());
+                }
+            }
+#endif
             this->mmio_regions_.emplace_back(mmio_region{.address = address, .size = size, .read_cb = std::move(read_cb)});
         }
 
@@ -2227,7 +2248,9 @@ namespace sogen::fex
 #ifdef __APPLE__
             // The host mmap/mprotect calls happen at 16KB granularity via the shadow table (see
             // sync_host_page_apple); guest VA == host VA is unaffected, this only changes which host
-            // syscalls actually get issued and at what alignment.
+            // syscalls actually get issued and at what alignment. The range is claimed before the shadow
+            // table changes, so a host_memory_collision leaves the shadow table as it was.
+            this->reserve_guest_address_range(address, size);
             this->set_shadow_range_apple(address, size, permissions);
             this->sync_host_pages_covering_apple(address, size);
 #else
@@ -2277,6 +2300,14 @@ namespace sogen::fex
                 const uint64_t run_end = next == this->claimed_host_ranges_.end() ? end : std::min(next->first, end);
                 this->claim_host_range(cursor, static_cast<size_t>(run_end - cursor));
                 cursor = run_end;
+            }
+        }
+
+        void register_fixed_guest_range(const uint64_t address, const size_t size) override
+        {
+            if (std::ranges::find(this->fixed_guest_ranges_, std::pair{address, size}) == this->fixed_guest_ranges_.end())
+            {
+                this->fixed_guest_ranges_.emplace_back(address, size);
             }
         }
 
@@ -2404,9 +2435,14 @@ namespace sogen::fex
         }
 
 #ifndef __APPLE__
-        // Outside the low window, host memory can only appear in the guest at its own address. Inside it, the
-        // window's pages are replaced with a second mapping of the host memory instead.
+        // Inside the low window or the arena, the reserved pages are replaced with a second mapping of the host memory.
+        // Without either, host memory can only appear in the guest at its own address.
         bool host_memory_mapping_requires_identity() const override
+        {
+            return this->low_guest_window_ == 0 && this->guest_arena_ == 0;
+        }
+
+        bool host_memory_can_stay_in_place() const override
         {
             return this->low_guest_window_ == 0;
         }
@@ -2816,6 +2852,10 @@ namespace sogen::fex
 #ifdef __APPLE__
             mach_vm_address_t target = address;
             const kern_return_t result = ::mach_vm_allocate(mach_task_self(), &target, size, VM_FLAGS_FIXED);
+            if (result == KERN_NO_SPACE)
+            {
+                throw host_memory_collision{};
+            }
             if (result != KERN_SUCCESS || target != address)
             {
                 throw std::runtime_error("FEX backend failed to reserve guest address range at the host level");
@@ -2834,13 +2874,17 @@ namespace sogen::fex
 
                 void* result = ::mmap(reinterpret_cast<void*>(host_address), span_size, PROT_NONE,
                                       MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                if (result == MAP_FAILED && errno != EEXIST)
+                {
+                    throw std::runtime_error("FEX backend failed to reserve guest address range at the host level");
+                }
                 if (result == MAP_FAILED || reinterpret_cast<uint64_t>(result) != host_address)
                 {
                     if (result != MAP_FAILED)
                     {
                         ::munmap(result, span_size);
                     }
-                    throw std::runtime_error("FEX backend failed to reserve guest address range at the host level");
+                    throw host_memory_collision{};
                 }
             });
 #endif
@@ -4369,6 +4413,7 @@ namespace sogen::fex
         uint64_t instance_id_{std::random_device{}() | (static_cast<uint64_t>(std::random_device{}()) << 32)};
 
         std::map<uint64_t, size_t> claimed_host_ranges_;
+        std::vector<std::pair<uint64_t, size_t>> fixed_guest_ranges_;
 
         // Host base of the window backing a WoW64 process's low 4GB, or 0 while guest VA == host VA.
         uint64_t low_guest_window_{};

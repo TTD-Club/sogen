@@ -388,7 +388,7 @@ namespace sogen
                                              ULONG extended_parameter_count);
         NTSTATUS handle_NtUnmapViewOfSection(const syscall_context& c, handle process_handle, uint64_t base_address);
         NTSTATUS handle_NtUnmapViewOfSectionEx(const syscall_context& c, handle process_handle, uint64_t base_address, ULONG /*flags*/);
-        NTSTATUS handle_NtAreMappedFilesTheSame();
+        NTSTATUS handle_NtAreMappedFilesTheSame(const syscall_context& c, uint64_t file1_mapped_as_an_image, uint64_t file2_mapped_as_file);
 
         // syscalls/semaphore.cpp:
         NTSTATUS handle_NtOpenSemaphore(const syscall_context& c, emulator_object<handle> semaphore_handle, ACCESS_MASK /*desired_access*/,
@@ -790,6 +790,7 @@ namespace sogen
         uint64_t handle_NtUserSetClipboardData();
         uint64_t handle_NtUserGetProcessDpiAwarenessContext();
         BOOL handle_NtUserSetProcessDpiAwarenessContext();
+        uint32_t handle_NtUserSendInput(const syscall_context& c, uint32_t input_count, emulator_pointer inputs, int32_t input_size);
         uint32_t handle_NtUserMapVirtualKeyEx(const syscall_context& c, uint32_t code, uint32_t map_type, uint32_t keyboard_id,
                                               uint64_t keyboard_layout);
         int32_t handle_NtUserToUnicodeEx(const syscall_context& c, uint32_t virtual_key, uint32_t scan_code, emulator_pointer key_state,
@@ -1185,8 +1186,35 @@ namespace sogen
             }
         }
 
-        NTSTATUS handle_NtQueryWnfStateData()
+        NTSTATUS handle_NtQueryWnfStateData(const syscall_context&, const emulator_object<uint64_t> state_name,
+                                            const emulator_pointer /*type_id*/, const emulator_pointer /*explicit_scope*/,
+                                            const emulator_object<ULONG> change_stamp, const emulator_pointer buffer,
+                                            const emulator_object<ULONG> buffer_size)
         {
+            const auto name = state_name.try_read();
+            if (!name)
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            // External WNF state names are XORed with this key; the decoded low bits hold the version and the data scope.
+            constexpr uint64_t state_name_key = 0x41C64E6DA3BC0074;
+            constexpr uint64_t max_data_scope = 5;
+            const auto decoded = *name ^ state_name_key;
+            if ((decoded & 0xF) != 1 || ((decoded >> 6) & 0xF) > max_data_scope)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            const auto size = buffer_size.try_read();
+            if (!change_stamp || !size || (!buffer && *size != 0))
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            // There is no WNF store, so every well-formed name reads like one that was never published.
+            change_stamp.write(0);
+            buffer_size.write(0);
             return STATUS_SUCCESS;
         }
 
@@ -1939,6 +1967,7 @@ namespace sogen
         add_handler(NtUserRedrawFrame);
         add_handler(NtUserGetCursorInfo);
         add_handler(NtUserMapVirtualKeyEx);
+        add_handler(NtUserSendInput);
         add_handler(NtUserToUnicodeEx);
         add_handler(NtUserSetProcessDpiAwarenessContext);
         add_handler(NtUserGetRawInputDeviceList);
