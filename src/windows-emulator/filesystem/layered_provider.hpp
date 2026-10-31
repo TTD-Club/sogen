@@ -54,9 +54,9 @@ namespace sogen
 
         std::optional<struct compat_stat> stat(const windows_path& path) const override;
         std::vector<directory_entry> list(const windows_path& path) const override;
-        open_result open(const windows_path& path, const std::u16string& mode) override;
-        NTSTATUS create_directory(const windows_path& path) override;
-        NTSTATUS rename(const windows_path& from, const windows_path& to) override;
+        open_result open(const windows_path& path, const std::u16string& mode, std::u16string_view spelled_leaf) override;
+        NTSTATUS create_directory(const windows_path& path, std::u16string_view spelled_leaf) override;
+        NTSTATUS rename(const windows_path& from, const windows_path& to, std::u16string_view spelled_leaf) override;
         NTSTATUS remove(const windows_path& path) override;
 
       private:
@@ -64,14 +64,15 @@ namespace sogen
 
         std::optional<std::filesystem::path> get_host_path(const windows_path& path) const override;
 
-        NTSTATUS create_directory_unchecked(const windows_path& path);
-        NTSTATUS rename_unchecked(const windows_path& from, const windows_path& to);
+        NTSTATUS create_directory_unchecked(const windows_path& path, std::u16string_view spelled_leaf);
+        NTSTATUS rename_unchecked(const windows_path& from, const windows_path& to, std::u16string_view spelled_leaf);
         NTSTATUS remove_unchecked(const windows_path& path);
         uint64_t generation(const windows_path& path) const;
         bool lower_visible(const windows_path& path) const;
         std::optional<struct compat_stat> lower_stat(const windows_path& path) const;
+        std::u16string lower_spelling(const windows_path& path) const;
         NTSTATUS create_upper_parents(const windows_path& path);
-        bool copy_to_upper(const windows_path& source, const windows_path& destination);
+        bool copy_to_upper(const windows_path& source, const windows_path& destination, std::u16string_view spelled_leaf);
         bool copy_up(const windows_path& path);
 
         std::unique_ptr<mount_provider> lower_{};

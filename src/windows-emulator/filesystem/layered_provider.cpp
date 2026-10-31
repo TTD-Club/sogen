@@ -288,7 +288,7 @@ namespace sogen
             }
 
             const bool appending = this->mode_.find(u'a') != std::u16string::npos;
-            auto reopened = this->provider_->upper_->open(this->path_, appending ? this->mode_ : u"r+b");
+            auto reopened = this->provider_->upper_->open(this->path_, appending ? this->mode_ : u"r+b", {});
             if (!reopened.file)
             {
                 return false;
@@ -364,6 +364,19 @@ namespace sogen
         return this->lower_->stat(path);
     }
 
+    std::u16string layered_provider::lower_spelling(const windows_path& path) const
+    {
+        for (auto& entry : this->lower_->list(path.parent()))
+        {
+            if (windows_path(entry.name).u16string() == path.leaf())
+            {
+                return std::move(entry.name);
+            }
+        }
+
+        return {};
+    }
+
     std::optional<struct compat_stat> layered_provider::stat(const windows_path& path) const
     {
         if (auto upper = this->upper_->stat(path))
@@ -434,7 +447,7 @@ namespace sogen
                 return STATUS_OBJECT_PATH_NOT_FOUND;
             }
 
-            const auto status = this->upper_->create_directory(ancestor);
+            const auto status = this->upper_->create_directory(ancestor, this->lower_spelling(ancestor));
             if (status != STATUS_SUCCESS && status != STATUS_OBJECT_NAME_COLLISION)
             {
                 return status;
@@ -444,9 +457,10 @@ namespace sogen
         return STATUS_SUCCESS;
     }
 
-    bool layered_provider::copy_to_upper(const windows_path& source, const windows_path& destination)
+    bool layered_provider::copy_to_upper(const windows_path& source, const windows_path& destination,
+                                         const std::u16string_view spelled_leaf)
     {
-        const auto input = this->lower_->open(source, u"rb");
+        const auto input = this->lower_->open(source, u"rb", {});
         const auto target = this->upper_->get_host_path(destination);
         if (!input.file || !target)
         {
@@ -493,7 +507,7 @@ namespace sogen
             std::filesystem::last_write_time(temporary, file_now - duration_cast<std::filesystem::file_time_type::duration>(age), ec);
         }
 
-        std::filesystem::rename(temporary, *target, ec);
+        std::filesystem::rename(temporary, spell_created_leaf(*target, destination, spelled_leaf, false), ec);
         return !ec;
     }
 
@@ -504,10 +518,10 @@ namespace sogen
             return true;
         }
 
-        return this->create_upper_parents(path) == STATUS_SUCCESS && this->copy_to_upper(path, path);
+        return this->create_upper_parents(path) == STATUS_SUCCESS && this->copy_to_upper(path, path, this->lower_spelling(path));
     }
 
-    open_result layered_provider::open(const windows_path& path, const std::u16string& mode)
+    open_result layered_provider::open(const windows_path& path, const std::u16string& mode, const std::u16string_view spelled_leaf)
     {
         const auto upper = this->upper_->stat(path);
 
@@ -515,7 +529,7 @@ namespace sogen
         {
             if (upper)
             {
-                return this->upper_->open(path, mode);
+                return this->upper_->open(path, mode, {});
             }
 
             if (!this->lower_stat(path))
@@ -523,12 +537,12 @@ namespace sogen
                 return {.status = STATUS_OBJECT_NAME_NOT_FOUND};
             }
 
-            return this->lower_->open(path, mode);
+            return this->lower_->open(path, mode, {});
         }
 
         if (upper)
         {
-            return this->upper_->open(path, mode);
+            return this->upper_->open(path, mode, {});
         }
 
         const auto lower = this->lower_stat(path);
@@ -545,10 +559,10 @@ namespace sogen
                 return {.status = status};
             }
 
-            return this->upper_->open(path, mode);
+            return this->upper_->open(path, mode, lower ? this->lower_spelling(path) : std::u16string{spelled_leaf});
         }
 
-        auto input = this->lower_->open(path, u"rb");
+        auto input = this->lower_->open(path, u"rb", {});
         if (!input.file)
         {
             return input;
@@ -563,9 +577,9 @@ namespace sogen
         return entry == this->generations_.end() ? 0 : entry->second;
     }
 
-    NTSTATUS layered_provider::create_directory(const windows_path& path)
+    NTSTATUS layered_provider::create_directory(const windows_path& path, const std::u16string_view spelled_leaf)
     {
-        const auto status = this->create_directory_unchecked(path);
+        const auto status = this->create_directory_unchecked(path, spelled_leaf);
         if (status == STATUS_SUCCESS)
         {
             ++this->generations_[path];
@@ -574,7 +588,7 @@ namespace sogen
         return status;
     }
 
-    NTSTATUS layered_provider::create_directory_unchecked(const windows_path& path)
+    NTSTATUS layered_provider::create_directory_unchecked(const windows_path& path, const std::u16string_view spelled_leaf)
     {
         if (this->stat(path))
         {
@@ -593,12 +607,12 @@ namespace sogen
             return STATUS_ACCESS_DENIED;
         }
 
-        return this->upper_->create_directory(path);
+        return this->upper_->create_directory(path, spelled_leaf);
     }
 
-    NTSTATUS layered_provider::rename(const windows_path& from, const windows_path& to)
+    NTSTATUS layered_provider::rename(const windows_path& from, const windows_path& to, const std::u16string_view spelled_leaf)
     {
-        const auto status = this->rename_unchecked(from, to);
+        const auto status = this->rename_unchecked(from, to, spelled_leaf);
         if (status == STATUS_SUCCESS)
         {
             ++this->generations_[from];
@@ -608,7 +622,7 @@ namespace sogen
         return status;
     }
 
-    NTSTATUS layered_provider::rename_unchecked(const windows_path& from, const windows_path& to)
+    NTSTATUS layered_provider::rename_unchecked(const windows_path& from, const windows_path& to, const std::u16string_view spelled_leaf)
     {
         const auto source = this->stat(from);
         if (!source)
@@ -636,7 +650,7 @@ namespace sogen
                 return STATUS_NOT_SAME_DEVICE;
             }
 
-            return this->upper_->rename(from, to);
+            return this->upper_->rename(from, to, spelled_leaf);
         }
 
         if (in_upper)
@@ -647,7 +661,7 @@ namespace sogen
                 return STATUS_ACCESS_DENIED;
             }
 
-            return this->upper_->rename(from, to);
+            return this->upper_->rename(from, to, spelled_leaf);
         }
 
         // Replacing needs the old destination to survive a failed or interrupted rename, which has no durable record yet.
@@ -656,7 +670,7 @@ namespace sogen
             return STATUS_OBJECT_NAME_COLLISION;
         }
 
-        if (!this->copy_to_upper(from, to))
+        if (!this->copy_to_upper(from, to, spelled_leaf))
         {
             return STATUS_ACCESS_DENIED;
         }

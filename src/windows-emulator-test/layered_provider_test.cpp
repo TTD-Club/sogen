@@ -105,7 +105,7 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"file.txt"}), u"rb");
+        const auto result = provider->open(guest({u"file.txt"}), u"rb", {});
         ASSERT_TRUE(result.file);
         EXPECT_EQ("lower contents", read_all(*result.file));
         EXPECT_FALSE(std::filesystem::exists(this->upper() / "file.txt"));
@@ -115,7 +115,7 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"file.txt"}), u"r+b");
+        const auto result = provider->open(guest({u"file.txt"}), u"r+b", {});
         ASSERT_TRUE(result.file);
         EXPECT_EQ("lower contents", read_all(*result.file));
         EXPECT_FALSE(std::filesystem::exists(this->upper() / "file.txt"));
@@ -125,7 +125,7 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"file.txt"}), u"r+b");
+        const auto result = provider->open(guest({u"file.txt"}), u"r+b", {});
         ASSERT_TRUE(result.file);
         ASSERT_TRUE(result.file->seek(6, SEEK_SET));
         EXPECT_EQ(3u, write_text(*result.file, "NEW"));
@@ -141,7 +141,7 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"file.txt"}), u"wb");
+        const auto result = provider->open(guest({u"file.txt"}), u"wb", {});
         ASSERT_TRUE(result.file);
         EXPECT_EQ(0, result.file->size());
         EXPECT_EQ("", read_host_file(this->upper() / "file.txt"));
@@ -152,7 +152,7 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"file.txt"}), u"r+b");
+        const auto result = provider->open(guest({u"file.txt"}), u"r+b", {});
         ASSERT_TRUE(result.file);
         ASSERT_TRUE(result.file->resize(5));
         ASSERT_TRUE(result.file->flush());
@@ -165,7 +165,7 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"file.txt"}), u"ab");
+        const auto result = provider->open(guest({u"file.txt"}), u"ab", {});
         ASSERT_TRUE(result.file);
         EXPECT_EQ(4u, write_text(*result.file, "-end"));
         ASSERT_TRUE(result.file->flush());
@@ -177,8 +177,8 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto first = provider->open(guest({u"file.txt"}), u"r+b");
-        const auto second = provider->open(guest({u"file.txt"}), u"r+b");
+        const auto first = provider->open(guest({u"file.txt"}), u"r+b", {});
+        const auto second = provider->open(guest({u"file.txt"}), u"r+b", {});
         ASSERT_TRUE(first.file);
         ASSERT_TRUE(second.file);
 
@@ -195,7 +195,7 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"dir", u"new.txt"}), u"wb");
+        const auto result = provider->open(guest({u"dir", u"new.txt"}), u"wb", {});
         ASSERT_TRUE(result.file);
         EXPECT_EQ(3u, write_text(*result.file, "new"));
         ASSERT_TRUE(result.file->flush());
@@ -204,7 +204,7 @@ namespace sogen::test
         EXPECT_FALSE(std::filesystem::exists(this->lower() / "dir" / "new.txt"));
         EXPECT_EQ((std::set<std::u16string>{u"old.txt", u"keep.txt", u"new.txt"}), names_in(*provider, guest({u"dir"})));
 
-        EXPECT_EQ(STATUS_OBJECT_PATH_NOT_FOUND, provider->open(guest({u"missing", u"new.txt"}), u"wb").status);
+        EXPECT_EQ(STATUS_OBJECT_PATH_NOT_FOUND, provider->open(guest({u"missing", u"new.txt"}), u"wb", {}).status);
     }
 
     TEST_F(LayeredProviderTest, RemovedLowerFilesStayHiddenAcrossRestarts)
@@ -213,7 +213,7 @@ namespace sogen::test
             const auto provider = this->make_provider();
             EXPECT_EQ(STATUS_SUCCESS, provider->remove(guest({u"file.txt"})));
             EXPECT_FALSE(provider->stat(guest({u"file.txt"})));
-            EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, provider->open(guest({u"file.txt"}), u"rb").status);
+            EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, provider->open(guest({u"file.txt"}), u"rb", {}).status);
             EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, provider->remove(guest({u"file.txt"})));
         }
 
@@ -222,12 +222,12 @@ namespace sogen::test
         EXPECT_EQ(0u, names_in(*provider, {}).count(u"file.txt"));
         EXPECT_TRUE(std::filesystem::exists(this->lower() / "file.txt"));
 
-        const auto recreated = provider->open(guest({u"file.txt"}), u"wb");
+        const auto recreated = provider->open(guest({u"file.txt"}), u"wb", {});
         ASSERT_TRUE(recreated.file);
         EXPECT_EQ(3u, write_text(*recreated.file, "new"));
         ASSERT_TRUE(recreated.file->flush());
 
-        const auto reread = provider->open(guest({u"file.txt"}), u"rb");
+        const auto reread = provider->open(guest({u"file.txt"}), u"rb", {});
         ASSERT_TRUE(reread.file);
         EXPECT_EQ("new", read_all(*reread.file));
     }
@@ -251,7 +251,7 @@ namespace sogen::test
             ASSERT_EQ(STATUS_SUCCESS, provider->remove(guest({u"dir", u"old.txt"})));
             ASSERT_EQ(STATUS_SUCCESS, provider->remove(guest({u"dir", u"keep.txt"})));
             ASSERT_EQ(STATUS_SUCCESS, provider->remove(guest({u"dir"})));
-            ASSERT_EQ(STATUS_SUCCESS, provider->create_directory(guest({u"dir"})));
+            ASSERT_EQ(STATUS_SUCCESS, provider->create_directory(guest({u"dir"}), {}));
             EXPECT_TRUE(names_in(*provider, guest({u"dir"})).empty());
         }
 
@@ -265,10 +265,10 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        EXPECT_EQ(STATUS_OBJECT_NAME_COLLISION, provider->create_directory(guest({u"dir"})));
-        EXPECT_EQ(STATUS_SUCCESS, provider->create_directory(guest({u"fresh"})));
-        EXPECT_EQ(STATUS_OBJECT_NAME_COLLISION, provider->create_directory(guest({u"fresh"})));
-        EXPECT_EQ(STATUS_OBJECT_PATH_NOT_FOUND, provider->create_directory(guest({u"missing", u"child"})));
+        EXPECT_EQ(STATUS_OBJECT_NAME_COLLISION, provider->create_directory(guest({u"dir"}), {}));
+        EXPECT_EQ(STATUS_SUCCESS, provider->create_directory(guest({u"fresh"}), {}));
+        EXPECT_EQ(STATUS_OBJECT_NAME_COLLISION, provider->create_directory(guest({u"fresh"}), {}));
+        EXPECT_EQ(STATUS_OBJECT_PATH_NOT_FOUND, provider->create_directory(guest({u"missing", u"child"}), {}));
     }
 
     TEST_F(LayeredProviderTest, ListingsMergeBothLayers)
@@ -283,7 +283,7 @@ namespace sogen::test
         const auto entries = provider->list({});
         EXPECT_EQ(3u, entries.size());
 
-        const auto shadowed = provider->open(guest({u"file.txt"}), u"rb");
+        const auto shadowed = provider->open(guest({u"file.txt"}), u"rb", {});
         ASSERT_TRUE(shadowed.file);
         EXPECT_EQ("shadow", read_all(*shadowed.file));
     }
@@ -292,7 +292,7 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        ASSERT_EQ(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"dir", u"moved.txt"})));
+        ASSERT_EQ(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"dir", u"moved.txt"}), {}));
 
         EXPECT_FALSE(provider->stat(guest({u"file.txt"})));
         EXPECT_EQ("lower contents", read_host_file(this->upper() / "dir" / "moved.txt"));
@@ -307,9 +307,9 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"file.txt"}), u"r+b");
+        const auto result = provider->open(guest({u"file.txt"}), u"r+b", {});
         ASSERT_TRUE(result.file);
-        ASSERT_EQ(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"dir", u"moved.txt"})));
+        ASSERT_EQ(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"dir", u"moved.txt"}), {}));
 
         EXPECT_EQ(0u, write_text(*result.file, "NEW"));
         EXPECT_FALSE(provider->stat(guest({u"file.txt"})));
@@ -320,11 +320,11 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"file.txt"}), u"r+b");
+        const auto result = provider->open(guest({u"file.txt"}), u"r+b", {});
         ASSERT_TRUE(result.file);
         ASSERT_EQ(STATUS_SUCCESS, provider->remove(guest({u"file.txt"})));
 
-        const auto created = provider->open(guest({u"file.txt"}), u"wb");
+        const auto created = provider->open(guest({u"file.txt"}), u"wb", {});
         ASSERT_TRUE(created.file);
         ASSERT_EQ(3u, write_text(*created.file, "own"));
         ASSERT_TRUE(created.file->flush());
@@ -338,9 +338,9 @@ namespace sogen::test
         write_host_file(this->upper() / "taken.txt", "x");
         const auto provider = this->make_provider();
 
-        const auto result = provider->open(guest({u"file.txt"}), u"r+b");
+        const auto result = provider->open(guest({u"file.txt"}), u"r+b", {});
         ASSERT_TRUE(result.file);
-        EXPECT_NE(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"taken.txt"})));
+        EXPECT_NE(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"taken.txt"}), {}));
 
         EXPECT_EQ(3u, write_text(*result.file, "NEW"));
     }
@@ -350,7 +350,7 @@ namespace sogen::test
         std::filesystem::create_directories(this->state() / "journal");
 
         const auto provider = this->make_provider();
-        EXPECT_NE(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"dir", u"target.txt"})));
+        EXPECT_NE(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"dir", u"target.txt"}), {}));
 
         EXPECT_TRUE(provider->stat(guest({u"file.txt"})));
         EXPECT_FALSE(provider->stat(guest({u"dir", u"target.txt"})));
@@ -362,8 +362,8 @@ namespace sogen::test
         write_host_file(this->upper() / "dir" / "target.txt", "keep me");
 
         const auto provider = this->make_provider();
-        EXPECT_EQ(STATUS_OBJECT_NAME_COLLISION, provider->rename(guest({u"file.txt"}), guest({u"dir", u"old.txt"})));
-        EXPECT_EQ(STATUS_OBJECT_NAME_COLLISION, provider->rename(guest({u"file.txt"}), guest({u"dir", u"target.txt"})));
+        EXPECT_EQ(STATUS_OBJECT_NAME_COLLISION, provider->rename(guest({u"file.txt"}), guest({u"dir", u"old.txt"}), {}));
+        EXPECT_EQ(STATUS_OBJECT_NAME_COLLISION, provider->rename(guest({u"file.txt"}), guest({u"dir", u"target.txt"}), {}));
 
         EXPECT_EQ("keep me", read_host_file(this->upper() / "dir" / "target.txt"));
         EXPECT_TRUE(provider->stat(guest({u"file.txt"})));
@@ -408,12 +408,12 @@ namespace sogen::test
         const auto provider = this->make_provider();
 
         {
-            const auto result = provider->open(guest({u"file.txt"}), u"r+b");
+            const auto result = provider->open(guest({u"file.txt"}), u"r+b", {});
             ASSERT_TRUE(result.file);
             ASSERT_EQ(1u, write_text(*result.file, "L"));
         }
 
-        ASSERT_EQ(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"renamed.txt"})));
+        ASSERT_EQ(STATUS_SUCCESS, provider->rename(guest({u"file.txt"}), guest({u"renamed.txt"}), {}));
         EXPECT_FALSE(provider->stat(guest({u"file.txt"})));
         EXPECT_EQ("Lower contents", read_host_file(this->upper() / "renamed.txt"));
     }
@@ -422,11 +422,11 @@ namespace sogen::test
     {
         const auto provider = this->make_provider();
 
-        EXPECT_EQ(STATUS_NOT_SAME_DEVICE, provider->rename(guest({u"dir"}), guest({u"moved"})));
+        EXPECT_EQ(STATUS_NOT_SAME_DEVICE, provider->rename(guest({u"dir"}), guest({u"moved"}), {}));
         EXPECT_TRUE(provider->stat(guest({u"dir"})));
 
-        ASSERT_EQ(STATUS_SUCCESS, provider->create_directory(guest({u"fresh"})));
-        EXPECT_EQ(STATUS_SUCCESS, provider->rename(guest({u"fresh"}), guest({u"fresher"})));
+        ASSERT_EQ(STATUS_SUCCESS, provider->create_directory(guest({u"fresh"}), {}));
+        EXPECT_EQ(STATUS_SUCCESS, provider->rename(guest({u"fresh"}), guest({u"fresher"}), {}));
         EXPECT_TRUE(provider->stat(guest({u"fresher"})));
         EXPECT_FALSE(provider->stat(guest({u"fresh"})));
     }
@@ -483,5 +483,34 @@ namespace sogen::test
         EXPECT_EQ("lower contents", read_host_file(this->lower() / "file.txt"));
         EXPECT_EQ(STATUS_SUCCESS, fs.remove(windows_path{'c', {u"dir", u"old.txt"}}));
         EXPECT_THROW(fs.map(windows_path{'d', {}}, this->root, filesystem_mode::copy_on_write), std::runtime_error);
+    }
+
+    TEST_F(LayeredProviderTest, NewAndCopiedUpEntriesKeepTheirSpelling)
+    {
+        write_host_file(this->lower() / "Mixed" / "Lower.TXT", "lower");
+        const auto provider = this->make_provider();
+
+        const auto created = provider->open(guest({u"new.txt"}), u"wb", u"New.Txt");
+        ASSERT_TRUE(created.file);
+        ASSERT_EQ(STATUS_SUCCESS, provider->create_directory(guest({u"fresh"}), u"Fresh"));
+
+        const auto copied = provider->open(guest({u"mixed", u"lower.txt"}), u"r+b", {});
+        ASSERT_TRUE(copied.file);
+        EXPECT_EQ(1u, write_text(*copied.file, "L"));
+        ASSERT_TRUE(copied.file->flush());
+
+        const auto host_names = [](const std::filesystem::path& directory) {
+            std::set<std::u16string> names{};
+            for (const auto& entry : std::filesystem::directory_iterator(directory))
+            {
+                names.insert(entry.path().filename().u16string());
+            }
+
+            return names;
+        };
+
+        EXPECT_EQ((std::set<std::u16string>{u"New.Txt", u"Fresh", u"Mixed"}), host_names(this->upper()));
+        EXPECT_EQ((std::set<std::u16string>{u"Lower.TXT"}), host_names(this->upper() / "Mixed"));
+        EXPECT_EQ("Lower", read_host_file(this->upper() / "Mixed" / "Lower.TXT"));
     }
 }
