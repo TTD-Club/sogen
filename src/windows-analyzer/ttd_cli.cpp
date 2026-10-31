@@ -360,6 +360,7 @@ namespace sogen::ttd
         replay_result verify_checkpoints(windows_emulator& win_emu, const cli_options& options)
         {
             trace recorded(options.replay);
+            use_recorded_registry(win_emu, recorded);
             size_t mismatches = 0;
             for (const auto& target : recorded.checkpoints())
             {
@@ -613,14 +614,25 @@ namespace sogen::ttd
         return std::nullopt;
     }
 
+    bool needs_hive_files(const cli_options& options)
+    {
+        return !options.replays() || !trace(options.replay).has_registry_hives();
+    }
+
     void prepare_replay(windows_emulator& win_emu, const cli_options& options)
     {
-        // A plain seek and the string scan restore their checkpoint themselves; the other scans start from the setup.
-        if (!options.replays() || options.scan_selfmod || !options.buffers.empty() || !options.strings.empty() || options.is_plain_seek())
+        if (!options.replays())
         {
             return;
         }
+        // Before anything sets up the process, which reads the registry.
         trace recorded(options.replay);
+        use_recorded_registry(win_emu, recorded);
+        // A plain seek and the string scan restore their checkpoint themselves; the other scans start from the setup.
+        if (options.scan_selfmod || !options.buffers.empty() || !options.strings.empty() || options.is_plain_seek())
+        {
+            return;
+        }
         snapshot::load_emulator_state(win_emu, *recorded.checkpoint_for_step(options.seek).state);
     }
 

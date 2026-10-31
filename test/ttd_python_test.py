@@ -21,6 +21,7 @@ NEW_VALUE = 0x2222222222222222
 FORKED_VALUE = 0x4444444444444444
 WM_APP = 0x8000
 UI_VALUE = 0x5A5A
+FORKED_UI_VALUE = 0xA5A5
 
 
 def main() -> None:
@@ -222,7 +223,25 @@ def main() -> None:
             plain_replay.seek(load.position)
             assert read_u64(keyed_emulator, address) == NEW_VALUE
             assert keyed_emulator.serialize_state() == plain_replay.emulator.serialize_state()
-        del plain_replay, keyed_replay, strict_replay
+        # A trace carries what the recording read of its registry hives, so its replay needs no hive files, and neither
+        # does that of a fork recorded from such a replay.
+        assert trace.has_registry_hives
+        hiveless_settings = {**settings, "load_registry": False}
+        assert ttd.environment_differences(trace, **hiveless_settings) == []
+        hiveless = ttd.Replay(keyed, hiveless_emulator := ttd.create_emulator(sample, **hiveless_settings))
+        for position in (load.position, store.position, keyed.instruction_count):
+            hiveless.seek(position)
+            plain_replay.seek(position)
+            assert hiveless_emulator.serialize_state() == plain_replay.emulator.serialize_state(), position
+        assert hiveless.manifest_differences() == [], hiveless.manifest_differences()
+        hiveless.seek(store.position)
+        hiveless_fork_trace = str(pathlib.Path(directory) / "hiveless-fork.sogttd")
+        with ttd.record(hiveless_emulator, hiveless_fork_trace, checkpoint_interval=5000, max_instructions=20000) as hiveless_fork:
+            assert hiveless_fork.has_registry_hives
+            assert hiveless_fork.manifest["registry"] == trace.manifest["registry"], hiveless_fork.manifest
+            ttd.Replay(hiveless_fork, ttd.create_emulator(sample, **hiveless_settings), strict=True).seek(
+                hiveless_fork.instruction_count)
+        del plain_replay, keyed_replay, strict_replay, hiveless
         plain.close()
         keyed.close()
 
@@ -236,6 +255,15 @@ def main() -> None:
         assert pathlib.PurePath(sample).name.lower() in manifest["command_line"].lower(), manifest
         assert ttd_format.Trace(cli_trace).manifest == manifest
         assert replay.manifest_differences() == []
+        # The same check before building an emulator, and the registry fingerprint on its own. An emulation root's
+        # hives are its registry folder; registry_directory applies only without one.
+        assert ttd.environment_differences(trace, **settings) == [], ttd.environment_differences(trace, **settings)
+        hives = (pathlib.Path(settings["emulation_root"]) / "registry" if settings.get("emulation_root")
+                 else pathlib.Path(settings["registry_directory"]))
+        assert ttd.registry_fingerprint(str(hives)) == manifest["registry"]
+        # The trace carries what it read of its hives (see has_registry_hives below), so other hive files do not matter.
+        other_hives = ttd.environment_differences(trace, **{**settings, "emulation_root": "", "registry_directory": directory})
+        assert "registry differs" not in [difference.split(":")[0] for difference in other_hives], other_hives
 
         # Replay scans: the transient string, the generated function's write-then-execute wave, and written buffers.
         transient = [found for found in replay.strings() if "SOGEN_TTD_TRANSIENT_STRING_FOR_RECOVERY" in found.value]
@@ -304,17 +332,18 @@ def main() -> None:
                               if (event.step, event.address, event.kind) == (store.position, address, ttd_format.WRITE))
         recorded_store.data = (0x3333333333333333).to_bytes(8, "little")
         ttd_format.replace_chunk(tampered, store_chunk, chunk_events)
-        # It also names recorded inputs that differ for the replay, such as the registry hives.
-        ttd_format.replace_manifest(tampered, {**manifest, "registry": "0" * 16})
+        # It also names recorded inputs that differ for the replay, such as the system DLLs (not the registry hives,
+        # which the trace carries).
+        ttd_format.replace_manifest(tampered, {**manifest, "system_dlls": "0" * 16})
         with ttd.Trace(tampered) as tampered_trace:
             tampered_replay = ttd.Replay(tampered_trace, emulator)
             try:
                 tampered_replay.seek(store.position)
             except ttd.DivergenceError as error:
                 assert isinstance(error, RuntimeError) and "accessed different data" in str(error), error
-                assert "registry differs" in str(error), error
+                assert "system_dlls differs" in str(error), error
                 assert [difference.split(":")[0] for difference in tampered_replay.manifest_differences()] == [
-                    "registry differs"]
+                    "system_dlls differs"]
             else:
                 raise AssertionError("A tampered recording replayed without divergence")
             del tampered_replay
@@ -511,6 +540,29 @@ def main() -> None:
             ui_replay.run_to(ui_writes[-1].position)
             assert read_u64(ui_replay.emulator, ui_address) == UI_VALUE
             assert ui_replay.strings()
+            # Input injected after a seek reaches a recorded fork at its first pump, right after its initial
+            # checkpoint and at the same position; a replay from that checkpoint delivers it once.
+            injected_fork_trace = str(pathlib.Path(directory) / "injected-fork.sogttd")
+            ui_replay.seek(inputs[0].position - 1)
+            ttd.inject_ui_event(ui_replay.emulator, window, WM_APP, FORKED_UI_VALUE)
+            with ttd.record(ui_replay.emulator, injected_fork_trace, checkpoint_interval=1000000,
+                            max_instructions=ui_writes[-1].position - inputs[0].position + 20000) as injected_fork:
+                fork_inputs = injected_fork.ui_inputs
+                assert [(i.checkpoint, i.event_number, i.position) for i in fork_inputs] == [
+                    (0, 0, injected_fork.start_position)], fork_inputs
+                assert injected_fork.event(0).kind == ttd.HOST_WRITE
+                assert injected_fork.end_position == injected_fork.instruction_count > injected_fork.start_position
+                fork_ui_writes = injected_fork.accesses(ui_address, 8, kinds=ttd.WRITE)
+                assert fork_ui_writes[-1].data == FORKED_UI_VALUE.to_bytes(8, "little"), fork_ui_writes
+                assert injected_fork.memory_at(injected_fork.end_position, ui_address, 8) == list(
+                    FORKED_UI_VALUE.to_bytes(8, "little"))
+                injected_replay = ttd.Replay(injected_fork, ttd.create_emulator(sample, headless=True, **settings))
+                injected_replay.seek(injected_fork.end_position)
+                assert read_u64(injected_replay.emulator, ui_address) == FORKED_UI_VALUE
+                injected_replay.seek(injected_fork.start_position)
+                injected_replay.run_to(fork_ui_writes[-1].position)
+                assert read_u64(injected_replay.emulator, ui_address) == FORKED_UI_VALUE
+                del injected_replay
             try:
                 ttd.Replay(ui_recorded, sogen.windows.create_application(sample, backend=sogen.Backend.unicorn,
                                                                          use_relative_time=True, headless=True,

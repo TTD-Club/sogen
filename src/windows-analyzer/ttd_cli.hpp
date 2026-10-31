@@ -88,6 +88,8 @@ namespace sogen::ttd
 
     std::optional<int> run_offline(const cli_options& options);
 
+    // Whether the emulator should load hive files: not for replaying a trace that carries its hives.
+    bool needs_hive_files(const cli_options& options);
     void prepare_replay(windows_emulator& win_emu, const cli_options& options);
     replay_result replay(windows_emulator& win_emu, const cli_options& options);
     void record(windows_emulator& win_emu, const cli_options& options, const std::function<bool()>& interrupted);

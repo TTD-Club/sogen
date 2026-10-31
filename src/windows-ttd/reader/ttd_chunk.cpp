@@ -1604,6 +1604,72 @@ namespace sogen::ttd
         return offsets;
     }
 
+    std::vector<std::byte> encode_registry_hives(const std::span<const recorded_hive_file> hives)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, hives.size());
+        for (const auto& hive : hives)
+        {
+            put_varint(raw, hive.name.size());
+            const auto name = std::as_bytes(std::span(hive.name));
+            raw.insert(raw.end(), name.begin(), name.end());
+            put_varint(raw, hive.size);
+            put_varint(raw, hive.ranges.size());
+            uint64_t end = 0;
+            for (const auto& [offset, bytes] : hive.ranges)
+            {
+                put_varint(raw, offset - end);
+                put_varint(raw, bytes.size());
+                raw.insert(raw.end(), bytes.begin(), bytes.end());
+                end = offset + bytes.size();
+            }
+        }
+        return compress_table(raw, "registry hives");
+    }
+
+    std::vector<recorded_hive_file> decode_registry_hives(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto invalid = [] { return std::runtime_error("Invalid TTD registry hives"); };
+        const auto count = reader.varint();
+        if (count > raw.size())
+        {
+            throw invalid();
+        }
+        std::vector<recorded_hive_file> hives(static_cast<size_t>(count));
+        for (auto& hive : hives)
+        {
+            const auto name = reader.bytes(reader.varint());
+            hive.name.assign(reinterpret_cast<const char*>(name.data()), name.size());
+            hive.size = reader.varint();
+            const auto ranges = reader.varint();
+            if (ranges > raw.size())
+            {
+                throw invalid();
+            }
+            uint64_t end = 0;
+            for (uint64_t i = 0; i < ranges; ++i)
+            {
+                const auto gap = reader.varint();
+                const auto length = reader.varint();
+                // Ranges ascend without touching (only the first may start at the previous end, 0) and lie in the file.
+                if ((i && !gap) || gap > hive.size - end || !length || length > hive.size - end - gap)
+                {
+                    throw invalid();
+                }
+                const auto bytes = reader.bytes(length);
+                hive.ranges.emplace_back(end + gap, std::vector<std::byte>(bytes.begin(), bytes.end()));
+                end += gap + length;
+            }
+        }
+        if (!reader.done())
+        {
+            throw invalid();
+        }
+        return hives;
+    }
+
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)
     {
         std::vector<std::byte> filtered(data.begin(), data.end());

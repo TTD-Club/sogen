@@ -633,7 +633,13 @@ namespace sogen::py
                     "Bytes of memory the keyframes of seeks may use; the least recently used are dropped beyond it")
                 .def_prop_ro("keyframe_count", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).size(); })
                 .def_prop_ro("keyframe_memory", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).memory_usage(); })
-                .def_prop_ro("instruction_count", [](const ttd_trace& self) { return self.native().metadata().instruction_count; })
+                .def_prop_ro(
+                    "instruction_count", [](const ttd_trace& self) { return self.native().metadata().instruction_count; },
+                    "Position of the last recorded instruction; positions run from start_position + 1 to it, so for a fork "
+                    "it is not the number of instructions the trace holds (that is instruction_count - start_position)")
+                .def_prop_ro(
+                    "end_position", [](const ttd_trace& self) { return self.native().metadata().instruction_count; },
+                    "Position of the last recorded instruction, the last position a seek reaches; the same as instruction_count")
                 .def_prop_ro("event_count", [](const ttd_trace& self) { return self.native().metadata().event_count; })
                 .def_prop_ro("access_mask", [](const ttd_trace& self) { return static_cast<access_kind>(self.native().access_mask()); })
                 .def_prop_ro(
@@ -800,6 +806,10 @@ namespace sogen::py
                 .def_prop_ro(
                     "has_checkpoint_memory", [](const ttd_trace& self) { return self.native().has_checkpoint_memory(); },
                     "Whether memory_at takes bytes no access shows from checkpoints")
+                .def_prop_ro(
+                    "has_registry_hives", [](const ttd_trace& self) { return self.native().has_registry_hives(); },
+                    "Whether the trace holds what the recording read of its registry hives: replays then need no hive files "
+                    "(create_emulator(..., load_registry=False))")
                 .def_prop_rw(
                     "checkpoint_cache_size", [](const ttd_trace& self) { return self.native().checkpoint_cache_size(); },
                     [](const ttd_trace& self, const size_t count) { self.native().set_checkpoint_cache_size(count); },
@@ -954,6 +964,19 @@ namespace sogen::py
                   "The format version of a Sogen TTD trace file (read from its first 8 bytes), or None if it is not one");
             m.def("is_supported_trace_version", &ttd::is_supported_trace_version, nb::arg("version"),
                   "Whether this build reads traces of that format version");
+            m.def(
+                "environment_differences",
+                [](const ttd_trace& recorded, const nb::kwargs& kwargs) {
+                    return ttd::environment_differences(recorded.native(), make_emulator_settings(kwargs));
+                },
+                nb::arg("trace"), nb::arg("kwargs"),
+                "Before building an emulator: the recorded inputs outside the checkpoints (emulation_root, registry, "
+                "system_dlls, build) that an emulator with these keyword arguments (as for create_emulator) would read "
+                "differently. Replay.manifest_differences is the same check after a seek.");
+            m.def("registry_fingerprint", &ttd::registry_fingerprint, nb::arg("hive_directory"),
+                  "The manifest's \"registry\" value for a folder of hives; compare it with Trace.manifest[\"registry\"]");
+            m.def("system_dll_fingerprint", &ttd::system_dll_fingerprint, nb::arg("system32"),
+                  "The manifest's \"system_dlls\" value for a System32 folder on this machine");
         }
 
         void register_replay(nb::module_& m)

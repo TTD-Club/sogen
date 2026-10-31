@@ -253,25 +253,6 @@ namespace sogen::py
             return network::parse_network_mode(nb::cast<std::string>(value));
         }
 
-        emulator_settings make_emulator_settings(const nb::kwargs& kwargs)
-        {
-            emulator_settings settings{};
-            settings.disable_logging = get_kwarg<bool>(kwargs, "disable_logging", false);
-            settings.use_relative_time = get_kwarg<bool>(kwargs, "use_relative_time", false);
-            settings.emulation_root = get_kwarg<std::filesystem::path>(kwargs, "emulation_root", {});
-            settings.registry_directory =
-                get_kwarg<std::filesystem::path>(kwargs, "registry_directory", std::filesystem::path{"./registry"});
-            settings.root_mode =
-                parse_python_filesystem_mode(get_kwarg<std::string>(kwargs, "root_mode", std::string(to_string(default_root_mode))));
-            parse_path_mappings(kwargs.contains("path_mappings") ? kwargs["path_mappings"] : nb::none(), settings.mounts);
-            parse_mounts(kwargs.contains("mounts") ? kwargs["mounts"] : nb::none(), settings.mounts);
-            settings.port_mappings = parse_port_mappings(kwargs.contains("port_mappings") ? kwargs["port_mappings"] : nb::none());
-            settings.fake_env.number_of_processors = get_kwarg<uint32_t>(kwargs, "number_of_processors", 4);
-            settings.fake_env.nt_product_type = static_cast<uint8_t>(get_kwarg<uint32_t>(kwargs, "nt_product_type", 1));
-            settings.network = get_network_mode(kwargs);
-            return settings;
-        }
-
         application_settings make_application_settings(const nb::object& application, const nb::object& args, const nb::kwargs& kwargs)
         {
             application_settings settings{};
@@ -406,6 +387,25 @@ namespace sogen::py
             }
             return interfaces;
         }
+    }
+
+    emulator_settings make_emulator_settings(const nb::kwargs& kwargs)
+    {
+        emulator_settings settings{};
+        settings.disable_logging = get_kwarg<bool>(kwargs, "disable_logging", false);
+        settings.use_relative_time = get_kwarg<bool>(kwargs, "use_relative_time", false);
+        settings.emulation_root = get_kwarg<std::filesystem::path>(kwargs, "emulation_root", {});
+        settings.registry_directory = get_kwarg<std::filesystem::path>(kwargs, "registry_directory", std::filesystem::path{"./registry"});
+        settings.load_registry = get_kwarg<bool>(kwargs, "load_registry", true);
+        settings.root_mode =
+            parse_python_filesystem_mode(get_kwarg<std::string>(kwargs, "root_mode", std::string(to_string(default_root_mode))));
+        parse_path_mappings(kwargs.contains("path_mappings") ? kwargs["path_mappings"] : nb::none(), settings.mounts);
+        parse_mounts(kwargs.contains("mounts") ? kwargs["mounts"] : nb::none(), settings.mounts);
+        settings.port_mappings = parse_port_mappings(kwargs.contains("port_mappings") ? kwargs["port_mappings"] : nb::none());
+        settings.fake_env.number_of_processors = get_kwarg<uint32_t>(kwargs, "number_of_processors", 4);
+        settings.fake_env.nt_product_type = static_cast<uint8_t>(get_kwarg<uint32_t>(kwargs, "nt_product_type", 1));
+        settings.network = get_network_mode(kwargs);
+        return settings;
     }
 
     std::unique_ptr<windows_emulator> create_empty_emulator(const nb::kwargs& kwargs)

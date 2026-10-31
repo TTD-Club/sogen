@@ -126,7 +126,9 @@ with ttd.Trace("sample.sogttd") as trace:
 relative clock, or a live UI whose events cannot be recorded; `sogen.windows.create_application(..., headless=True)`
 gives a headless one). `Trace.ui_inputs` lists the window events a recording logged;
 `ttd.inject_ui_event(emu, window, message, wparam, lparam)` delivers one as if the host window produced it, once that
-window exists (scripted input; a recording logs it like live input). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
+window exists (scripted input; a recording logs it like live input). Events injected after a seek and before
+`ttd.record` reach the fork at its first pump: they are logged at the fork's start position, after its initial
+checkpoint, and replays deliver them from there. An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
 also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_python_test.py` covers queries,
 the manifest, replay of a CLI trace, a fork and a recorded fork (replayed in Python and the CLI), divergence and
 CPUID-mismatch errors, the replay scans (also on a fork), the syscall, module, and thread lists, a replay after an
@@ -460,7 +462,14 @@ found through the section table (24-byte entries `type, offset, size`):
   seek refuses a trace with another `backend` or `cpuid`. The emulation root,
   hives, system DLLs, and build live outside the checkpoints and are read
   again by a replay, so a divergence message lists those that differ
-  (`Replay.manifest_differences()` in Python).
+  (`Replay.manifest_differences()` in Python). `environment_differences`
+  (`ttd.environment_differences(trace, **settings)`) checks the same before
+  an emulator exists, and `registry_fingerprint` / `system_dll_fingerprint`
+  (also in `sogen.ttd`) compute the two values for a folder. For traces with
+  the registry hives section, the hive files do not matter (`registry` never
+  differs). `SECURITY` and
+  `SAM` are optional: the emulator does not read them, and a registry
+  without them (no password hashes or LSA secrets) records and replays.
 
 - UI inputs (type 7, size = entry count; absent in older traces): 56-byte
   entries `checkpoint, event_number, step, window, message (uint32), reserved
@@ -587,6 +596,24 @@ found through the section table (24-byte entries `type, offset, size`):
   layout is thereby read outside the emulator; `test/ttd_reader_test.py`
   compares `memory_at` with a replayed emulator's memory, so a change to it
   fails the test.
+- Registry hives (type 19, size = compressed bytes; absent in older traces):
+  what the recording read of each hive file, from the emulator's start, so
+  that replays need no hive files. A zstd frame: the hive count as a varint,
+  then per hive its file name (`SYSTEM`, ...) as a varint length and UTF-8
+  bytes, the file size and the range count as varints, and per range the gap
+  from the end of the previous range, the length, and the bytes. The hive
+  parser reads its files only through `hive_file`, which keeps every range
+  read; a replay from any checkpoint reads a subset of them, since resolving a
+  key reads the same cells whether or not this run had them cached. Seeks and
+  replays serve the registry from the section (`ttd::use_recorded_registry`),
+  with the hive files only for data beyond it and only if their fingerprint is
+  the manifest's `registry`; otherwise reading beyond it throws (the replay has
+  then left the recording). An emulator for such a trace can be built with
+  `load_registry = false` (Python `load_registry=False`); the analyzer loads
+  no hive files to replay one. A fork stores the parts it was given and what
+  it read. Size: ttd-step-sample 87 KB (1% of the trace), test-sample 208 KB
+  (0.5%). SAM and SECURITY contribute only their signature and root key
+  block (340 bytes each) unless the guest opens them. `Trace.has_registry_hives`.
 
 Unknown section types are ignored, so sections can be added without a new
 version. The library reads versions 1-4 and 7-9 (`ttd::is_supported_trace_version`;
@@ -721,7 +748,8 @@ seeking to `N-1` reports RIP at the writing instruction.
 `src/samples/ttd-step-sample`.
 
 Positions are contiguous: every position from 1 to `instruction_count` has
-exactly one execute event (when execute tracing is on), which
+exactly one execute event (for a recorded fork, from `start_position + 1`; `instruction_count`, also named
+`end_position`, is the trace's last position, not its length) when execute tracing is on, which
 `ttd_step_test.py` checks. The counter only counts instructions that start
 executing. A thread preempted at the end of its time slice is stopped before
 the instruction runs and that instruction is counted when the thread resumes,

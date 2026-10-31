@@ -34,21 +34,6 @@ namespace sogen
             return path == "." ? std::filesystem::path{} : path;
         }
 
-        void register_hive(registry_manager::hive_map& hives, const utils::path_key& key, const std::filesystem::path& file)
-        {
-            hives[key] = std::make_unique<hive_parser>(file);
-        }
-
-        void register_optional_hive(registry_manager::hive_map& hives, const utils::path_key& key, const std::filesystem::path& file)
-        {
-            if (!std::filesystem::is_regular_file(file))
-            {
-                return;
-            }
-
-            hives[key] = std::make_unique<hive_parser>(file);
-        }
-
         std::pair<utils::path_key, bool> perform_path_substitution(const std::map<utils::path_key, utils::path_key>& path_mapping,
                                                                    utils::path_key path)
         {
@@ -77,29 +62,74 @@ namespace sogen
     registry_manager::registry_manager(const std::filesystem::path& hive_path)
         : hive_path_(std::filesystem::absolute(hive_path))
     {
-        this->setup();
+        this->setup(nullptr);
     }
 
-    void registry_manager::setup()
+    void registry_manager::use_recorded_hives(const recorded_hives& hives, std::string identity, const bool fall_back_to_files)
+    {
+        if (!fall_back_to_files)
+        {
+            this->hive_path_.clear();
+        }
+        this->setup(&hives);
+        this->hive_identity_ = std::move(identity);
+    }
+
+    recorded_hives registry_manager::read_hives()
+    {
+        recorded_hives result{};
+        for (const auto& [name, key] : this->hive_files_)
+        {
+            auto& file = this->hives_.at(key)->get_file();
+            result.emplace(name, recorded_hive{.size = file.size(), .contents = file.known_ranges()});
+        }
+        return result;
+    }
+
+    void registry_manager::setup(const recorded_hives* recorded)
     {
         this->path_mapping_.clear();
-        this->overlay_values_.clear();
         this->hives_.clear();
+        this->hive_files_.clear();
+        this->hive_identity_.clear();
 
         const std::filesystem::path root = R"(\registry)";
         const std::filesystem::path machine = root / "machine";
         const std::filesystem::path user = root / "user";
 
-        register_hive(this->hives_, machine / "system", this->hive_path_ / "SYSTEM");
-        register_hive(this->hives_, machine / "software", this->hive_path_ / "SOFTWARE");
-        register_optional_hive(this->hives_, machine / "hardware", this->hive_path_ / "HARDWARE");
+        // From the hive file, or from the parts of it a recording read (none if the recording had no such file), with
+        // the file beyond them if there is a hive path.
+        const auto add_hive = [&](const std::filesystem::path& key, const std::string& file, const bool optional) {
+            if (recorded)
+            {
+                const auto hive = recorded->find(file);
+                if (hive == recorded->end())
+                {
+                    return;
+                }
+                const auto fallback = this->hive_path_.empty() ? std::filesystem::path{} : this->hive_path_ / file;
+                this->hives_[key] = std::make_unique<hive_parser>(hive->second.size, hive->second.contents, fallback);
+            }
+            else
+            {
+                if (optional && !std::filesystem::is_regular_file(this->hive_path_ / file))
+                {
+                    return;
+                }
+                this->hives_[key] = std::make_unique<hive_parser>(this->hive_path_ / file);
+            }
+            this->hive_files_.emplace(file, key);
+        };
 
-        // SYSTEM-only hives that applications cannot open. Newer Windows builds refuse REG SAVE for them,
-        // even from SYSTEM, so a root grabbed there has none.
-        register_optional_hive(this->hives_, machine / "security", this->hive_path_ / "SECURITY");
-        register_optional_hive(this->hives_, machine / "sam", this->hive_path_ / "SAM");
+        // The emulator itself reads neither SECURITY nor SAM; they hold the local password hashes and LSA secrets, so a
+        // registry meant to be shared can leave them out (guests that open them then find no such key).
+        add_hive(machine / "system", "SYSTEM", false);
+        add_hive(machine / "security", "SECURITY", true);
+        add_hive(machine / "sam", "SAM", true);
+        add_hive(machine / "software", "SOFTWARE", false);
+        add_hive(machine / "hardware", "HARDWARE", true);
 
-        register_hive(this->hives_, root / "user", this->hive_path_ / "NTUSER.DAT");
+        add_hive(root / "user", "NTUSER.DAT", false);
 
         this->add_path_mapping(user / registry_utils::get_user_sid_string(*this), user);
         this->add_path_mapping(user / ".Default", user);
@@ -457,18 +487,18 @@ namespace sogen
         }
 
         hive_key* backing_key = nullptr;
-        std::ifstream* hive_file = nullptr;
+        hive_file* backing_file = nullptr;
         size_t backing_count = 0;
         if (const auto iterator = this->hives_.find(key.hive); iterator != this->hives_.end())
         {
             backing_key = iterator->second->get_sub_key(key.path.get());
-            hive_file = &iterator->second->get_file();
+            backing_file = &iterator->second->get_file();
             if (backing_key)
             {
-                backing_count = backing_key->get_value_count(*hive_file);
+                backing_count = backing_key->get_value_count(*backing_file);
                 if (index < backing_count)
                 {
-                    const auto* entry = backing_key->get_value(*hive_file, index);
+                    const auto* entry = backing_key->get_value(*backing_file, index);
                     return entry ? this->get_value(key, entry->name) : std::nullopt;
                 }
             }
@@ -483,7 +513,7 @@ namespace sogen
         auto overlay_index = index - backing_count;
         for (const auto& [name, value] : overlay_entry->second.values)
         {
-            if (backing_key && backing_key->get_value(*hive_file, name))
+            if (backing_key && backing_key->get_value(*backing_file, name))
             {
                 continue;
             }
@@ -511,15 +541,15 @@ namespace sogen
         }
 
         hive_key* backing_key = nullptr;
-        std::ifstream* hive_file = nullptr;
+        hive_file* backing_file = nullptr;
         size_t result = 0;
         if (const auto iterator = this->hives_.find(key.hive); iterator != this->hives_.end())
         {
             backing_key = iterator->second->get_sub_key(key.path.get());
-            hive_file = &iterator->second->get_file();
+            backing_file = &iterator->second->get_file();
             if (backing_key)
             {
-                result = backing_key->get_value_count(*hive_file);
+                result = backing_key->get_value_count(*backing_file);
             }
         }
 
@@ -531,7 +561,7 @@ namespace sogen
 
         for (const auto& [name, _] : overlay_entry->second.values)
         {
-            if (!backing_key || !backing_key->get_value(*hive_file, name))
+            if (!backing_key || !backing_key->get_value(*backing_file, name))
             {
                 ++result;
             }
@@ -721,18 +751,18 @@ namespace sogen
         }
 
         hive_key* backing_key = nullptr;
-        std::ifstream* hive_file = nullptr;
+        hive_file* backing_file = nullptr;
         size_t backing_count = 0;
         if (const auto iterator = this->hives_.find(key.hive); iterator != this->hives_.end())
         {
             backing_key = iterator->second->get_sub_key(key.path.get());
-            hive_file = &iterator->second->get_file();
+            backing_file = &iterator->second->get_file();
             if (backing_key)
             {
-                backing_count = backing_key->get_sub_key_count(*hive_file);
+                backing_count = backing_key->get_sub_key_count(*backing_file);
                 if (index < backing_count)
                 {
-                    if (const auto* name = backing_key->get_sub_key_name(*hive_file, index))
+                    if (const auto* name = backing_key->get_sub_key_name(*backing_file, index))
                     {
                         return *name;
                     }
@@ -750,7 +780,7 @@ namespace sogen
         auto overlay_index = index - backing_count;
         for (const auto& [name, _] : overlay_entry->second.sub_keys)
         {
-            if (backing_key && backing_key->get_sub_key(*hive_file, name))
+            if (backing_key && backing_key->get_sub_key(*backing_file, name))
             {
                 continue;
             }
@@ -774,15 +804,15 @@ namespace sogen
         }
 
         hive_key* backing_key = nullptr;
-        std::ifstream* hive_file = nullptr;
+        hive_file* backing_file = nullptr;
         size_t result = 0;
         if (const auto iterator = this->hives_.find(key.hive); iterator != this->hives_.end())
         {
             backing_key = iterator->second->get_sub_key(key.path.get());
-            hive_file = &iterator->second->get_file();
+            backing_file = &iterator->second->get_file();
             if (backing_key)
             {
-                result = backing_key->get_sub_key_count(*hive_file);
+                result = backing_key->get_sub_key_count(*backing_file);
             }
         }
 
@@ -794,7 +824,7 @@ namespace sogen
 
         for (const auto& [name, _] : overlay_entry->second.sub_keys)
         {
-            if (!backing_key || !backing_key->get_sub_key(*hive_file, name))
+            if (!backing_key || !backing_key->get_sub_key(*backing_file, name))
             {
                 ++result;
             }

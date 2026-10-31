@@ -40,6 +40,7 @@ namespace sogen
     class linux_memory_manager;
     class memory_manager;
     class windows_emulator;
+    struct emulator_settings;
     enum class memory_region_kind : uint8_t;
     enum class stop_reason : uint8_t;
     struct linux_process_context;
@@ -114,6 +115,8 @@ namespace sogen::py
     nb::bytes serialize_state_bytes(const windows_emulator& emulator);
     void deserialize_state_bytes(windows_emulator& emulator, const nb::bytes& buffer);
 
+    // The emulator settings the keyword arguments of sogen.windows.create_application select.
+    emulator_settings make_emulator_settings(const nb::kwargs& kwargs);
     std::unique_ptr<windows_emulator> create_empty_emulator(const nb::kwargs& kwargs);
     std::unique_ptr<windows_emulator> create_application_emulator(const nb::object& application, const nb::object& args,
                                                                   const nb::kwargs& kwargs);

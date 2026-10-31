@@ -276,6 +276,12 @@ namespace sogen::ttd
     std::vector<std::byte> encode_checkpoint_memory_offsets(std::span<const uint64_t> offsets);
     std::vector<uint64_t> decode_checkpoint_memory_offsets(std::span<const std::byte> compressed);
 
+    // The registry hives section is a zstd frame: the hive count as a varint, then per hive its name as a varint length
+    // and UTF-8 bytes, the file size and the range count as varints, and per range the gap from the end of the previous
+    // range (from 0 for the first), the length, and the bytes.
+    std::vector<std::byte> encode_registry_hives(std::span<const recorded_hive_file> hives);
+    std::vector<recorded_hive_file> decode_registry_hives(std::span<const std::byte> compressed);
+
     // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
     // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.
     // The register snapshots section is a zstd frame of varints: the entry count, then per entry the step and
