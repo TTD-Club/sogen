@@ -236,12 +236,24 @@ namespace sogen
             {
                 static_assert(std::is_trivially_copyable_v<T>);
                 std::array<std::byte, sizeof(T)> bytes{};
-                const auto* base = reinterpret_cast<const std::byte*>(&object);
-                const auto copy_member = [&](const auto& member) {
-                    const auto* start = reinterpret_cast<const std::byte*>(&member);
-                    std::memcpy(bytes.data() + (start - base), start, sizeof(member));
-                };
-                (copy_member(object.*members), ...);
+                copy_members(object, bytes.data(), members...);
+                this->write(bytes.data(), bytes.size());
+            }
+
+            // Writes `vec` as write_vector() writes a vector of a trivially copyable type, but with every byte outside
+            // `members` zero, like write_zero_padded.
+            template <typename T, typename... Members>
+            void write_zero_padded_vector(const std::vector<T>& vec, Members T::*... members)
+            {
+                static_assert(std::is_trivially_copyable_v<T>);
+                this->write(static_cast<uint64_t>(vec.size()));
+
+                std::vector<std::byte> bytes(vec.size() * sizeof(T));
+                for (size_t i = 0; i < vec.size(); ++i)
+                {
+                    copy_members(vec[i], bytes.data() + (i * sizeof(T)), members...);
+                }
+
                 this->write(bytes.data(), bytes.size());
             }
 
@@ -269,6 +281,9 @@ namespace sogen
 
                 if constexpr (detail::is_plain_v<std::remove_cv_t<T>>)
                 {
+                    static_assert(std::has_unique_object_representations_v<std::remove_cv_t<T>> ||
+                                      std::is_floating_point_v<std::remove_cv_t<T>> || std::is_same_v<std::remove_cv_t<T>, bool>,
+                                  "Element type may have padding: write the vector with write_zero_padded_vector");
                     this->write(vec.data(), vec.size_bytes());
                 }
                 else
@@ -428,6 +443,17 @@ namespace sogen
             std::vector<std::byte> buffer_{};
             std::optional<size_t> break_offset_{};
             std::unordered_map<const void*, uint64_t> shared_objects_{};
+
+            template <typename T, typename... Members>
+            static void copy_members(const T& object, std::byte* destination, Members T::*... members)
+            {
+                const auto* base = reinterpret_cast<const std::byte*>(&object);
+                const auto copy_member = [&](const auto& member) {
+                    const auto* start = reinterpret_cast<const std::byte*>(&member);
+                    std::memcpy(destination + (start - base), start, sizeof(member));
+                };
+                (copy_member(object.*members), ...);
+            }
 
             void begin_entry(const size_t length)
             {
