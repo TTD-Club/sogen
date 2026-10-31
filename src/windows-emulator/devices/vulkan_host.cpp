@@ -1452,7 +1452,12 @@ namespace sogen
                 buffer.write_vector(this->description.attachments);
                 buffer.write_vector(this->description.subpasses);
                 buffer.write_vector(this->description.references);
-                buffer.write_vector(this->description.dependencies);
+                using dependency = vulkan_host::render_pass_dependency;
+                buffer.write_zero_padded_vector(this->description.dependencies, &dependency::src_subpass, &dependency::dst_subpass,
+                                                &dependency::src_stage_mask, &dependency::dst_stage_mask, &dependency::src_access_mask,
+                                                &dependency::dst_access_mask, &dependency::flags, &dependency::view_offset,
+                                                &dependency::has_memory_barrier2, &dependency::src_stage_mask2,
+                                                &dependency::dst_stage_mask2, &dependency::src_access_mask2, &dependency::dst_access_mask2);
                 buffer.write_vector(this->description.preserves);
                 buffer.write_vector(this->description.correlated_view_masks);
             }

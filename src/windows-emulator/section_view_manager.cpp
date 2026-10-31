@@ -136,7 +136,8 @@ namespace sogen
         buffer.write_map(this->views_);
         for (const auto address : this->views_ | std::views::keys)
         {
-            buffer.write_vector(memory.get_committed_regions(address));
+            using region = basic_memory_region<nt_memory_permission>;
+            buffer.write_zero_padded_vector(memory.get_committed_regions(address), &region::start, &region::length, &region::permissions);
         }
     }
 
