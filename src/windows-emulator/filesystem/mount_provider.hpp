@@ -7,6 +7,7 @@ namespace sogen
 {
 
     class file_system;
+    class layered_provider;
 
     struct directory_entry
     {
@@ -43,6 +44,7 @@ namespace sogen
 
       private:
         friend class file_system;
+        friend class layered_provider;
 
         virtual std::optional<std::filesystem::path> get_host_path(const windows_path& path) const = 0;
     };
