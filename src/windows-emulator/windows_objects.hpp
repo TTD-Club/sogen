@@ -881,7 +881,8 @@ namespace sogen
             buffer.write(this->renamed_to);
             buffer.write(this->host_path.u16string());
             buffer.write(this->handle);
-            buffer.write_vector(this->change_watches);
+            buffer.write_zero_padded_vector(this->change_watches, &directory_change_watch::thread_id, &directory_change_watch::event,
+                                            &directory_change_watch::io_status_block);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
