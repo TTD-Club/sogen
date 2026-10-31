@@ -446,6 +446,10 @@ namespace sogen::ttd
         access_event event_at(uint64_t number);
         size_t read_events(uint64_t first_number, std::span<access_event> output);
         uint64_t first_event_after(uint64_t step);
+        // The number of the first event after the state a replay stands in at `step`. The events recorded at a
+        // position come before that state, except at a checkpoint: window input delivered at the first pump after it
+        // (logged with its index) is recorded at its position too.
+        uint64_t first_event_after_state(uint64_t step);
         uint64_t access_mask();
         std::vector<std::byte> access_data(const access_event& event);
         std::optional<uint64_t> latest_write_to_byte(uint64_t page, uint64_t address, uint64_t first_number, uint64_t last_number);

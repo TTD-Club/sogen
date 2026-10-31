@@ -126,7 +126,9 @@ with ttd.Trace("sample.sogttd") as trace:
 relative clock, or a live UI whose events cannot be recorded; `sogen.windows.create_application(..., headless=True)`
 gives a headless one). `Trace.ui_inputs` lists the window events a recording logged;
 `ttd.inject_ui_event(emu, window, message, wparam, lparam)` delivers one as if the host window produced it, once that
-window exists (scripted input; a recording logs it like live input). An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
+window exists (scripted input; a recording logs it like live input). Events injected after a seek and before
+`ttd.record` reach the fork at its first pump: they are logged at the fork's start position, after its initial
+checkpoint, and replays deliver them from there. An emulator made with `sogen.windows.create_application` instead of `ttd.create_emulator`
 also lacks the CPUID overrides and would diverge at the first CPUID. `test/ttd_python_test.py` covers queries,
 the manifest, replay of a CLI trace, a fork and a recorded fork (replayed in Python and the CLI), divergence and
 CPUID-mismatch errors, the replay scans (also on a fork), the syscall, module, and thread lists, a replay after an
@@ -746,7 +748,8 @@ seeking to `N-1` reports RIP at the writing instruction.
 `src/samples/ttd-step-sample`.
 
 Positions are contiguous: every position from 1 to `instruction_count` has
-exactly one execute event (when execute tracing is on), which
+exactly one execute event (for a recorded fork, from `start_position + 1`; `instruction_count`, also named
+`end_position`, is the trace's last position, not its length) when execute tracing is on, which
 `ttd_step_test.py` checks. The counter only counts instructions that start
 executing. A thread preempted at the end of its time slice is stopped before
 the instruction runs and that instruction is counted when the thread resumes,

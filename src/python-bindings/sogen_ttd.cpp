@@ -633,7 +633,13 @@ namespace sogen::py
                     "Bytes of memory the keyframes of seeks may use; the least recently used are dropped beyond it")
                 .def_prop_ro("keyframe_count", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).size(); })
                 .def_prop_ro("keyframe_memory", [](const ttd_trace& self) { return sogen::ttd::keyframes(self.native()).memory_usage(); })
-                .def_prop_ro("instruction_count", [](const ttd_trace& self) { return self.native().metadata().instruction_count; })
+                .def_prop_ro(
+                    "instruction_count", [](const ttd_trace& self) { return self.native().metadata().instruction_count; },
+                    "Position of the last recorded instruction; positions run from start_position + 1 to it, so for a fork "
+                    "it is not the number of instructions the trace holds (that is instruction_count - start_position)")
+                .def_prop_ro(
+                    "end_position", [](const ttd_trace& self) { return self.native().metadata().instruction_count; },
+                    "Position of the last recorded instruction, the last position a seek reaches; the same as instruction_count")
                 .def_prop_ro("event_count", [](const ttd_trace& self) { return self.native().metadata().event_count; })
                 .def_prop_ro("access_mask", [](const ttd_trace& self) { return static_cast<access_kind>(self.native().access_mask()); })
                 .def_prop_ro(

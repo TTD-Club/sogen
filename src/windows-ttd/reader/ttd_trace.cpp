@@ -1300,6 +1300,23 @@ namespace sogen::ttd
         return low;
     }
 
+    uint64_t trace::first_event_after_state(const uint64_t step)
+    {
+        const auto after = first_event_after(step);
+        const auto checkpoint = std::ranges::lower_bound(checkpoints_, step, {}, &checkpoint_entry::step);
+        if (checkpoint == checkpoints_.end() || checkpoint->step != step)
+        {
+            return after;
+        }
+        const auto index = static_cast<uint64_t>(checkpoint - checkpoints_.begin());
+        const auto input = std::ranges::lower_bound(ui_inputs_, index, {}, &ui_input_entry::checkpoint);
+        if (input == ui_inputs_.end() || input->checkpoint != index)
+        {
+            return after;
+        }
+        return std::min(after, input->event_number);
+    }
+
     uint64_t trace::first_event_at_or_after(const uint64_t step)
     {
         return step ? first_event_after(step - 1) : 0;
@@ -1697,7 +1714,7 @@ namespace sogen::ttd
         const auto checkpoint_step = checkpoint_step_for(position);
         // As in fill_from_checkpoint: the checkpoint's own events came before it, a mapping change numbered like an
         // event came before that event, and one numbered like the first event after the position counts as before it.
-        const auto after = first_event_after(checkpoint_step);
+        const auto after = first_event_after_state(checkpoint_step);
         const auto boundary = first_event_after(position);
 
         // Per byte: whether it is settled, whether it was remapped since the checkpoint and not written after, whether
@@ -2127,7 +2144,7 @@ namespace sogen::ttd
         const auto memory = checkpoint_memory_at(checkpoint_index(checkpoint_step));
         // The events of the checkpoint's instructions came before it; a mapping change numbered like the first event
         // after it may have come either side, so it counts as after.
-        const auto after = first_event_after(checkpoint_step);
+        const auto after = first_event_after_state(checkpoint_step);
         std::vector<std::pair<uint64_t, uint64_t>> remapped_ranges{};
         for (auto change = std::ranges::lower_bound(mapping_changes_, after, {}, &mapping_change::event_number);
              change != mapping_changes_.end() && change->event_number <= boundary; ++change)
@@ -2273,8 +2290,8 @@ namespace sogen::ttd
         const auto end = std::min(first.metadata().instruction_count, second.metadata().instruction_count);
         const auto instruction_bytes = first.has_instruction_bytes() && second.has_instruction_bytes();
         const auto access_data = first.has_access_data() && second.has_access_data();
-        event_reader first_reader(first, first.first_event_after(start));
-        event_reader second_reader(second, second.first_event_after(start));
+        event_reader first_reader(first, first.first_event_after_state(start));
+        event_reader second_reader(second, second.first_event_after_state(start));
         const auto next = [&](event_reader& reader) {
             auto event = reader.next(kinds);
             return event && event->step <= end ? event : std::nullopt;

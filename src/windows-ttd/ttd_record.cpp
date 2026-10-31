@@ -1113,7 +1113,7 @@ namespace sogen::ttd
     replay_verifier::replay_verifier(windows_emulator& emu, trace& recorded, const uint64_t from_step, const bool strict)
         : emu_(emu),
           trace_(recorded),
-          first_number_(recorded.first_event_after(from_step)),
+          first_number_(recorded.first_event_after_state(from_step)),
           reader_(recorded, first_number_),
           access_mask_(recorded.access_mask()),
           strict_(strict)
@@ -1535,7 +1535,7 @@ namespace sogen::ttd
             throw divergence_error(*error_);
         }
         const auto position = emu_.get_executed_instructions();
-        if (const auto missed = reader_.next(access_mask_); missed && missed->step <= position)
+        if (const auto missed = reader_.next(access_mask_); missed && reader_.last_number() < trace_.first_event_after_state(position))
         {
             std::ostringstream message;
             message << "TTD replay reached position " << std::hex << position << " without recorded event " << std::dec
