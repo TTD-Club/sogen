@@ -1017,6 +1017,24 @@ namespace sogen
                                                                                                      : STATUS_ACCESS_VIOLATION;
             }
 
+            case SystemVhdBootInformation: {
+                // SYSTEM_VHD_BOOT_INFORMATION followed by its strings; a system not booted from a VHD answers with an
+                // empty parent volume and an empty file path right after it.
+                struct system_vhd_boot_information
+                {
+                    BOOLEAN os_disk_is_vhd;
+                    ULONG os_vhd_file_path_offset;
+                    std::array<char16_t, 2> os_vhd_parent_volume;
+                    std::array<char16_t, 2> os_vhd_file_path;
+                };
+
+                static_assert(sizeof(system_vhd_boot_information) == 16);
+                return handle_query<system_vhd_boot_information>(
+                    c.emu, system_information, system_information_length, return_length, [&](system_vhd_boot_information& info) {
+                        info.os_vhd_file_path_offset = offsetof(system_vhd_boot_information, os_vhd_file_path);
+                    });
+            }
+
             case SystemBootEnvironmentInformation:
                 return handle_query<SYSTEM_BOOT_ENVIRONMENT_INFORMATION>(
                     c.emu, system_information, system_information_length, return_length, [&](SYSTEM_BOOT_ENVIRONMENT_INFORMATION& info) {
