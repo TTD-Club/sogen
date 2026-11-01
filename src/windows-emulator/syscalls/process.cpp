@@ -1,6 +1,7 @@
 #include "../std_include.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
+#include "../system_processes.hpp"
 #include "../devices/named_pipe.hpp"
 
 #include <utils/finally.hpp>
@@ -10,6 +11,113 @@ namespace sogen
 
     namespace syscalls
     {
+        namespace
+        {
+            constexpr ACCESS_MASK process_query_information = 0x0400;
+            constexpr ACCESS_MASK process_query_limited_information = 0x1000;
+            constexpr ACCESS_MASK maximum_allowed = 0x02000000;
+
+            // Processes of other accounts reject a standard user outright. The user's own processes grant only the
+            // query and wait rights: the emulator holds no memory or threads behind them to back any other right.
+            NTSTATUS check_system_process_access(const system_process& process, const ACCESS_MASK desired_access)
+            {
+                constexpr auto granted_access =
+                    process_query_information | process_query_limited_information | SYNCHRONIZE | maximum_allowed;
+                if (!process.owned_by_user || (desired_access & ~granted_access) != 0)
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS write_unicode_string_information(const syscall_context& c, const std::u16string_view value,
+                                                      const uint64_t process_information, const uint32_t process_information_length,
+                                                      const emulator_object<uint32_t> return_length)
+            {
+                using string_t = UNICODE_STRING<EmulatorTraits<Emu64>>;
+
+                const auto string_length = value.size() * sizeof(char16_t);
+                const auto buffer_length = value.empty() ? 0 : string_length + sizeof(char16_t);
+                const auto required_length = static_cast<uint32_t>(sizeof(string_t) + buffer_length);
+
+                if (return_length)
+                {
+                    return_length.write(required_length);
+                }
+
+                if (process_information_length < required_length)
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                const auto buffer = value.empty() ? 0 : process_information + sizeof(string_t);
+                if (buffer)
+                {
+                    const std::u16string terminated{value};
+                    c.emu.write_memory(buffer, terminated.c_str(), buffer_length);
+                }
+
+                emulator_object<string_t>{c.emu, process_information}.write({
+                    .Length = static_cast<USHORT>(string_length),
+                    .MaximumLength = static_cast<USHORT>(buffer_length),
+                    .Buffer = buffer,
+                });
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS query_system_process(const syscall_context& c, const system_process& process, const uint32_t info_class,
+                                          const uint64_t process_information, const uint32_t process_information_length,
+                                          const emulator_object<uint32_t> return_length)
+            {
+                const auto init_basic_info = [&](PROCESS_BASIC_INFORMATION64& basic_info) {
+                    basic_info = {};
+                    basic_info.ExitStatus = STATUS_PENDING;
+                    basic_info.BasePriority = process.base_priority;
+                    basic_info.UniqueProcessId = process.id;
+                    basic_info.InheritedFromUniqueProcessId = process.parent_id;
+                };
+
+                switch (info_class)
+                {
+                case ProcessBasicInformation:
+                    switch (process_information_length)
+                    {
+                    case sizeof(PROCESS_BASIC_INFORMATION64):
+                        return handle_query<PROCESS_BASIC_INFORMATION64>(c.emu, process_information, process_information_length,
+                                                                         return_length, init_basic_info);
+                    case sizeof(PROCESS_EXTENDED_BASIC_INFORMATION):
+                        return handle_query<PROCESS_EXTENDED_BASIC_INFORMATION>(c.emu, process_information, process_information_length,
+                                                                                return_length,
+                                                                                [&](PROCESS_EXTENDED_BASIC_INFORMATION& ext) {
+                                                                                    ext = {};
+                                                                                    ext.Size = sizeof(PROCESS_EXTENDED_BASIC_INFORMATION);
+                                                                                    init_basic_info(ext.BasicInfo);
+                                                                                });
+                    default:
+                        return STATUS_INFO_LENGTH_MISMATCH;
+                    }
+
+                case ProcessSessionInformation:
+                    return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
+                                               [&](ULONG& session_id) { session_id = process.session_id; });
+
+                case ProcessImageFileName: {
+                    const auto device_path =
+                        process.image_path.empty() ? std::u16string{} : windows_path{process.image_path}.to_device_path();
+                    return write_unicode_string_information(c, device_path, process_information, process_information_length, return_length);
+                }
+
+                case ProcessImageFileNameWin32:
+                    return write_unicode_string_information(c, process.image_path, process_information, process_information_length,
+                                                            return_length);
+
+                default:
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
+        }
+
         namespace
         {
             constexpr ULONG windows_cui_subsystem = 3;
@@ -448,6 +556,11 @@ namespace sogen
                 return STATUS_INVALID_INFO_CLASS;
             }
 
+            if (const auto* system = find_system_process(process_handle))
+            {
+                return query_system_process(c, *system, info_class, process_information, process_information_length, return_length);
+            }
+
             if (!c.proc.is_current_process_handle(process_handle))
             {
                 const auto* managed = c.proc.processes.get(process_handle);
@@ -743,6 +856,7 @@ namespace sogen
                         c.proc.kusd.access([](const KUSER_SHARED_DATA64& kusd) { return kusd.ActiveProcessorCount; });
                     basic_info.AffinityMask = processor_count >= 64 ? ~0ull : ((1ull << processor_count) - 1);
                     basic_info.UniqueProcessId = c.proc.process_id;
+                    basic_info.InheritedFromUniqueProcessId = guest_parent_process_id;
                 };
 
                 switch (process_information_length)
@@ -834,6 +948,10 @@ namespace sogen
 
                 return STATUS_SUCCESS;
             }
+
+            case ProcessSessionInformation:
+                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
+                                           [](ULONG& session_id) { session_id = interactive_session_id; });
 
             case ProcessImageFileName: {
                 const auto image_path = c.win_emu.mod_manager.executable->module_path.to_device_path();
@@ -1219,7 +1337,7 @@ namespace sogen
         }
 
         NTSTATUS handle_NtOpenProcess(const syscall_context& c, const emulator_object<handle> process_handle,
-                                      const ACCESS_MASK /*desired_access*/,
+                                      const ACCESS_MASK desired_access,
                                       const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> /*object_attributes*/,
                                       const emulator_object<CLIENT_ID64> client_id)
         {
@@ -1257,6 +1375,16 @@ namespace sogen
             {
                 process_handle.write(STEAM_PROCESS_HANDLE);
                 return STATUS_SUCCESS;
+            }
+
+            if (const auto* system = find_system_process(id.UniqueProcess); system && system->id != 0)
+            {
+                const auto status = check_system_process_access(*system, desired_access);
+                if (status == STATUS_SUCCESS)
+                {
+                    process_handle.write(make_system_process_handle(*system));
+                }
+                return status;
             }
 
             return STATUS_INVALID_CID;

@@ -1,6 +1,9 @@
 ﻿#include "../std_include.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
+#include "../system_processes.hpp"
+
+#include <unordered_set>
 
 namespace sogen
 {
@@ -366,28 +369,143 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        struct listed_process
+        {
+            uint64_t id{};
+            uint64_t parent_id{};
+            uint32_t session_id{};
+            int32_t base_priority{};
+            std::u16string image_name{};
+            std::vector<uint64_t> thread_ids{};
+        };
+
+        listed_process describe_guest_process(const syscall_context& c)
+        {
+            listed_process guest{
+                .id = c.proc.process_id,
+                .parent_id = guest_parent_process_id,
+                .session_id = interactive_session_id,
+                .base_priority = 8,
+                .image_name = u8_to_u16(c.win_emu.mod_manager.executable->name),
+            };
+
+            uint64_t active_thread_id{};
+            if (c.vcpu.active_thread && c.vcpu.active_thread->teb64)
+            {
+                c.vcpu.active_thread->teb64->access([&](const TEB64& teb) {
+                    guest.id = teb.ClientId.UniqueProcess;
+                    active_thread_id = teb.ClientId.UniqueThread;
+                });
+            }
+
+            for (const auto& thread : c.proc.threads | std::views::values)
+            {
+                if (thread.is_terminated() || !thread.teb64)
+                {
+                    continue;
+                }
+
+                thread.teb64->access([&](const TEB64& teb) { guest.thread_ids.push_back(teb.ClientId.UniqueThread); });
+            }
+
+            if (guest.thread_ids.empty())
+            {
+                guest.thread_ids.push_back(active_thread_id);
+            }
+
+            return guest;
+        }
+
+        std::vector<listed_process> collect_processes(const syscall_context& c)
+        {
+            auto guest = describe_guest_process(c);
+
+            std::unordered_set<uint64_t> taken_ids{guest.id};
+            for (const auto& process : c.proc.processes | std::views::values)
+            {
+                taken_ids.insert(process.id);
+            }
+
+            const auto processor_count = c.proc.kusd.access([](const KUSER_SHARED_DATA64& kusd) { return kusd.ActiveProcessorCount; });
+
+            std::vector<listed_process> processes{};
+            processes.reserve(system_processes.size() + 1);
+
+            auto next_thread_id = uint64_t{system_thread_id_base};
+            for (const auto& process : system_processes)
+            {
+                const auto is_idle = process.id == 0;
+                const auto thread_count = is_idle ? processor_count : process.thread_count;
+
+                listed_process entry{
+                    .id = process.id,
+                    .parent_id = process.parent_id,
+                    .session_id = process.session_id,
+                    .base_priority = process.base_priority,
+                    .image_name = std::u16string{process.image_name},
+                };
+
+                for (uint32_t i = 0; i < thread_count; ++i)
+                {
+                    entry.thread_ids.push_back(is_idle ? 0 : next_thread_id);
+                    next_thread_id += 4;
+                }
+
+                if (!is_idle && taken_ids.contains(process.id))
+                {
+                    continue;
+                }
+
+                processes.push_back(std::move(entry));
+            }
+
+            processes.push_back(std::move(guest));
+            return processes;
+        }
+
+        uint64_t image_name_buffer_size(const listed_process& process)
+        {
+            return process.image_name.empty() ? 0 : (process.image_name.size() + 1) * sizeof(char16_t);
+        }
+
+        UNICODE_STRING<EmulatorTraits<Emu64>> write_image_name(const syscall_context& c, const listed_process& process,
+                                                               const uint64_t buffer)
+        {
+            if (process.image_name.empty())
+            {
+                return {};
+            }
+
+            const auto buffer_size = image_name_buffer_size(process);
+            c.emu.write_memory(buffer, process.image_name.c_str(), static_cast<size_t>(buffer_size));
+
+            return {
+                .Length = static_cast<USHORT>(process.image_name.size() * sizeof(char16_t)),
+                .MaximumLength = static_cast<USHORT>(buffer_size),
+                .Buffer = buffer,
+            };
+        }
+
         NTSTATUS handle_system_basicprocess_information(const syscall_context& c, const uint64_t system_information,
                                                         const uint32_t system_information_length,
                                                         const emulator_object<uint32_t> return_length)
         {
-            using Traits = EmulatorTraits<Emu64>;
-            using proc_t = SYSTEM_BASICPROCESS_INFORMATION<Traits>;
+            using proc_t = SYSTEM_BASICPROCESS_INFORMATION<EmulatorTraits<Emu64>>;
 
-            uint64_t process_id = c.proc.process_id;
+            const auto processes = collect_processes(c);
+            const auto entry_size = [](const listed_process& process) {
+                return align_up(sizeof(proc_t) + image_name_buffer_size(process), sizeof(uint64_t));
+            };
 
-            if (c.vcpu.active_thread && c.vcpu.active_thread->teb64)
+            uint64_t required{};
+            for (const auto& process : processes)
             {
-                c.vcpu.active_thread->teb64->access([&](const TEB64& teb) { process_id = teb.ClientId.UniqueProcess; });
+                required += entry_size(process);
             }
-
-            const auto image_name = u8_to_u16(c.win_emu.mod_manager.executable->name);
-            const auto image_name_length = image_name.size() * sizeof(char16_t);
-            const auto image_name_buffer_length = image_name_length + sizeof(char16_t);
-            const auto required = static_cast<uint32_t>(sizeof(proc_t) + image_name_buffer_length);
 
             if (return_length)
             {
-                return_length.write(required);
+                return_length.write(static_cast<uint32_t>(required));
             }
 
             if (system_information_length < required)
@@ -395,24 +513,22 @@ namespace sogen
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
 
-            proc_t proc{};
+            auto entry_address = system_information;
+            for (size_t i = 0; i < processes.size(); ++i)
+            {
+                const auto& process = processes[i];
+                const auto is_last = i + 1 == processes.size();
 
-            proc.NextEntryOffset = 0; // Single process; terminator
-            proc.UniqueProcessId = process_id;
-            proc.InheritedFromUniqueProcessId = 0;
+                proc_t info{};
+                info.NextEntryOffset = is_last ? 0 : static_cast<ULONG>(entry_size(process));
+                info.UniqueProcessId = process.id;
+                info.InheritedFromUniqueProcessId = process.parent_id;
+                info.SequenceNumber = process.id;
+                info.ImageName = write_image_name(c, process, entry_address + sizeof(proc_t));
 
-            // Ideally this should be a monotonically increasing value assigned when
-            // the emulated process is created. The process ID is a reasonable fallback
-            // when no separate sequence number is available.
-            proc.SequenceNumber = process_id;
-
-            const auto image_name_buffer = system_information + sizeof(proc);
-            proc.ImageName.Length = static_cast<USHORT>(image_name_length);
-            proc.ImageName.MaximumLength = static_cast<USHORT>(image_name_buffer_length);
-            proc.ImageName.Buffer = image_name_buffer;
-
-            c.emu.write_memory(system_information, &proc, sizeof(proc));
-            c.emu.write_memory(image_name_buffer, image_name.c_str(), image_name_buffer_length);
+                c.emu.write_memory(entry_address, &info, sizeof(info));
+                entry_address += entry_size(process);
+            }
 
             return STATUS_SUCCESS;
         }
@@ -420,46 +536,24 @@ namespace sogen
         NTSTATUS handle_system_process_information(const syscall_context& c, const uint64_t system_information,
                                                    const uint32_t system_information_length, const emulator_object<uint32_t> return_length)
         {
-            using Traits = EmulatorTraits<Emu64>;
-            using proc_t = SYSTEM_PROCESS_INFORMATION<Traits>;
-            using thread_t = SYSTEM_THREAD_INFORMATION<Traits>;
+            using proc_t = SYSTEM_PROCESS_INFORMATION<EmulatorTraits<Emu64>>;
+            using thread_t = SYSTEM_THREAD_INFORMATION<EmulatorTraits<Emu64>>;
 
-            uint64_t process_id = c.proc.process_id;
-            uint64_t active_tid = 0;
-            if (c.vcpu.active_thread && c.vcpu.active_thread->teb64)
+            const auto processes = collect_processes(c);
+            const auto threads_size = [](const listed_process& process) { return process.thread_ids.size() * sizeof(thread_t); };
+            const auto entry_size = [&](const listed_process& process) {
+                return align_up(sizeof(proc_t) + threads_size(process) + image_name_buffer_size(process), sizeof(uint64_t));
+            };
+
+            uint64_t required{};
+            for (const auto& process : processes)
             {
-                c.vcpu.active_thread->teb64->access([&](const TEB64& teb) {
-                    process_id = teb.ClientId.UniqueProcess;
-                    active_tid = teb.ClientId.UniqueThread;
-                });
+                required += entry_size(process);
             }
-
-            std::vector<uint64_t> thread_ids;
-            for (const auto& t : c.proc.threads | std::views::values)
-            {
-                if (t.is_terminated() || !t.teb64)
-                {
-                    continue;
-                }
-                uint64_t tid = 0;
-                t.teb64->access([&](const TEB64& teb) { tid = teb.ClientId.UniqueThread; });
-                thread_ids.push_back(tid);
-            }
-
-            if (thread_ids.empty())
-            {
-                thread_ids.push_back(active_tid);
-            }
-
-            const auto image_name = u8_to_u16(c.win_emu.mod_manager.executable->name);
-            const auto image_name_length = image_name.size() * sizeof(char16_t);
-            const auto image_name_buffer_length = image_name_length + sizeof(char16_t);
-            const auto thread_information_length = thread_ids.size() * sizeof(thread_t);
-            const auto required = static_cast<uint32_t>(sizeof(proc_t) + thread_information_length + image_name_buffer_length);
 
             if (return_length)
             {
-                return_length.write(required);
+                return_length.write(static_cast<uint32_t>(required));
             }
 
             if (system_information_length < required)
@@ -467,36 +561,39 @@ namespace sogen
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
 
-            proc_t proc{};
-            memset(&proc, 0, sizeof(proc));
-            proc.NextEntryOffset = 0; // single process; terminator
-            proc.NumberOfThreads = static_cast<ULONG>(thread_ids.size());
-            proc.BasePriority = 8;
-            proc.UniqueProcessId = process_id;
-            proc.HandleCount = 0;
-            proc.SessionId = 0;
-
-            const auto image_name_buffer = system_information + sizeof(proc) + thread_information_length;
-            proc.ImageName.Length = static_cast<USHORT>(image_name_length);
-            proc.ImageName.MaximumLength = static_cast<USHORT>(image_name_buffer_length);
-            proc.ImageName.Buffer = image_name_buffer;
-
-            c.emu.write_memory(system_information, &proc, sizeof(proc));
-
-            for (size_t i = 0; i < thread_ids.size(); ++i)
+            auto entry_address = system_information;
+            for (size_t i = 0; i < processes.size(); ++i)
             {
-                thread_t info{};
-                memset(&info, 0, sizeof(info));
-                info.ClientId.UniqueProcess = process_id;
-                info.ClientId.UniqueThread = thread_ids[i];
-                info.Priority = 8;
-                info.BasePriority = 8;
-                info.ThreadState = 5; // Waiting
-                info.WaitReason = 6;  // WrQueue
-                c.emu.write_memory(system_information + sizeof(proc_t) + i * sizeof(thread_t), &info, sizeof(info));
-            }
+                const auto& process = processes[i];
+                const auto is_last = i + 1 == processes.size();
 
-            c.emu.write_memory(image_name_buffer, image_name.c_str(), image_name_buffer_length);
+                proc_t info{};
+                memset(&info, 0, sizeof(info));
+                info.NextEntryOffset = is_last ? 0 : static_cast<ULONG>(entry_size(process));
+                info.NumberOfThreads = static_cast<ULONG>(process.thread_ids.size());
+                info.BasePriority = process.base_priority;
+                info.UniqueProcessId = process.id;
+                info.InheritedFromUniqueProcessId = process.parent_id;
+                info.SessionId = process.session_id;
+                info.ImageName = write_image_name(c, process, entry_address + sizeof(proc_t) + threads_size(process));
+
+                c.emu.write_memory(entry_address, &info, sizeof(info));
+
+                for (size_t t = 0; t < process.thread_ids.size(); ++t)
+                {
+                    thread_t thread{};
+                    memset(&thread, 0, sizeof(thread));
+                    thread.ClientId.UniqueProcess = process.id;
+                    thread.ClientId.UniqueThread = process.thread_ids[t];
+                    thread.Priority = process.base_priority;
+                    thread.BasePriority = process.base_priority;
+                    thread.ThreadState = 5; // Waiting
+                    thread.WaitReason = 6;  // WrQueue
+                    c.emu.write_memory(entry_address + sizeof(proc_t) + (t * sizeof(thread_t)), &thread, sizeof(thread));
+                }
+
+                entry_address += entry_size(process);
+            }
 
             return STATUS_SUCCESS;
         }
