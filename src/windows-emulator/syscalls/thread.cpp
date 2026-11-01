@@ -370,6 +370,24 @@ namespace sogen
             return STATUS_INVALID_INFO_CLASS;
         }
 
+        namespace
+        {
+            // Fixed-size classes take exactly the size of their structure; any other length fails without a return length.
+            template <typename T>
+            NTSTATUS write_exact_thread_information(const syscall_context& c, const T& value, const uint64_t thread_information,
+                                                    const uint32_t thread_information_length, const emulator_object<uint32_t> return_length)
+            {
+                if (thread_information_length != sizeof(T))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                c.emu.write_memory(thread_information, value);
+                return_length.write_if_valid(sizeof(T));
+                return STATUS_SUCCESS;
+            }
+        }
+
         NTSTATUS handle_NtQueryInformationThread(const syscall_context& c, const handle thread_handle, const uint32_t info_class,
                                                  const uint64_t thread_information, const uint32_t thread_information_length,
                                                  const emulator_object<uint32_t> return_length)
@@ -381,13 +399,13 @@ namespace sogen
                     return STATUS_NOT_SUPPORTED;
                 }
 
+                if (thread_information_length != sizeof(THREAD_BASIC_INFORMATION64))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
                 if (return_length)
                 {
                     return_length.write(sizeof(THREAD_BASIC_INFORMATION64));
-                }
-                if (thread_information_length < sizeof(THREAD_BASIC_INFORMATION64))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
                 }
 
                 const auto status = c.win_emu.processes()->exit_status(managed->process);
@@ -479,14 +497,14 @@ namespace sogen
 
             if (info_class == ThreadTebInformation)
             {
+                if (thread_information_length != sizeof(THREAD_TEB_INFORMATION))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
                 if (return_length)
                 {
                     return_length.write(sizeof(THREAD_TEB_INFORMATION));
-                }
-
-                if (thread_information_length < sizeof(THREAD_TEB_INFORMATION))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
                 }
 
                 const auto teb_info = c.emu.read_memory<THREAD_TEB_INFORMATION>(thread_information);
@@ -498,14 +516,14 @@ namespace sogen
 
             if (info_class == ThreadBasicInformation)
             {
+                if (thread_information_length != sizeof(THREAD_BASIC_INFORMATION64))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
                 if (return_length)
                 {
                     return_length.write(sizeof(THREAD_BASIC_INFORMATION64));
-                }
-
-                if (thread_information_length < sizeof(THREAD_BASIC_INFORMATION64))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
                 }
 
                 const emulator_object<THREAD_BASIC_INFORMATION64> info{c.emu, thread_information};
@@ -520,14 +538,14 @@ namespace sogen
 
             if (info_class == ThreadAmILastThread)
             {
+                if (thread_information_length != sizeof(ULONG))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
                 if (return_length)
                 {
                     return_length.write(sizeof(ULONG));
-                }
-
-                if (thread_information_length < sizeof(ULONG))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
                 }
 
                 const emulator_object<ULONG> info{c.emu, thread_information};
@@ -538,14 +556,14 @@ namespace sogen
 
             if (info_class == ThreadQuerySetWin32StartAddress)
             {
+                if (thread_information_length != sizeof(EmulatorTraits<Emu64>::PVOID))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
                 if (return_length)
                 {
                     return_length.write(sizeof(EmulatorTraits<Emu64>::PVOID));
-                }
-
-                if (thread_information_length < sizeof(EmulatorTraits<Emu64>::PVOID))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
                 }
 
                 const emulator_object<EmulatorTraits<Emu64>::PVOID> info{c.emu, thread_information};
@@ -556,20 +574,44 @@ namespace sogen
 
             if (info_class == ThreadPerformanceCount)
             {
+                if (thread_information_length != sizeof(LARGE_INTEGER))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
                 if (return_length)
                 {
                     return_length.write(sizeof(LARGE_INTEGER));
-                }
-
-                if (thread_information_length < sizeof(LARGE_INTEGER))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
                 }
 
                 const emulator_object<LARGE_INTEGER> info{c.emu, thread_information};
                 info.write({});
 
                 return STATUS_SUCCESS;
+            }
+
+            if (info_class == ThreadIsTerminated)
+            {
+                return write_exact_thread_information(c, ULONG{thread->is_terminated() ? 1u : 0u}, thread_information,
+                                                      thread_information_length, return_length);
+            }
+
+            if (info_class == ThreadSuspendCount)
+            {
+                return write_exact_thread_information(c, static_cast<ULONG>(thread->suspended), thread_information,
+                                                      thread_information_length, return_length);
+            }
+
+            if (info_class == ThreadPriorityBoost || info_class == ThreadBreakOnTermination)
+            {
+                return write_exact_thread_information(c, ULONG{0}, thread_information, thread_information_length, return_length);
+            }
+
+            if (info_class == ThreadActualBasePriority)
+            {
+                constexpr LONG normal_base_priority = 8;
+                return write_exact_thread_information(c, normal_base_priority, thread_information, thread_information_length,
+                                                      return_length);
             }
 
             if (info_class == ThreadCycleTime)
@@ -633,38 +675,18 @@ namespace sogen
 
             if (info_class == ThreadTimes)
             {
+                if (thread_information_length != sizeof(KERNEL_USER_TIMES))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
                 if (return_length)
                 {
                     return_length.write(sizeof(KERNEL_USER_TIMES));
                 }
 
-                if (thread_information_length != sizeof(KERNEL_USER_TIMES))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
-                }
-
                 const emulator_object<KERNEL_USER_TIMES> info{c.emu, thread_information};
                 info.write(KERNEL_USER_TIMES{});
-
-                return STATUS_SUCCESS;
-            }
-
-            if (info_class == ThreadPriority)
-            {
-                if (return_length)
-                {
-                    return_length.write(sizeof(LONG));
-                }
-
-                if (thread_information_length < sizeof(LONG))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
-                }
-
-                constexpr LONG normal_priority = 8;
-
-                const emulator_object<LONG> info{c.emu, thread_information};
-                info.write(normal_priority);
 
                 return STATUS_SUCCESS;
             }
@@ -697,14 +719,14 @@ namespace sogen
 
             if (info_class == ThreadGroupInformation)
             {
+                if (thread_information_length != sizeof(GROUP_AFFINITY))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
                 if (return_length)
                 {
                     return_length.write(sizeof(GROUP_AFFINITY));
-                }
-
-                if (thread_information_length != sizeof(GROUP_AFFINITY))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
                 }
 
                 const emulator_object<GROUP_AFFINITY> info{c.emu, thread_information};
@@ -721,14 +743,14 @@ namespace sogen
             {
                 constexpr ULONG normal_page_priority = 5; // MEMORY_NORMAL_PRIORITY
 
+                if (thread_information_length != sizeof(ULONG))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
                 if (return_length)
                 {
                     return_length.write(sizeof(ULONG));
-                }
-
-                if (thread_information_length != sizeof(ULONG))
-                {
-                    return STATUS_BUFFER_OVERFLOW;
                 }
 
                 const emulator_object<ULONG> info{c.emu, thread_information};
@@ -737,35 +759,27 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            if (info_class == ThreadNameInformation)
+            // Windows only lets these classes be set; ThreadDescriptorTableEntry has no meaning without segmentation.
+            switch (info_class)
             {
-                const auto name_bytes = static_cast<uint32_t>(thread->name.size() * sizeof(char16_t));
-                const auto total_size = static_cast<uint32_t>(sizeof(THREAD_NAME_INFORMATION<EmulatorTraits<Emu64>>)) + name_bytes;
-
-                if (return_length)
-                {
-                    return_length.write(total_size);
-                }
-
-                if (thread_information_length < total_size)
-                {
-                    return STATUS_BUFFER_TOO_SMALL;
-                }
-
-                const auto name_buffer = thread_information + sizeof(THREAD_NAME_INFORMATION<EmulatorTraits<Emu64>>);
-                if (name_bytes != 0)
-                {
-                    c.emu.write_memory(name_buffer, thread->name.data(), name_bytes);
-                }
-
-                const emulator_object<THREAD_NAME_INFORMATION<EmulatorTraits<Emu64>>> info{c.emu, thread_information};
-                info.access([&](THREAD_NAME_INFORMATION<EmulatorTraits<Emu64>>& value) {
-                    value.ThreadName.Length = static_cast<uint16_t>(name_bytes);
-                    value.ThreadName.MaximumLength = static_cast<uint16_t>(name_bytes);
-                    value.ThreadName.Buffer = name_buffer;
-                });
-
-                return STATUS_SUCCESS;
+            case ThreadPriority:
+            case ThreadBasePriority:
+            case ThreadAffinityMask:
+            case ThreadImpersonationToken:
+            case ThreadEnableAlignmentFaultFixup:
+            case ThreadEventPair:
+            case ThreadZeroTlsCell:
+            case ThreadIdealProcessor:
+            case ThreadSetTlsArrayAddress:
+            case ThreadSwitchLegacyState:
+            case ThreadCSwitchMon:
+            case ThreadCSwitchPmu:
+            case ThreadUmsInformation:
+                return STATUS_INVALID_INFO_CLASS;
+            case ThreadDescriptorTableEntry:
+                return STATUS_NOT_IMPLEMENTED;
+            default:
+                break;
             }
 
             c.win_emu.log.error("Unsupported thread query info class: 0x%X\n", info_class);
