@@ -618,6 +618,7 @@ namespace sogen
         this->gdi_dc_states.clear();
         this->gdi_dc_save_states.clear();
         this->gdi_bitmap_surfaces.clear();
+        this->gdi_fonts.clear();
         this->gdi_window_surfaces.clear();
         this->dxgk = {};
         this->etw_notification_event.reset();
@@ -806,6 +807,20 @@ namespace sogen
         return cls_ptr;
     }
 
+    void process_context::set_mouse_capture(const hwnd window)
+    {
+        this->mouse_capture_window = window;
+        this->user_handles.get_server_info().access([&](USER_SERVERINFO& server_info) { server_info.captureCount = window != 0 ? 1 : 0; });
+    }
+
+    void process_context::release_mouse_capture(const hwnd window)
+    {
+        if (this->mouse_capture_window == window)
+        {
+            this->set_mouse_capture(0);
+        }
+    }
+
     void process_context::serialize(utils::buffer_serializer& buffer, const emulator_thread* active_thread) const
     {
         buffer.write_vector(this->sid);
@@ -842,6 +857,7 @@ namespace sogen
         buffer.write_map(this->gdi_dc_states);
         buffer.write_map(this->gdi_dc_save_states);
         buffer.write_map(this->gdi_bitmap_surfaces);
+        buffer.write_map(this->gdi_fonts);
         buffer.write_map(this->gdi_window_surfaces);
         buffer.write(this->dxgk);
         buffer.write_optional(this->etw_notification_event);
@@ -896,6 +912,8 @@ namespace sogen
         buffer.write(this->mutants);
         buffer.write(this->default_desktop);
         buffer.write(this->desktops);
+        buffer.write(this->window_stations);
+        buffer.write(this->process_window_station);
         buffer.write(this->windows);
         buffer.write(this->menus);
         buffer.write(this->timers);
@@ -971,6 +989,7 @@ namespace sogen
         buffer.read_map(this->gdi_dc_states);
         buffer.read_map(this->gdi_dc_save_states);
         buffer.read_map(this->gdi_bitmap_surfaces);
+        buffer.read_map(this->gdi_fonts);
         buffer.read_map(this->gdi_window_surfaces);
         buffer.read(this->dxgk);
         buffer.read_optional(this->etw_notification_event);
@@ -1025,6 +1044,8 @@ namespace sogen
         buffer.read(this->mutants);
         buffer.read(this->default_desktop);
         buffer.read(this->desktops);
+        buffer.read(this->window_stations);
+        buffer.read(this->process_window_station);
         buffer.read(this->windows);
         buffer.read(this->menus);
         buffer.read(this->timers);
@@ -1081,6 +1102,15 @@ namespace sogen
     void process_context::restore_after_state_restore(windows_emulator& win_emu)
     {
         this->section_views.restore_views(win_emu.memory);
+
+        // captureCount lives in guest memory, which a snapshot taken before it was maintained restores as 0 while
+        // mouse_capture_window is set. user32 reads the count to decide whether to ask for the capture window at all.
+        // A process that never created a user object has no server info to write to, so only a real capture is
+        // reestablished.
+        if (this->mouse_capture_window != 0)
+        {
+            this->set_mouse_capture(this->mouse_capture_window);
+        }
 
         restore_windows_after_state_restore(win_emu);
 
@@ -1235,6 +1265,8 @@ namespace sogen
             return &timers;
         case handle_types::desktop:
             return &desktops;
+        case handle_types::window_station:
+            return &window_stations;
         case handle_types::port:
             return &ports;
         case handle_types::section:
@@ -1487,6 +1519,7 @@ namespace sogen
             }
 
             i->second.ref_count = 1;
+            this->release_mouse_capture(i->second.handle);
             this->gdi_window_surfaces.erase(static_cast<uint32_t>(i->second.handle));
             i = this->windows.erase(i).first;
         }

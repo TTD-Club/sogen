@@ -37,7 +37,7 @@ namespace sogen
     class emulator_thread;
     class ui_backend;
     class linux_emulator;
-    class linux_memory_manager;
+    class posix_memory_manager;
     class memory_manager;
     class windows_emulator;
     struct emulator_settings;
@@ -65,7 +65,6 @@ namespace sogen::py
     using sogen::linux_exported_symbol;
     using sogen::linux_mapped_module;
     using sogen::linux_mapped_section;
-    using sogen::linux_memory_manager;
     using sogen::linux_process_context;
     using sogen::linux_thread;
     using sogen::mapped_module;
@@ -75,6 +74,7 @@ namespace sogen::py
     using sogen::memory_region_kind;
     using sogen::memory_violation_continuation;
     using sogen::nt_memory_permission;
+    using sogen::posix_memory_manager;
     using sogen::process_context;
     using sogen::stop_reason;
     using sogen::thread_wait_state;
