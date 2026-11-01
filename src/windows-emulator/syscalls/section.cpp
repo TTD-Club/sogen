@@ -1,4 +1,5 @@
 #include "../std_include.hpp"
+#include "../session_objects.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
 #include "../memory_manager.hpp"
@@ -428,7 +429,7 @@ namespace sogen
             auto filename_sv = std::u16string_view(filename);
             c.win_emu.callbacks.on_generic_access("Opening section", filename);
 
-            if (utils::string::equals_ignore_case(filename_sv, u"\\Windows\\SharedSection"sv))
+            if (utils::string::equals_ignore_case(strip_session_directory(filename_sv), u"\\Windows\\SharedSection"sv))
             {
                 constexpr auto shared_section_size = 0x10000;
 
@@ -463,7 +464,7 @@ namespace sogen
             }
 
             if (utils::string::equals_ignore_case(filename_sv, u"windows_shell_global_counters"sv) ||
-                utils::string::equals_ignore_case(filename_sv, u"\\Windows\\ThemeSection"sv) ||
+                utils::string::equals_ignore_case(strip_session_directory(filename_sv), u"\\Windows\\ThemeSection"sv) ||
                 utils::string::equals_ignore_case(filename_sv, u"Global\\__ComCatalogCache__"sv) ||
                 utils::string::equals_ignore_case(filename_sv, u"{00020000-0000-1005-8005-0000C06B5161}"sv) ||
                 utils::string::equals_ignore_case(filename_sv, u"Global\\{00020000-0000-1005-8005-0000C06B5161}"sv))
