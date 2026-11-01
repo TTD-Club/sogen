@@ -3,6 +3,7 @@
 #include "../io_completion_wait.hpp"
 #include "../low_level_hooks.hpp"
 #include "../syscall_utils.hpp"
+#include "../system_processes.hpp"
 #include "../devices/named_pipe.hpp"
 
 namespace sogen
@@ -826,7 +827,8 @@ namespace sogen
             }
             case handle_types::process:
                 // The synthetic Steam process never signals, so a liveness wait times out ("alive").
-                return (h == STEAM_PROCESS_HANDLE || c.proc.processes.get(h)) ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
+                return (h == STEAM_PROCESS_HANDLE || find_system_process(h) || c.proc.processes.get(h)) ? STATUS_SUCCESS
+                                                                                                        : STATUS_INVALID_HANDLE;
 
             case handle_types::managed_thread:
                 return validate_handle_in_store(c.proc.managed_threads);

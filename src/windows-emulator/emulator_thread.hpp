@@ -298,6 +298,7 @@ namespace sogen
         bool is_wow64_process{};
         uint64_t native_environment{};
         uint64_t compatibility_environment{};
+        std::u16string image_name{};
 
       private:
         void serialize_object(utils::buffer_serializer& buffer) const override
@@ -307,6 +308,7 @@ namespace sogen
             buffer.write(this->is_wow64_process);
             buffer.write(this->native_environment);
             buffer.write(this->compatibility_environment);
+            buffer.write_string(this->image_name);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -316,6 +318,7 @@ namespace sogen
             buffer.read(this->is_wow64_process);
             buffer.read(this->native_environment);
             buffer.read(this->compatibility_environment);
+            buffer.read_string(this->image_name);
         }
     };
 
