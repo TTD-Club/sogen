@@ -3,7 +3,8 @@
 // NOLINTBEGIN(modernize-use-using,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-use-enum-class)
 
 #ifndef OS_WINDOWS
-#define CREATE_SUSPENDED 0x00000004
+#define CREATE_SUSPENDED       0x00000004
+#define MEMORY_PRIORITY_NORMAL 5
 #endif
 
 #define CONTEXT_X86_MAIN              0x00010000
