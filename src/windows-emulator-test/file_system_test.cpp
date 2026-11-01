@@ -134,6 +134,32 @@ namespace sogen::test
         EXPECT_EQ(6, result.file->size());
     }
 
+    TEST_F(FileSystemTest, HostPathsLongerThanMaxPathAreReachable)
+    {
+        const std::u16string component(100, u'd');
+        const windows_path guest_directory{'a', {component, component, component}};
+
+        auto host_directory = this->root / "a" / component / component / component;
+#ifdef OS_WINDOWS
+        host_directory = LR"(\\?\)" + host_directory.wstring();
+#endif
+        std::filesystem::create_directories(host_directory);
+        write_host_file(host_directory / "file.txt", "deep");
+
+        file_system fs{this->root, filesystem_mode::read_write};
+
+        const auto opened = fs.open(guest_directory / u"file.txt", u"rb");
+        ASSERT_TRUE(opened.file);
+        EXPECT_EQ(4, opened.file->size());
+
+        const auto entries = fs.list_directory(guest_directory);
+        ASSERT_EQ(1, entries.size());
+        EXPECT_EQ(u"file.txt", entries.front().name);
+
+        EXPECT_EQ(STATUS_SUCCESS, fs.create_directory(guest_directory / u"created"));
+        EXPECT_TRUE(fs.stat(guest_directory / u"created"));
+    }
+
     TEST_F(FileSystemTest, UnknownDrivesDoNotResolve)
     {
         file_system fs{this->root};

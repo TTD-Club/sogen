@@ -44,6 +44,8 @@ namespace sogen::ttd
         uint64_t ip{};
         uint64_t address{};
         uint64_t size{};
+        // A bit set of access kinds: zero is none of them.
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         access_kind kind{};
         // Execute: the instruction bytes just before execution. Reads and writes: the accessed bytes when size <= 16,
         // otherwise their offset within a bulk block (bytes 0-7) and the block's index (bytes 8-15).
@@ -238,6 +240,7 @@ namespace sogen::ttd
 
     struct section_entry
     {
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
         section_type type{};
         uint64_t offset{};
         uint64_t size{};

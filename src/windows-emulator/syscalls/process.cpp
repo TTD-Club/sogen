@@ -1,6 +1,7 @@
 #include "../std_include.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
+#include "../system_processes.hpp"
 #include "../devices/named_pipe.hpp"
 
 #include <utils/finally.hpp>
@@ -12,9 +13,165 @@ namespace sogen
     {
         namespace
         {
+            constexpr ACCESS_MASK process_query_information = 0x0400;
+            constexpr ACCESS_MASK process_query_limited_information = 0x1000;
+            constexpr ACCESS_MASK maximum_allowed = 0x02000000;
+
+            // Processes of other accounts reject a standard user outright. The user's own processes grant only the
+            // query and wait rights: the emulator holds no memory or threads behind them to back any other right.
+            NTSTATUS check_system_process_access(const system_process& process, const ACCESS_MASK desired_access)
+            {
+                constexpr auto granted_access =
+                    process_query_information | process_query_limited_information | SYNCHRONIZE | maximum_allowed;
+                if (!process.owned_by_user || (desired_access & ~granted_access) != 0)
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS write_unicode_string_information(const syscall_context& c, const std::u16string_view value,
+                                                      const uint64_t process_information, const uint32_t process_information_length,
+                                                      const emulator_object<uint32_t> return_length)
+            {
+                using string_t = UNICODE_STRING<EmulatorTraits<Emu64>>;
+
+                const auto string_length = value.size() * sizeof(char16_t);
+                const auto buffer_length = value.empty() ? 0 : string_length + sizeof(char16_t);
+                const auto required_length = static_cast<uint32_t>(sizeof(string_t) + buffer_length);
+
+                if (return_length)
+                {
+                    return_length.write(required_length);
+                }
+
+                if (process_information_length < required_length)
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                const auto buffer = value.empty() ? 0 : process_information + sizeof(string_t);
+                if (buffer)
+                {
+                    const std::u16string terminated{value};
+                    c.emu.write_memory(buffer, terminated.c_str(), buffer_length);
+                }
+
+                emulator_object<string_t>{c.emu, process_information}.write({
+                    .Length = static_cast<USHORT>(string_length),
+                    .MaximumLength = static_cast<USHORT>(buffer_length),
+                    .Buffer = buffer,
+                });
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS query_system_process(const syscall_context& c, const system_process& process, const uint32_t info_class,
+                                          const uint64_t process_information, const uint32_t process_information_length,
+                                          const emulator_object<uint32_t> return_length)
+            {
+                const auto init_basic_info = [&](PROCESS_BASIC_INFORMATION64& basic_info) {
+                    basic_info = {};
+                    basic_info.ExitStatus = STATUS_PENDING;
+                    basic_info.BasePriority = process.base_priority;
+                    basic_info.UniqueProcessId = process.id;
+                    basic_info.InheritedFromUniqueProcessId = process.parent_id;
+                };
+
+                switch (info_class)
+                {
+                case ProcessBasicInformation:
+                    switch (process_information_length)
+                    {
+                    case sizeof(PROCESS_BASIC_INFORMATION64):
+                        return handle_query<PROCESS_BASIC_INFORMATION64>(c.emu, process_information, process_information_length,
+                                                                         return_length, init_basic_info);
+                    case sizeof(PROCESS_EXTENDED_BASIC_INFORMATION):
+                        return handle_query<PROCESS_EXTENDED_BASIC_INFORMATION>(c.emu, process_information, process_information_length,
+                                                                                return_length,
+                                                                                [&](PROCESS_EXTENDED_BASIC_INFORMATION& ext) {
+                                                                                    ext = {};
+                                                                                    ext.Size = sizeof(PROCESS_EXTENDED_BASIC_INFORMATION);
+                                                                                    init_basic_info(ext.BasicInfo);
+                                                                                });
+                    default:
+                        return STATUS_INFO_LENGTH_MISMATCH;
+                    }
+
+                case ProcessSessionInformation:
+                    return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
+                                               [&](ULONG& session_id) { session_id = process.session_id; });
+
+                case ProcessImageFileName: {
+                    const auto device_path =
+                        process.image_path.empty() ? std::u16string{} : windows_path{process.image_path}.to_device_path();
+                    return write_unicode_string_information(c, device_path, process_information, process_information_length, return_length);
+                }
+
+                case ProcessImageFileNameWin32:
+                    return write_unicode_string_information(c, process.image_path, process_information, process_information_length,
+                                                            return_length);
+
+                default:
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
+        }
+
+        namespace
+        {
             constexpr ULONG windows_cui_subsystem = 3;
             constexpr USHORT executable_large_address_aware_image = 0x0022;
             constexpr ULONG process_create_flags_inherit_handles = 4;
+
+            constexpr UCHAR image_dynamically_relocated = 0x04;
+
+            // The headers of a PE32 image use 32-bit fields, so they are read with the layout matching the image.
+            template <typename Address>
+            void fill_image_information(const syscall_context& c, const mapped_module& image,
+                                        SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>& information)
+            {
+                const auto dos_header = c.emu.read_memory<PEDosHeader_t>(image.image_base);
+                const auto nt_headers = c.emu.read_memory<PENTHeaders_t<Address>>(image.image_base + dos_header.e_lfanew);
+                const auto& file_header = nt_headers.FileHeader;
+                const auto& optional_header = nt_headers.OptionalHeader;
+                const auto file_stat = c.win_emu.file_sys.stat(image.module_path);
+
+                information.TransferAddress = image.entry_point;
+                information.MaximumStackSize = optional_header.SizeOfStackReserve;
+                information.CommittedStackSize = optional_header.SizeOfStackCommit;
+                information.SubSystemType = optional_header.Subsystem;
+                information.SubSystemMajorVersion = optional_header.MajorSubsystemVersion;
+                information.SubSystemMinorVersion = optional_header.MinorSubsystemVersion;
+                information.MajorOperatingSystemVersion = optional_header.MajorOperatingSystemVersion;
+                information.MinorOperatingSystemVersion = optional_header.MinorOperatingSystemVersion;
+                information.ImageCharacteristics = file_header.Characteristics;
+                information.DllCharacteristics = optional_header.DllCharacteristics;
+                information.Machine = file_header.Machine;
+                information.ImageContainsCode = TRUE;
+                information.ImageFlags = image.image_base != image.image_base_file ? image_dynamically_relocated : 0;
+                information.ImageFileSize = file_stat ? static_cast<ULONG>(file_stat->st_size) : 0;
+                information.LoaderFlags = optional_header.LoaderFlags;
+                information.CheckSum = optional_header.CheckSum;
+            }
+
+            // IoPriorityNormal
+            constexpr ULONG io_priority_normal = 2;
+
+            // These classes take exactly the size of their structure; any other length fails without a return length.
+            template <typename T>
+            NTSTATUS write_exact_information(const syscall_context& c, const T& value, const uint64_t process_information,
+                                             const uint32_t process_information_length, const emulator_object<uint32_t> return_length)
+            {
+                if (process_information_length != sizeof(T))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                c.emu.write_memory(process_information, value);
+                return_length.write_if_valid(sizeof(T));
+                return STATUS_SUCCESS;
+            }
 
             // The defaults of a process without a job: unlimited pools, page file and time. GlobalMemoryStatusEx caps the
             // available page file at PagefileLimit, so zero would report no memory at all.
@@ -329,6 +486,7 @@ namespace sogen
             child.is_wow64_process = child_is_wow64;
             child.native_environment = result.native_environment;
             child.compatibility_environment = result.compatibility_environment;
+            child.image_name = application_path.leaf();
             const auto child_process_handle = c.proc.processes.store(std::move(child));
 
             managed_process_thread initial_thread{};
@@ -397,6 +555,11 @@ namespace sogen
             {
                 c.win_emu.log.error("Unsupported NtQueryInformationProcess info class: 0x%X\n", info_class);
                 return STATUS_INVALID_INFO_CLASS;
+            }
+
+            if (const auto* system = find_system_process(process_handle))
+            {
+                return query_system_process(c, *system, info_class, process_information, process_information_length, return_length);
             }
 
             if (!c.proc.is_current_process_handle(process_handle))
@@ -602,6 +765,10 @@ namespace sogen
                 return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
                                            [&](ULONG& res) { res = c.proc.hard_error_mode; });
 
+            case ProcessPagePriority:
+                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
+                                           [&](ULONG& res) { res = c.proc.page_priority; });
+
             case ProcessDebugPort: {
                 const auto& proc_name = c.win_emu.mod_manager.executable->name;
                 c.win_emu.callbacks.on_suspicious_activity(std::string("Anti-debug check with ProcessDebugPort [") + proc_name + "]");
@@ -669,14 +836,6 @@ namespace sogen
                                                                 c.PriorityClass = 32; // Normal
                                                             });
 
-            case ProcessPagePriority:
-                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
-                                           [](ULONG& priority) { priority = 5; }); // MEMORY_PRIORITY_NORMAL
-
-            case ProcessIoPriority:
-                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
-                                           [](ULONG& priority) { priority = 2; }); // IoPriorityNormal
-
             case ProcessHandleCount:
                 return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
                                            [&](ULONG& count) { count = c.proc.count_handles(); });
@@ -698,6 +857,7 @@ namespace sogen
                         c.proc.kusd.access([](const KUSER_SHARED_DATA64& kusd) { return kusd.ActiveProcessorCount; });
                     basic_info.AffinityMask = processor_count >= 64 ? ~0ull : ((1ull << processor_count) - 1);
                     basic_info.UniqueProcessId = c.proc.process_id;
+                    basic_info.InheritedFromUniqueProcessId = guest_parent_process_id;
                 };
 
                 switch (process_information_length)
@@ -720,34 +880,16 @@ namespace sogen
             case ProcessImageInformation:
                 return handle_query<SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>>(
                     c.emu, process_information, process_information_length, return_length,
-                    [&](SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>& i) {
-                        const auto& mod = *c.win_emu.mod_manager.executable;
-
-                        const emulator_object<PEDosHeader_t> dos_header_obj{c.emu, mod.image_base};
-                        const auto dos_header = dos_header_obj.read();
-
-                        const emulator_object<PENTHeaders_t<uint64_t>> nt_headers_obj{c.emu, mod.image_base + dos_header.e_lfanew};
-                        const auto nt_headers = nt_headers_obj.read();
-
-                        const auto& file_header = nt_headers.FileHeader;
-                        const auto& optional_header = nt_headers.OptionalHeader;
-
-                        i.TransferAddress = 0;
-                        i.MaximumStackSize = optional_header.SizeOfStackReserve;
-                        i.CommittedStackSize = optional_header.SizeOfStackCommit;
-                        i.SubSystemType = optional_header.Subsystem;
-                        i.SubSystemMajorVersion = optional_header.MajorSubsystemVersion;
-                        i.SubSystemMinorVersion = optional_header.MinorSubsystemVersion;
-                        i.MajorOperatingSystemVersion = optional_header.MajorOperatingSystemVersion;
-                        i.MinorOperatingSystemVersion = optional_header.MinorOperatingSystemVersion;
-                        i.ImageCharacteristics = file_header.Characteristics;
-                        i.DllCharacteristics = optional_header.DllCharacteristics;
-                        i.Machine = file_header.Machine;
-                        i.ImageContainsCode = TRUE;
-                        i.ImageFlags = 0; // TODO
-                        i.ImageFileSize = optional_header.SizeOfImage;
-                        i.LoaderFlags = optional_header.LoaderFlags;
-                        i.CheckSum = optional_header.CheckSum;
+                    [&](SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>& information) {
+                        const auto& executable = *c.win_emu.mod_manager.executable;
+                        if (executable.machine == IMAGE_FILE_MACHINE_I386)
+                        {
+                            fill_image_information<uint32_t>(c, executable, information);
+                        }
+                        else
+                        {
+                            fill_image_information<uint64_t>(c, executable, information);
+                        }
                     });
 
             case ProcessQuotaLimits: {
@@ -808,6 +950,10 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            case ProcessSessionInformation:
+                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
+                                           [](ULONG& session_id) { session_id = interactive_session_id; });
+
             case ProcessImageFileName: {
                 const auto image_path = c.win_emu.mod_manager.executable->module_path.to_device_path();
                 const auto string_length = image_path.size() * sizeof(char16_t);
@@ -862,6 +1008,97 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            case ProcessPriorityBoost:
+            case ProcessBreakOnTermination:
+            case ProcessAffinityUpdateMode:
+            case ProcessMemoryAllocationMode:
+            case ProcessHandleCheckingMode:
+            case ProcessCheckStackExtentsMode:
+            case ProcessRaiseUMExceptionOnInvalidHandleClose:
+            case ProcessSubsystemInformation:
+                return write_exact_information(c, ULONG{0}, process_information, process_information_length, return_length);
+
+            case ProcessLUIDDeviceMapsEnabled:
+                return write_exact_information(c, ULONG{1}, process_information, process_information_length, return_length);
+
+            case ProcessIoPriority:
+                return write_exact_information(c, io_priority_normal, process_information, process_information_length, return_length);
+
+            case ProcessIoCounters:
+                return write_exact_information(c, std::array<uint64_t, 6>{}, process_information, process_information_length,
+                                               return_length);
+
+            case ProcessCycleTime:
+                return write_exact_information(
+                    c, std::array<uint64_t, 2>{c.win_emu.get_executed_instructions(), c.win_emu.clock().timestamp_counter()},
+                    process_information, process_information_length, return_length);
+
+            case ProcessKeepAliveCount:
+                return write_exact_information(c, std::array<ULONG, 2>{}, process_information, process_information_length,
+                                               emulator_object<uint32_t>{c.emu, 0});
+
+            case ProcessProtectionInformation:
+                return write_exact_information(c, uint8_t{0}, process_information, process_information_length, return_length);
+
+            case ProcessInPrivate:
+                return write_exact_information(c, BOOLEAN{FALSE}, process_information, process_information_length,
+                                               emulator_object<uint32_t>{c.emu, 0});
+
+            case ProcessChildProcessInformation:
+                return write_exact_information(c, std::array<BOOLEAN, 3>{}, process_information, process_information_length, return_length);
+
+            // Windows answers these classes only when they are set, or not at all for a user-mode caller.
+            case ProcessBasePriority:
+            case ProcessRaisePriority:
+            case ProcessExceptionPort:
+            case ProcessAccessToken:
+            case ProcessLdtSize:
+            case ProcessIoPortHandlers:
+            case ProcessUserModeIOPL:
+            case ProcessForegroundInformation:
+            case ProcessTlsInformation:
+            case ProcessThreadStackAllocation:
+            case ProcessTokenVirtualizationEnabled:
+            case ProcessDynamicFunctionTableInformation:
+            case ProcessRevokeFileHandles:
+            case ProcessWorkingSetControl:
+            case ProcessMemoryExhaustion:
+            case ProcessFaultInformation:
+            case ProcessSubsystemProcess:
+            case ProcessReserved3Information:
+            case ProcessDisableSystemAllowedCpuSets:
+            case ProcessManageWritesToExecutableMemory:
+            case ProcessDebugAuthInformation:
+            case ProcessSystemResourceManagement:
+            case ProcessLoaderDetour:
+            case ProcessCombineSecurityDomainsInformation:
+            case ProcessFiberShadowStackAllocation:
+            case ProcessFreeFiberShadowStackAllocation:
+            case ProcessAltSystemCallInformation:
+            case ProcessDynamicEHContinuationTargets:
+            case ProcessDynamicEnforcedCetCompatibleRanges:
+            case ProcessCreateStateChange:
+            case ProcessApplyStateChange:
+            case ProcessEnableOptionalXStateFeatures:
+            case ProcessAssignCpuPartitions:
+            case ProcessPriorityClassEx:
+            case ProcessSchedulerSharedData:
+            case ProcessSlistRollbackInformation:
+                return STATUS_INVALID_INFO_CLASS;
+
+            case ProcessLdtInformation:
+                return STATUS_NOT_IMPLEMENTED;
+
+            case ProcessWorkingSetWatch:
+                return STATUS_UNSUCCESSFUL;
+
+            case ProcessIumChallengeResponse:
+                return STATUS_OBJECT_TYPE_MISMATCH;
+
+            case ProcessWakeInformation:
+            case ProcessTelemetryCoverage:
+                return STATUS_ACCESS_DENIED;
+
             default:
                 c.win_emu.log.error("Unsupported process info class: 0x%X\n", info_class);
                 c.emu.stop();
@@ -900,7 +1137,7 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            if (info_class == ProcessPagePriority || info_class == ProcessIoPriority)
+            if (info_class == ProcessIoPriority)
             {
                 return process_information_length == sizeof(ULONG) ? STATUS_SUCCESS : STATUS_INFO_LENGTH_MISMATCH;
             }
@@ -915,6 +1152,23 @@ namespace sogen
                 ULONG mode{};
                 c.emu.read_memory(process_information, &mode, sizeof(mode));
                 c.proc.hard_error_mode = mode;
+                return STATUS_SUCCESS;
+            }
+
+            if (info_class == ProcessPagePriority)
+            {
+                if (process_information_length != sizeof(ULONG))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                const auto priority = c.emu.read_memory<ULONG>(process_information);
+                if (priority > MEMORY_PRIORITY_NORMAL)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                c.proc.page_priority = priority;
                 return STATUS_SUCCESS;
             }
 
@@ -1084,7 +1338,7 @@ namespace sogen
         }
 
         NTSTATUS handle_NtOpenProcess(const syscall_context& c, const emulator_object<handle> process_handle,
-                                      const ACCESS_MASK /*desired_access*/,
+                                      const ACCESS_MASK desired_access,
                                       const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> /*object_attributes*/,
                                       const emulator_object<CLIENT_ID64> client_id)
         {
@@ -1122,6 +1376,16 @@ namespace sogen
             {
                 process_handle.write(STEAM_PROCESS_HANDLE);
                 return STATUS_SUCCESS;
+            }
+
+            if (const auto* system = find_system_process(id.UniqueProcess); system && system->id != 0)
+            {
+                const auto status = check_system_process_access(*system, desired_access);
+                if (status == STATUS_SUCCESS)
+                {
+                    process_handle.write(make_system_process_handle(*system));
+                }
+                return status;
             }
 
             return STATUS_INVALID_CID;

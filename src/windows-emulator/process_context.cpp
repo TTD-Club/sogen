@@ -462,7 +462,7 @@ namespace sogen
             p.CriticalSectionTimeout.QuadPart = critical_section_timeout;
             p.ImageSubsystemMajorVersion = 6;
 
-            // TODO: p.SessionId = 1;
+            p.SessionId = 1;
             p.OSPlatformId = 2;
             p.OSMajorVersion = version.get_major_version();
             p.OSMinorVersion = version.get_minor_version();
@@ -564,7 +564,7 @@ namespace sogen
                 p32.CriticalSectionTimeout.QuadPart = critical_section_timeout;
                 p32.ImageSubsystemMajorVersion = 6;
 
-                // TODO: p32.SessionId = 1;
+                p32.SessionId = 1;
                 p32.OSPlatformId = 2;
                 p32.OSMajorVersion = version.get_major_version();
                 p32.OSMinorVersion = version.get_minor_version();
@@ -840,6 +840,7 @@ namespace sogen
         buffer.write(this->is_wow64_process);
         buffer.write(this->gdt_base);
         buffer.write(this->hard_error_mode);
+        buffer.write(this->page_priority);
         buffer.write(this->native_architecture);
         buffer.write(this->ntdll_image_base);
         buffer.write(this->ldr_initialize_thunk);
@@ -967,6 +968,7 @@ namespace sogen
         buffer.read(this->is_wow64_process);
         buffer.read(this->gdt_base);
         buffer.read(this->hard_error_mode);
+        buffer.read(this->page_priority);
         buffer.read(this->native_architecture);
         (void)windows_abi_for(this->native_architecture);
         if (this->is_wow64_process && this->native_architecture != windows_guest_architecture::x86_64)

@@ -1,4 +1,5 @@
 #include "../std_include.hpp"
+#include "../session_objects.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
 #include "../memory_manager.hpp"
@@ -428,7 +429,7 @@ namespace sogen
             auto filename_sv = std::u16string_view(filename);
             c.win_emu.callbacks.on_generic_access("Opening section", filename);
 
-            if (utils::string::equals_ignore_case(filename_sv, u"\\Windows\\SharedSection"sv))
+            if (utils::string::equals_ignore_case(strip_session_directory(filename_sv), u"\\Windows\\SharedSection"sv))
             {
                 constexpr auto shared_section_size = 0x10000;
 
@@ -463,7 +464,7 @@ namespace sogen
             }
 
             if (utils::string::equals_ignore_case(filename_sv, u"windows_shell_global_counters"sv) ||
-                utils::string::equals_ignore_case(filename_sv, u"\\Windows\\ThemeSection"sv) ||
+                utils::string::equals_ignore_case(strip_session_directory(filename_sv), u"\\Windows\\ThemeSection"sv) ||
                 utils::string::equals_ignore_case(filename_sv, u"Global\\__ComCatalogCache__"sv) ||
                 utils::string::equals_ignore_case(filename_sv, u"{00020000-0000-1005-8005-0000C06B5161}"sv) ||
                 utils::string::equals_ignore_case(filename_sv, u"Global\\{00020000-0000-1005-8005-0000C06B5161}"sv))
@@ -1114,15 +1115,17 @@ namespace sogen
                     // Image contains code
                     info.ImageContainsCode = cached.has_code ? TRUE : FALSE;
 
+                    info.MajorOperatingSystemVersion = cached.major_operating_system_version;
+                    info.MinorOperatingSystemVersion = cached.minor_operating_system_version;
+
                     // Image flags
-                    info.ImageMappedFlat = 1;
                     info.ImageDynamicallyRelocated = (cached.dll_characteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) ? 1 : 0;
 
                     // Other fields
                     info.ZeroBits = 0;
                     info.LoaderFlags = cached.loader_flags;
                     info.CheckSum = cached.checksum;
-                    info.ImageFileSize = static_cast<ULONG>(section_entry->maximum_size);
+                    info.ImageFileSize = cached.file_size;
                 }
                 else
                 {
@@ -1174,7 +1177,6 @@ namespace sogen
                         info.ImageContainsCode = TRUE;
 
                         // Image flags
-                        info.ImageMappedFlat = 1;
                         info.ImageDynamicallyRelocated = 1; // ASLR enabled
 
                         // File size
@@ -1197,7 +1199,6 @@ namespace sogen
                         info.ImageCharacteristics = 0x0022;
                         info.DllCharacteristics = 0x8160;
                         info.ImageContainsCode = TRUE;
-                        info.ImageMappedFlat = 1;
                         info.ImageDynamicallyRelocated = 1;
                         info.ImageFileSize = static_cast<ULONG>(section_entry->maximum_size);
                     }

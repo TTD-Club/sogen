@@ -441,6 +441,7 @@ namespace sogen
         }
 
         uint32_t hard_error_mode{0};
+        uint32_t page_priority{MEMORY_PRIORITY_NORMAL};
 
         callbacks* callbacks_{};
 

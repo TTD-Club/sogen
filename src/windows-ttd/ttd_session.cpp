@@ -276,9 +276,11 @@ namespace sogen::ttd
     {
         // As windows_emulator sets up its emulation root, hives, and file system.
         const auto root = settings.emulation_root.empty() ? settings.emulation_root : std::filesystem::absolute(settings.emulation_root);
-        const auto hive_directory = !settings.load_registry ? std::filesystem::path{}
-                                    : root.empty()          ? std::filesystem::absolute(settings.registry_directory)
-                                                            : root / "registry";
+        std::filesystem::path hive_directory{};
+        if (settings.load_registry)
+        {
+            hive_directory = root.empty() ? std::filesystem::absolute(settings.registry_directory) : root / "registry";
+        }
         file_system file_sys(root.empty() ? root : root / "filesys", settings.root_mode);
         for (const auto& mount : settings.mounts)
         {

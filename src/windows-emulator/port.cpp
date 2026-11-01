@@ -1,4 +1,5 @@
 #include "std_include.hpp"
+#include "session_objects.hpp"
 #include "port.hpp"
 #include "logger.hpp"
 #include "io_completion_wait.hpp"
@@ -298,7 +299,7 @@ namespace sogen
 
     std::unique_ptr<port> create_port(const std::u16string_view port)
     {
-        if (port == u"\\Windows\\ApiPort")
+        if (strip_session_directory(port) == u"\\Windows\\ApiPort")
         {
             return create_api_port();
         }

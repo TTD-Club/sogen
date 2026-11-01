@@ -14,6 +14,26 @@ namespace sogen
             constexpr uint32_t token_authentication_id = 0x1000;
             constexpr uint32_t token_id = 0x1001;
             constexpr uint32_t token_modified_id = 0x1002;
+            constexpr uint32_t token_source_id = 0x1003;
+            constexpr uint32_t system_logon_id = 0x3E7;
+
+            struct token_source
+            {
+                std::array<char, 8> name{};
+                uint32_t identifier_low{};
+                int32_t identifier_high{};
+            };
+
+            struct empty_token_groups
+            {
+                ULONG group_count{};
+                ULONG padding{};
+            };
+
+            // TOKEN_MANDATORY_POLICY_NO_WRITE_UP | TOKEN_MANDATORY_POLICY_NEW_PROCESS_MIN
+            constexpr ULONG default_mandatory_policy = 0x3;
+            // SE_GROUP_LOGON_ID | SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED
+            constexpr ULONG logon_sid_attributes = 0xC0000007;
 
             // SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED.
             constexpr uint32_t group_enabled = 0x7;
@@ -439,6 +459,11 @@ namespace sogen
 
             if (token_information_class == TokenImpersonationLevel)
             {
+                if (get_token_type(token_handle) != TokenImpersonation)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
                 constexpr auto required_size = sizeof(SECURITY_IMPERSONATION_LEVEL);
                 return_length.write(required_size);
 
@@ -447,8 +472,7 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                const auto level =
-                    !anonymous && get_token_type(token_handle) == TokenImpersonation ? SecurityImpersonation : SecurityAnonymous;
+                const auto level = anonymous ? SecurityAnonymous : SecurityImpersonation;
                 emulator_object<SECURITY_IMPERSONATION_LEVEL>{c.emu, token_information}.write(level);
                 return STATUS_SUCCESS;
             }
@@ -582,8 +606,7 @@ namespace sogen
             }
 
             if (token_information_class == TokenUserClaimAttributes || token_information_class == TokenDeviceClaimAttributes ||
-                token_information_class == TokenRestrictedUserClaimAttributes ||
-                token_information_class == TokenRestrictedDeviceClaimAttributes || token_information_class == TokenSecurityAttributes)
+                token_information_class == TokenSecurityAttributes || token_information_class == TokenSingletonAttributes)
             {
                 constexpr auto required_size = sizeof(TOKEN_SECURITY_ATTRIBUTES_INFORMATION);
                 return_length.write(required_size);
@@ -661,6 +684,86 @@ namespace sogen
                 info.IsolationEnabled = FALSE;
                 c.emu.write_memory(token_information, info);
 
+                return STATUS_SUCCESS;
+            }
+
+            if (token_information_class == TokenSessionReference || token_information_class == TokenRestrictedUserClaimAttributes ||
+                token_information_class == TokenRestrictedDeviceClaimAttributes || token_information_class == TokenRestrictedDeviceGroups ||
+                token_information_class == TokenChildProcessFlags || token_information_class == TokenIsLessPrivilegedAppContainer)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            if (token_information_class == TokenAuditPolicy)
+            {
+                return STATUS_PRIVILEGE_NOT_HELD;
+            }
+
+            // The token is not split by UAC (see TokenElevationType), so it has no linked token.
+            if (token_information_class == TokenLinkedToken)
+            {
+                return STATUS_NO_SUCH_LOGON_SESSION;
+            }
+
+            const auto write_value = [&](const auto& value) {
+                constexpr auto required_size = static_cast<ULONG>(sizeof(value));
+                return_length.write(required_size);
+                if (token_information_length < required_size)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                c.emu.write_memory(token_information, value);
+                return STATUS_SUCCESS;
+            };
+
+            switch (token_information_class)
+            {
+            case TokenSource:
+                return write_value(token_source{
+                    .name = {'U', 's', 'e', 'r', '3', '2', ' ', '\0'},
+                    .identifier_low = token_source_id,
+                });
+            case TokenOrigin:
+                return write_value(LUID{.LowPart = system_logon_id, .HighPart = 0});
+            case TokenVirtualizationAllowed:
+                return write_value(ULONG{1});
+            case TokenVirtualizationEnabled:
+            case TokenAppContainerNumber:
+            case TokenIsRestricted:
+                return write_value(ULONG{0});
+            case TokenMandatoryPolicy:
+                return write_value(default_mandatory_policy);
+            case TokenRestrictedSids:
+            case TokenCapabilities:
+                return write_value(empty_token_groups{});
+            case TokenDeviceGroups:
+                return write_value(TOKEN_GROUPS64{});
+            default:
+                break;
+            }
+
+            if (token_information_class == TokenLogonSid)
+            {
+                // S-1-5-5-X-Y names the logon session whose LUID is X:Y.
+                constexpr std::array<uint32_t, 3> sub_authorities{5, 0, token_authentication_id};
+                constexpr std::array<uint8_t, 8> sid_header{1, static_cast<uint8_t>(sub_authorities.size()), 0, 0, 0, 0, 0, 5};
+                constexpr auto sid_size = sid_header.size() + sizeof(sub_authorities);
+                constexpr auto required_size = static_cast<ULONG>(sizeof(TOKEN_GROUPS64) + sid_size);
+                return_length.write(required_size);
+                if (token_information_length < required_size)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                TOKEN_GROUPS64 groups{};
+                groups.GroupCount = 1;
+                groups.Groups[0].Sid = token_information + sizeof(TOKEN_GROUPS64);
+                groups.Groups[0].Attributes = logon_sid_attributes;
+
+                c.emu.write_memory(token_information, groups);
+                c.emu.write_memory(groups.Groups[0].Sid, sid_header);
+                c.emu.write_memory(groups.Groups[0].Sid + sid_header.size(), sub_authorities);
                 return STATUS_SUCCESS;
             }
 

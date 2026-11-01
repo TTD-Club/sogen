@@ -31,6 +31,27 @@ namespace sogen::test
         }
     }
 
+    TEST(TimeTest, TimeOfDayBootTimeMatchesTheInterruptTime)
+    {
+        auto emu = create_empty_emulator();
+        const auto storage = emu.memory.allocate_memory(0x1000, memory_permission::read_write);
+        const syscall_context context{.win_emu = emu, .emu = emu.vcpu(0).cpu, .vcpu = emu.vcpu(0), .proc = emu.process};
+
+        ASSERT_EQ(STATUS_SUCCESS, syscalls::handle_NtQuerySystemInformation(context, SystemTimeOfDayInformation, storage + 0x100,
+                                                                            sizeof(SYSTEM_TIMEOFDAY_INFORMATION64), {emu.memory, storage}));
+        const auto info = emu.memory.read_memory<SYSTEM_TIMEOFDAY_INFORMATION64>(storage + 0x100);
+
+        const auto current_time = utils::convert_to_ksystem_time(emu.clock().system_now());
+        const auto expected_current_time = (static_cast<int64_t>(current_time.High1Time) << 32) | current_time.LowPart;
+        const auto interrupt_time = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
+                                        emu.clock().steady_now().time_since_epoch())
+                                        .count();
+
+        EXPECT_EQ(expected_current_time, info.CurrentTime.QuadPart);
+        EXPECT_EQ(interrupt_time, info.CurrentTime.QuadPart - info.BootTime.QuadPart);
+        EXPECT_NE(0, info.BootTime.QuadPart);
+    }
+
     TEST(TimeTest, SystemTimeIsAccurate)
     {
         std::string output_buffer{};

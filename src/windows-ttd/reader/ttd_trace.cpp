@@ -195,6 +195,7 @@ namespace sogen::ttd
         template <typename T>
         T read_object(std::istream& stream)
         {
+            // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
             T object{};
             stream.read(reinterpret_cast<char*>(&object), sizeof(object));
             if (!stream)
@@ -1257,6 +1258,7 @@ namespace sogen::ttd
             }
             else if (version_ == 3)
             {
+                // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
                 v3_event old{};
                 memcpy(&old, entry, sizeof(old));
                 output[i] = {.step = old.step, .ip = old.ip, .address = old.address, .size = old.size, .kind = old.kind};
