@@ -47,6 +47,24 @@ namespace sogen
                 information.CheckSum = optional_header.CheckSum;
             }
 
+            // IoPriorityNormal
+            constexpr ULONG io_priority_normal = 2;
+
+            // These classes take exactly the size of their structure; any other length fails without a return length.
+            template <typename T>
+            NTSTATUS write_exact_information(const syscall_context& c, const T& value, const uint64_t process_information,
+                                             const uint32_t process_information_length, const emulator_object<uint32_t> return_length)
+            {
+                if (process_information_length != sizeof(T))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                c.emu.write_memory(process_information, value);
+                return_length.write_if_valid(sizeof(T));
+                return STATUS_SUCCESS;
+            }
+
             // The defaults of a process without a job: unlimited pools, page file and time. GlobalMemoryStatusEx caps the
             // available page file at PagefileLimit, so zero would report no memory at all.
             template <typename Traits>
@@ -704,10 +722,6 @@ namespace sogen
                                                                 c.PriorityClass = 32; // Normal
                                                             });
 
-            case ProcessIoPriority:
-                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
-                                           [](ULONG& priority) { priority = 2; }); // IoPriorityNormal
-
             case ProcessHandleCount:
                 return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
                                            [&](ULONG& count) { count = c.proc.count_handles(); });
@@ -874,6 +888,97 @@ namespace sogen
 
                 return STATUS_SUCCESS;
             }
+
+            case ProcessPriorityBoost:
+            case ProcessBreakOnTermination:
+            case ProcessAffinityUpdateMode:
+            case ProcessMemoryAllocationMode:
+            case ProcessHandleCheckingMode:
+            case ProcessCheckStackExtentsMode:
+            case ProcessRaiseUMExceptionOnInvalidHandleClose:
+            case ProcessSubsystemInformation:
+                return write_exact_information(c, ULONG{0}, process_information, process_information_length, return_length);
+
+            case ProcessLUIDDeviceMapsEnabled:
+                return write_exact_information(c, ULONG{1}, process_information, process_information_length, return_length);
+
+            case ProcessIoPriority:
+                return write_exact_information(c, io_priority_normal, process_information, process_information_length, return_length);
+
+            case ProcessIoCounters:
+                return write_exact_information(c, std::array<uint64_t, 6>{}, process_information, process_information_length,
+                                               return_length);
+
+            case ProcessCycleTime:
+                return write_exact_information(
+                    c, std::array<uint64_t, 2>{c.win_emu.get_executed_instructions(), c.win_emu.clock().timestamp_counter()},
+                    process_information, process_information_length, return_length);
+
+            case ProcessKeepAliveCount:
+                return write_exact_information(c, std::array<ULONG, 2>{}, process_information, process_information_length,
+                                               emulator_object<uint32_t>{c.emu, 0});
+
+            case ProcessProtectionInformation:
+                return write_exact_information(c, uint8_t{0}, process_information, process_information_length, return_length);
+
+            case ProcessInPrivate:
+                return write_exact_information(c, BOOLEAN{FALSE}, process_information, process_information_length,
+                                               emulator_object<uint32_t>{c.emu, 0});
+
+            case ProcessChildProcessInformation:
+                return write_exact_information(c, std::array<BOOLEAN, 3>{}, process_information, process_information_length, return_length);
+
+            // Windows answers these classes only when they are set, or not at all for a user-mode caller.
+            case ProcessBasePriority:
+            case ProcessRaisePriority:
+            case ProcessExceptionPort:
+            case ProcessAccessToken:
+            case ProcessLdtSize:
+            case ProcessIoPortHandlers:
+            case ProcessUserModeIOPL:
+            case ProcessForegroundInformation:
+            case ProcessTlsInformation:
+            case ProcessThreadStackAllocation:
+            case ProcessTokenVirtualizationEnabled:
+            case ProcessDynamicFunctionTableInformation:
+            case ProcessRevokeFileHandles:
+            case ProcessWorkingSetControl:
+            case ProcessMemoryExhaustion:
+            case ProcessFaultInformation:
+            case ProcessSubsystemProcess:
+            case ProcessReserved3Information:
+            case ProcessDisableSystemAllowedCpuSets:
+            case ProcessManageWritesToExecutableMemory:
+            case ProcessDebugAuthInformation:
+            case ProcessSystemResourceManagement:
+            case ProcessLoaderDetour:
+            case ProcessCombineSecurityDomainsInformation:
+            case ProcessFiberShadowStackAllocation:
+            case ProcessFreeFiberShadowStackAllocation:
+            case ProcessAltSystemCallInformation:
+            case ProcessDynamicEHContinuationTargets:
+            case ProcessDynamicEnforcedCetCompatibleRanges:
+            case ProcessCreateStateChange:
+            case ProcessApplyStateChange:
+            case ProcessEnableOptionalXStateFeatures:
+            case ProcessAssignCpuPartitions:
+            case ProcessPriorityClassEx:
+            case ProcessSchedulerSharedData:
+            case ProcessSlistRollbackInformation:
+                return STATUS_INVALID_INFO_CLASS;
+
+            case ProcessLdtInformation:
+                return STATUS_NOT_IMPLEMENTED;
+
+            case ProcessWorkingSetWatch:
+                return STATUS_UNSUCCESSFUL;
+
+            case ProcessIumChallengeResponse:
+                return STATUS_OBJECT_TYPE_MISMATCH;
+
+            case ProcessWakeInformation:
+            case ProcessTelemetryCoverage:
+                return STATUS_ACCESS_DENIED;
 
             default:
                 c.win_emu.log.error("Unsupported process info class: 0x%X\n", info_class);
