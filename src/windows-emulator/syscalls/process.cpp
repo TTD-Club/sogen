@@ -16,6 +16,37 @@ namespace sogen
             constexpr USHORT executable_large_address_aware_image = 0x0022;
             constexpr ULONG process_create_flags_inherit_handles = 4;
 
+            constexpr UCHAR image_dynamically_relocated = 0x04;
+
+            // The headers of a PE32 image use 32-bit fields, so they are read with the layout matching the image.
+            template <typename Address>
+            void fill_image_information(const syscall_context& c, const mapped_module& image,
+                                        SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>& information)
+            {
+                const auto dos_header = c.emu.read_memory<PEDosHeader_t>(image.image_base);
+                const auto nt_headers = c.emu.read_memory<PENTHeaders_t<Address>>(image.image_base + dos_header.e_lfanew);
+                const auto& file_header = nt_headers.FileHeader;
+                const auto& optional_header = nt_headers.OptionalHeader;
+                const auto file_stat = c.win_emu.file_sys.stat(image.module_path);
+
+                information.TransferAddress = image.entry_point;
+                information.MaximumStackSize = optional_header.SizeOfStackReserve;
+                information.CommittedStackSize = optional_header.SizeOfStackCommit;
+                information.SubSystemType = optional_header.Subsystem;
+                information.SubSystemMajorVersion = optional_header.MajorSubsystemVersion;
+                information.SubSystemMinorVersion = optional_header.MinorSubsystemVersion;
+                information.MajorOperatingSystemVersion = optional_header.MajorOperatingSystemVersion;
+                information.MinorOperatingSystemVersion = optional_header.MinorOperatingSystemVersion;
+                information.ImageCharacteristics = file_header.Characteristics;
+                information.DllCharacteristics = optional_header.DllCharacteristics;
+                information.Machine = file_header.Machine;
+                information.ImageContainsCode = TRUE;
+                information.ImageFlags = image.image_base != image.image_base_file ? image_dynamically_relocated : 0;
+                information.ImageFileSize = file_stat ? static_cast<ULONG>(file_stat->st_size) : 0;
+                information.LoaderFlags = optional_header.LoaderFlags;
+                information.CheckSum = optional_header.CheckSum;
+            }
+
             // The defaults of a process without a job: unlimited pools, page file and time. GlobalMemoryStatusEx caps the
             // available page file at PagefileLimit, so zero would report no memory at all.
             template <typename Traits>
@@ -720,34 +751,16 @@ namespace sogen
             case ProcessImageInformation:
                 return handle_query<SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>>(
                     c.emu, process_information, process_information_length, return_length,
-                    [&](SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>& i) {
-                        const auto& mod = *c.win_emu.mod_manager.executable;
-
-                        const emulator_object<PEDosHeader_t> dos_header_obj{c.emu, mod.image_base};
-                        const auto dos_header = dos_header_obj.read();
-
-                        const emulator_object<PENTHeaders_t<uint64_t>> nt_headers_obj{c.emu, mod.image_base + dos_header.e_lfanew};
-                        const auto nt_headers = nt_headers_obj.read();
-
-                        const auto& file_header = nt_headers.FileHeader;
-                        const auto& optional_header = nt_headers.OptionalHeader;
-
-                        i.TransferAddress = 0;
-                        i.MaximumStackSize = optional_header.SizeOfStackReserve;
-                        i.CommittedStackSize = optional_header.SizeOfStackCommit;
-                        i.SubSystemType = optional_header.Subsystem;
-                        i.SubSystemMajorVersion = optional_header.MajorSubsystemVersion;
-                        i.SubSystemMinorVersion = optional_header.MinorSubsystemVersion;
-                        i.MajorOperatingSystemVersion = optional_header.MajorOperatingSystemVersion;
-                        i.MinorOperatingSystemVersion = optional_header.MinorOperatingSystemVersion;
-                        i.ImageCharacteristics = file_header.Characteristics;
-                        i.DllCharacteristics = optional_header.DllCharacteristics;
-                        i.Machine = file_header.Machine;
-                        i.ImageContainsCode = TRUE;
-                        i.ImageFlags = 0; // TODO
-                        i.ImageFileSize = optional_header.SizeOfImage;
-                        i.LoaderFlags = optional_header.LoaderFlags;
-                        i.CheckSum = optional_header.CheckSum;
+                    [&](SECTION_IMAGE_INFORMATION<EmulatorTraits<Emu64>>& information) {
+                        const auto& executable = *c.win_emu.mod_manager.executable;
+                        if (executable.machine == IMAGE_FILE_MACHINE_I386)
+                        {
+                            fill_image_information<uint32_t>(c, executable, information);
+                        }
+                        else
+                        {
+                            fill_image_information<uint64_t>(c, executable, information);
+                        }
                     });
 
             case ProcessQuotaLimits: {
