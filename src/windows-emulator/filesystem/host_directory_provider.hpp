@@ -55,6 +55,7 @@ namespace sogen
 
       private:
         std::optional<std::filesystem::path> get_host_path(const windows_path& path) const override;
+        std::optional<std::filesystem::path> resolve_host_path(const windows_path& path) const;
 
         std::filesystem::path target_{};
         bool lookup_ignores_case_{};
