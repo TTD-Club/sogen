@@ -462,7 +462,7 @@ namespace sogen
             p.CriticalSectionTimeout.QuadPart = critical_section_timeout;
             p.ImageSubsystemMajorVersion = 6;
 
-            // TODO: p.SessionId = 1;
+            p.SessionId = 1;
             p.OSPlatformId = 2;
             p.OSMajorVersion = version.get_major_version();
             p.OSMinorVersion = version.get_minor_version();
@@ -564,7 +564,7 @@ namespace sogen
                 p32.CriticalSectionTimeout.QuadPart = critical_section_timeout;
                 p32.ImageSubsystemMajorVersion = 6;
 
-                // TODO: p32.SessionId = 1;
+                p32.SessionId = 1;
                 p32.OSPlatformId = 2;
                 p32.OSMajorVersion = version.get_major_version();
                 p32.OSMinorVersion = version.get_minor_version();
