@@ -97,6 +97,31 @@ namespace sogen
 
             constexpr std::array<uint8_t, 12> anonymous_sid{1, 1, 0, 0, 0, 0, 0, 5, 7, 0, 0, 0};
 
+            // Windows 11 26200 answers classes up to 0x3A, past the last one TOKEN_INFORMATION_CLASS names.
+            constexpr ULONG last_token_information_class = 0x3A;
+
+            bool is_writable_range(memory_manager& memory, const uint64_t address, const uint64_t size)
+            {
+                const auto end = address + size;
+                if (address == 0 || end < address)
+                {
+                    return false;
+                }
+
+                for (auto current = address; current < end;)
+                {
+                    const auto region = memory.get_region_info(current);
+                    if (!region.is_committed || !is_writable(region.permissions.common))
+                    {
+                        return false;
+                    }
+
+                    current = region.start + region.length;
+                }
+
+                return true;
+            }
+
             handle resolve_token(const syscall_context& c, const handle token)
             {
                 if (token == CURRENT_THREAD_TOKEN || token == CURRENT_THREAD_EFFECTIVE_TOKEN)
@@ -199,6 +224,13 @@ namespace sogen
                                                 const TOKEN_INFORMATION_CLASS token_information_class, const uint64_t token_information,
                                                 const ULONG token_information_length, const emulator_object<ULONG> return_length)
         {
+            if (token_information_class < TokenUser || static_cast<ULONG>(token_information_class) > last_token_information_class)
+            {
+                c.win_emu.log.error("Unsupported NtQueryInformationToken info class: 0x%X\n",
+                                    static_cast<uint32_t>(token_information_class));
+                return STATUS_INVALID_INFO_CLASS;
+            }
+
             const auto token_handle = resolve_token(c, requested_token);
             if (token_handle == 0 && requested_token == CURRENT_THREAD_TOKEN)
             {
@@ -714,6 +746,72 @@ namespace sogen
             privilege_set_length.write(0);
             granted_access.write(granted);
             access_status.write(!denied && remaining == 0 ? STATUS_SUCCESS : STATUS_ACCESS_DENIED);
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtPrivilegeCheck(const syscall_context& c, const handle client_token, const emulator_pointer required_privileges,
+                                         const emulator_object<BOOLEAN> result)
+        {
+            struct privilege_set_header
+            {
+                ULONG privilege_count;
+                ULONG control;
+            };
+
+            constexpr ULONG privilege_set_all_necessary = 1;
+            constexpr ULONG max_privilege_count = 66;
+            constexpr DWORD privilege_used_for_access = 0x80000000;
+
+            if (client_token != CURRENT_PROCESS_TOKEN && client_token != DUMMY_IMPERSONATION_TOKEN &&
+                client_token != ANONYMOUS_IMPERSONATION_TOKEN)
+            {
+                const auto object_handle = c.proc.resolve_object_pseudo_handle(client_token, c.vcpu.active_thread);
+                auto* store = c.proc.get_handle_store(object_handle);
+                return store && store->get_object(object_handle) ? STATUS_OBJECT_TYPE_MISMATCH : STATUS_INVALID_HANDLE;
+            }
+
+            const auto header = emulator_object<privilege_set_header>{c.emu, required_privileges}.try_read();
+            if (!header)
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            // PRIVILEGE_SET declares one entry, so Windows probes that much even for an empty set.
+            const auto probed_entries = std::max<uint64_t>(header->privilege_count, 1);
+            const auto set_size = sizeof(privilege_set_header) + (probed_entries * sizeof(token_privilege));
+            if (!is_writable_range(c.win_emu.memory, required_privileges, set_size) ||
+                !is_writable_range(c.win_emu.memory, result.value(), sizeof(BOOLEAN)))
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            if (header->privilege_count > max_privilege_count)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            // The impersonation tokens hold no privileges.
+            const auto* held = client_token == CURRENT_PROCESS_TOKEN ? &c.proc.token_privileges : nullptr;
+
+            ULONG enabled_count = 0;
+            const auto entries = required_privileges + sizeof(privilege_set_header);
+            for (ULONG i = 0; i < header->privilege_count; ++i)
+            {
+                const auto entry_address = entries + (static_cast<uint64_t>(i) * sizeof(token_privilege));
+                auto entry = c.emu.read_memory<token_privilege>(entry_address);
+                const auto privilege = held && entry.Luid.HighPart == 0 ? held->find(entry.Luid.LowPart) : decltype(held->end()){};
+                const auto enabled = held && privilege != held->end() && (privilege->second & privilege_enabled) != 0;
+                if (enabled)
+                {
+                    ++enabled_count;
+                    entry.Attributes |= privilege_used_for_access;
+                    c.emu.write_memory(entry_address, entry);
+                }
+            }
+
+            const auto all_necessary = (header->control & privilege_set_all_necessary) != 0;
+            const BOOLEAN granted = all_necessary ? enabled_count == header->privilege_count : enabled_count != 0;
+            result.write(granted);
             return STATUS_SUCCESS;
         }
 

@@ -35,7 +35,7 @@ namespace sogen
     };
 
     class memory_manager;
-    class linux_memory_manager;
+    class posix_memory_manager;
 
     namespace ttd
     {
@@ -47,7 +47,7 @@ namespace sogen
     {
       public:
         friend memory_manager;
-        friend linux_memory_manager;
+        friend posix_memory_manager;
         friend ttd::view_engine;
 
         virtual ~memory_interface() = default;
