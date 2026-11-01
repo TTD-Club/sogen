@@ -486,6 +486,7 @@ namespace sogen
             child.is_wow64_process = child_is_wow64;
             child.native_environment = result.native_environment;
             child.compatibility_environment = result.compatibility_environment;
+            child.image_name = application_path.leaf();
             const auto child_process_handle = c.proc.processes.store(std::move(child));
 
             managed_process_thread initial_thread{};

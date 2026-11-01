@@ -459,7 +459,41 @@ namespace sogen
                 processes.push_back(std::move(entry));
             }
 
+            const auto guest_id = guest.id;
             processes.push_back(std::move(guest));
+
+            for (const auto& child : c.proc.processes | std::views::values)
+            {
+                if (!child.process || !c.win_emu.processes())
+                {
+                    continue;
+                }
+
+                const auto status = c.win_emu.processes()->exit_status(child.process);
+                if (!status || status.status.has_value())
+                {
+                    continue;
+                }
+
+                listed_process entry{
+                    .id = child.id,
+                    .parent_id = guest_id,
+                    .session_id = interactive_session_id,
+                    .base_priority = 8,
+                    .image_name = child.image_name,
+                };
+
+                for (const auto& thread : c.proc.managed_threads | std::views::values)
+                {
+                    if (thread.process_id == child.id)
+                    {
+                        entry.thread_ids.push_back(thread.thread_id);
+                    }
+                }
+
+                processes.push_back(std::move(entry));
+            }
+
             return processes;
         }
 

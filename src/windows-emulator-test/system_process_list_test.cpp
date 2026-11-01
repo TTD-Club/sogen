@@ -20,6 +20,61 @@ namespace sogen::test
         constexpr ACCESS_MASK process_query_limited_information = 0x1000;
         constexpr ACCESS_MASK process_vm_read = 0x0010;
 
+        class child_process_manager final : public process_manager
+        {
+          public:
+            bool exited{};
+
+            process_create_result create_process(process_create_request) override
+            {
+                return {.error = process_error::unavailable};
+            }
+
+            process_error resume_process(managed_process) override
+            {
+                return process_error::unavailable;
+            }
+
+            process_error terminate_process(managed_process, uint64_t) override
+            {
+                return process_error::unavailable;
+            }
+
+            process_exit_status_result exit_status(managed_process) const override
+            {
+                if (this->exited)
+                {
+                    return {.status = process_exit{.code = 0}};
+                }
+                return {};
+            }
+
+            process_memory_result allocate_memory(managed_process, uint64_t, uint64_t, memory_permission, bool, bool) override
+            {
+                return {.error = process_error::unavailable};
+            }
+
+            process_error free_memory(managed_process, uint64_t, uint64_t, bool) override
+            {
+                return process_error::unavailable;
+            }
+
+            process_memory_result protect_memory(managed_process, uint64_t, uint64_t, memory_permission) override
+            {
+                return {.error = process_error::unavailable};
+            }
+
+            process_memory_read_result read_memory(managed_process, uint64_t, uint64_t) const override
+            {
+                return {.error = process_error::unavailable};
+            }
+
+            process_memory_result write_memory(managed_process, uint64_t, std::span<const uint8_t>) override
+            {
+                return {.error = process_error::unavailable};
+            }
+        };
+
         struct listed_process
         {
             uint64_t id{};
@@ -121,7 +176,9 @@ namespace sogen::test
                 return entry == processes.end() ? nullptr : &*entry;
             }
 
-            windows_emulator emu = create_sample_emulator();
+            child_process_manager manager{};
+            windows_emulator emu = create_sample_emulator(emulator_settings{.use_relative_time = true}, {}, {},
+                                                          emulator_interfaces{.processes = &this->manager});
             uint64_t buffer{};
         };
     }
@@ -193,5 +250,32 @@ namespace sogen::test
                                                              0x400, {this->emu.memory, this->buffer}));
         const auto path = this->read_name(this->emu.memory.read_memory<UNICODE_STRING<EmulatorTraits<Emu64>>>(this->buffer + 0x1000));
         EXPECT_EQ(u"C:\\Windows\\explorer.exe", path);
+    }
+
+    TEST_F(SystemProcessListTest, RunningChildrenAreListedUnderTheGuest)
+    {
+        constexpr uint32_t child_id = 0x5000;
+
+        emulator_process child{};
+        child.process = managed_process{.value = 1};
+        child.id = child_id;
+        child.image_name = u"child.exe";
+        this->emu.process.processes.store(std::move(child));
+
+        managed_process_thread thread{};
+        thread.process = managed_process{.value = 1};
+        thread.process_id = child_id;
+        thread.thread_id = child_id + 4;
+        this->emu.process.managed_threads.store(std::move(thread));
+
+        const auto processes = this->query_full_list();
+        const auto* listed = find(processes, u"child.exe");
+        ASSERT_NE(nullptr, listed);
+        EXPECT_EQ(child_id, listed->id);
+        EXPECT_EQ(uint64_t{this->emu.process.process_id}, listed->parent_id);
+        EXPECT_EQ(1u, listed->thread_count);
+
+        this->manager.exited = true;
+        EXPECT_EQ(nullptr, find(this->query_full_list(), u"child.exe"));
     }
 }
