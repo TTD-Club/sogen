@@ -129,4 +129,41 @@ namespace sogen::test
         emulator_object<handle>{this->emu->memory, this->storage}.write({});
         EXPECT_EQ(STATUS_SUCCESS, this->set(ThreadImpersonationToken, this->storage, sizeof(handle)));
     }
+
+    TEST_F(ThreadInformationTest, FixedSizeClassesRequireTheExactLength)
+    {
+        uint32_t return_length{};
+        constexpr auto basic_size = static_cast<uint32_t>(sizeof(THREAD_BASIC_INFORMATION64));
+        for (const uint32_t length : {basic_size - 1, basic_size + 8})
+        {
+            SCOPED_TRACE(length);
+            EXPECT_EQ(STATUS_INFO_LENGTH_MISMATCH, this->query(ThreadBasicInformation, this->storage, length, return_length));
+            EXPECT_EQ(untouched, return_length);
+        }
+
+        EXPECT_EQ(STATUS_SUCCESS, this->query(ThreadBasicInformation, this->storage, basic_size, return_length));
+        EXPECT_EQ(sizeof(THREAD_BASIC_INFORMATION64), return_length);
+    }
+
+    TEST_F(ThreadInformationTest, ReportsTheSuspendCountAndTerminationOfARunningThread)
+    {
+        uint32_t return_length{};
+        this->emu->memory.write_memory(this->storage, untouched);
+        ASSERT_EQ(STATUS_SUCCESS, this->query(ThreadSuspendCount, this->storage, sizeof(ULONG), return_length));
+        EXPECT_EQ(0u, this->emu->memory.read_memory<ULONG>(this->storage));
+
+        this->emu->memory.write_memory(this->storage, untouched);
+        ASSERT_EQ(STATUS_SUCCESS, this->query(ThreadIsTerminated, this->storage, sizeof(ULONG), return_length));
+        EXPECT_EQ(0u, this->emu->memory.read_memory<ULONG>(this->storage));
+    }
+
+    TEST_F(ThreadInformationTest, SetOnlyClassesCannotBeQueried)
+    {
+        uint32_t return_length{};
+        for (const auto info_class : {ThreadPriority, ThreadBasePriority, ThreadAffinityMask, ThreadZeroTlsCell, ThreadIdealProcessor})
+        {
+            SCOPED_TRACE(static_cast<int>(info_class));
+            EXPECT_EQ(STATUS_INVALID_INFO_CLASS, this->query(info_class, this->storage, sizeof(ULONG), return_length));
+        }
+    }
 }
