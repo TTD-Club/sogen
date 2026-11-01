@@ -217,6 +217,44 @@ namespace sogen
         }
 
 #ifdef OS_WINDOWS
+        // Win32 file functions reject a path past MAX_PATH, CreateDirectoryW already past MAX_PATH - 12, unless the
+        // process is long path aware, which in turn needs the LongPathsEnabled system policy. The extended-length
+        // prefix lifts the limit unconditionally. As in LLVM's widenPath, only a path that needs it gets it, so every
+        // other one keeps the form it is logged and compared in.
+        std::filesystem::path to_host_api_path(const std::filesystem::path& path)
+        {
+            constexpr size_t longest_plain_path = MAX_PATH - 12;
+            constexpr std::wstring_view extended_prefix = LR"(\\?\)";
+            constexpr std::wstring_view unc_prefix = LR"(\\)";
+            constexpr std::wstring_view extended_unc_prefix = LR"(\\?\UNC\)";
+
+            if (path.native().size() < longest_plain_path || path.native().starts_with(extended_prefix))
+            {
+                return path;
+            }
+
+            std::error_code ec{};
+            const auto native = std::filesystem::absolute(path, ec).lexically_normal().native();
+            if (ec)
+            {
+                return path;
+            }
+
+            if (native.starts_with(unc_prefix))
+            {
+                return std::wstring{extended_unc_prefix} + native.substr(unc_prefix.size());
+            }
+
+            return std::wstring{extended_prefix} + native;
+        }
+#else
+        const std::filesystem::path& to_host_api_path(const std::filesystem::path& path)
+        {
+            return path;
+        }
+#endif
+
+#ifdef OS_WINDOWS
         struct find_handle_deleter
         {
             void operator()(void* handle) const noexcept
@@ -328,6 +366,17 @@ namespace sogen
     }
 
     std::optional<std::filesystem::path> host_directory_provider::get_host_path(const windows_path& path) const
+    {
+        const auto host_path = this->resolve_host_path(path);
+        if (!host_path)
+        {
+            return std::nullopt;
+        }
+
+        return to_host_api_path(*host_path);
+    }
+
+    std::optional<std::filesystem::path> host_directory_provider::resolve_host_path(const windows_path& path) const
     {
         if (path.empty())
         {
