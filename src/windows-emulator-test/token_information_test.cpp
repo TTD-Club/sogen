@@ -145,8 +145,8 @@ namespace sogen::test
 
     TEST_F(TokenInformationTest, EmptyClaimsHaveSupportedVersion)
     {
-        for (const auto information_class : {TokenUserClaimAttributes, TokenDeviceClaimAttributes, TokenRestrictedUserClaimAttributes,
-                                             TokenRestrictedDeviceClaimAttributes, TokenSecurityAttributes})
+        for (const auto information_class :
+             {TokenUserClaimAttributes, TokenDeviceClaimAttributes, TokenSecurityAttributes, TokenSingletonAttributes})
         {
             EXPECT_EQ(STATUS_BUFFER_TOO_SMALL, this->query(information_class, 0));
             ASSERT_EQ(STATUS_SUCCESS, this->query(information_class, sizeof(TOKEN_SECURITY_ATTRIBUTES_INFORMATION)));
@@ -328,4 +328,43 @@ namespace sogen::test
         }
     }
 
+    TEST_F(TokenInformationTest, RejectsClassesWindowsDoesNotAnswerForThisToken)
+    {
+        for (const auto information_class :
+             {TokenImpersonationLevel, TokenSessionReference, TokenRestrictedUserClaimAttributes, TokenRestrictedDeviceClaimAttributes,
+              TokenRestrictedDeviceGroups, TokenChildProcessFlags, TokenIsLessPrivilegedAppContainer})
+        {
+            SCOPED_TRACE(static_cast<int>(information_class));
+            EXPECT_EQ(STATUS_INVALID_PARAMETER, this->query(information_class, 0x100));
+        }
+
+        EXPECT_EQ(STATUS_PRIVILEGE_NOT_HELD, this->query(TokenAuditPolicy, 0x100));
+        EXPECT_EQ(STATUS_NO_SUCH_LOGON_SESSION, this->query(TokenLinkedToken, 0x100));
+    }
+
+    TEST_F(TokenInformationTest, ReportsTheInteractiveLogonSource)
+    {
+        ASSERT_EQ(STATUS_SUCCESS, this->query(TokenSource, 16));
+        const auto name = emulator_object<std::array<char, 8>>{this->emu->memory, this->storage + 0x100}.read();
+        EXPECT_EQ((std::array<char, 8>{'U', 's', 'e', 'r', '3', '2', ' ', '\0'}), name);
+
+        ASSERT_EQ(STATUS_SUCCESS, this->query(TokenOrigin, 8));
+        EXPECT_EQ(0x3E7u, (emulator_object<ULONG>{this->emu->memory, this->storage + 0x100}.read()));
+    }
+
+    TEST_F(TokenInformationTest, ReportsTheLogonSidOfTheLogonSession)
+    {
+        EXPECT_EQ(STATUS_BUFFER_TOO_SMALL, this->query(TokenLogonSid, 0));
+        const auto required_size = emulator_object<ULONG>{this->emu->memory, this->storage}.read();
+        EXPECT_EQ(sizeof(TOKEN_GROUPS64) + 20, required_size);
+
+        ASSERT_EQ(STATUS_SUCCESS, this->query(TokenLogonSid, required_size));
+        const auto groups = emulator_object<TOKEN_GROUPS64>{this->emu->memory, this->storage + 0x100}.read();
+        ASSERT_EQ(1u, groups.GroupCount);
+        EXPECT_EQ(0xC0000007u, groups.Groups[0].Attributes);
+
+        const auto sid = emulator_object<std::array<uint8_t, 12>>{this->emu->memory, groups.Groups[0].Sid}.read();
+        constexpr std::array<uint8_t, 12> logon_sid_prefix{1, 3, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0};
+        EXPECT_EQ(logon_sid_prefix, sid);
+    }
 }
