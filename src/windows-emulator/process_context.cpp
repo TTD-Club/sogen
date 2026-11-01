@@ -840,6 +840,7 @@ namespace sogen
         buffer.write(this->is_wow64_process);
         buffer.write(this->gdt_base);
         buffer.write(this->hard_error_mode);
+        buffer.write(this->page_priority);
         buffer.write(this->native_architecture);
         buffer.write(this->ntdll_image_base);
         buffer.write(this->ldr_initialize_thunk);
@@ -967,6 +968,7 @@ namespace sogen
         buffer.read(this->is_wow64_process);
         buffer.read(this->gdt_base);
         buffer.read(this->hard_error_mode);
+        buffer.read(this->page_priority);
         buffer.read(this->native_architecture);
         (void)windows_abi_for(this->native_architecture);
         if (this->is_wow64_process && this->native_architecture != windows_guest_architecture::x86_64)

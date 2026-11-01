@@ -633,6 +633,10 @@ namespace sogen
                 return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
                                            [&](ULONG& res) { res = c.proc.hard_error_mode; });
 
+            case ProcessPagePriority:
+                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
+                                           [&](ULONG& res) { res = c.proc.page_priority; });
+
             case ProcessDebugPort: {
                 const auto& proc_name = c.win_emu.mod_manager.executable->name;
                 c.win_emu.callbacks.on_suspicious_activity(std::string("Anti-debug check with ProcessDebugPort [") + proc_name + "]");
@@ -699,10 +703,6 @@ namespace sogen
                                                                 c.Foreground = 1;
                                                                 c.PriorityClass = 32; // Normal
                                                             });
-
-            case ProcessPagePriority:
-                return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
-                                           [](ULONG& priority) { priority = 5; }); // MEMORY_PRIORITY_NORMAL
 
             case ProcessIoPriority:
                 return handle_query<ULONG>(c.emu, process_information, process_information_length, return_length,
@@ -913,7 +913,7 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            if (info_class == ProcessPagePriority || info_class == ProcessIoPriority)
+            if (info_class == ProcessIoPriority)
             {
                 return process_information_length == sizeof(ULONG) ? STATUS_SUCCESS : STATUS_INFO_LENGTH_MISMATCH;
             }
@@ -928,6 +928,23 @@ namespace sogen
                 ULONG mode{};
                 c.emu.read_memory(process_information, &mode, sizeof(mode));
                 c.proc.hard_error_mode = mode;
+                return STATUS_SUCCESS;
+            }
+
+            if (info_class == ProcessPagePriority)
+            {
+                if (process_information_length != sizeof(ULONG))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                const auto priority = c.emu.read_memory<ULONG>(process_information);
+                if (priority > MEMORY_PRIORITY_NORMAL)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                c.proc.page_priority = priority;
                 return STATUS_SUCCESS;
             }
 
