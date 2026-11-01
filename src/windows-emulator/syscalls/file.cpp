@@ -1491,6 +1491,39 @@ namespace sogen
                 return ret(STATUS_SUCCESS, required_length);
             }
 
+            if (info_class == FileNetworkOpenInformation)
+            {
+                constexpr auto required_length = sizeof(FILE_NETWORK_OPEN_INFORMATION);
+                if (length < required_length)
+                {
+                    return ret(STATUS_INFO_LENGTH_MISMATCH);
+                }
+
+                struct compat_stat file_stat{};
+                if (!stat_open_file(*f, file_stat))
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+
+                const auto deterministic_time = c.win_emu.uses_relative_time();
+
+                FILE_NETWORK_OPEN_INFORMATION info{};
+                info.CreationTime = get_file_time(deterministic_time, file_stat.st_ctimespec);
+                info.LastAccessTime = get_file_time(deterministic_time, file_stat.st_atimespec);
+                info.LastWriteTime = get_file_time(deterministic_time, file_stat.st_mtimespec);
+                info.ChangeTime = info.LastWriteTime;
+                info.FileAttributes = with_reparse_attribute(host_file_attributes(file_stat), reparse_tag_at(c, f->name));
+
+                if (f->handle)
+                {
+                    info.EndOfFile.QuadPart = f->handle.size();
+                    info.AllocationSize.QuadPart = static_cast<LONGLONG>(align_up(info.EndOfFile.QuadPart, 512));
+                }
+
+                c.emu.write_memory(file_information, info);
+                return ret(STATUS_SUCCESS, required_length);
+            }
+
             const auto all_info = info_class == FileAllInformation;
             size_t all_length = 0;
 
