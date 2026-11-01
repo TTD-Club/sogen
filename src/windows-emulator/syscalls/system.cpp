@@ -501,6 +501,23 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        // The interrupt time counts from boot, so the boot time is the system time it started counting at.
+        void fill_time_of_day_information(const syscall_context& c, SYSTEM_TIMEOFDAY_INFORMATION64& info)
+        {
+            auto& clock = c.win_emu.clock();
+            const auto current_time = utils::convert_to_ksystem_time(clock.system_now());
+            const auto interrupt_time =
+                std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(clock.steady_now().time_since_epoch())
+                    .count();
+
+            info.CurrentTime.QuadPart = (static_cast<int64_t>(current_time.High1Time) << 32) | current_time.LowPart;
+            info.BootTime.QuadPart = info.CurrentTime.QuadPart - interrupt_time;
+            info.TimeZoneBias.QuadPart = c.proc.kusd.access([](const KUSER_SHARED_DATA64& kusd) {
+                return (static_cast<int64_t>(kusd.TimeZoneBias.High1Time) << 32) | kusd.TimeZoneBias.LowPart;
+            });
+            info.TimeZoneId = 0x00000002;
+        }
+
         NTSTATUS handle_system_pagefile_information(const syscall_context& c, const uint64_t system_information,
                                                     const uint32_t system_information_length, const emulator_object<uint32_t> return_length)
         {
@@ -618,9 +635,7 @@ namespace sogen
                 return handle_query<SYSTEM_TIMEOFDAY_INFORMATION64>(c.emu, system_information, system_information_length, return_length,
                                                                     [&](SYSTEM_TIMEOFDAY_INFORMATION64& info) {
                                                                         memset(&info, 0, sizeof(info));
-                                                                        info.BootTime.QuadPart = 0;
-                                                                        info.TimeZoneId = 0x00000002;
-                                                                        // TODO: Fill
+                                                                        fill_time_of_day_information(c, info);
                                                                     });
 
             case SystemTimeZoneInformation:
