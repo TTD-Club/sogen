@@ -518,6 +518,9 @@ namespace sogen
             uint16_t subsystem_minor_version{};
             uint16_t image_characteristics{};
             uint16_t dll_characteristics{};
+            uint16_t major_operating_system_version{};
+            uint16_t minor_operating_system_version{};
+            uint32_t file_size{};
             bool has_code{false};
             std::array<char, 7> _padding{};
         };
@@ -759,6 +762,9 @@ namespace sogen
 
             info.machine = static_cast<uint16_t>(file_header.Machine);
             info.image_characteristics = file_header.Characteristics;
+            info.major_operating_system_version = optional_header.MajorOperatingSystemVersion;
+            info.minor_operating_system_version = optional_header.MinorOperatingSystemVersion;
+            info.file_size = static_cast<uint32_t>(file_data.size());
 
             info.entry_point_rva = optional_header.AddressOfEntryPoint;
             info.image_base = optional_header.ImageBase;
