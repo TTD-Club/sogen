@@ -29,6 +29,7 @@ namespace sogen::py
             uint64_t ip{};
             uint64_t address{};
             uint64_t size{};
+            // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
             access_kind kind{};
             // Bytes read or written, or for an execute the instruction bytes.
             std::vector<std::byte> data{};
@@ -974,7 +975,7 @@ namespace sogen::py
                 "system_dlls, build) that an emulator with these keyword arguments (as for create_emulator) would read "
                 "differently. Replay.manifest_differences is the same check after a seek.");
             m.def("registry_fingerprint", &ttd::registry_fingerprint, nb::arg("hive_directory"),
-                  "The manifest's \"registry\" value for a folder of hives; compare it with Trace.manifest[\"registry\"]");
+                  R"(The manifest's "registry" value for a folder of hives; compare it with Trace.manifest["registry"])");
             m.def("system_dll_fingerprint", &ttd::system_dll_fingerprint, nb::arg("system32"),
                   "The manifest's \"system_dlls\" value for a System32 folder on this machine");
         }

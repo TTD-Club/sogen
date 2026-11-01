@@ -232,9 +232,12 @@ namespace sogen
 
         const auto length = static_cast<size_t>(std::min<uint64_t>(size, this->size_ - offset));
         const std::span target(static_cast<std::byte*>(buffer), length);
-        if (auto range = this->contents_.upper_bound(offset);
-            range != this->contents_.begin() && (--range, range->first + range->second.size() >= offset + length))
+        auto range = this->contents_.upper_bound(offset);
+        const auto in_contents =
+            range != this->contents_.begin() && std::prev(range)->first + std::prev(range)->second.size() >= offset + length;
+        if (in_contents)
         {
+            --range;
             std::memcpy(target.data(), range->second.data() + (offset - range->first), length);
         }
         else if (this->file_.is_open())

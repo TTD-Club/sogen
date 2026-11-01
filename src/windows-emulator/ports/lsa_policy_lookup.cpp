@@ -219,33 +219,40 @@ namespace sogen
         }
 
         // The token's groups (see NtQueryInformationToken's TokenGroups) and other common ones.
-        const std::array<well_known_sid, 17> k_well_known_sids = {
-            authority_group(1, 0, u"Everyone"),
-            authority_group(2, 0, u"LOCAL"),
-            authority_group(2, 1, u"CONSOLE LOGON"),
-            nt_authority_group(2, u"NETWORK"),
-            nt_authority_group(4, u"INTERACTIVE"),
-            nt_authority_group(11, u"Authenticated Users"),
-            nt_authority_group(15, u"This Organization"),
-            nt_authority_group(18, u"SYSTEM"),
-            nt_authority_group(19, u"LOCAL SERVICE"),
-            nt_authority_group(20, u"NETWORK SERVICE"),
-            nt_authority_group(113, u"Local account"),
-            {.sub_authorities = {64, 10}, .domain = u"NT AUTHORITY", .name = u"NTLM Authentication", .type = k_sid_type_well_known_group},
-            // The logon session's SID, S-1-5-5-0-<authentication id> (NtQueryInformationToken's token_authentication_id).
-            {.sub_authorities = {5, 0, 0x1000},
-             .domain = u"NT AUTHORITY",
-             .name = u"LogonSessionId_0_4096",
-             .type = k_sid_type_logon_session},
-            {.sub_authorities = {8192},
-             .domain = u"Mandatory Label",
-             .name = u"Medium Mandatory Level",
-             .type = k_sid_type_label,
-             .authority = 16},
-            builtin_alias(544, u"Administrators"),
-            builtin_alias(545, u"Users"),
-            builtin_alias(555, u"Remote Desktop Users"),
-        };
+        const std::array<well_known_sid, 17>& well_known_sids()
+        {
+            static const std::array<well_known_sid, 17> sids = {
+                authority_group(1, 0, u"Everyone"),
+                authority_group(2, 0, u"LOCAL"),
+                authority_group(2, 1, u"CONSOLE LOGON"),
+                nt_authority_group(2, u"NETWORK"),
+                nt_authority_group(4, u"INTERACTIVE"),
+                nt_authority_group(11, u"Authenticated Users"),
+                nt_authority_group(15, u"This Organization"),
+                nt_authority_group(18, u"SYSTEM"),
+                nt_authority_group(19, u"LOCAL SERVICE"),
+                nt_authority_group(20, u"NETWORK SERVICE"),
+                nt_authority_group(113, u"Local account"),
+                {.sub_authorities = {64, 10},
+                 .domain = u"NT AUTHORITY",
+                 .name = u"NTLM Authentication",
+                 .type = k_sid_type_well_known_group},
+                // The logon session's SID, S-1-5-5-0-<authentication id> (NtQueryInformationToken's token_authentication_id).
+                {.sub_authorities = {5, 0, 0x1000},
+                 .domain = u"NT AUTHORITY",
+                 .name = u"LogonSessionId_0_4096",
+                 .type = k_sid_type_logon_session},
+                {.sub_authorities = {8192},
+                 .domain = u"Mandatory Label",
+                 .name = u"Medium Mandatory Level",
+                 .type = k_sid_type_label,
+                 .authority = 16},
+                builtin_alias(544, u"Administrators"),
+                builtin_alias(545, u"Users"),
+                builtin_alias(555, u"Remote Desktop Users"),
+            };
+            return sids;
+        }
 
         // The binary SID S-1-<authority>-<sub authorities>.
         std::vector<uint8_t> make_sid(const std::span<const uint32_t> sub_authorities, const uint8_t authority = k_nt_authority)
@@ -659,7 +666,7 @@ namespace sogen
                     }
                 }
 
-                for (const auto& known : k_well_known_sids)
+                for (const auto& known : well_known_sids())
                 {
                     const auto sid = make_sid(known.sub_authorities, known.authority);
                     if (request_contains_sid(win_emu, c, sid))
