@@ -1,6 +1,7 @@
 #pragma once
 
 #include "handles.hpp"
+#include "io_device.hpp"
 #include "memory_manager.hpp"
 #include "filesystem/guest_file.hpp"
 
@@ -166,6 +167,49 @@ namespace sogen
         }
     };
 
+    // A debugger's view of the child processes it debugs; their events reach it through the process manager.
+    struct debug_object : ref_counted_object
+    {
+        struct debuggee
+        {
+            uint64_t process{};
+            uint32_t process_id{};
+            bool exit_reported{};
+            std::vector<uint32_t> thread_ids{};
+
+            void serialize(utils::buffer_serializer& buffer) const
+            {
+                buffer.write(this->process);
+                buffer.write(this->process_id);
+                buffer.write(this->exit_reported);
+                buffer.write_vector(this->thread_ids);
+            }
+
+            void deserialize(utils::buffer_deserializer& buffer)
+            {
+                buffer.read(this->process);
+                buffer.read(this->process_id);
+                buffer.read(this->exit_reported);
+                buffer.read_vector(this->thread_ids);
+            }
+        };
+
+        std::vector<debuggee> debuggees{};
+        bool kill_on_close{};
+
+        void serialize_object(utils::buffer_serializer& buffer) const override
+        {
+            buffer.write_vector(this->debuggees);
+            buffer.write(this->kill_on_close);
+        }
+
+        void deserialize_object(utils::buffer_deserializer& buffer) override
+        {
+            buffer.read_vector(this->debuggees);
+            buffer.read(this->kill_on_close);
+        }
+    };
+
     struct deferred_window_positions : ref_counted_object
     {
         std::vector<EMU_WINDOWPOS> positions{};
@@ -247,6 +291,7 @@ namespace sogen
     // across Windows builds (unlike the builtin control-class atoms, which vary per build and are
     // resolved through SERVERINFO.atomSysClass), so matching this canonical name is portable.
     inline constexpr std::u16string_view builtin_dialog_class_name = u"#32770";
+    inline constexpr uint16_t builtin_dialog_class_atom = 0x8002;
 
     inline std::u16string_view normalize_builtin_window_class_name(const std::u16string_view class_name)
     {
@@ -299,6 +344,10 @@ namespace sogen
         emulator_pointer wnd_proc{};
         hmenu system_menu_handle{};
         bool host_surface_window{};
+        // What the last NtUserUpdateLayeredWindow asked for, so presenting the window again keeps its alpha.
+        bool layered_blend{};
+        bool layered_premultiplied_alpha{};
+        uint8_t layered_constant_alpha{255};
         bool message_only{};
         bool unicode_proc{};
 
@@ -421,6 +470,9 @@ namespace sogen
             buffer.write(this->wnd_proc);
             buffer.write(this->system_menu_handle);
             buffer.write(this->host_surface_window);
+            buffer.write(this->layered_blend);
+            buffer.write(this->layered_premultiplied_alpha);
+            buffer.write(this->layered_constant_alpha);
             buffer.write(this->message_only);
             buffer.write(this->unicode_proc);
         }
@@ -448,6 +500,9 @@ namespace sogen
             buffer.read(this->wnd_proc);
             buffer.read(this->system_menu_handle);
             buffer.read(this->host_surface_window);
+            buffer.read(this->layered_blend);
+            buffer.read(this->layered_premultiplied_alpha);
+            buffer.read(this->layered_constant_alpha);
             buffer.read(this->message_only);
             buffer.read(this->unicode_proc);
         }
@@ -878,6 +933,8 @@ namespace sogen
         // Where the open resolved on the host, empty for opens no mount resolves.
         std::filesystem::path host_path{};
         std::vector<directory_change_watch> change_watches{};
+        std::optional<device_completion_association> completion_association{};
+        ULONG completion_notification_flags{};
 
         bool is_file() const
         {
@@ -902,6 +959,8 @@ namespace sogen
             buffer.write(this->handle);
             buffer.write_zero_padded_vector(this->change_watches, &directory_change_watch::thread_id, &directory_change_watch::event,
                                             &directory_change_watch::io_status_block);
+            buffer.write_optional(this->completion_association);
+            buffer.write(this->completion_notification_flags);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -916,6 +975,8 @@ namespace sogen
             this->host_path = buffer.read<std::u16string>();
             buffer.read(this->handle);
             buffer.read_vector(this->change_watches);
+            buffer.read_optional(this->completion_association);
+            buffer.read(this->completion_notification_flags);
         }
     };
 

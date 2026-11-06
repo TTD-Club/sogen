@@ -153,6 +153,13 @@ namespace sogen
             effective |= memory_permission::exec;
         }
 
+        // x86 paging cannot express execute-only pages: Windows reports PAGE_EXECUTE for them, but the code stays
+        // readable, and some images have sections without IMAGE_SCN_MEM_READ.
+        if (this->execute_implies_read_ && (effective & memory_permission::exec) != memory_permission::none)
+        {
+            effective |= memory_permission::read;
+        }
+
         return effective;
     }
 
@@ -164,6 +171,22 @@ namespace sogen
         }
 
         this->dep_enabled_ = enabled;
+        this->reapply_memory_protections();
+    }
+
+    void memory_manager::set_execute_implies_read(const bool enabled)
+    {
+        if (this->execute_implies_read_ == enabled)
+        {
+            return;
+        }
+
+        this->execute_implies_read_ = enabled;
+        this->reapply_memory_protections();
+    }
+
+    void memory_manager::reapply_memory_protections()
+    {
         for (const auto& reserved : this->reserved_regions_ | std::views::values)
         {
             if (reserved.kind == memory_region_kind::mmio)
@@ -398,7 +421,7 @@ namespace sogen
             throw std::runtime_error("Cross region protect not supported yet!");
         }
 
-        std::optional<memory_permission> old_first_permissions{};
+        std::optional<nt_memory_permission> old_first_permissions{};
 
         auto& committed_regions = entry->second.committed_regions;
         split_regions(committed_regions, {address, end});
@@ -435,6 +458,44 @@ namespace sogen
         this->update_layout_version(address, size);
 
         return true;
+    }
+
+    bool memory_manager::is_guard_page(const uint64_t address)
+    {
+        return this->get_region_info(address).permissions.is_guarded();
+    }
+
+    bool memory_manager::release_guard_page(const uint64_t address)
+    {
+        const auto region = this->get_region_info(address);
+        if (!region.permissions.is_guarded())
+        {
+            return false;
+        }
+
+        constexpr size_t page_size = 0x1000;
+        return this->protect_memory(page_align_down(address), page_size, region.permissions & ~memory_permission_ext::guard);
+    }
+
+    std::optional<uint64_t> memory_manager::find_guard_page_violation_address(const uint64_t address, const size_t size,
+                                                                              const memory_permission operation)
+    {
+        constexpr uint64_t page_size = 0x1000;
+        const auto first_page = page_align_down(address);
+        const auto last_page = page_align_down(address + std::max<size_t>(size, 1) - 1);
+        for (auto page = first_page;; page += page_size)
+        {
+            const auto permissions = this->get_region_info(page).permissions;
+            if (permissions.is_guarded())
+            {
+                return page == first_page ? address : page;
+            }
+
+            if ((this->get_effective_permissions(permissions) & operation) != operation || page == last_page)
+            {
+                return std::nullopt;
+            }
+        }
     }
 
     bool memory_manager::allocate_mmio(const uint64_t address, const size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb)
@@ -850,7 +911,7 @@ namespace sogen
                                .try_emplace(address,
                                             reserved_region{
                                                 .length = size,
-                                                .initial_permission = permissions,
+                                                .initial_permission = permissions.flattened(),
                                                 .kind = kind,
                                             })
                                .first;

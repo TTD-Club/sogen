@@ -11,6 +11,8 @@ namespace sogen::syscalls
                                                     emulator_pointer apc_context, NTSTATUS io_status,
                                                     EmulatorTraits<Emu64>::ULONG_PTR io_status_information,
                                                     emulator_object<BOOLEAN> already_signaled);
+    NTSTATUS handle_NtCancelWaitCompletionPacket(const syscall_context& c, handle wait_completion_packet_handle,
+                                                 BOOLEAN remove_signaled_packet);
     NTSTATUS handle_NtClose(const syscall_context& c, handle h);
 }
 
@@ -169,4 +171,177 @@ namespace sogen::test
     }
 
     INSTANTIATE_TEST_SUITE_P(ProcessAndThread, ManagedWaitCompletionTest, testing::Bool());
+
+    namespace
+    {
+        class stdin_console_backend final : public console_backend
+        {
+          public:
+            bool available{false};
+
+            bool input_available() override
+            {
+                return this->available;
+            }
+
+            std::optional<console_key_event> read_input_event(bool /*wait*/, bool /*remove*/) override
+            {
+                return std::nullopt;
+            }
+
+            std::string read_input(size_t /*length*/) override
+            {
+                return {};
+            }
+
+            void set_input_mode(const console_input_mode& /*mode*/) override
+            {
+            }
+
+            void reset() override
+            {
+            }
+        };
+
+        class ConsoleWaitCompletionTest : public testing::Test
+        {
+          protected:
+            void SetUp() override
+            {
+                auto backend = std::make_unique<stdin_console_backend>();
+                this->console = backend.get();
+
+                emulator_interfaces interfaces{};
+                interfaces.ui = std::make_unique<null_ui_backend>();
+                interfaces.audio = std::make_unique<null_audio_backend>();
+                interfaces.console = std::move(backend);
+                this->emu = std::make_unique<windows_emulator>(
+                    create_x86_64_emulator_from_environment(),
+                    emulator_settings{.disable_logging = true, .emulation_root = get_emulator_root(), .load_registry = false},
+                    emulator_callbacks{}, std::move(interfaces));
+                this->completion = this->emu->process.io_completions.store(io_completion{});
+                this->packet = this->emu->process.wait_completion_packets.store(wait_completion_packet{});
+                this->signaled =
+                    emulator_object<BOOLEAN>{this->emu->memory, this->emu->memory.allocate_memory(0x1000, memory_permission::read_write)};
+            }
+
+            syscall_context context()
+            {
+                return {.win_emu = *this->emu, .emu = this->emu->vcpu(0).cpu, .vcpu = this->emu->vcpu(0), .proc = this->emu->process};
+            }
+
+            NTSTATUS associate(const handle target)
+            {
+                return syscalls::handle_NtAssociateWaitCompletionPacket(this->context(), this->packet, this->completion, target, 0x1234,
+                                                                        0x5678, STATUS_SUCCESS, 42, *this->signaled);
+            }
+
+            stdin_console_backend* console{};
+            std::unique_ptr<windows_emulator> emu{};
+            handle completion{};
+            handle packet{};
+            std::optional<emulator_object<BOOLEAN>> signaled{};
+        };
+    }
+
+    // libuv registers a thread-pool wait on the console input handle to read a raw TTY, so a guest
+    // cannot start a terminal UI unless a wait packet can target stdin.
+    TEST_F(ConsoleWaitCompletionTest, StdinPacketCompletesOnlyOnceInputArrives)
+    {
+        ASSERT_EQ(this->associate(STDIN_HANDLE), STATUS_SUCCESS);
+        EXPECT_FALSE(this->signaled->read());
+
+        io_completion_message message{};
+        EXPECT_FALSE(io_completion_wait::dequeue_io_completion_message(*this->emu, this->completion, message));
+
+        this->console->available = true;
+        ASSERT_TRUE(io_completion_wait::dequeue_io_completion_message(*this->emu, this->completion, message));
+        EXPECT_EQ(message.key_context, 0x1234u);
+        EXPECT_EQ(message.apc_context, 0x5678u);
+    }
+
+    TEST_F(ConsoleWaitCompletionTest, ConsoleOutputHandleStaysUnsupported)
+    {
+        EXPECT_EQ(this->associate(STDOUT_HANDLE), STATUS_OBJECT_TYPE_MISMATCH);
+    }
+
+    TEST_F(ConsoleWaitCompletionTest, RealFileHandleStaysUnsupported)
+    {
+        const auto file_handle = this->emu->process.files.store(file{});
+        EXPECT_EQ(this->associate(file_handle), STATUS_OBJECT_TYPE_MISMATCH);
+    }
+
+    using WaitCompletionCancelTest = ConsoleWaitCompletionTest;
+
+    // Expected values captured on Windows 11 (build 26200), x64 and WoW64.
+    TEST_F(WaitCompletionCancelTest, StatusAndPacketFollowTheWaitState)
+    {
+        struct cancel_case
+        {
+            const char* row;
+            bool associate;
+            bool signal_before_cancel;
+            bool dequeue_before_cancel;
+            BOOLEAN remove_signaled_packet;
+            NTSTATUS status;
+            std::optional<NTSTATUS> second_status;
+            ULONG packets_after;
+        };
+
+        const std::array<cancel_case, 6> cases{{
+            {"never associated", false, false, false, FALSE, STATUS_CANCELLED, STATUS_CANCELLED, 0},
+            {"unsignalled, keep", true, false, false, FALSE, STATUS_SUCCESS, STATUS_CANCELLED, 0},
+            {"unsignalled, remove", true, false, false, TRUE, STATUS_SUCCESS, std::nullopt, 0},
+            {"queued, keep", true, true, false, FALSE, STATUS_PENDING, STATUS_PENDING, 1},
+            {"queued, remove", true, true, false, TRUE, STATUS_SUCCESS, STATUS_CANCELLED, 0},
+            {"already dequeued", true, true, true, FALSE, STATUS_CANCELLED, std::nullopt, 0},
+        }};
+
+        for (const auto& c : cases)
+        {
+            SCOPED_TRACE(c.row);
+            const auto wait_packet = this->emu->process.wait_completion_packets.store(wait_completion_packet{});
+            event synchronization_event{};
+            synchronization_event.type = SynchronizationEvent;
+            const auto target = this->emu->process.events.store(std::move(synchronization_event));
+            auto& target_event = *this->emu->process.events.get(target);
+
+            if (c.associate)
+            {
+                ASSERT_EQ(syscalls::handle_NtAssociateWaitCompletionPacket(this->context(), wait_packet, this->completion, target, 0x1234,
+                                                                           0x5678, STATUS_SUCCESS, 42, *this->signaled),
+                          STATUS_SUCCESS);
+            }
+
+            io_completion_message message{};
+            target_event.signaled = c.signal_before_cancel;
+            if (c.dequeue_before_cancel)
+            {
+                ASSERT_TRUE(io_completion_wait::dequeue_io_completion_message(*this->emu, this->completion, message));
+            }
+
+            EXPECT_EQ(syscalls::handle_NtCancelWaitCompletionPacket(this->context(), wait_packet, c.remove_signaled_packet), c.status);
+            if (c.second_status)
+            {
+                EXPECT_EQ(syscalls::handle_NtCancelWaitCompletionPacket(this->context(), wait_packet, c.remove_signaled_packet),
+                          *c.second_status);
+            }
+
+            if (!c.signal_before_cancel)
+            {
+                target_event.signaled = true;
+            }
+
+            ULONG packets = 0;
+            while (io_completion_wait::dequeue_io_completion_message(*this->emu, this->completion, message))
+            {
+                ++packets;
+            }
+            EXPECT_EQ(packets, c.packets_after);
+            EXPECT_EQ(target_event.signaled, !c.signal_before_cancel);
+
+            EXPECT_EQ(syscalls::handle_NtClose(this->context(), wait_packet), STATUS_SUCCESS);
+            EXPECT_EQ(syscalls::handle_NtClose(this->context(), target), STATUS_SUCCESS);
+        }
+    }
 }

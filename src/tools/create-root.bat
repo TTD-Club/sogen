@@ -71,8 +71,10 @@ CALL :collect comctl32.dll
 CALL :collect comdlg32.dll
 CALL :collect_file "%WINDIR%\System32\en-US", comdlg32.dll.mui, %EMU_SYSDIR%\en-us
 CALL :collect_file "%WINDIR%\SysWOW64\en-US", comdlg32.dll.mui, %EMU_SYSDIR_WOW64%\en-us
+CALL :collect coml2.dll
 CALL :collect coremessaging.dll
 CALL :collect credssp.dll
+CALL :collect crtdll.dll
 CALL :collect crypt32.dll
 CALL :collect cryptbase.dll
 CALL :collect cryptsp.dll
@@ -90,6 +92,7 @@ CALL :collect dciman32.dll
 CALL :collect ddraw.dll
 CALL :collect devobj.dll
 CALL :collect diagnosticdatasettings.dll
+CALL :collect dinput.dll
 CALL :collect dinput8.dll
 CALL :collect dnsapi.dll
 CALL :collect dpapi.dll
@@ -117,6 +120,7 @@ CALL :collect iphlpapi.dll
 CALL :collect kdcom.dll
 CALL :collect kernel.appcore.dll
 CALL :collect kernel32.dll
+CALL :collect_file "%WINDIR%\System32\en-US", kernel32.dll.mui, %EMU_SYSDIR%\en-us
 CALL :collect kernelbase.dll
 CALL :collect_file "%WINDIR%\System32\en-US", KernelBase.dll.mui, %EMU_SYSDIR%\en-us
 CALL :collect_file "%WINDIR%\SysWOW64\en-US", KernelBase.dll.mui, %EMU_SYSDIR_WOW64%\en-us
@@ -135,6 +139,7 @@ CALL :collect msasn1.dll
 CALL :collect mscms.dll
 CALL :collect mscoree.dll
 CALL :collect msdmo.dll
+CALL :collect msimg32.dll
 CALL :collect mskeyprotect.dll
 CALL :collect msvcp140.dll
 CALL :collect msvcp140_1.dll
@@ -163,7 +168,10 @@ CALL :collect ntasn1.dll
 CALL :collect ntdll.dll
 CALL :collect ntmarta.dll
 CALL :collect ole32.dll
+CALL :collect oleacc.dll
+CALL :collect oleaccrc.dll
 CALL :collect oleaut32.dll
+CALL :collect oledlg.dll
 CALL :collect opengl32.dll
 CALL :collect pdh.dll
 CALL :collect powrprof.dll
@@ -190,6 +198,7 @@ CALL :collect shcore.dll
 CALL :collect shell32.dll
 CALL :collect_file "%WINDIR%\System32\en-US", shell32.dll.mui, %EMU_SYSDIR%\en-us
 CALL :collect_file "%WINDIR%\SysWOW64\en-US", shell32.dll.mui, %EMU_SYSDIR_WOW64%\en-us
+CALL :collect shfolder.dll
 CALL :collect shlwapi.dll
 CALL :collect slwga.dll
 CALL :collect sppc.dll

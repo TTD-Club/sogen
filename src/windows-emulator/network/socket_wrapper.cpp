@@ -6,6 +6,24 @@ namespace sogen
 
     namespace network
     {
+        namespace
+        {
+            template <typename Query>
+            std::optional<address> query_address(const SOCKET s, const Query query)
+            {
+                sockaddr_storage addr{};
+                socklen_t addrlen = sizeof(sockaddr_storage);
+                if (query(s, reinterpret_cast<sockaddr*>(&addr), &addrlen) != 0)
+                {
+                    return {};
+                }
+
+                address result{};
+                result.set_address(reinterpret_cast<sockaddr*>(&addr), addrlen);
+                return result;
+            }
+        }
+
         socket_wrapper::socket_wrapper(SOCKET s)
             : socket_(s)
         {
@@ -45,32 +63,17 @@ namespace sogen
 
         bool socket_wrapper::is_listening()
         {
-            if (!this->socket_.is_valid())
-            {
-                return false;
-            }
-
-            int val{};
-            socklen_t len = sizeof(val);
-            const auto res = getsockopt(this->socket_.get_socket(), SOL_SOCKET, SO_ACCEPTCONN, reinterpret_cast<char*>(&val), &len);
-
-            return res != SOCKET_ERROR && val == 1;
+            return this->listening_;
         }
 
         std::optional<address> socket_wrapper::get_local_address()
         {
-            sockaddr_storage addr{};
-            socklen_t addrlen = sizeof(sockaddr_storage);
-            const auto res = ::getsockname(this->socket_.get_socket(), reinterpret_cast<sockaddr*>(&addr), &addrlen);
+            return query_address(this->socket_.get_socket(), ::getsockname);
+        }
 
-            if (res != 0)
-            {
-                return {};
-            }
-
-            address address{};
-            address.set_address(reinterpret_cast<sockaddr*>(&addr), addrlen);
-            return address;
+        std::optional<address> socket_wrapper::get_remote_address()
+        {
+            return query_address(this->socket_.get_socket(), ::getpeername);
         }
 
         bool socket_wrapper::bind(const address& addr)
@@ -85,7 +88,13 @@ namespace sogen
 
         bool socket_wrapper::listen(int backlog)
         {
-            return ::listen(this->socket_.get_socket(), backlog) == 0;
+            if (::listen(this->socket_.get_socket(), backlog) != 0)
+            {
+                return false;
+            }
+
+            this->listening_ = true;
+            return true;
         }
 
         std::unique_ptr<i_socket> socket_wrapper::accept(address& address)

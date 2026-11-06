@@ -68,6 +68,113 @@ namespace
         return result;
     }
 
+    template <typename Array, typename Element>
+    std::vector<Element> to_vector(JNIEnv& env, const Array values, void (JNIEnv::*get_region)(Array, jsize, jsize, Element*))
+    {
+        std::vector<Element> result(values ? static_cast<size_t>(env.GetArrayLength(values)) : 0);
+        if (!result.empty())
+        {
+            (env.*get_region)(values, 0, static_cast<jsize>(result.size()), result.data());
+        }
+
+        return result;
+    }
+
+    jobject get_object_field(JNIEnv& env, const jobject object, const char* name, const char* signature)
+    {
+        auto* object_class = env.GetObjectClass(object);
+        auto* value = env.GetObjectField(object, env.GetFieldID(object_class, name, signature));
+        env.DeleteLocalRef(object_class);
+        return value;
+    }
+
+    std::string get_string_field(JNIEnv& env, const jobject object, const char* name)
+    {
+        auto* value = static_cast<jstring>(get_object_field(env, object, name, "Ljava/lang/String;"));
+        auto result = to_string(env, value);
+        env.DeleteLocalRef(value);
+        return result;
+    }
+
+    sogen::android::document_tree to_document_tree(JNIEnv& env, const jobject tree)
+    {
+        auto* path_array = static_cast<jobjectArray>(get_object_field(env, tree, "paths", "[Ljava/lang/String;"));
+        auto* id_array = static_cast<jobjectArray>(get_object_field(env, tree, "ids", "[Ljava/lang/String;"));
+        auto* size_array = static_cast<jlongArray>(get_object_field(env, tree, "sizes", "[J"));
+        auto* modified_array = static_cast<jlongArray>(get_object_field(env, tree, "modified", "[J"));
+        auto* directory_array = static_cast<jbooleanArray>(get_object_field(env, tree, "directories", "[Z"));
+
+        const auto paths = to_strings(env, path_array);
+        const auto ids = to_strings(env, id_array);
+        const auto sizes = to_vector(env, size_array, &JNIEnv::GetLongArrayRegion);
+        const auto modified = to_vector(env, modified_array, &JNIEnv::GetLongArrayRegion);
+        const auto directories = to_vector(env, directory_array, &JNIEnv::GetBooleanArrayRegion);
+
+        env.DeleteLocalRef(path_array);
+        env.DeleteLocalRef(id_array);
+        env.DeleteLocalRef(size_array);
+        env.DeleteLocalRef(modified_array);
+        env.DeleteLocalRef(directory_array);
+
+        const auto count = paths.size();
+        if (ids.size() != count || sizes.size() != count || modified.size() != count || directories.size() != count)
+        {
+            throw std::runtime_error("Inconsistent document tree listing");
+        }
+
+        sogen::android::document_tree result{
+            .guest_path = get_string_field(env, tree, "guestPath"),
+            .uri = get_string_field(env, tree, "uri"),
+            .upper_directory = get_string_field(env, tree, "upperDirectory"),
+            .state_directory = get_string_field(env, tree, "stateDirectory"),
+        };
+
+        result.entries.reserve(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            result.entries.push_back(sogen::document_entry{
+                .path = sogen::u8_to_u16(paths[i]),
+                .id = ids[i],
+                .is_directory = directories[i] == JNI_TRUE,
+                .size = static_cast<uint64_t>(sizes[i]),
+                .modified_ms = modified[i],
+            });
+        }
+
+        return result;
+    }
+
+    std::vector<sogen::directory_mount> to_directory_mounts(JNIEnv& env, const jobjectArray values)
+    {
+        const auto strings = to_strings(env, values);
+        if (strings.size() % sogen::directory_mount::argument_count != 0)
+        {
+            throw std::runtime_error("Inconsistent directory mounts");
+        }
+
+        std::vector<sogen::directory_mount> result{};
+        for (size_t i = 0; i < strings.size(); i += sogen::directory_mount::argument_count)
+        {
+            result.push_back(sogen::directory_mount::from_arguments(std::span(strings).subspan(i, sogen::directory_mount::argument_count)));
+        }
+
+        return result;
+    }
+
+    std::vector<sogen::android::document_tree> to_document_trees(JNIEnv& env, const jobjectArray trees)
+    {
+        std::vector<sogen::android::document_tree> result{};
+        const auto count = trees ? env.GetArrayLength(trees) : 0;
+        for (jsize i = 0; i < count; ++i)
+        {
+            auto* tree = env.GetObjectArrayElement(trees, i);
+            result.push_back(to_document_tree(env, tree));
+            env.DeleteLocalRef(tree);
+        }
+
+        return result;
+    }
+
     sogen::android::mouse_button to_mouse_button(const jint button)
     {
         switch (button)
@@ -102,16 +209,16 @@ extern "C"
 
     JNIEXPORT jint JNICALL Java_dev_sogen_app_runtime_SogenNative_nativeRun(
         JNIEnv* env, jobject /*self*/, const jlong handle, jstring root, jstring application, jobjectArray arguments,
-        jobjectArray environment, jobjectArray path_mappings, jstring working_directory, jstring backend, const jboolean live_network,
-        jstring sandbox_executable, jstring vulkan_hook_directory, jstring vulkan_driver_directory, jstring vulkan_driver_name,
-        jstring snapshot_directory, jstring resume_file)
+        jobjectArray environment, jstring root_layer, jobjectArray directory_mounts, jobjectArray document_trees, jstring working_directory,
+        jstring backend, const jboolean live_network, jstring sandbox_executable, jstring vulkan_hook_directory,
+        jstring vulkan_driver_directory, jstring vulkan_driver_name, jstring snapshot_directory, jstring resume_file)
     {
-        const sogen::android::run_config config{
+        sogen::android::run_config config{
             .emulation_root = to_string(*env, root),
             .application = to_string(*env, application),
             .arguments = to_strings(*env, arguments),
             .environment = to_pairs<std::string>(*env, environment),
-            .path_mappings = to_pairs<std::filesystem::path>(*env, path_mappings),
+            .root_layer = to_string(*env, root_layer),
             .working_directory = to_string(*env, working_directory),
             .backend = to_string(*env, backend),
             .live_network = live_network == JNI_TRUE,
@@ -125,6 +232,17 @@ extern "C"
             .snapshot_directory = to_string(*env, snapshot_directory),
             .resume_file = to_string(*env, resume_file),
         };
+
+        try
+        {
+            config.directory_mounts = to_directory_mounts(*env, directory_mounts);
+            config.document_trees = to_document_trees(*env, document_trees);
+        }
+        catch (const std::exception& e)
+        {
+            env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"), e.what());
+            return 1;
+        }
 
         return get_session(handle).run(config);
     }

@@ -125,6 +125,22 @@ namespace sogen
         }
     };
 
+    // Every path that presents a window surface goes through this, so none of them can drop the layered-window
+    // alpha and have the compositor show a layered window opaque.
+    inline ui_surface_desc make_window_surface_desc(const gdi_bitmap_surface& surface, const window* win)
+    {
+        return ui_surface_desc{
+            .width = static_cast<int>(surface.width),
+            .height = static_cast<int>(surface.height),
+            .stride = static_cast<int>(surface.width * sizeof(uint32_t)),
+            .format = ui_surface_format::bgra8,
+            .pixels = surface.pixels.data(),
+            .layered = win && win->layered_blend,
+            .premultiplied_alpha = win && win->layered_premultiplied_alpha,
+            .constant_alpha = win ? win->layered_constant_alpha : uint8_t{255},
+        };
+    }
+
     struct gdi_dc_state
     {
         uint32_t selected_bitmap{};
@@ -132,6 +148,8 @@ namespace sogen
         int32_t current_x{};
         int32_t current_y{};
         bool is_memory_dc{};
+        // Retrieved with GetDC and friends, which hand out the desktop window's DC for no window.
+        bool is_window_dc{};
 
         void serialize(utils::buffer_serializer& buffer) const
         {
@@ -140,6 +158,7 @@ namespace sogen
             buffer.write(this->current_x);
             buffer.write(this->current_y);
             buffer.write(this->is_memory_dc);
+            buffer.write(this->is_window_dc);
         }
 
         void deserialize(utils::buffer_deserializer& buffer)
@@ -149,6 +168,7 @@ namespace sogen
             buffer.read(this->current_x);
             buffer.read(this->current_y);
             buffer.read(this->is_memory_dc);
+            buffer.read(this->is_window_dc);
         }
     };
 
@@ -185,15 +205,37 @@ namespace sogen
             emulator_pointer guest_obj_addr{};
             EMU_WNDCLASSEX wnd_class{};
             CLSMENUNAME<EmulatorTraits<Emu64>> menu_name{};
+            bool ansi_proc{};
+            uint16_t atom{};
 
             class_entry() = default;
 
             class_entry(const emulator_pointer guest_obj, const EMU_WNDCLASSEX& wnd_class,
-                        const CLSMENUNAME<EmulatorTraits<Emu64>>& menu_name)
+                        const CLSMENUNAME<EmulatorTraits<Emu64>>& menu_name, const uint16_t atom, const bool ansi_proc = false)
                 : guest_obj_addr(guest_obj),
                   wnd_class(wnd_class),
-                  menu_name(menu_name)
+                  menu_name(menu_name),
+                  ansi_proc(ansi_proc),
+                  atom(atom)
             {
+            }
+
+            void serialize(utils::buffer_serializer& buffer) const
+            {
+                buffer.write(this->guest_obj_addr);
+                buffer.write(this->wnd_class);
+                buffer.write(this->menu_name);
+                buffer.write(this->ansi_proc);
+                buffer.write(this->atom);
+            }
+
+            void deserialize(utils::buffer_deserializer& buffer)
+            {
+                buffer.read(this->guest_obj_addr);
+                buffer.read(this->wnd_class);
+                buffer.read(this->menu_name);
+                buffer.read(this->ansi_proc);
+                buffer.read(this->atom);
             }
         };
 
@@ -473,11 +515,15 @@ namespace sogen
         uint64_t dispatch_client_message{};
         uint32_t gdi_default_dc_handle{};
         uint32_t gdi_memory_dc_default_bitmap_handle{};
+        uint32_t gdi_objects_peak{};
+        uint32_t user_objects_peak{};
         std::map<uint32_t, gdi_dc_state> gdi_dc_states{};
         // Per-DC stack of states pushed by NtGdiSaveDC and popped by NtGdiRestoreDC.
         std::map<uint32_t, std::vector<gdi_dc_state>> gdi_dc_save_states{};
         std::map<uint32_t, gdi_bitmap_surface> gdi_bitmap_surfaces{};
         std::map<uint32_t, EMU_LOGFONTW> gdi_fonts{};
+        std::map<uint32_t, std::vector<RECT>> gdi_regions{};
+        std::map<uint32_t, std::vector<EMU_PALETTEENTRY>> gdi_palettes{};
         // Persistent per-top-level-window paint surface; child controls composite into it at their offset.
         std::map<uint32_t, gdi_bitmap_surface> gdi_window_surfaces{};
         dxgk_state dxgk{};
@@ -505,15 +551,24 @@ namespace sogen
         // mouse button was pressed since the last GetAsyncKeyState query for that virtual key.
         std::array<uint8_t, 256> async_key_state{};
 
-        // Raw mouse input registration (NtUserRegisterRawInputDevices). When registered, mouse motion
-        // synthesizes relative-mouse RAWINPUT delivered as WM_INPUT, so in-game mouse-look works.
-        // raw_mouse_target is the explicit hwndTarget; 0 means "follow focus" (deliver to the foreground
-        // window), resolved at delivery time so a registration done before any window is foreground still works.
-        bool raw_mouse_registered{};
-        hwnd raw_mouse_target{};
-        // Keyboard raw input registration (HID usage page 0x01, usage 0x06), mirroring the mouse fields above.
-        bool raw_keyboard_registered{};
-        hwnd raw_keyboard_target{};
+        struct raw_input_registration
+        {
+            uint16_t usage_page{};
+            uint16_t usage{};
+            uint32_t flags{};
+            // 0 follows the keyboard focus, which is resolved at delivery time so that a registration made before any
+            // window is in the foreground still works.
+            hwnd target{};
+        };
+
+        // The devices registered for raw input, in the order of usage page and usage that NtUserGetRegisteredRawInputDevices
+        // reports them in. A registered mouse or keyboard has its input also arrive as WM_INPUT, which games read for
+        // mouse-look and key presses.
+        std::vector<raw_input_registration> raw_input_registrations{};
+
+        const raw_input_registration* find_raw_input_registration(uint16_t usage_page, uint16_t usage) const;
+        const raw_input_registration* raw_mouse_registration() const;
+        const raw_input_registration* raw_keyboard_registration() const;
 
         // Keyboard and mouse input held back until every low-level hook it is due for has seen it, in arrival order.
         struct low_level_input
@@ -725,6 +780,7 @@ namespace sogen
         handle_store<handle_types::registry, registry_key> registry_keys{};
         handle_store<handle_types::process, emulator_process> processes{};
         handle_store<handle_types::managed_thread, managed_process_thread> managed_threads{};
+        handle_store<handle_types::debug_object, debug_object> debug_objects{};
         std::map<uint32_t, handle> thread_handles_by_id{};
         std::map<uint16_t, atom_entry> atoms{};
         utils::insensitive_u16string_map<class_entry> classes{};

@@ -27,6 +27,15 @@ namespace sogen
 #define NTM_REGULAR        0x00000040
 #define TRUETYPE_FONTTYPE  0x00000004
 #define RDH_RECTANGLES     1
+#define RGN_ERROR          0
+#define NULLREGION         1
+#define SIMPLEREGION       2
+#define COMPLEXREGION      3
+#define RGN_AND            1
+#define RGN_OR             2
+#define RGN_XOR            3
+#define RGN_DIFF           4
+#define RGN_COPY           5
 
     struct ABC
     {
@@ -147,6 +156,16 @@ namespace sogen
 
     static_assert(sizeof(EMU_TTPOLYCURVE_HEADER) == 0x04);
 
+    struct EMU_PALETTEENTRY
+    {
+        BYTE peRed;
+        BYTE peGreen;
+        BYTE peBlue;
+        BYTE peFlags;
+    };
+
+    static_assert(sizeof(EMU_PALETTEENTRY) == 0x04);
+
     struct EMU_BITMAPINFOHEADER
     {
         DWORD biSize;
@@ -172,17 +191,8 @@ namespace sogen
             EmulatorTraits<Emu64>::PVOID NextFree;
         };
 
-        union
-        {
-            struct
-            {
-                USHORT ProcessId;
-                USHORT Lock : 1;
-                USHORT Count : 15;
-            };
-
-            ULONG Value;
-        } Owner;
+        // The owning process id, with the entry lock in bit 0. gdi32 compares it with the whole 32-bit process id.
+        ULONG Owner;
 
         USHORT Unique;
         UCHAR Type;
@@ -203,6 +213,14 @@ namespace sogen
     static_assert(sizeof(GDI_HANDLE_ENTRY32) == 0x10);
 
 #define GDI_MAX_HANDLE_COUNT 0xFFFF // 0x4000
+
+    // What NtUserGetGuiResources takes. These describe the guest's ABI, so they have names of their own rather than
+    // the SDK's GR_*: WinUser.h spells GR_GLOBAL as a HANDLE and defines it only for WINVER >= 0x0601.
+    constexpr uint32_t gui_resources_gdiobjects = 0;
+    constexpr uint32_t gui_resources_userobjects = 1;
+    constexpr uint32_t gui_resources_gdiobjects_peak = 2;
+    constexpr uint32_t gui_resources_userobjects_peak = 4;
+    constexpr uint64_t gui_resources_global_process = static_cast<uint64_t>(-2);
 
 #ifndef CBM_INIT
 #define CBM_INIT 0x04

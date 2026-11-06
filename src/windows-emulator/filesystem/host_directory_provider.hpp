@@ -41,10 +41,17 @@ namespace sogen
         void switch_direction(io_direction direction);
     };
 
+    // Whether host symlinks below the target are followed, or treated as absent so that every access stays inside it.
+    enum class host_links
+    {
+        follow,
+        refuse,
+    };
+
     class host_directory_provider final : public mount_provider
     {
       public:
-        explicit host_directory_provider(std::filesystem::path target);
+        explicit host_directory_provider(std::filesystem::path target, host_links links = host_links::follow);
 
         std::optional<struct compat_stat> stat(const windows_path& path) const override;
         std::vector<directory_entry> list(const windows_path& path) const override;
@@ -56,8 +63,10 @@ namespace sogen
       private:
         std::optional<std::filesystem::path> get_host_path(const windows_path& path) const override;
         std::optional<std::filesystem::path> resolve_host_path(const windows_path& path) const;
+        static bool avoids_links(const std::filesystem::path& root, const std::filesystem::path& host_path);
 
         std::filesystem::path target_{};
+        host_links links_{};
         bool lookup_ignores_case_{};
 
         std::optional<std::filesystem::path> get_creation_path(const windows_path& path, std::u16string_view spelled_leaf,

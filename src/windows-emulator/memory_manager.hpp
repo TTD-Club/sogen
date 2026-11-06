@@ -128,6 +128,10 @@ namespace sogen
         bool protect_memory(uint64_t address, uint64_t size, nt_memory_permission permissions,
                             nt_memory_permission* old_permissions = nullptr);
 
+        bool is_guard_page(uint64_t address);
+        bool release_guard_page(uint64_t address);
+        std::optional<uint64_t> find_guard_page_violation_address(uint64_t address, size_t size, memory_permission operation);
+
         // Pre-reserves the host ranges the backend reports (memory_interface::reserved_host_ranges) so
         // later guest allocations steer clear. Only ever adds ranges, so it is cheap enough to call
         // before every dynamic allocation and can never momentarily drop a reservation.
@@ -260,6 +264,7 @@ namespace sogen
         memory_stats compute_memory_stats() const;
 
         void set_dep_enabled(bool enabled);
+        void set_execute_implies_read(bool enabled);
 
         bool is_dep_enabled() const
         {
@@ -272,6 +277,7 @@ namespace sogen
         std::atomic<std::uint64_t> layout_version_{0};
         std::uint64_t default_allocation_address_{0x100000000ULL};
         bool dep_enabled_{true};
+        bool execute_implies_read_{false};
         std::vector<uint64_t> host_reserved_addresses_{};
         std::function<void(uint64_t, uint64_t)> mapping_change_callback_{};
         std::function<void(uint64_t, uint64_t)> region_change_callback_{};
@@ -290,6 +296,7 @@ namespace sogen
         void update_layout_version(uint64_t address, uint64_t size);
         bool commit_memory(uint64_t address, uint64_t size, nt_memory_permission permissions, bool allow_image_section);
         memory_permission get_effective_permissions(nt_memory_permission permissions) const;
+        void reapply_memory_protections();
 
         // allocate_memory(address, ...) without the host-range rescan the public overload performs
         // first; reserve_host_memory_ranges calls this to avoid recursing back into itself.

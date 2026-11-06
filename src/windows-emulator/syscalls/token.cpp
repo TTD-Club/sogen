@@ -38,6 +38,7 @@ namespace sogen
             // SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED.
             constexpr uint32_t group_enabled = 0x7;
             constexpr uint32_t group_logon_id = 0xC0000000;
+            constexpr uint32_t group_owner = 0x8;
             // SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED.
             constexpr uint32_t group_integrity = 0x60;
 
@@ -61,8 +62,9 @@ namespace sogen
 
             // The groups of a medium-integrity local user's token, in Windows' order: the account domain's None group
             // (for an S-1-5-21 user), Everyone, BUILTIN\Users, INTERACTIVE, CONSOLE LOGON, Authenticated Users, This
-            // Organization, Local account, the logon session, LOCAL, NTLM Authentication, and the integrity label.
-            std::vector<token_group> token_groups(const process_context& process)
+            // Organization, Local account, the logon session, LOCAL, NTLM Authentication, and the integrity label. An
+            // elevated token also holds BUILTIN\Administrators, as its owner, and has high integrity.
+            std::vector<token_group> token_groups(const process_context& process, const bool elevated)
             {
                 std::vector<token_group> groups{};
                 const auto& user = process.sid;
@@ -78,6 +80,10 @@ namespace sogen
                 }
 
                 groups.push_back({.sid = make_sid(1, {0}), .attributes = group_enabled});
+                if (elevated)
+                {
+                    groups.push_back({.sid = make_sid(5, {32, 544}), .attributes = group_enabled | group_owner});
+                }
                 groups.push_back({.sid = make_sid(5, {32, 545}), .attributes = group_enabled});
                 groups.push_back({.sid = make_sid(5, {4}), .attributes = group_enabled});
                 groups.push_back({.sid = make_sid(2, {1}), .attributes = group_enabled});
@@ -87,7 +93,7 @@ namespace sogen
                 groups.push_back({.sid = make_sid(5, {5, 0, token_authentication_id}), .attributes = group_enabled | group_logon_id});
                 groups.push_back({.sid = make_sid(2, {0}), .attributes = group_enabled});
                 groups.push_back({.sid = make_sid(5, {64, 10}), .attributes = group_enabled});
-                groups.push_back({.sid = make_sid(16, {0x2000}), .attributes = group_integrity});
+                groups.push_back({.sid = make_sid(16, {elevated ? 0x3000u : 0x2000u}), .attributes = group_integrity});
                 return groups;
             }
 
@@ -119,28 +125,6 @@ namespace sogen
 
             // Windows 11 26200 answers classes up to 0x3A, past the last one TOKEN_INFORMATION_CLASS names.
             constexpr ULONG last_token_information_class = 0x3A;
-
-            bool is_writable_range(memory_manager& memory, const uint64_t address, const uint64_t size)
-            {
-                const auto end = address + size;
-                if (address == 0 || end < address)
-                {
-                    return false;
-                }
-
-                for (auto current = address; current < end;)
-                {
-                    const auto region = memory.get_region_info(current);
-                    if (!region.is_committed || !is_writable(region.permissions.common))
-                    {
-                        return false;
-                    }
-
-                    current = region.start + region.length;
-                }
-
-                return true;
-            }
 
             handle resolve_token(const syscall_context& c, const handle token)
             {
@@ -323,7 +307,7 @@ namespace sogen
                 }
 
                 // TOKEN_GROUPS: the count, the SID_AND_ATTRIBUTES entries, then the SIDs they point to.
-                const auto groups = token_groups(c.proc);
+                const auto groups = token_groups(c.proc, c.win_emu.runs_elevated());
                 const auto entries_offset = offsetof(TOKEN_GROUPS64, Groups);
                 auto required_size = entries_offset + groups.size() * sizeof(SID_AND_ATTRIBUTES64);
                 for (const auto& group : groups)
@@ -530,7 +514,7 @@ namespace sogen
                 }
 
                 c.emu.write_memory(token_information, TOKEN_ELEVATION{
-                                                          .TokenIsElevated = 0,
+                                                          .TokenIsElevated = !anonymous && c.win_emu.runs_elevated() ? 1u : 0u,
                                                       });
                 return STATUS_SUCCESS;
             }
@@ -545,7 +529,8 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                // TokenElevationTypeDefault: no UAC split token (matches the non-elevated TokenElevation above).
+                // TokenElevationTypeDefault: no UAC split token, as for the built-in Administrator (RID 500) the token
+                // belongs to.
                 emulator_object<ULONG>{c.emu, token_information}.write(1);
                 return STATUS_SUCCESS;
             }
@@ -596,7 +581,7 @@ namespace sogen
                 stats.ExpirationTime.QuadPart = std::numeric_limits<LONGLONG>::max();
                 stats.TokenType = get_token_type(token_handle);
                 stats.ImpersonationLevel = !anonymous && stats.TokenType == TokenImpersonation ? SecurityImpersonation : SecurityAnonymous;
-                stats.GroupCount = anonymous ? 0 : static_cast<DWORD>(token_groups(c.proc).size());
+                stats.GroupCount = anonymous ? 0 : static_cast<DWORD>(token_groups(c.proc, c.win_emu.runs_elevated()).size());
                 stats.PrivilegeCount = anonymous ? 0 : static_cast<DWORD>(c.proc.token_privileges.size());
                 stats.ModifiedId.LowPart = token_modified_id;
 
@@ -629,12 +614,16 @@ namespace sogen
 
             if (token_information_class == TokenIntegrityLevel)
             {
-                // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-                const uint8_t medium_integrity_sid[] = {
+                // S-1-16-8192 (medium) or S-1-16-12288 (high)
+                std::array<uint8_t, 20> integrity_sid = {
                     0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 };
+                if (!anonymous && c.win_emu.runs_elevated())
+                {
+                    integrity_sid[9] = 0x30;
+                }
 
-                constexpr auto required_size = sizeof(medium_integrity_sid) + sizeof(TOKEN_MANDATORY_LABEL64);
+                constexpr auto required_size = sizeof(integrity_sid) + sizeof(TOKEN_MANDATORY_LABEL64);
                 return_length.write(required_size);
 
                 if (required_size > token_information_length)
@@ -647,7 +636,7 @@ namespace sogen
                 label.Label.Sid = token_information + sizeof(TOKEN_MANDATORY_LABEL64);
 
                 emulator_object<TOKEN_MANDATORY_LABEL64>{c.emu, token_information}.write(label);
-                c.emu.write_memory(token_information + sizeof(TOKEN_MANDATORY_LABEL64), medium_integrity_sid, sizeof(medium_integrity_sid));
+                c.emu.write_memory(token_information + sizeof(TOKEN_MANDATORY_LABEL64), integrity_sid.data(), integrity_sid.size());
                 return STATUS_SUCCESS;
             }
 
@@ -813,7 +802,7 @@ namespace sogen
                 const auto acl = emulator_object<ACL>{c.emu, dacl_address}.read();
                 auto ace_address = dacl_address + sizeof(ACL);
                 // An ACE applies to the user and to the token's groups (not its integrity label).
-                const auto groups = token_groups(c.proc);
+                const auto groups = token_groups(c.proc, c.win_emu.runs_elevated());
                 const auto applies_to_token = [&](const uint64_t ace_sid) {
                     return sid_matches(c.emu.memory(), ace_sid, c.proc.sid) || std::ranges::any_of(groups, [&](const token_group& group) {
                                return group.attributes != group_integrity && sid_matches(c.emu.memory(), ace_sid, group.sid);

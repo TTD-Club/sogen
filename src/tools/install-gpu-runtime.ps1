@@ -12,6 +12,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# GitHub's API and release CDN occasionally answer with an HTTP error such as 504; retry those before failing the job.
+foreach ($cmdlet in 'Invoke-WebRequest', 'Invoke-RestMethod') {
+    $PSDefaultParameterValues["${cmdlet}:MaximumRetryCount"] = 5
+    $PSDefaultParameterValues["${cmdlet}:RetryIntervalSec"] = 10
+}
+
 $system32 = Join-Path $WindowsDir 'system32'
 $syswow64 = Join-Path $WindowsDir 'syswow64'
 
@@ -77,13 +83,16 @@ try {
 
     # Windows' opengl32 needs a vendor OpenGL driver, which the guest does not have. Mesa's picks the first
     # driver it can start, Zink on the Vulkan shim or llvmpipe on the CPU.
-    $mesaRelease = Invoke-RestMethod -Uri 'https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest' -Headers $apiHeaders
-    $mesaAsset = $mesaRelease.assets | Where-Object { $_.name -like 'mesa3d-*-release-msvc.7z' } | Select-Object -First 1
-    if (-not $mesaAsset) { throw "No Mesa MSVC release archive found in $($mesaRelease.tag_name)" }
+    # Pinned because the MSVC build of 26.2.6 ships without OpenGL.
+    $mesaVersion = '26.2.5'
+    $mesaSha256 = '997123ef4ce8896204ab912d5b54f19372c487ff9835bcefafa2fca23b8953c2'
+    $mesaName = "mesa3d-$mesaVersion-release-msvc.7z"
 
-    Write-Host "Downloading Mesa $($mesaRelease.tag_name): $($mesaAsset.name)"
-    $mesaArchive = Join-Path $work $mesaAsset.name
-    Invoke-WebRequest -Uri $mesaAsset.browser_download_url -OutFile $mesaArchive
+    Write-Host "Downloading Mesa ${mesaVersion}: $mesaName"
+    $mesaArchive = Join-Path $work $mesaName
+    Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/$mesaVersion/$mesaName" -OutFile $mesaArchive
+    $mesaHash = (Get-FileHash -Path $mesaArchive -Algorithm SHA256).Hash
+    if ($mesaHash -ne $mesaSha256) { throw "Mesa archive checksum mismatch: $mesaHash" }
 
     $mesaRoot = Join-Path $work 'mesa'
     7z x -y "-o$mesaRoot" $mesaArchive | Out-Null

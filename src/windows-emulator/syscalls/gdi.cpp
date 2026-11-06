@@ -41,16 +41,39 @@ namespace sogen
             constexpr uint32_t k_gdi_font_attr_size = 0x40;
             constexpr uint32_t k_gdi_region_attr_size = 0x20;
 
-            constexpr uint32_t k_gdi_dc_attr_hbrush_offset = 0x10;
-            constexpr uint32_t k_gdi_dc_attr_hpen_offset = 0x18;
+            constexpr uint32_t k_max_palette_entries = 0xFFFF;
+            constexpr uint64_t k_log_palette_entries_offset = 0x04;
+            constexpr uint32_t k_palette_object_size = sizeof(uint16_t);
+            constexpr uint8_t k_palette_entry_reserved = 0x01;
+            constexpr uint32_t k_clr_invalid = 0xFFFFFFFF;
+
+            constexpr uint32_t k_gdi_pal_animate = 0;
+            constexpr uint32_t k_gdi_pal_set_entries = 1;
+            constexpr uint32_t k_gdi_pal_get_entries = 2;
+
+            constexpr uint32_t k_gdi_dc_attr_hbrush_offset = 0xA0;
+            constexpr uint32_t k_gdi_dc_attr_hpen_offset = 0xA8;
+            constexpr uint32_t k_gdi_dc_attr_dc_brush_color_offset = 0xC4;   // SetDCBrushColor
+            constexpr uint32_t k_gdi_dc_attr_dc_pen_color_offset = 0xCC;     // SetDCPenColor
             constexpr uint32_t k_gdi_dc_attr_background_color_offset = 0x20; // DC_ATTR.crBackgroundClr (SetBkColor)
             constexpr uint32_t k_gdi_dc_attr_text_color_offset = 0x28;       // DC_ATTR.crForegroundClr (SetTextColor)
+            constexpr uint32_t k_gdi_dc_attr_rop2_offset = 0xD4;             // DC_ATTR.jROP2 (SetROP2)
             constexpr uint32_t k_gdi_dc_attr_pt_current_offset = 0xD8;
             constexpr uint32_t k_gdi_dc_attr_text_align_offset = 0x110; // DC_ATTR.lTextAlign (SetTextAlign)
             constexpr uint32_t k_gdi_dc_attr_font_offset = 0x128;
 
+            constexpr uint32_t k_error_invalid_handle = 6;
+            constexpr uint8_t k_r2_copypen = 13;
+
             constexpr uint32_t k_stock_white_brush_index = 0x00;
-            constexpr uint32_t k_stock_black_pen_index = 0x06;
+            constexpr uint32_t k_stock_ltgray_brush_index = 0x01;
+            constexpr uint32_t k_stock_gray_brush_index = 0x02;
+            constexpr uint32_t k_stock_dkgray_brush_index = 0x03;
+            constexpr uint32_t k_stock_black_brush_index = 0x04;
+            constexpr uint32_t k_stock_null_brush_index = 0x05;
+            constexpr uint32_t k_stock_white_pen_index = 0x06;
+            constexpr uint32_t k_stock_black_pen_index = 0x07;
+            constexpr uint32_t k_stock_null_pen_index = 0x08;
             constexpr uint32_t k_stock_system_font_index = 0x0D;
             constexpr uint32_t k_stock_default_gui_font_index = 0x11;
             constexpr uint32_t k_stock_dc_brush_index = 0x12;
@@ -102,7 +125,10 @@ namespace sogen
 
             constexpr int16_t k_gdi_batch_cmd_text_out = 2;
             constexpr int16_t k_gdi_batch_cmd_poly_pat_blt = 1;
+            constexpr int16_t k_gdi_batch_cmd_delete_object = 7;
+            constexpr int16_t k_gdi_batch_cmd_delete_region = 8;
             constexpr uint32_t k_gdibs_no_rect = 0x80000000u;
+            constexpr uint32_t k_ps_solid = 0;
             constexpr size_t k_gdi_poly_pat_blt_rect_offset = 0x30;
             constexpr size_t k_gdi_pat_rect_size = 0x18;
 
@@ -218,6 +244,16 @@ namespace sogen
                 POINTL viewport_org{};
                 std::array<gdi_batch_pat_rect, 1> rects{};
             };
+
+            // gdi32's DeleteObject queues brushes and pens that have a user attribute as command 7 and regions as command 8.
+            struct gdi_batch_delete_object
+            {
+                gdi_batch_header header{};
+                uint32_t reserved{};
+                uint64_t handle{};
+            };
+
+            static_assert(sizeof(gdi_batch_delete_object) == 0x10);
 
             constexpr uint32_t k_dxgk_adapter_count = 1;
             constexpr uint32_t k_dxgk_adapter_handle = 0x4000;
@@ -348,6 +384,34 @@ namespace sogen
                 return read_gdi_shared_value(c, offsetof(GDI_SHARED_MEMORY64, Objects) + (sizeof(uint64_t) * index));
             }
 
+            // The stock objects, the memory DC default bitmap among them, and the system color brushes belong to the
+            // system on Windows: they are neither charged to the process nor deleted by DeleteObject.
+            template <typename Predicate>
+            bool any_system_gdi_object(const syscall_context& c, const Predicate& predicate)
+            {
+                if (predicate(c.proc.gdi_memory_dc_default_bitmap_handle))
+                {
+                    return true;
+                }
+
+                for (uint32_t index = 0; index < std::extent_v<decltype(GDI_SHARED_MEMORY64::Objects)>; ++index)
+                {
+                    if (predicate(static_cast<uint32_t>(read_gdi_object_slot(c, index))))
+                    {
+                        return true;
+                    }
+                }
+
+                const auto server_info = c.proc.user_handles.get_server_info().read();
+                return std::ranges::any_of(server_info.ahbrSystem,
+                                           [&](const auto brush) { return predicate(static_cast<uint32_t>(brush)); });
+            }
+
+            bool is_system_gdi_object(const syscall_context& c, const uint32_t handle_value)
+            {
+                return any_system_gdi_object(c, [&](const uint32_t object) { return object == handle_value; });
+            }
+
             bool write_gdi_object_slot(const syscall_context& c, const uint32_t index, const uint64_t value)
             {
                 if (index >= 0x20)
@@ -422,6 +486,18 @@ namespace sogen
                 return base;
             }
 
+            // The handle table entry holds only the base type, which gdi32's SelectObject checks against the low five
+            // bits of the handle's type byte: pens and extended pens are brushes there. The full type stays in Unique.
+            uint8_t gdi_base_type(const uint8_t type)
+            {
+                return static_cast<uint8_t>(type & 0x1Fu);
+            }
+
+            uint8_t gdi_object_type(const GDI_HANDLE_ENTRY64& entry)
+            {
+                return static_cast<uint8_t>(entry.Unique & 0x7Fu);
+            }
+
             uint32_t allocate_gdi_handle(const syscall_context& c, const uint8_t type, const uint64_t user_ptr, const uint64_t object_ptr)
             {
                 const auto table = ensure_gdi_shared_table(c);
@@ -456,9 +532,9 @@ namespace sogen
                     entry_obj.access([&](GDI_HANDLE_ENTRY64& writable) {
                         writable = {};
                         writable.Object = object_ptr;
-                        writable.Owner.ProcessId = static_cast<uint16_t>(c.proc.process_id);
+                        writable.Owner = c.proc.process_id;
                         writable.Unique = unique;
-                        writable.Type = type;
+                        writable.Type = gdi_base_type(type);
                         writable.Flags = 0;
                         writable.UserPointer = encoded_user_ptr;
                     });
@@ -472,7 +548,8 @@ namespace sogen
             bool read_gdi_entry_for_handle(const syscall_context& c, uint32_t handle_value, GDI_HANDLE_ENTRY64& entry,
                                            uint64_t& entry_addr);
 
-            uint32_t allocate_gdi_object(const syscall_context& c, const uint8_t type, const uint32_t attr_size)
+            uint32_t allocate_gdi_object(const syscall_context& c, const uint8_t type, const uint32_t attr_size,
+                                         const bool has_user_attribute)
             {
                 const uint64_t attr = allocate_gdi_user_block(c, attr_size);
                 if (attr == 0)
@@ -480,7 +557,7 @@ namespace sogen
                     return 0;
                 }
 
-                const uint64_t user_ptr = (type == k_gdi_font_type) ? 0 : attr;
+                const uint64_t user_ptr = has_user_attribute ? attr : 0;
                 const auto handle_value = allocate_gdi_handle(c, type, user_ptr, attr);
                 if (handle_value == 0)
                 {
@@ -489,17 +566,279 @@ namespace sogen
                 return handle_value;
             }
 
+            uint32_t allocate_gdi_object(const syscall_context& c, const uint8_t type, const uint32_t attr_size)
+            {
+                return allocate_gdi_object(c, type, attr_size, type != k_gdi_font_type);
+            }
+
             bool get_gdi_object_address(const syscall_context& c, const uint32_t handle_value, const uint8_t expected_type, uint64_t& addr)
             {
                 GDI_HANDLE_ENTRY64 entry{};
                 uint64_t entry_addr = 0;
-                if (!read_gdi_entry_for_handle(c, handle_value, entry, entry_addr) || entry.Type != expected_type)
+                if (!read_gdi_entry_for_handle(c, handle_value, entry, entry_addr) || gdi_object_type(entry) != expected_type)
                 {
                     return false;
                 }
 
                 addr = entry.Object;
                 return addr != 0;
+            }
+
+            // RGNATTR. gdi32 answers simple and null regions from it in user mode and edits it in place
+            // (CreateRectRgn, SetRectRgn, OffsetRgn, simple CombineRgn cases), so it is the authority for
+            // those; only complex regions keep their rectangles in process state.
+            struct gdi_region_attr
+            {
+                ULONG attr_flags;
+                ULONG complexity;
+                RECT bounds;
+            };
+
+            static_assert(sizeof(gdi_region_attr) <= k_gdi_region_attr_size);
+
+            using gdi_region_span = std::pair<LONG, LONG>;
+
+            bool is_empty_rect(const RECT& rect)
+            {
+                return rect.left >= rect.right || rect.top >= rect.bottom;
+            }
+
+            std::vector<RECT> rect_region(const RECT& rect)
+            {
+                return is_empty_rect(rect) ? std::vector<RECT>{} : std::vector<RECT>{rect};
+            }
+
+            RECT region_bounds(const std::vector<RECT>& rects)
+            {
+                if (rects.empty())
+                {
+                    return {};
+                }
+
+                auto bounds = rects.front();
+                for (const auto& rect : rects)
+                {
+                    bounds.left = (std::min)(bounds.left, rect.left);
+                    bounds.top = (std::min)(bounds.top, rect.top);
+                    bounds.right = (std::max)(bounds.right, rect.right);
+                    bounds.bottom = (std::max)(bounds.bottom, rect.bottom);
+                }
+
+                return bounds;
+            }
+
+            ULONG region_complexity(const std::vector<RECT>& rects)
+            {
+                if (rects.empty())
+                {
+                    return NULLREGION;
+                }
+
+                return rects.size() == 1 ? SIMPLEREGION : COMPLEXREGION;
+            }
+
+            std::optional<std::vector<RECT>> read_gdi_region(const syscall_context& c, const uint32_t region)
+            {
+                uint64_t attr_address = 0;
+                if (!get_gdi_object_address(c, region, k_gdi_region_type, attr_address))
+                {
+                    return std::nullopt;
+                }
+
+                gdi_region_attr attr{};
+                if (!c.win_emu.memory.try_read_memory(attr_address, &attr, sizeof(attr)))
+                {
+                    return std::nullopt;
+                }
+
+                switch (attr.complexity)
+                {
+                case NULLREGION:
+                    return std::vector<RECT>{};
+                case SIMPLEREGION:
+                    return rect_region(attr.bounds);
+                case COMPLEXREGION:
+                    if (const auto it = c.proc.gdi_regions.find(region); it != c.proc.gdi_regions.end())
+                    {
+                        return it->second;
+                    }
+                    break;
+                default:
+                    break;
+                }
+
+                c.win_emu.log.error("Region 0x%X has unsupported complexity %u\n", region, static_cast<uint32_t>(attr.complexity));
+                return std::nullopt;
+            }
+
+            int32_t store_gdi_region(const syscall_context& c, const uint32_t region, std::vector<RECT> rects)
+            {
+                uint64_t attr_address = 0;
+                if (!get_gdi_object_address(c, region, k_gdi_region_type, attr_address))
+                {
+                    return RGN_ERROR;
+                }
+
+                gdi_region_attr attr{};
+                if (!c.win_emu.memory.try_read_memory(attr_address, &attr, sizeof(attr)))
+                {
+                    return RGN_ERROR;
+                }
+
+                attr.complexity = region_complexity(rects);
+                attr.bounds = region_bounds(rects);
+                if (!c.win_emu.memory.try_write_memory(attr_address, &attr, sizeof(attr)))
+                {
+                    return RGN_ERROR;
+                }
+
+                if (attr.complexity == COMPLEXREGION)
+                {
+                    c.proc.gdi_regions[region] = std::move(rects);
+                }
+                else
+                {
+                    c.proc.gdi_regions.erase(region);
+                }
+
+                return static_cast<int32_t>(attr.complexity);
+            }
+
+            bool region_mode_includes(const int32_t mode, const bool in_first, const bool in_second)
+            {
+                switch (mode)
+                {
+                case RGN_AND:
+                    return in_first && in_second;
+                case RGN_OR:
+                    return in_first || in_second;
+                case RGN_XOR:
+                    return in_first != in_second;
+                case RGN_DIFF:
+                    return in_first && !in_second;
+                case RGN_COPY:
+                    return in_first;
+                default:
+                    return false;
+                }
+            }
+
+            struct gdi_region_source_rect
+            {
+                RECT rect;
+                bool from_second;
+            };
+
+            struct gdi_region_edge
+            {
+                LONG x;
+                bool from_second;
+                int32_t depth_change;
+            };
+
+            std::vector<gdi_region_span> combine_region_band(const std::vector<gdi_region_source_rect>& band_rects, const int32_t mode)
+            {
+                std::vector<gdi_region_edge> edges{};
+                edges.reserve(band_rects.size() * 2);
+                for (const auto& [rect, from_second] : band_rects)
+                {
+                    edges.push_back({.x = rect.left, .from_second = from_second, .depth_change = 1});
+                    edges.push_back({.x = rect.right, .from_second = from_second, .depth_change = -1});
+                }
+
+                std::ranges::sort(edges, {}, &gdi_region_edge::x);
+
+                std::vector<gdi_region_span> spans{};
+                int32_t first_depth = 0;
+                int32_t second_depth = 0;
+                for (size_t i = 0; i < edges.size();)
+                {
+                    const auto left = edges[i].x;
+                    for (; i < edges.size() && edges[i].x == left; ++i)
+                    {
+                        (edges[i].from_second ? second_depth : first_depth) += edges[i].depth_change;
+                    }
+
+                    if (i == edges.size() || !region_mode_includes(mode, first_depth > 0, second_depth > 0))
+                    {
+                        continue;
+                    }
+
+                    const auto right = edges[i].x;
+                    if (!spans.empty() && spans.back().second == left)
+                    {
+                        spans.back().second = right;
+                    }
+                    else
+                    {
+                        spans.emplace_back(left, right);
+                    }
+                }
+
+                return spans;
+            }
+
+            // GetRegionData exposes the y-x banded form Windows keeps regions in.
+            std::vector<RECT> combine_regions(const std::vector<RECT>& first, const std::vector<RECT>& second, const int32_t mode)
+            {
+                std::vector<LONG> band_edges{};
+                std::vector<gdi_region_source_rect> pending{};
+                const auto add_source = [&](const std::vector<RECT>& rects, const bool from_second) {
+                    for (const auto& rect : rects)
+                    {
+                        band_edges.insert(band_edges.end(), {rect.top, rect.bottom});
+                        pending.push_back({.rect = rect, .from_second = from_second});
+                    }
+                };
+
+                add_source(first, false);
+                add_source(second, true);
+
+                std::ranges::sort(band_edges);
+                band_edges.erase(std::ranges::unique(band_edges).begin(), band_edges.end());
+                std::ranges::sort(pending, {}, [](const gdi_region_source_rect& source) { return source.rect.top; });
+
+                std::vector<RECT> result{};
+                std::vector<gdi_region_span> previous_spans{};
+                size_t previous_band_start = 0;
+                std::vector<gdi_region_source_rect> band_rects{};
+                size_t next_pending = 0;
+
+                for (size_t i = 0; i + 1 < band_edges.size(); ++i)
+                {
+                    const auto top = band_edges[i];
+                    const auto bottom = band_edges[i + 1];
+
+                    std::erase_if(band_rects, [&](const gdi_region_source_rect& source) { return source.rect.bottom <= top; });
+                    for (; next_pending < pending.size() && pending[next_pending].rect.top <= top; ++next_pending)
+                    {
+                        band_rects.push_back(pending[next_pending]);
+                    }
+
+                    auto spans = combine_region_band(band_rects, mode);
+                    if (spans.empty())
+                    {
+                        continue;
+                    }
+
+                    if (spans == previous_spans && result.back().bottom == top)
+                    {
+                        for (auto j = previous_band_start; j < result.size(); ++j)
+                        {
+                            result[j].bottom = bottom;
+                        }
+                        continue;
+                    }
+
+                    previous_band_start = result.size();
+                    for (const auto& [left, right] : spans)
+                    {
+                        result.push_back(RECT{.left = left, .top = top, .right = right, .bottom = bottom});
+                    }
+                    previous_spans = std::move(spans);
+                }
+
+                return result;
             }
 
             void sync_surface_from_guest_dib(const syscall_context& c, gdi_bitmap_surface& surface)
@@ -719,12 +1058,7 @@ namespace sogen
                     return;
                 }
 
-                c.win_emu.ui().present_surface(present_handle,
-                                               ui_surface_desc{.width = static_cast<int>(surface->width),
-                                                               .height = static_cast<int>(surface->height),
-                                                               .stride = static_cast<int>(surface->width * sizeof(uint32_t)),
-                                                               .format = ui_surface_format::bgra8,
-                                                               .pixels = surface->pixels.data()});
+                c.win_emu.ui().present_surface(present_handle, make_window_surface_desc(*surface, c.proc.windows.get(present_handle)));
             }
 
             void set_surface_pixel(gdi_bitmap_surface& surface, const int x, const int y, const uint32_t color)
@@ -855,6 +1189,13 @@ namespace sogen
                 return true;
             }
 
+            uint32_t read_dc_attr_colorref(const syscall_context& c, const uint64_t address)
+            {
+                uint32_t colorref = 0;
+                c.win_emu.memory.try_read_memory(address, &colorref, sizeof(colorref));
+                return colorref_to_bgra(colorref);
+            }
+
             uint32_t get_brush_color(const syscall_context& c, const uint32_t brush_handle)
             {
                 uint64_t brush_attr = 0;
@@ -881,6 +1222,11 @@ namespace sogen
                 if (pen_handle == 0)
                 {
                     return 0xFF000000u;
+                }
+
+                if (pen_handle == static_cast<uint32_t>(read_gdi_object_slot(c, k_stock_dc_pen_index)))
+                {
+                    return read_dc_attr_colorref(c, dc_attr + k_gdi_dc_attr_dc_pen_color_offset);
                 }
 
                 uint64_t pen_attr = 0;
@@ -910,7 +1256,24 @@ namespace sogen
                 }
             }
 
-            uint32_t get_dc_brush_color(const syscall_context& c, const hdc dc)
+            std::optional<uint32_t> get_brush_color_in_dc(const syscall_context& c, const hdc dc, const uint32_t brush_handle)
+            {
+                if (brush_handle == static_cast<uint32_t>(read_gdi_object_slot(c, k_stock_null_brush_index)))
+                {
+                    return std::nullopt;
+                }
+
+                uint64_t dc_attr = 0;
+                if (brush_handle == static_cast<uint32_t>(read_gdi_object_slot(c, k_stock_dc_brush_index)) &&
+                    get_gdi_object_address(c, static_cast<uint32_t>(dc), k_gdi_dc_type, dc_attr))
+                {
+                    return read_dc_attr_colorref(c, dc_attr + k_gdi_dc_attr_dc_brush_color_offset);
+                }
+
+                return get_brush_color(c, brush_handle);
+            }
+
+            std::optional<uint32_t> get_dc_brush_color(const syscall_context& c, const hdc dc)
             {
                 uint64_t dc_attr = 0;
                 if (!get_gdi_object_address(c, static_cast<uint32_t>(dc), k_gdi_dc_type, dc_attr))
@@ -925,7 +1288,7 @@ namespace sogen
                     return 0xFFFFFFFFu;
                 }
 
-                return get_brush_color(c, brush_handle);
+                return get_brush_color_in_dc(c, dc, brush_handle);
             }
 
             // Reads a COLORREF directly out of the DC_ATTR (the user-mode block gdi32 updates on
@@ -1099,6 +1462,19 @@ namespace sogen
                 return origin;
             }
 
+            bool is_stock_object_selected(const syscall_context& c, const hdc dc, const uint32_t attr_offset, const uint32_t stock_index)
+            {
+                uint64_t dc_attr = 0;
+                if (!get_gdi_object_address(c, static_cast<uint32_t>(dc), k_gdi_dc_type, dc_attr))
+                {
+                    return false;
+                }
+
+                uint32_t selected = 0;
+                c.win_emu.memory.try_read_memory(dc_attr + attr_offset, &selected, sizeof(selected));
+                return selected != 0 && selected == static_cast<uint32_t>(read_gdi_object_slot(c, stock_index));
+            }
+
             void fill_rect(gdi_bitmap_surface& surface, const int left, const int top, const int right, const int bottom,
                            const uint32_t color)
             {
@@ -1111,11 +1487,97 @@ namespace sogen
                 }
             }
 
+            uint8_t get_dc_rop2(const syscall_context& c, const hdc dc)
+            {
+                uint8_t rop2 = k_r2_copypen;
+                uint64_t dc_attr = 0;
+                if (get_gdi_object_address(c, static_cast<uint32_t>(dc), k_gdi_dc_type, dc_attr))
+                {
+                    c.win_emu.memory.try_read_memory(dc_attr + k_gdi_dc_attr_rop2_offset, &rop2, sizeof(rop2));
+                }
+                return rop2;
+            }
+
+            // An R2_* code minus one is the operation's truth table, indexed by (pen bit << 1) | destination bit.
+            uint32_t apply_rop2(const uint8_t rop2, const uint32_t pen, const uint32_t destination)
+            {
+                const auto table = static_cast<uint32_t>(rop2 - 1);
+                uint32_t result = 0;
+                if ((table & 1) != 0)
+                {
+                    result |= ~pen & ~destination;
+                }
+                if ((table & 2) != 0)
+                {
+                    result |= ~pen & destination;
+                }
+                if ((table & 4) != 0)
+                {
+                    result |= pen & ~destination;
+                }
+                if ((table & 8) != 0)
+                {
+                    result |= pen & destination;
+                }
+                return 0xFF000000u | (result & 0x00FFFFFFu);
+            }
+
+            void fill_rect_rop2(gdi_bitmap_surface& surface, const int64_t left, const int64_t top, const int64_t right,
+                                const int64_t bottom, const uint32_t color, const uint8_t rop2)
+            {
+                const auto x_begin = static_cast<size_t>(std::clamp<int64_t>(left, 0, surface.width));
+                const auto x_end = static_cast<size_t>(std::clamp<int64_t>(right, 0, surface.width));
+                const auto y_begin = static_cast<size_t>(std::clamp<int64_t>(top, 0, surface.height));
+                const auto y_end = static_cast<size_t>(std::clamp<int64_t>(bottom, 0, surface.height));
+                for (auto y = y_begin; y < y_end; ++y)
+                {
+                    for (auto x = x_begin; x < x_end; ++x)
+                    {
+                        auto& pixel = surface.pixels[(y * surface.width) + x];
+                        pixel = apply_rop2(rop2, color, pixel);
+                    }
+                }
+            }
+
+            // The outline is the closed polyline through the corners (left, top) and (right - 1, bottom - 1), each
+            // segment drawn without its last pixel, so a 1x1 rectangle draws nothing and every pixel is hit once.
+            void draw_rectangle_outline(gdi_bitmap_surface& surface, const int64_t left, const int64_t top, const int64_t right,
+                                        const int64_t bottom, const uint32_t color, const uint8_t rop2)
+            {
+                const auto right_edge = right - 1;
+                const auto bottom_edge = bottom - 1;
+                if (right_edge < left || bottom_edge < top || (right_edge == left && bottom_edge == top))
+                {
+                    return;
+                }
+
+                fill_rect_rop2(surface, left, top, right, top + 1, color, rop2);
+                if (bottom_edge > top)
+                {
+                    fill_rect_rop2(surface, left, bottom_edge, right, bottom, color, rop2);
+                }
+                fill_rect_rop2(surface, left, top + 1, left + 1, bottom_edge, color, rop2);
+                if (right_edge > left)
+                {
+                    fill_rect_rop2(surface, right_edge, top + 1, right, bottom_edge, color, rop2);
+                }
+            }
+
+            void delete_batched_object(const syscall_context& c, const uint32_t handle_value, const uint8_t base_type)
+            {
+                GDI_HANDLE_ENTRY64 entry{};
+                uint64_t entry_addr = 0;
+                if (read_gdi_entry_for_handle(c, handle_value, entry, entry_addr) && entry.Type == base_type)
+                {
+                    handle_NtGdiDeleteObjectApp(c, handle_value);
+                }
+            }
+
             template <typename Batch>
             bool flush_gdi_text_batch(const syscall_context& c, const Batch& batch)
             {
                 const auto batch_offset = batch.Offset & ~k_gdibs_no_rect;
-                if (batch_offset == 0 || batch.HDC == 0 || batch_offset > sizeof(batch.Buffer))
+                if (batch_offset == 0 || batch_offset > sizeof(batch.Buffer))
                 {
                     return true;
                 }
@@ -1126,10 +1588,7 @@ namespace sogen
                 int32_t origin_x = 0;
                 int32_t origin_y = 0;
                 uint32_t present_handle = 0;
-                if (!get_dc_state_and_surface(c, dc, dc_state, surface, origin_x, origin_y, &present_handle) || !surface)
-                {
-                    return true;
-                }
+                (void)get_dc_state_and_surface(c, dc, dc_state, surface, origin_x, origin_y, &present_handle);
 
                 const auto* bytes = reinterpret_cast<const uint8_t*>(batch.Buffer);
                 size_t offset = 0;
@@ -1141,8 +1600,16 @@ namespace sogen
                         break;
                     }
 
-                    if (header->cmd == k_gdi_batch_cmd_text_out &&
-                        static_cast<size_t>(header->size) >= offsetof(gdi_batch_text_out, string))
+                    if ((header->cmd == k_gdi_batch_cmd_delete_object || header->cmd == k_gdi_batch_cmd_delete_region) &&
+                        static_cast<size_t>(header->size) >= sizeof(gdi_batch_delete_object))
+                    {
+                        gdi_batch_delete_object delete_object{};
+                        std::memcpy(&delete_object, bytes + offset, sizeof(delete_object));
+                        delete_batched_object(c, static_cast<uint32_t>(delete_object.handle),
+                                              header->cmd == k_gdi_batch_cmd_delete_object ? k_gdi_brush_type : k_gdi_region_type);
+                    }
+                    else if (surface && header->cmd == k_gdi_batch_cmd_text_out &&
+                             static_cast<size_t>(header->size) >= offsetof(gdi_batch_text_out, string))
                     {
                         const auto* text_out = reinterpret_cast<const gdi_batch_text_out*>(header);
                         RECT clip_rect{.left = text_out->rect.left + origin_x,
@@ -1180,7 +1647,7 @@ namespace sogen
                                       has_rect && (text_out->options & ETO_CLIPPED) != 0 ? &clip_rect : nullptr, advances);
                         }
                     }
-                    else if (header->cmd == k_gdi_batch_cmd_poly_pat_blt &&
+                    else if (surface && header->cmd == k_gdi_batch_cmd_poly_pat_blt &&
                              static_cast<size_t>(header->size) >= k_gdi_poly_pat_blt_rect_offset)
                     {
                         uint32_t declared_count = 0;
@@ -1197,16 +1664,23 @@ namespace sogen
                             std::memcpy(&rect, bytes + rect_offset, sizeof(rect));
                             brush = rect.brush;
 
-                            const auto color = brush != 0 ? get_brush_color(c, static_cast<uint32_t>(brush)) : get_dc_brush_color(c, dc);
-                            fill_rect(*surface, rect.x + origin_x, rect.y + origin_y, rect.x + rect.width + origin_x,
-                                      rect.y + rect.height + origin_y, color);
+                            const auto color =
+                                brush != 0 ? get_brush_color_in_dc(c, dc, static_cast<uint32_t>(brush)) : get_dc_brush_color(c, dc);
+                            if (color)
+                            {
+                                fill_rect(*surface, rect.x + origin_x, rect.y + origin_y, rect.x + rect.width + origin_x,
+                                          rect.y + rect.height + origin_y, *color);
+                            }
                         }
                     }
 
                     offset += static_cast<size_t>(header->size);
                 }
 
-                present_win_surface(c, present_handle, surface);
+                if (surface)
+                {
+                    present_win_surface(c, present_handle, surface);
+                }
                 return true;
             }
 
@@ -1249,7 +1723,7 @@ namespace sogen
                         continue;
                     }
 
-                    const uint32_t handle = allocate_gdi_object(c, k_gdi_brush_type, k_gdi_brush_attr_size);
+                    const uint32_t handle = allocate_gdi_object(c, k_gdi_brush_type, k_gdi_brush_attr_size, false);
                     if (handle != 0)
                     {
                         brush = handle;
@@ -1267,7 +1741,7 @@ namespace sogen
 
                 if (client_drawing_brush == 0)
                 {
-                    const uint32_t handle = allocate_gdi_object(c, k_gdi_brush_type, k_gdi_brush_attr_size);
+                    const uint32_t handle = allocate_gdi_object(c, k_gdi_brush_type, k_gdi_brush_attr_size, false);
                     if (handle != 0)
                     {
                         client_drawing_brush = handle;
@@ -1294,6 +1768,23 @@ namespace sogen
                 });
             }
 
+            uint32_t stock_brush_color(const uint32_t index)
+            {
+                switch (index)
+                {
+                case k_stock_ltgray_brush_index:
+                    return 0x00C0C0C0u;
+                case k_stock_gray_brush_index:
+                    return 0x00808080u;
+                case k_stock_dkgray_brush_index:
+                    return 0x00404040u;
+                case k_stock_black_brush_index:
+                    return 0x00000000u;
+                default:
+                    return 0x00FFFFFFu;
+                }
+            }
+
             void seed_gdi_stock_objects(const syscall_context& c)
             {
                 struct stock_seed
@@ -1304,7 +1795,7 @@ namespace sogen
                     bool mirror_to_default_gui_slot;
                 };
 
-                constexpr std::array<stock_seed, 6> seeds = {
+                constexpr std::array<stock_seed, 13> seeds = {
                     stock_seed{
                         .index = k_stock_white_brush_index,
                         .type = k_gdi_brush_type,
@@ -1312,7 +1803,49 @@ namespace sogen
                         .mirror_to_default_gui_slot = false,
                     },
                     stock_seed{
+                        .index = k_stock_ltgray_brush_index,
+                        .type = k_gdi_brush_type,
+                        .attr_size = k_gdi_brush_attr_size,
+                        .mirror_to_default_gui_slot = false,
+                    },
+                    stock_seed{
+                        .index = k_stock_gray_brush_index,
+                        .type = k_gdi_brush_type,
+                        .attr_size = k_gdi_brush_attr_size,
+                        .mirror_to_default_gui_slot = false,
+                    },
+                    stock_seed{
+                        .index = k_stock_dkgray_brush_index,
+                        .type = k_gdi_brush_type,
+                        .attr_size = k_gdi_brush_attr_size,
+                        .mirror_to_default_gui_slot = false,
+                    },
+                    stock_seed{
+                        .index = k_stock_black_brush_index,
+                        .type = k_gdi_brush_type,
+                        .attr_size = k_gdi_brush_attr_size,
+                        .mirror_to_default_gui_slot = false,
+                    },
+                    stock_seed{
+                        .index = k_stock_null_brush_index,
+                        .type = k_gdi_brush_type,
+                        .attr_size = k_gdi_brush_attr_size,
+                        .mirror_to_default_gui_slot = false,
+                    },
+                    stock_seed{
+                        .index = k_stock_white_pen_index,
+                        .type = k_gdi_pen_type,
+                        .attr_size = k_gdi_pen_attr_size,
+                        .mirror_to_default_gui_slot = false,
+                    },
+                    stock_seed{
                         .index = k_stock_black_pen_index,
+                        .type = k_gdi_pen_type,
+                        .attr_size = k_gdi_pen_attr_size,
+                        .mirror_to_default_gui_slot = false,
+                    },
+                    stock_seed{
+                        .index = k_stock_null_pen_index,
                         .type = k_gdi_pen_type,
                         .attr_size = k_gdi_pen_attr_size,
                         .mirror_to_default_gui_slot = false,
@@ -1360,12 +1893,12 @@ namespace sogen
                     write_gdi_object_slot(c, seed.index, handle64);
                     if (seed.type == k_gdi_brush_type)
                     {
-                        const uint32_t color = seed.index == k_stock_white_brush_index ? 0x00FFFFFFu : k_default_system_colors[15];
-                        set_gdi_object_color(c, handle, k_gdi_brush_type, color);
+                        set_gdi_object_color(c, handle, k_gdi_brush_type, stock_brush_color(seed.index));
                     }
                     else if (seed.type == k_gdi_pen_type)
                     {
-                        set_gdi_object_color(c, handle, k_gdi_pen_type, 0x00000000u);
+                        const uint32_t color = seed.index == k_stock_white_pen_index ? 0x00FFFFFFu : 0x00000000u;
+                        set_gdi_object_color(c, handle, k_gdi_pen_type, color);
                     }
                     else if (seed.type == k_gdi_font_type)
                     {
@@ -1394,12 +1927,24 @@ namespace sogen
             {
                 std::array<uint8_t, k_gdi_dc_attr_size> zeroed{};
                 c.emu.write_memory(dc_attr, zeroed.data(), zeroed.size());
+                c.emu.write_memory(dc_attr + k_gdi_dc_attr_rop2_offset, &k_r2_copypen, sizeof(k_r2_copypen));
 
-                const uint64_t system_font = read_gdi_object_slot(c, k_stock_system_font_index);
-                if (system_font != 0)
+                constexpr uint32_t white = 0x00FFFFFFu;
+                c.emu.write_memory(dc_attr + k_gdi_dc_attr_dc_brush_color_offset, &white, sizeof(white));
+
+                const std::array<std::pair<uint32_t, uint32_t>, 3> default_objects{{
+                    {k_stock_system_font_index, k_gdi_dc_attr_font_offset},
+                    {k_stock_white_brush_index, k_gdi_dc_attr_hbrush_offset},
+                    {k_stock_black_pen_index, k_gdi_dc_attr_hpen_offset},
+                }};
+                for (const auto& [stock_index, attr_offset] : default_objects)
                 {
-                    const auto handle_value = static_cast<uint32_t>(system_font);
-                    c.emu.write_memory(dc_attr + k_gdi_dc_attr_font_offset, &handle_value, sizeof(handle_value));
+                    const uint64_t stock_object = read_gdi_object_slot(c, stock_index);
+                    if (stock_object != 0)
+                    {
+                        const auto handle_value = static_cast<uint32_t>(stock_object);
+                        c.emu.write_memory(dc_attr + attr_offset, &handle_value, sizeof(handle_value));
+                    }
                 }
             }
 
@@ -1538,10 +2083,69 @@ namespace sogen
                 }
             }
 
+            std::span<EMU_PALETTEENTRY> palette_range(std::vector<EMU_PALETTEENTRY>& palette, const uint16_t start, const uint16_t count)
+            {
+                if (start >= palette.size())
+                {
+                    return {};
+                }
+
+                return std::span{palette}.subspan(start, std::min<size_t>(count, palette.size() - start));
+            }
+
+            LONG read_palette_entries(const syscall_context& c, std::vector<EMU_PALETTEENTRY>& palette, const uint16_t start,
+                                      const uint16_t count, const emulator_pointer entries)
+            {
+                const auto range = palette_range(palette, start, count);
+                if (!c.win_emu.memory.try_write_memory(entries, range.data(), range.size_bytes()))
+                {
+                    return 0;
+                }
+
+                return static_cast<LONG>(range.size());
+            }
+
+            // AnimatePalette only replaces the entries that were created with PC_RESERVED.
+            LONG write_palette_entries(const syscall_context& c, std::vector<EMU_PALETTEENTRY>& palette, const uint16_t start,
+                                       const uint16_t count, const emulator_pointer entries, const bool reserved_only)
+            {
+                const auto range = palette_range(palette, start, count);
+                std::vector<EMU_PALETTEENTRY> source(range.size());
+                if (!c.win_emu.memory.try_read_memory(entries, source.data(), source.size() * sizeof(EMU_PALETTEENTRY)))
+                {
+                    return 0;
+                }
+
+                for (size_t i = 0; i < range.size(); ++i)
+                {
+                    if (!reserved_only || (range[i].peFlags & k_palette_entry_reserved) != 0)
+                    {
+                        range[i] = source[i];
+                    }
+                }
+
+                return static_cast<LONG>(range.size());
+            }
+
+            uint32_t find_nearest_palette_index(const std::vector<EMU_PALETTEENTRY>& palette, const COLORREF color)
+            {
+                const auto distance = [color](const EMU_PALETTEENTRY& entry) {
+                    const auto red = static_cast<int32_t>(entry.peRed) - static_cast<int32_t>(color & 0xFF);
+                    const auto green = static_cast<int32_t>(entry.peGreen) - static_cast<int32_t>((color >> 8) & 0xFF);
+                    const auto blue = static_cast<int32_t>(entry.peBlue) - static_cast<int32_t>((color >> 16) & 0xFF);
+                    return red * red + green * green + blue * blue;
+                };
+
+                const auto nearest = std::ranges::min_element(palette, {}, distance);
+                return static_cast<uint32_t>(std::distance(palette.begin(), nearest));
+            }
+
             uint32_t get_gdi_object_size(const uint8_t type)
             {
                 switch (type)
                 {
+                case k_gdi_palette_type:
+                    return k_palette_object_size;
                 case k_gdi_brush_type:
                     return k_logbrush_size;
                 case k_gdi_pen_type:
@@ -1734,6 +2338,11 @@ namespace sogen
                 return status;
             }
 
+            bool rop3_uses_pattern(const uint8_t rop3)
+            {
+                return ((rop3 >> 4) & 0x0Fu) != (rop3 & 0x0Fu);
+            }
+
             bool rop3_uses_source(const uint8_t rop3)
             {
                 // ROP3 truth-table index: bit0=D, bit1=S, bit2=P.
@@ -1775,6 +2384,87 @@ namespace sogen
                 }
 
                 return out;
+            }
+
+            // Windows fails a request whose output would exceed this many bytes before writing anything.
+            constexpr uint64_t max_char_metric_output_size = 0x2710000;
+
+            bool is_char_metric_request_valid(const syscall_context& c, const hdc dc, const UINT char_count, const size_t entry_size,
+                                              const emulator_pointer chars, const emulator_pointer buffer)
+            {
+                return dc != 0 && buffer != 0 && char_count != 0 &&
+                       static_cast<uint64_t>(char_count) * entry_size <= max_char_metric_output_size &&
+                       (chars == 0 || is_readable_range(c.win_emu.memory, chars, static_cast<uint64_t>(char_count) * sizeof(char16_t)));
+            }
+
+            bool write_guest_block(const syscall_context& c, const emulator_pointer address, const void* data, const size_t size)
+            {
+                return is_writable_range(c.win_emu.memory, address, size) && c.emu.try_write_memory(address, data, size);
+            }
+
+            bool write_guest_bytes_up_to_fault(const syscall_context& c, const emulator_pointer address, const void* data,
+                                               const size_t size)
+            {
+                const auto* bytes = static_cast<const std::byte*>(data);
+                for (size_t offset = 0; offset < size;)
+                {
+                    const auto current = address + offset;
+                    const auto piece = static_cast<size_t>(std::min<uint64_t>(size - offset, page_align_up(current + 1) - current));
+                    if (!write_guest_block(c, current, bytes + offset, piece))
+                    {
+                        return false;
+                    }
+
+                    offset += piece;
+                }
+
+                return true;
+            }
+
+            template <typename Entry>
+            bool write_repeated_entries(const syscall_context& c, const emulator_pointer buffer, const UINT count, const Entry& entry)
+            {
+                std::array<Entry, 0x100> chunk{};
+                chunk.fill(entry);
+                for (UINT written = 0; written < count;)
+                {
+                    const auto chunk_count = std::min<size_t>(chunk.size(), count - written);
+                    if (!write_guest_bytes_up_to_fault(c, buffer + (static_cast<uint64_t>(written) * sizeof(Entry)), chunk.data(),
+                                                       chunk_count * sizeof(Entry)))
+                    {
+                        return false;
+                    }
+
+                    written += static_cast<UINT>(chunk_count);
+                }
+
+                return true;
+            }
+
+            // Windows measures at most this many characters, with or without a fit count or partial extents.
+            constexpr uint64_t max_text_extent_chars = max_char_metric_output_size / (sizeof(char16_t) + sizeof(ULONG));
+
+            bool write_fixed_width_extents(const syscall_context& c, const emulator_pointer extents, const ULONG count)
+            {
+                std::array<ULONG, 0x100> chunk{};
+                for (ULONG written = 0; written < count;)
+                {
+                    const auto chunk_count = std::min<size_t>(chunk.size(), count - written);
+                    for (size_t i = 0; i < chunk_count; ++i)
+                    {
+                        chunk[i] = static_cast<ULONG>((written + i + 1) * k_default_font_width);
+                    }
+
+                    if (!write_guest_bytes_up_to_fault(c, extents + (static_cast<uint64_t>(written) * sizeof(ULONG)), chunk.data(),
+                                                       chunk_count * sizeof(ULONG)))
+                    {
+                        return false;
+                    }
+
+                    written += static_cast<ULONG>(chunk_count);
+                }
+
+                return true;
             }
         }
 
@@ -2017,12 +2707,14 @@ namespace sogen
 
         uint64_t handle_NtGdiCreatePatternBrushInternal(const syscall_context& c, const handle /*bitmap*/, const uint32_t /*unused*/)
         {
-            return allocate_gdi_object(c, k_gdi_brush_type, k_gdi_brush_attr_size);
+            return allocate_gdi_object(c, k_gdi_brush_type, k_gdi_brush_attr_size, false);
         }
 
-        uint64_t handle_NtGdiCreatePen(const syscall_context& c, const uint32_t /*style*/, const uint32_t /*width*/, const uint32_t color)
+        uint64_t handle_NtGdiCreatePen(const syscall_context& c, const uint32_t style, const uint32_t width, const uint32_t color)
         {
-            const auto handle = allocate_gdi_object(c, k_gdi_pen_type, k_gdi_pen_attr_size);
+            // On Windows only solid pens of width 0, the pens gdi32 can cache, have a user attribute. gdi32 deletes the
+            // others at once instead of queueing the delete in the GDI batch.
+            const auto handle = allocate_gdi_object(c, k_gdi_pen_type, k_gdi_pen_attr_size, style == k_ps_solid && width == 0);
             uint64_t pen_attr = 0;
             if (handle != 0 && get_gdi_object_address(c, static_cast<uint32_t>(handle), k_gdi_pen_type, pen_attr))
             {
@@ -2031,9 +2723,27 @@ namespace sogen
             return handle;
         }
 
-        uint64_t handle_NtGdiCreatePaletteInternal(const syscall_context& c)
+        uint64_t handle_NtGdiCreatePaletteInternal(const syscall_context& c, const emulator_pointer log_palette, const uint32_t entry_count)
         {
-            return allocate_gdi_object(c, k_gdi_palette_type, k_gdi_palette_attr_size);
+            if (entry_count == 0 || entry_count > k_max_palette_entries)
+            {
+                return 0;
+            }
+
+            std::vector<EMU_PALETTEENTRY> entries(entry_count);
+            if (!c.win_emu.memory.try_read_memory(log_palette + k_log_palette_entries_offset, entries.data(),
+                                                  entries.size() * sizeof(EMU_PALETTEENTRY)))
+            {
+                return 0;
+            }
+
+            const auto palette = allocate_gdi_object(c, k_gdi_palette_type, k_gdi_palette_attr_size);
+            if (palette != 0)
+            {
+                c.proc.gdi_palettes[palette] = std::move(entries);
+            }
+
+            return palette;
         }
 
         uint64_t handle_NtGdiCreateHalftonePalette(const syscall_context& c)
@@ -2041,9 +2751,70 @@ namespace sogen
             return allocate_gdi_object(c, k_gdi_palette_type, k_gdi_palette_attr_size);
         }
 
-        NTSTATUS handle_NtGdiDoPalette()
+        LONG handle_NtGdiDoPalette(const syscall_context& c, const handle object, const uint16_t start, const uint16_t count,
+                                   const emulator_pointer entries, const uint32_t function, const BOOL /*inbound*/)
         {
-            return STATUS_SUCCESS;
+            const auto palette = c.proc.gdi_palettes.find(static_cast<uint32_t>(object.bits));
+            if (palette == c.proc.gdi_palettes.end())
+            {
+                return 0;
+            }
+
+            switch (function)
+            {
+            case k_gdi_pal_get_entries:
+                return entries == 0 ? static_cast<LONG>(palette->second.size())
+                                    : read_palette_entries(c, palette->second, start, count, entries);
+            case k_gdi_pal_set_entries:
+                return write_palette_entries(c, palette->second, start, count, entries, false);
+            case k_gdi_pal_animate:
+                return write_palette_entries(c, palette->second, start, count, entries, true) != 0 ? TRUE : FALSE;
+            default:
+                return 0;
+            }
+        }
+
+        uint32_t handle_NtGdiGetNearestPaletteIndex(const syscall_context& c, const handle palette, const COLORREF color)
+        {
+            const auto it = c.proc.gdi_palettes.find(static_cast<uint32_t>(palette.bits));
+            if (it == c.proc.gdi_palettes.end())
+            {
+                return k_clr_invalid;
+            }
+
+            return find_nearest_palette_index(it->second, color);
+        }
+
+        uint32_t count_process_gdi_objects(const syscall_context& c)
+        {
+            uint64_t table = 0;
+            c.proc.peb64.access([&](const PEB64& peb) { table = peb.GdiSharedHandleTable; });
+            if (table == 0)
+            {
+                return 0;
+            }
+
+            std::unordered_set<uint32_t> system_objects{};
+            any_system_gdi_object(c, [&](const uint32_t object) {
+                system_objects.insert(object);
+                return false;
+            });
+
+            std::vector<GDI_HANDLE_ENTRY64> entries(GDI_MAX_HANDLE_COUNT);
+            c.emu.read_memory(table, entries.data(), entries.size() * sizeof(GDI_HANDLE_ENTRY64));
+
+            uint32_t count = 0;
+            for (uint32_t index = 0; index < entries.size(); ++index)
+            {
+                const auto& entry = entries[index];
+                const auto handle_value = (static_cast<uint32_t>(entry.Unique) << 16) | index;
+                if (entry.Type != 0 && (entry.Owner & ~1u) == c.proc.process_id && !system_objects.contains(handle_value))
+                {
+                    ++count;
+                }
+            }
+
+            return count;
         }
 
         uint64_t handle_NtGdiCreateCompatibleDC(const syscall_context& c, const hdc /*dc*/)
@@ -2079,7 +2850,9 @@ namespace sogen
             const auto dc = allocate_gdi_dc(c, dc_attr);
             if (dc != 0)
             {
-                c.proc.gdi_dc_states[dc].target_window = window;
+                auto& state = c.proc.gdi_dc_states[dc];
+                state.target_window = window;
+                state.is_window_dc = true;
             }
             return dc;
         }
@@ -2700,6 +3473,11 @@ namespace sogen
                 return 0;
             }
 
+            if (is_system_gdi_object(c, handle_value))
+            {
+                return 1;
+            }
+
             const emulator_object<GDI_HANDLE_ENTRY64> entry_obj{c.emu, entry_addr};
             entry_obj.access([&](GDI_HANDLE_ENTRY64& writable) {
                 const auto unique = writable.Unique;
@@ -2722,14 +3500,11 @@ namespace sogen
                 c.win_emu.memory.release_memory(entry.Object, 0);
             }
 
-            if (handle_value == c.proc.gdi_memory_dc_default_bitmap_handle)
-            {
-                c.proc.gdi_memory_dc_default_bitmap_handle = 0;
-            }
-
             c.proc.gdi_dc_states.erase(handle_value);
             c.proc.gdi_bitmap_surfaces.erase(handle_value);
             c.proc.gdi_fonts.erase(handle_value);
+            c.proc.gdi_regions.erase(handle_value);
+            c.proc.gdi_palettes.erase(handle_value);
             return 1;
         }
 
@@ -2838,7 +3613,8 @@ namespace sogen
                 return 0;
             }
 
-            const uint32_t object_size = get_gdi_object_size(entry.Type);
+            const auto object_type = gdi_object_type(entry);
+            const uint32_t object_size = get_gdi_object_size(object_type);
             if (object_size == 0)
             {
                 return 0;
@@ -2856,7 +3632,13 @@ namespace sogen
 
             std::vector<uint8_t> object_data(object_size, 0);
 
-            if (entry.Type == k_gdi_bitmap_type)
+            if (object_type == k_gdi_palette_type)
+            {
+                const auto palette = c.proc.gdi_palettes.find(handle_value);
+                const auto entry_count = static_cast<uint16_t>(palette == c.proc.gdi_palettes.end() ? 0 : palette->second.size());
+                std::memcpy(object_data.data(), &entry_count, sizeof(entry_count));
+            }
+            else if (object_type == k_gdi_bitmap_type)
             {
                 const auto bmp_it = c.proc.gdi_bitmap_surfaces.find(handle_value);
                 if (bmp_it != c.proc.gdi_bitmap_surfaces.end())
@@ -2877,7 +3659,7 @@ namespace sogen
                     bitmap.as<uint32_t>(20).set(static_cast<uint32_t>(surface.guest_bits));
                 }
             }
-            else if (entry.Type == k_gdi_font_type)
+            else if (object_type == k_gdi_font_type)
             {
                 if (const auto font_it = c.proc.gdi_fonts.find(handle_value); font_it != c.proc.gdi_fonts.end())
                 {
@@ -3143,77 +3925,71 @@ namespace sogen
                                           const ULONG max_extent, const emulator_object<ULONG> fit, const emulator_pointer extents,
                                           const emulator_pointer size, const ULONG /*flags*/)
         {
-            if (dc == 0 || size == 0)
+            // Windows answers an empty string without looking at the DC or the text.
+            if (char_count == 0)
             {
-                return FALSE;
-            }
-
-            // The count sizes buffers the guest passed, so the text is checked before anything is derived from it.
-            // Windows reads the text first, so a count larger than that buffer fails there; the width here does not
-            // depend on the characters, but a bogus count must still fail rather than be believed.
-            if (char_count != 0)
-            {
-                char16_t last_character{};
-                const auto last = text + (static_cast<uint64_t>(char_count) - 1) * sizeof(char16_t);
-                if (text == 0 || !c.win_emu.memory.try_read_memory(last, &last_character, sizeof(last_character)))
+                constexpr SIZE empty_size{};
+                constexpr ULONG no_fit = 0;
+                if (size == 0 || !write_guest_block(c, size, &empty_size, sizeof(empty_size)))
                 {
                     return FALSE;
                 }
+
+                if (fit && !write_guest_block(c, fit.value(), &no_fit, sizeof(no_fit)))
+                {
+                    return FALSE;
+                }
+
+                return TRUE;
+            }
+
+            // Windows reads the whole text before writing anything, although the fixed-width measure does not need it.
+            if (dc == 0 || size == 0 || char_count > max_text_extent_chars ||
+                !is_readable_range(c.win_emu.memory, text, static_cast<uint64_t>(char_count) * sizeof(char16_t)))
+            {
+                return FALSE;
             }
 
             const SIZE text_size{
                 .cx = static_cast<LONG>(k_default_font_width * char_count),
                 .cy = static_cast<LONG>(k_default_font_height),
             };
-            c.emu.write_memory(size, &text_size, sizeof(text_size));
-
-            if (fit)
+            if (!write_guest_block(c, size, &text_size, sizeof(text_size)))
             {
-                fit.write(std::min<ULONG>(char_count, max_extent / k_default_font_width));
+                return FALSE;
             }
 
-            if (extents != 0 && char_count != 0)
+            const ULONG fitting = std::min<ULONG>(char_count, max_extent / k_default_font_width);
+            if (fit && !write_guest_block(c, fit.value(), &fitting, sizeof(fitting)))
             {
-                // Written in fixed chunks: nothing host-side is sized by the guest's count.
-                constexpr ULONG chunk_size = 256;
-                std::array<ULONG, chunk_size> partial_extents{};
+                return FALSE;
+            }
 
-                for (ULONG written = 0; written < char_count; written += chunk_size)
-                {
-                    const auto count = std::min(chunk_size, char_count - written);
-                    for (ULONG i = 0; i < count; ++i)
-                    {
-                        partial_extents[i] = static_cast<ULONG>(k_default_font_width * (written + i + 1));
-                    }
-
-                    const auto destination = extents + static_cast<uint64_t>(written) * sizeof(ULONG);
-                    if (!c.win_emu.memory.try_write_memory(destination, partial_extents.data(), count * sizeof(ULONG)))
-                    {
-                        return FALSE;
-                    }
-                }
+            const ULONG extent_count = fit ? fitting : char_count;
+            if (extents != 0 && !write_fixed_width_extents(c, extents, extent_count))
+            {
+                return FALSE;
             }
 
             return TRUE;
         }
 
         BOOL handle_NtGdiGetCharWidthW(const syscall_context& c, const hdc dc, const UINT /*first_char*/, const UINT char_count,
-                                       const emulator_pointer /*chars*/, const UINT /*flags*/, const emulator_pointer buffer)
+                                       const emulator_pointer chars, const UINT /*flags*/, const emulator_pointer buffer)
         {
-            if (dc == 0 || buffer == 0)
+            if (!is_char_metric_request_valid(c, dc, char_count, sizeof(int32_t), chars, buffer))
             {
                 return FALSE;
             }
 
-            const std::vector<int32_t> widths(char_count, static_cast<int32_t>(k_default_font_width));
-            c.emu.write_memory(buffer, widths.data(), widths.size() * sizeof(int32_t));
-            return TRUE;
+            const auto width = static_cast<int32_t>(k_default_font_width);
+            return write_repeated_entries(c, buffer, char_count, width) ? TRUE : FALSE;
         }
 
         BOOL handle_NtGdiGetCharABCWidthsW(const syscall_context& c, const hdc dc, const UINT /*first_char*/, const UINT char_count,
-                                           const emulator_pointer /*chars*/, const UINT /*flags*/, const emulator_pointer buffer)
+                                           const emulator_pointer chars, const UINT /*flags*/, const emulator_pointer buffer)
         {
-            if (dc == 0 || buffer == 0)
+            if (!is_char_metric_request_valid(c, dc, char_count, sizeof(ABC), chars, buffer))
             {
                 return FALSE;
             }
@@ -3223,9 +3999,7 @@ namespace sogen
                 .abcB = k_default_font_width,
                 .abcC = 0,
             };
-            const std::vector<ABC> widths(char_count, metrics);
-            c.emu.write_memory(buffer, widths.data(), widths.size() * sizeof(ABC));
-            return TRUE;
+            return write_repeated_entries(c, buffer, char_count, metrics) ? TRUE : FALSE;
         }
 
         uint32_t handle_NtGdiGetGlyphOutline(const syscall_context& c, const hdc dc, const UINT character, const UINT format,
@@ -3525,62 +4299,60 @@ namespace sogen
         uint64_t handle_NtGdiCreateRectRgn(const syscall_context& c, const LONG x_left, const LONG y_top, const LONG x_right,
                                            const LONG y_bottom)
         {
-            const auto handle = allocate_gdi_object(c, k_gdi_region_type, k_gdi_region_attr_size);
-            uint64_t region_attr = 0;
-            if (handle != 0 && get_gdi_object_address(c, handle, k_gdi_region_type, region_attr))
-            {
-                const RECT rect{
-                    .left = x_left,
-                    .top = y_top,
-                    .right = x_right,
-                    .bottom = y_bottom,
-                };
-                c.emu.write_memory(region_attr, &rect, sizeof(rect));
-            }
-            return handle;
+            const auto region = allocate_gdi_object(c, k_gdi_region_type, k_gdi_region_attr_size);
+            const RECT rect{
+                .left = (std::min)(x_left, x_right),
+                .top = (std::min)(y_top, y_bottom),
+                .right = (std::max)(x_left, x_right),
+                .bottom = (std::max)(y_top, y_bottom),
+            };
+            (void)store_gdi_region(c, region, rect_region(rect));
+            return region;
         }
 
         bool set_gdi_region_rect(const syscall_context& c, const handle region, const RECT& rect)
         {
-            uint64_t region_attr = 0;
-            if (!get_gdi_object_address(c, static_cast<uint32_t>(region.bits), k_gdi_region_type, region_attr))
+            return store_gdi_region(c, static_cast<uint32_t>(region.bits), rect_region(rect)) != RGN_ERROR;
+        }
+
+        int32_t handle_NtGdiCombineRgn(const syscall_context& c, const handle destination, const handle first_source,
+                                       const handle second_source, const int32_t mode)
+        {
+            if (mode < RGN_AND || mode > RGN_COPY)
             {
-                return false;
+                c.win_emu.log.error("Unsupported region combine mode: %d\n", mode);
+                set_guest_last_error(c, k_error_invalid_parameter);
+                return RGN_ERROR;
             }
 
-            c.emu.write_memory(region_attr, &rect, sizeof(rect));
-            return true;
+            const auto first = read_gdi_region(c, static_cast<uint32_t>(first_source.bits));
+            const auto second =
+                mode == RGN_COPY ? std::optional{std::vector<RECT>{}} : read_gdi_region(c, static_cast<uint32_t>(second_source.bits));
+            if (!first || !second)
+            {
+                set_guest_last_error(c, k_error_invalid_handle);
+                return RGN_ERROR;
+            }
+
+            const auto result = store_gdi_region(c, static_cast<uint32_t>(destination.bits), combine_regions(*first, *second, mode));
+            if (result == RGN_ERROR)
+            {
+                set_guest_last_error(c, k_error_invalid_handle);
+            }
+
+            return result;
         }
 
         BOOL handle_NtGdiEqualRgn(const syscall_context& c, const handle first_region, const handle second_region)
         {
-            uint64_t first_attr = 0;
-            uint64_t second_attr = 0;
-            if (!get_gdi_object_address(c, static_cast<uint32_t>(first_region.bits), k_gdi_region_type, first_attr) ||
-                !get_gdi_object_address(c, static_cast<uint32_t>(second_region.bits), k_gdi_region_type, second_attr))
+            const auto first = read_gdi_region(c, static_cast<uint32_t>(first_region.bits));
+            const auto second = read_gdi_region(c, static_cast<uint32_t>(second_region.bits));
+            if (!first || !second)
             {
                 return FALSE;
             }
 
-            RECT first_rect{};
-            RECT second_rect{};
-            if (!c.win_emu.memory.try_read_memory(first_attr, &first_rect, sizeof(first_rect)) ||
-                !c.win_emu.memory.try_read_memory(second_attr, &second_rect, sizeof(second_rect)))
-            {
-                return FALSE;
-            }
-
-            const auto first_empty = first_rect.left >= first_rect.right || first_rect.top >= first_rect.bottom;
-            const auto second_empty = second_rect.left >= second_rect.right || second_rect.top >= second_rect.bottom;
-            if (first_empty || second_empty)
-            {
-                return first_empty == second_empty ? TRUE : FALSE;
-            }
-
-            return first_rect.left == second_rect.left && first_rect.top == second_rect.top && first_rect.right == second_rect.right &&
-                           first_rect.bottom == second_rect.bottom
-                       ? TRUE
-                       : FALSE;
+            return combine_regions(*first, *second, RGN_XOR).empty() ? TRUE : FALSE;
         }
 
         int32_t handle_NtGdiGetRandomRgn(const syscall_context&, const hdc dc, const uint64_t region, const LONG /*index*/)
@@ -3591,15 +4363,20 @@ namespace sogen
         uint32_t handle_NtGdiGetRegionData(const syscall_context& c, const handle hrgn, const ULONG buffer_size,
                                            const emulator_pointer region_data)
         {
-            uint64_t region_attr = 0;
-            if (!get_gdi_object_address(c, static_cast<uint32_t>(hrgn.bits), k_gdi_region_type, region_attr))
+            const auto rects = read_gdi_region(c, static_cast<uint32_t>(hrgn.bits));
+            if (!rects)
             {
                 return 0;
             }
 
-            (void)region_attr;
+            const auto rects_bytes = rects->size() * sizeof(RECT);
+            if (rects_bytes > std::numeric_limits<DWORD>::max() - sizeof(RGNDATAHEADER))
+            {
+                return 0;
+            }
 
-            constexpr DWORD required_size = sizeof(RGNDATAHEADER);
+            const auto rects_size = static_cast<DWORD>(rects_bytes);
+            const auto required_size = static_cast<DWORD>(sizeof(RGNDATAHEADER) + rects_bytes);
             if (region_data == 0)
             {
                 return required_size;
@@ -3607,16 +4384,22 @@ namespace sogen
 
             if (buffer_size < required_size)
             {
+                set_guest_last_error(c, k_error_invalid_parameter);
                 return 0;
             }
 
             RGNDATAHEADER header{};
             header.dwSize = sizeof(header);
             header.iType = RDH_RECTANGLES;
-            header.nCount = 0;
-            header.nRgnSize = 0;
-            header.rcBound = RECT{};
+            header.nCount = static_cast<DWORD>(rects->size());
+            header.nRgnSize = rects_size;
+            header.rcBound = region_bounds(*rects);
             c.emu.write_memory(region_data, &header, sizeof(header));
+            if (!rects->empty())
+            {
+                c.emu.write_memory(region_data + sizeof(header), rects->data(), rects_size);
+            }
+
             return required_size;
         }
 
@@ -3764,8 +4547,12 @@ namespace sogen
                 }
             }
 
-            const auto color = get_dc_pen_color(c, dc);
-            draw_line(*surface, dc_state->current_x + origin_x, dc_state->current_y + origin_y, x_end + origin_x, y_end + origin_y, color);
+            if (!is_stock_object_selected(c, dc, k_gdi_dc_attr_hpen_offset, k_stock_null_pen_index))
+            {
+                const auto color = get_dc_pen_color(c, dc);
+                draw_line(*surface, dc_state->current_x + origin_x, dc_state->current_y + origin_y, x_end + origin_x, y_end + origin_y,
+                          color);
+            }
 
             dc_state->current_x = x_end;
             dc_state->current_y = y_end;
@@ -3781,21 +4568,45 @@ namespace sogen
         BOOL handle_NtGdiRectangle(const syscall_context& c, const hdc dc, const LONG left, const LONG top, const LONG right,
                                    const LONG bottom)
         {
-            set_dc_current_point(c, dc, left, top);
+            uint64_t dc_attr = 0;
+            if (!get_gdi_object_address(c, static_cast<uint32_t>(dc), k_gdi_dc_type, dc_attr))
+            {
+                set_guest_last_error(c, k_error_invalid_handle);
+                return FALSE;
+            }
 
-            if (!handle_NtGdiLineTo(c, dc, right - 1, top))
+            (void)handle_NtGdiFlush(c);
+
+            gdi_dc_state* dc_state = nullptr;
+            gdi_bitmap_surface* surface = nullptr;
+            int32_t origin_x = 0;
+            int32_t origin_y = 0;
+            uint32_t present_handle = 0;
+            if (!get_dc_state_and_surface(c, dc, dc_state, surface, origin_x, origin_y, &present_handle) || !surface)
             {
-                return FALSE;
+                return TRUE;
             }
-            if (!handle_NtGdiLineTo(c, dc, right - 1, bottom - 1))
+
+            const auto x0 = static_cast<int64_t>((std::min)(left, right)) + origin_x;
+            const auto y0 = static_cast<int64_t>((std::min)(top, bottom)) + origin_y;
+            const auto x1 = static_cast<int64_t>((std::max)(left, right)) + origin_x;
+            const auto y1 = static_cast<int64_t>((std::max)(top, bottom)) + origin_y;
+            const auto rop2 = get_dc_rop2(c, dc);
+            const auto has_outline = !is_stock_object_selected(c, dc, k_gdi_dc_attr_hpen_offset, k_stock_null_pen_index);
+
+            if (const auto brush_color = get_dc_brush_color(c, dc))
             {
-                return FALSE;
+                const auto inset = has_outline ? 1 : 0;
+                fill_rect_rop2(*surface, x0 + inset, y0 + inset, x1 - 1, y1 - 1, *brush_color, rop2);
             }
-            if (!handle_NtGdiLineTo(c, dc, left, bottom - 1))
+
+            if (has_outline)
             {
-                return FALSE;
+                draw_rectangle_outline(*surface, x0, y0, x1, y1, get_dc_pen_color(c, dc), rop2);
             }
-            return handle_NtGdiLineTo(c, dc, left, top);
+
+            present_win_surface(c, present_handle, surface);
+            return TRUE;
         }
 
         BOOL handle_NtGdiBitBlt(const syscall_context& c, const hdc dst_dc, const int x_dst, const int y_dst, const int width,
@@ -3934,7 +4745,12 @@ namespace sogen
                 }
             }
 
-            const uint32_t pattern = get_dc_brush_color(c, dst_dc);
+            const auto pattern_color = get_dc_brush_color(c, dst_dc);
+            if (!pattern_color && !needs_source && rop3_uses_pattern(rop3))
+            {
+                return TRUE;
+            }
+            const uint32_t pattern = pattern_color.value_or(0xFFFFFFFFu);
 
             for (size_t row = 0; row < blt_height; ++row)
             {
@@ -4011,7 +4827,12 @@ namespace sogen
             const bool flip_src_x = src_width < 0;
             const bool flip_src_y = src_height < 0;
 
-            const uint32_t pattern = get_dc_brush_color(c, dst_dc);
+            const auto pattern_color = get_dc_brush_color(c, dst_dc);
+            if (!pattern_color && !needs_source && rop3_uses_pattern(rop3))
+            {
+                return TRUE;
+            }
+            const uint32_t pattern = pattern_color.value_or(0xFFFFFFFFu);
 
             for (int dy = 0; dy < dst_h; ++dy)
             {
@@ -4172,7 +4993,7 @@ namespace sogen
         }
 
         BOOL handle_NtGdiPatBlt(const syscall_context& c, const hdc dc, const LONG x, const LONG y, const LONG width, const LONG height,
-                                const DWORD /*rop*/)
+                                const DWORD rop)
         {
             gdi_dc_state* dc_state = nullptr;
             gdi_bitmap_surface* surface = nullptr;
@@ -4183,12 +5004,24 @@ namespace sogen
                 return FALSE;
             }
 
+            const auto rop3 = static_cast<uint8_t>((rop >> 16) & 0xFFu);
             const auto color = get_dc_brush_color(c, dc);
+            if (!color && rop3_uses_pattern(rop3))
+            {
+                return TRUE;
+            }
+
+            const auto pattern = color.value_or(0);
             for (int yy = 0; yy < height; ++yy)
             {
                 for (int xx = 0; xx < width; ++xx)
                 {
-                    set_surface_pixel(*surface, x + xx + origin_x, y + yy + origin_y, color);
+                    const auto px = x + xx + origin_x;
+                    const auto py = y + yy + origin_y;
+                    if (const auto destination = get_surface_pixel(*surface, px, py))
+                    {
+                        set_surface_pixel(*surface, px, py, apply_rop3(rop3, 0, *destination, pattern) | 0xFF000000u);
+                    }
                 }
             }
             return TRUE;
@@ -4227,9 +5060,12 @@ namespace sogen
                     return FALSE;
                 }
 
-                const auto color = brush != 0 ? get_brush_color(c, static_cast<uint32_t>(brush)) : get_dc_brush_color(c, dc);
-                fill_rect(*surface, rect[0] + origin_x, rect[1] + origin_y, rect[0] + rect[2] + origin_x, rect[1] + rect[3] + origin_y,
-                          color);
+                const auto color = brush != 0 ? get_brush_color_in_dc(c, dc, static_cast<uint32_t>(brush)) : get_dc_brush_color(c, dc);
+                if (color)
+                {
+                    fill_rect(*surface, rect[0] + origin_x, rect[1] + origin_y, rect[0] + rect[2] + origin_x, rect[1] + rect[3] + origin_y,
+                              *color);
+                }
             }
             return TRUE;
         }
@@ -4421,7 +5257,7 @@ namespace sogen
             {
                 GDI_HANDLE_ENTRY32 entry32{};
                 entry32.Object = static_cast<uint32_t>(entry.Object & std::numeric_limits<uint32_t>::max());
-                entry32.OwnerValue = entry.Owner.Value;
+                entry32.OwnerValue = entry.Owner;
                 entry32.Unique = entry.Unique;
                 entry32.Type = entry.Type;
                 entry32.Flags = entry.Flags;

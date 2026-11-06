@@ -29,6 +29,9 @@ interface NativeListener {
 
     /** [error] is empty once the process was saved to [path]. */
     fun onSnapshot(path: String, error: String)
+
+    /** Opens a document of a [DocumentTree] for reading. Returns a descriptor the caller owns, or -1. */
+    fun openDocument(tree: String, documentId: String): Int
 }
 
 /** Owns one native emulation session. Only used inside the `:sogen` process. */
@@ -36,13 +39,21 @@ class SogenNative(listener: NativeListener) : AutoCloseable {
     private val handle: Long = nativeCreate(listener)
 
     /** Child processes run in [sandboxExecutable]; an empty path leaves the guest unable to create them. */
-    fun run(config: RunConfig, sandboxExecutable: String, vulkan: VulkanDriver): Int = nativeRun(
+    fun run(
+        config: RunConfig,
+        directoryMounts: List<DirectoryMount>,
+        documentTrees: List<DocumentTree>,
+        sandboxExecutable: String,
+        vulkan: VulkanDriver,
+    ): Int = nativeRun(
         handle,
         config.emulationRoot,
         config.application,
         config.arguments.toTypedArray(),
         config.environment.flatMap { listOf(it.key, it.value) }.toTypedArray(),
-        config.pathMappings.flatMap { listOf(it.key, it.value) }.toTypedArray(),
+        config.rootLayerDirectory,
+        directoryMounts.flatMap { it.toArguments() }.toTypedArray(),
+        documentTrees.toTypedArray(),
         config.workingDirectory,
         config.backend,
         config.liveNetwork,
@@ -86,7 +97,9 @@ class SogenNative(listener: NativeListener) : AutoCloseable {
         application: String,
         arguments: Array<String>,
         environment: Array<String>,
-        pathMappings: Array<String>,
+        rootLayerDirectory: String,
+        directoryMounts: Array<String>,
+        documentTrees: Array<DocumentTree>,
         workingDirectory: String,
         backend: String,
         liveNetwork: Boolean,

@@ -1,7 +1,12 @@
 #include "std_include.hpp"
 #include "session.hpp"
 
+#include <future>
+#include <iterator>
+
 #include <backend_selection.hpp>
+#include <filesystem/document_mount.hpp>
+#include <filesystem/layered_provider.hpp>
 #include <snapshot.hpp>
 #include <subprocess_process_manager.hpp>
 #include <windows_emulator.hpp>
@@ -10,6 +15,9 @@ namespace sogen::android
 {
     namespace
     {
+        // Opening a document costs milliseconds, and games open the same few files over and over.
+        constexpr size_t cached_document_descriptors = 64;
+
         jstring make_java_string(JNIEnv& env, const std::u16string_view text)
         {
             return env.NewString(reinterpret_cast<const jchar*>(text.data()), static_cast<jsize>(text.size()));
@@ -67,42 +75,39 @@ namespace sogen::android
 
         emulator_settings create_emulator_settings(const run_config& config)
         {
-            // Games keep their saves and settings in the emulation root and in their own directory. Like the
-            // sandbox, they read the TSC and KUSER_SHARED_DATA natively instead of trapping every access.
-            emulator_settings settings{
+            // Like the sandbox, games read the TSC and KUSER_SHARED_DATA natively instead of trapping every access.
+            return emulator_settings{
                 .intercept_rdtsc = false,
                 .intercept_kusd = false,
                 .emulation_root = config.emulation_root,
-                .root_mode = filesystem_mode::read_write,
+                .root_mode = filesystem_mode::copy_on_write,
+                .root_layer = config.root_layer,
                 .network = config.live_network ? network::network_mode::live : network::network_mode::offline,
                 .spoof_gpu_features = true,
             };
-
-            for (const auto& [guest, host] : config.path_mappings)
-            {
-                settings.mounts.push_back(mount_spec{
-                    .host_path = host,
-                    .guest_path = windows_path(u8_to_u16(guest)),
-                    .mode = filesystem_mode::read_write,
-                });
-            }
-
-            return settings;
         }
 
         // What a saved process depends on outside of itself, which a resume has to find unchanged.
         std::string describe_configuration(const run_config& config)
         {
-            std::string configuration = "emulation-root=" + config.emulation_root.string() + "\nbackend=" + config.backend +
-                                        "\nnetwork=" + (config.live_network ? "live" : "offline") + "\n";
-            for (const auto& [guest, host] : config.path_mappings)
+            std::string configuration = "emulation-root=" + config.emulation_root.string() + "\nroot-layer=" + config.root_layer.string() +
+                                        "\nbackend=" + config.backend + "\nnetwork=" + (config.live_network ? "live" : "offline") + "\n";
+            for (const auto& mount : config.directory_mounts)
             {
-                configuration += "mount=" + host.string() + ":" + guest + "\n";
+                configuration += "directory=" + mount.host_directory.string() + ":" + mount.guest_path.string() + ":" +
+                                 mount.upper_directory.string() + "\n";
+            }
+            for (const auto& tree : config.document_trees)
+            {
+                configuration += "documents=" + tree.uri + ":" + tree.guest_path + ":" + tree.upper_directory.string() + "\n";
             }
             return configuration;
         }
 
-        std::vector<std::string> create_child_arguments(const emulator_settings& settings, const uint16_t port, const std::string& token)
+        std::vector<std::string> create_child_arguments(const emulator_settings& settings,
+                                                        const std::vector<directory_mount>& directory_mounts,
+                                                        const std::vector<document_mount>& document_mounts, const uint16_t port,
+                                                        const std::string& token)
         {
             std::vector<std::string> arguments{
                 "--managed-process-port",
@@ -113,6 +118,8 @@ namespace sogen::android
                 settings.emulation_root.string(),
                 "--root-mode",
                 std::string{to_string(settings.root_mode)},
+                "--root-layer",
+                settings.root_layer.string(),
                 "--network",
                 std::string{network::to_string(settings.network)},
             };
@@ -122,10 +129,16 @@ namespace sogen::android
                 arguments.emplace_back("--spoof-gpu-features");
             }
 
-            for (const auto& mount : settings.mounts)
+            for (const auto& mount : directory_mounts)
             {
-                arguments.emplace_back("--mount");
-                arguments.push_back(render_mount_spec(mount));
+                arguments.emplace_back("--directory-mount");
+                std::ranges::move(mount.to_arguments(), std::back_inserter(arguments));
+            }
+
+            for (const auto& mount : document_mounts)
+            {
+                arguments.emplace_back("--document-mount");
+                std::ranges::move(mount.to_arguments(), std::back_inserter(arguments));
             }
 
             return arguments;
@@ -148,6 +161,7 @@ namespace sogen::android
             .on_cursor_moved = env.GetMethodID(listener_class, "onCursorMoved", "(JII)V"),
             .on_relative_mouse_changed = env.GetMethodID(listener_class, "onRelativeMouseChanged", "(JZ)V"),
             .on_snapshot = env.GetMethodID(listener_class, "onSnapshot", "(Ljava/lang/String;Ljava/lang/String;)V"),
+            .open_document = env.GetMethodID(listener_class, "openDocument", "(Ljava/lang/String;Ljava/lang/String;)I"),
         };
         env.DeleteLocalRef(listener_class);
 
@@ -187,17 +201,58 @@ namespace sogen::android
             callbacks.on_stdout = pseudo_terminal::write_output;
 
             auto settings = create_emulator_settings(config);
+
+            std::vector<provider_mount> mounts{};
+            for (const auto& mount : config.directory_mounts)
+            {
+                mounts.push_back(provider_mount{
+                    .guest_path = mount.guest_path,
+                    .provider = create_directory_mount(mount),
+                    .mode = filesystem_mode::copy_on_write,
+                });
+            }
+
+            std::vector<std::unique_ptr<document_broker>> brokers{};
+            std::vector<document_mount> child_document_mounts{};
+            for (const auto& tree : config.document_trees)
+            {
+                auto source = std::make_shared<descriptor_document_source>(
+                    [this, uri = tree.uri](const std::string& document_id) { return this->open_document(uri, document_id); },
+                    cached_document_descriptors);
+
+                if (!config.sandbox_executable.empty())
+                {
+                    const auto& broker = brokers.emplace_back(std::make_unique<document_broker>(tree.entries, source));
+                    child_document_mounts.push_back(document_mount{
+                        .guest_path = windows_path{tree.guest_path},
+                        .broker = broker->name(),
+                        .token = broker->token(),
+                        .upper_directory = tree.upper_directory,
+                        .state_directory = tree.state_directory,
+                    });
+                }
+
+                mounts.push_back(provider_mount{
+                    .guest_path = windows_path{tree.guest_path},
+                    .provider =
+                        std::make_unique<layered_provider>(std::make_unique<document_tree_provider>(tree.entries, std::move(source)),
+                                                           tree.upper_directory, tree.state_directory),
+                    .mode = filesystem_mode::copy_on_write,
+                });
+            }
+
             std::unique_ptr<subprocess_process_manager> processes{};
             if (!config.sandbox_executable.empty())
             {
-                processes =
-                    std::make_unique<subprocess_process_manager>(config.sandbox_executable, [settings](const auto port, const auto& token) {
-                        return create_child_arguments(settings, port, token);
+                processes = std::make_unique<subprocess_process_manager>(
+                    config.sandbox_executable,
+                    [settings, directory_mounts = config.directory_mounts, child_document_mounts](const auto port, const auto& token) {
+                        return create_child_arguments(settings, directory_mounts, child_document_mounts, port, token);
                     });
             }
 
             auto emulator = create_x86_64_emulator(parse_backend(config.backend));
-            emulator_interfaces interfaces{.ui = std::move(ui), .processes = processes.get()};
+            emulator_interfaces interfaces{.ui = std::move(ui), .processes = processes.get(), .mounts = std::move(mounts)};
             auto win_emu_ptr = config.resume_file.empty()
                                    ? std::make_unique<windows_emulator>(std::move(emulator), create_application_settings(config),
                                                                         std::move(settings), std::move(callbacks), std::move(interfaces))
@@ -321,6 +376,26 @@ namespace sogen::android
             env.DeleteLocalRef(java_path);
             env.DeleteLocalRef(java_error);
         });
+    }
+
+    unique_fd session::open_document(const std::string& tree, const std::string& document_id)
+    {
+        std::promise<int> descriptor{};
+        auto result = descriptor.get_future();
+        this->dispatcher_.post([this, &tree, &document_id, &descriptor](JNIEnv& env) {
+            auto* java_tree = make_java_string(env, u8_to_u16(tree));
+            auto* java_id = make_java_string(env, u8_to_u16(document_id));
+            const auto fd = env.CallIntMethod(this->listener_, this->methods_.open_document, java_tree, java_id);
+            if (env.ExceptionCheck())
+            {
+                env.ExceptionClear();
+            }
+            env.DeleteLocalRef(java_tree);
+            env.DeleteLocalRef(java_id);
+            descriptor.set_value(fd);
+        });
+
+        return unique_fd{result.get()};
     }
 
     void session::with_ui(const std::function<void(android_ui_backend&)>& action)

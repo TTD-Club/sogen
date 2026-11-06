@@ -30,6 +30,8 @@
 #define FNID_SENDMESSAGEWTOOPTION 0x2B3
 #define FNID_SENDMESSAGECALLBACK  0x2B8
 
+#define CSF_ANSIPROC              0x0002
+
 namespace sogen
 {
 
@@ -154,6 +156,16 @@ namespace sogen
 
     static_assert(sizeof(RAWINPUTDEVICE32) == 0x0C);
 
+    struct RAWINPUTDEVICE64
+    {
+        uint16_t usUsagePage;
+        uint16_t usUsage;
+        uint32_t dwFlags;
+        uint64_t hwndTarget;
+    };
+
+    static_assert(sizeof(RAWINPUTDEVICE64) == 0x10);
+
     struct RAWINPUTHEADER32
     {
         uint32_t dwType;
@@ -257,13 +269,22 @@ namespace sogen
 
     struct USER_CLASS
     {
-        uint8_t pad_000[0x30];
+        uint8_t pad_000[2];
+        uint16_t atom;
+        uint8_t pad_004[0x1C];
+        uint64_t lpfnWndProc;
+        uint8_t pad_028[8];
         uint64_t lpszAnsiClassName;
         uint8_t pad_038[0xC8];
     };
 
+    static_assert(offsetof(USER_CLASS, atom) == 0x02);
+    static_assert(offsetof(USER_CLASS, lpfnWndProc) == 0x20);
     static_assert(offsetof(USER_CLASS, lpszAnsiClassName) == 0x30);
     static_assert(sizeof(USER_CLASS) == 0x100);
+
+    // USER_WINDOW::bFlags is byte 2 of tagWND::state, so WNDS_ANSIWINDOWPROC (0x00080000) is bit 3 there.
+    constexpr uint8_t USER_WINDOW_ANSI_WINDOW_PROC = 0x08;
 
     struct USER_WINDOW
     {
