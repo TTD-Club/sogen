@@ -11,6 +11,10 @@ namespace sogen
 
     namespace syscalls
     {
+        NTSTATUS handle_NtAllocateVirtualMemory(const syscall_context& c, handle process_handle, emulator_object<uint64_t> base_address,
+                                                uint64_t zero_bits, emulator_object<uint64_t> bytes_to_allocate, uint32_t allocation_type,
+                                                uint32_t page_protection);
+
         namespace
         {
             constexpr ACCESS_MASK process_query_information = 0x0400;
@@ -313,6 +317,46 @@ namespace sogen
             {
                 return exit.kind == process_exit_kind::runtime_failure ? STATUS_UNSUCCESSFUL : static_cast<NTSTATUS>(exit.code);
             }
+
+            NTSTATUS reserve_thread_stack(const syscall_context& c, const handle process_handle, const uint64_t allocation_address)
+            {
+                const emulator_object<PROCESS_STACK_ALLOCATION_INFORMATION> allocation{c.emu, allocation_address};
+                const auto requested = allocation.read();
+                const emulator_object<uint64_t> stack_base{c.emu,
+                                                           allocation_address + offsetof(PROCESS_STACK_ALLOCATION_INFORMATION, StackBase)};
+                const emulator_object<uint64_t> reserve_size{c.emu, allocation_address +
+                                                                        offsetof(PROCESS_STACK_ALLOCATION_INFORMATION, ReserveSize)};
+
+                stack_base.write(0);
+                const auto status = handle_NtAllocateVirtualMemory(c, process_handle, stack_base, requested.ZeroBits, reserve_size,
+                                                                   MEM_RESERVE, PAGE_READWRITE);
+
+                // Windows reports only the stack base and leaves the requested size as the caller passed it.
+                reserve_size.write(requested.ReserveSize);
+                return status;
+            }
+
+            NTSTATUS allocate_thread_stack(const syscall_context& c, const handle process_handle, const uint64_t information,
+                                           const uint32_t length)
+            {
+                if (length == sizeof(PROCESS_STACK_ALLOCATION_INFORMATION))
+                {
+                    return reserve_thread_stack(c, process_handle, information);
+                }
+
+                if (length != sizeof(PROCESS_STACK_ALLOCATION_INFORMATION_EX))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                const auto extended = c.emu.read_memory<PROCESS_STACK_ALLOCATION_INFORMATION_EX>(information);
+                if (extended.PreferredNode != 0 || extended.Reserved0 != 0 || extended.Reserved1 != 0 || extended.Reserved2 != 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                return reserve_thread_stack(c, process_handle, information + offsetof(PROCESS_STACK_ALLOCATION_INFORMATION_EX, AllocInfo));
+            }
         }
 
         NTSTATUS handle_NtCreateUserProcess(const syscall_context& c, const emulator_object<handle> process_handle,
@@ -400,6 +444,27 @@ namespace sogen
                 }
                 return STATUS_SUCCESS;
             };
+            handle debug_object_handle{};
+            for (size_t i = 0; i < attribute_count; ++i)
+            {
+                const emulator_object<PS_ATTRIBUTE<EmulatorTraits<Emu64>>> attributes{
+                    c.emu, attribute_list.value() + offsetof(PS_ATTRIBUTE_LIST<EmulatorTraits<Emu64>>, Attributes)};
+                const auto attribute = attributes.read(i);
+                if ((attribute.Attribute & PS_ATTRIBUTE_NUMBER_MASK) == PsAttributeDebugObject)
+                {
+                    debug_object_handle.bits = attribute.Value;
+                }
+            }
+
+            if (debug_object_handle.bits)
+            {
+                if (!c.proc.debug_objects.get(debug_object_handle))
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+                request.debugged = true;
+            }
+
             bool explicit_handle_list{};
             for (size_t i = 0; i < attribute_count; ++i)
             {
@@ -488,6 +553,11 @@ namespace sogen
             child.compatibility_environment = result.compatibility_environment;
             child.image_name = application_path.leaf();
             const auto child_process_handle = c.proc.processes.store(std::move(child));
+
+            if (auto* debugger = c.proc.debug_objects.get(debug_object_handle))
+            {
+                debugger->debuggees.push_back({.process = result.process.value, .process_id = process_id, .thread_ids = {thread_id}});
+            }
 
             managed_process_thread initial_thread{};
             initial_thread.process = result.process;
@@ -1331,6 +1401,11 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            if (info_class == ProcessThreadStackAllocation)
+            {
+                return allocate_thread_stack(c, process_handle, process_information, process_information_length);
+            }
+
             c.win_emu.log.error("Unsupported info process class: 0x%X\n", info_class);
             c.emu.stop();
 
@@ -1419,6 +1494,7 @@ namespace sogen
                     if (&thread != c.vcpu.active_thread)
                     {
                         c.proc.terminate_thread(thread, exit_status);
+                        registry_notification::end_thread_requests(c, thread.id);
                     }
                 }
 
@@ -1427,6 +1503,12 @@ namespace sogen
 
             if (c.proc.is_current_process_handle(process_handle))
             {
+                c.win_emu.report_debug_event({
+                    .kind = process_debug_event_kind::exit_process,
+                    .thread_id = c.thread().id,
+                    .exit_status = static_cast<uint32_t>(exit_status),
+                });
+
                 c.proc.exit_status = exit_status;
                 c.win_emu.stop();
                 return STATUS_SUCCESS;

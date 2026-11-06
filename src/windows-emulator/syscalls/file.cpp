@@ -27,12 +27,84 @@ namespace sogen
                 uint64_t completion_key;
             };
 
+            constexpr ULONG file_io_completion_notification_modes = 0x7;
+
+            bool is_synchronous(const file& f)
+            {
+                return (f.file_mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
+            }
+
+            bool is_completion_information_class(const FILE_INFORMATION_CLASS info_class)
+            {
+                return info_class == FileCompletionInformation || info_class == FileReplaceCompletionInformation ||
+                       info_class == FileIoCompletionNotificationInformation;
+            }
+
+            NTSTATUS apply_completion_information(const syscall_context& c, file& f, const uint64_t file_information, const ULONG length,
+                                                  const FILE_INFORMATION_CLASS info_class)
+            {
+                if (info_class == FileIoCompletionNotificationInformation)
+                {
+                    if (length < sizeof(ULONG))
+                    {
+                        return STATUS_INFO_LENGTH_MISMATCH;
+                    }
+
+                    const auto modes = emulator_object<ULONG>{c.emu, file_information}.try_read();
+                    if (!modes)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+
+                    if (is_synchronous(f))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+
+                    // Windows only ever adds modes: unknown bits are ignored and a set mode cannot be cleared.
+                    f.completion_notification_flags |= *modes & file_io_completion_notification_modes;
+                    return STATUS_SUCCESS;
+                }
+
+                if (length < sizeof(file_completion_information))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                const auto info = emulator_object<file_completion_information>{c.emu, file_information}.try_read();
+                if (!info)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+
+                if (is_synchronous(f))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                if (info_class == FileReplaceCompletionInformation)
+                {
+                    return replace_completion_port(c.proc, c.vcpu.active_thread, f.completion_association, info->completion_port,
+                                                   info->completion_key);
+                }
+
+                return associate_completion_port(c.proc, c.vcpu.active_thread, f.completion_association, info->completion_port,
+                                                 info->completion_key);
+            }
+
+            bool is_file_information_class(const uint32_t info_class)
+            {
+                return info_class != 0 && info_class < FileMaximumInformation;
+            }
+
             std::u16string normalize_named_pipe_path(const std::u16string_view filename)
             {
-                constexpr std::u16string_view dos_prefix = u"\\??\\Pipe\\";
-                if (utils::string::starts_with_ignore_case(filename, dos_prefix))
+                for (const auto prefix : dos_named_pipe_prefixes)
                 {
-                    return u"\\Device\\NamedPipe\\" + std::u16string(filename.substr(dos_prefix.size()));
+                    if (utils::string::starts_with_ignore_case(filename, prefix))
+                    {
+                        return u"\\Device\\NamedPipe\\" + std::u16string(filename.substr(prefix.size()));
+                    }
                 }
                 return std::u16string(filename);
             }
@@ -486,6 +558,12 @@ namespace sogen
                                              const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
                                              const uint64_t file_information, const ULONG length, const FILE_INFORMATION_CLASS info_class)
         {
+            if (!is_file_information_class(static_cast<uint32_t>(info_class)))
+            {
+                c.win_emu.log.error("Unsupported NtSetInformationFile info class: 0x%X\n", static_cast<uint32_t>(info_class));
+                return STATUS_INVALID_INFO_CLASS;
+            }
+
             auto* f = c.proc.files.get(file_handle);
             if (!f)
             {
@@ -498,15 +576,30 @@ namespace sogen
                 auto* device = c.proc.devices.get(file_handle);
                 if (device)
                 {
-                    if (info_class == FileCompletionInformation)
+                    if (info_class == FileCompletionInformation || info_class == FileReplaceCompletionInformation)
                     {
                         if (length < sizeof(file_completion_information))
                         {
                             return STATUS_INFO_LENGTH_MISMATCH;
                         }
 
-                        const auto info = c.emu.read_memory<file_completion_information>(file_information);
-                        return device->set_completion_association(c.proc, c.vcpu.active_thread, info.completion_port, info.completion_key);
+                        const auto info = emulator_object<file_completion_information>{c.emu, file_information}.try_read();
+                        if (!info)
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+
+                        const auto status = info_class == FileCompletionInformation
+                                                ? device->set_completion_association(c.proc, c.vcpu.active_thread, info->completion_port,
+                                                                                     info->completion_key)
+                                                : device->replace_completion_association(c.proc, c.vcpu.active_thread,
+                                                                                         info->completion_port, info->completion_key);
+                        if (status == STATUS_SUCCESS && io_status_block)
+                        {
+                            io_status_block.write({});
+                        }
+
+                        return status;
                     }
 
                     if (info_class == FileIoCompletionNotificationInformation)
@@ -537,6 +630,17 @@ namespace sogen
                 }
 
                 return STATUS_INVALID_HANDLE;
+            }
+
+            if (is_completion_information_class(info_class))
+            {
+                const auto status = apply_completion_information(c, *f, file_information, length, info_class);
+                if (status == STATUS_SUCCESS && io_status_block)
+                {
+                    io_status_block.write({});
+                }
+
+                return status;
             }
 
             if (changes_file_state(info_class) && !c.win_emu.file_sys.is_writable(f->handle.path()))
@@ -851,6 +955,13 @@ namespace sogen
                                                      const uint64_t fs_information, const ULONG length,
                                                      const FS_INFORMATION_CLASS fs_information_class)
         {
+            if (const auto info_class = static_cast<uint32_t>(fs_information_class);
+                info_class == 0 || info_class >= FileFsMaximumInformation)
+            {
+                c.win_emu.log.error("Unsupported NtQueryVolumeInformationFile info class: 0x%X\n", info_class);
+                return STATUS_INVALID_INFO_CLASS;
+            }
+
             switch (fs_information_class)
             {
             case FileFsDeviceInformation:
@@ -1137,6 +1248,12 @@ namespace sogen
                                                const ULONG query_flags,
                                                const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> file_name)
         {
+            if (!is_file_information_class(info_class))
+            {
+                c.win_emu.log.error("Unsupported NtQueryDirectoryFile info class: 0x%X\n", info_class);
+                return STATUS_INVALID_INFO_CLASS;
+            }
+
             auto* f = c.proc.files.get(file_handle);
             if (!f || !f->is_directory())
             {
@@ -1199,7 +1316,7 @@ namespace sogen
                                                const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
                                                const uint64_t file_information, uint32_t length, const uint32_t info_class)
         {
-            if (info_class == 0 || info_class >= FileMaximumInformation)
+            if (!is_file_information_class(info_class))
             {
                 return STATUS_INVALID_INFO_CLASS;
             }
@@ -1844,6 +1961,17 @@ namespace sogen
                 return ret(STATUS_SUCCESS, all_length);
             }
 
+            if (info_class == FileIoCompletionNotificationInformation)
+            {
+                if (length < sizeof(ULONG))
+                {
+                    return ret(STATUS_INFO_LENGTH_MISMATCH);
+                }
+
+                c.emu.write_memory(file_information, f->completion_notification_flags);
+                return ret(STATUS_SUCCESS, sizeof(ULONG));
+            }
+
             c.win_emu.log.error("Unsupported query file info class: 0x%X\n", info_class);
             c.emu.stop();
 
@@ -1855,6 +1983,12 @@ namespace sogen
                                                  const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
                                                  const uint64_t file_information, const uint32_t length, const uint32_t info_class)
         {
+            if (!is_file_information_class(info_class))
+            {
+                c.win_emu.log.error("Unsupported NtQueryInformationByName info class: 0x%X\n", info_class);
+                return STATUS_INVALID_INFO_CLASS;
+            }
+
             IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
             block.Status = STATUS_SUCCESS;
             block.Information = 0;
@@ -2094,6 +2228,29 @@ namespace sogen
             }
         }
 
+        // Windows completes I/O on a file bound to a completion port asynchronously: even a read served from the
+        // cache returns STATUS_PENDING, and success or end of file reaches the caller through the packet.
+        NTSTATUS complete_file_io(const syscall_context& c, const file& f, const uint64_t event, const uint64_t apc_routine,
+                                  const uint64_t apc_context, const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                  const uint64_t wow64_io_status_block, const NTSTATUS status, const uint64_t information)
+        {
+            deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, status, information);
+            if (!f.completion_association)
+            {
+                return status;
+            }
+
+            io_device_context context{c.emu};
+            context.event = make_handle(event);
+            context.apc_context = apc_context;
+            context.io_status_block = io_status_block;
+            context.completion_port = f.completion_association->completion_port;
+            context.completion_key = f.completion_association->key;
+            io_device::queue_io_completion(c.win_emu, context);
+
+            return STATUS_PENDING;
+        }
+
         NTSTATUS handle_pipe_io(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
                                 const uint64_t apc_context, const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
                                 const uint64_t wow64_io_status_block, const uint64_t buffer, const ULONG length, const bool reading)
@@ -2137,6 +2294,12 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
+            {
+                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, buffer,
+                                      length, true);
+            }
+
             std::string temp_buffer{};
             temp_buffer.resize(length);
 
@@ -2152,16 +2315,15 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
-            {
-                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, buffer,
-                                      length, true);
-            }
-
             const auto* f = c.proc.files.get(file_handle);
             if (!f)
             {
                 return STATUS_INVALID_HANDLE;
+            }
+
+            if (f->completion_association && apc_routine)
+            {
+                return STATUS_INVALID_PARAMETER;
             }
 
             if (byte_offset)
@@ -2188,9 +2350,8 @@ namespace sogen
             if (bytes_read > 0)
             {
                 commit_file_data(std::string_view(temp_buffer.data(), bytes_read), c.emu, io_status_block, buffer);
-                deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, STATUS_SUCCESS,
-                                           bytes_read);
-                return STATUS_SUCCESS;
+                return complete_file_io(c, *f, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, STATUS_SUCCESS,
+                                        bytes_read);
             }
 
             const auto status = length > 0 ? STATUS_END_OF_FILE : STATUS_SUCCESS;
@@ -2203,8 +2364,7 @@ namespace sogen
                 io_status_block.write(block);
             }
 
-            deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, status, 0);
-            return status;
+            return complete_file_io(c, *f, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, status, 0);
         }
 
         namespace
@@ -2325,6 +2485,12 @@ namespace sogen
         {
             const auto wow64_io_status_block = wow64_io_status_block_address(c, io_status_block);
 
+            if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
+            {
+                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, buffer,
+                                      length, false);
+            }
+
             std::string temp_buffer{};
             temp_buffer.resize(length);
             c.emu.read_memory(buffer, temp_buffer.data(), temp_buffer.size());
@@ -2355,12 +2521,6 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            if (const auto* container = c.proc.devices.get(file_handle); container && container->get_internal_device<named_pipe>())
-            {
-                return handle_pipe_io(c, file_handle, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, buffer,
-                                      length, false);
-            }
-
             const auto* f = c.proc.files.get(file_handle);
             if (!f)
             {
@@ -2370,6 +2530,11 @@ namespace sogen
             if (!f->handle.is_writable())
             {
                 return STATUS_ACCESS_DENIED;
+            }
+
+            if (f->completion_association && apc_routine)
+            {
+                return STATUS_INVALID_PARAMETER;
             }
 
             if (byte_offset)
@@ -2411,8 +2576,7 @@ namespace sogen
                 io_status_block.write(block);
             }
 
-            deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, status, bytes_written);
-            return status;
+            return complete_file_io(c, *f, event, apc_routine, apc_context, io_status_block, wow64_io_status_block, status, bytes_written);
         }
 
         NTSTATUS handle_NtCopyFileChunk(const syscall_context& c, const handle source_handle, const handle destination_handle,
@@ -2693,32 +2857,16 @@ namespace sogen
                 container.granted_access = desired_access;
                 pipe_device->create_options = create_options;
                 container.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
-
-                // A client connects to a server instance of that name that has no client yet; with every instance busy
-                // the open fails with STATUS_PIPE_NOT_AVAILABLE (ERROR_PIPE_BUSY), without any with NOT_FOUND.
-                auto server_exists = false;
-                for (const auto& [index, existing] : c.proc.devices)
+                if (windows_path(pipe_device->name) != windows_path(u"\\Device\\NamedPipe\\"))
                 {
-                    (void)index;
-                    auto* server = existing.get_internal_device<named_pipe>();
-                    if (!server || !server->server || server->anonymous || windows_path(server->name) != windows_path(pipe_device->name))
+                    const auto instances = find_named_pipe_instances(c.proc, pipe_device->name);
+                    if (!instances.listening)
                     {
-                        continue;
+                        return instances.any ? STATUS_PIPE_NOT_AVAILABLE : STATUS_OBJECT_NAME_NOT_FOUND;
                     }
-
-                    server_exists = true;
-                    if (server->unopened_peer)
-                    {
-                        pipe_device->copy_configuration(*server);
-                        container.granted_access = desired_access;
-                        pipe_device->create_options = create_options;
-                        pipe_device->endpoint = std::move(server->unopened_peer);
-                        break;
-                    }
-                }
-                if (!pipe_device->endpoint && windows_path(pipe_device->name) != windows_path(u"\\Device\\NamedPipe\\"))
-                {
-                    return server_exists ? STATUS_PIPE_NOT_AVAILABLE : STATUS_OBJECT_NAME_NOT_FOUND;
+                    pipe_device->copy_configuration(*instances.listening);
+                    pipe_device->create_options = create_options;
+                    pipe_device->endpoint = std::move(instances.listening->unopened_peer);
                 }
             }
 
@@ -2926,6 +3074,10 @@ namespace sogen
                 {
                     c.win_emu.log.warn("Opening device %s failed: %s\n", u16_to_u8(*io_device_name).c_str(), e.what());
                     return STATUS_NOT_SUPPORTED;
+                }
+                if (auto* pipe_device = container->get_internal_device<named_pipe>())
+                {
+                    pipe_device->create_options = create_options;
                 }
 
                 const auto handle = c.proc.devices.store(std::move(*container));
@@ -3506,7 +3658,7 @@ namespace sogen
                 for (const auto& entry : c.proc.devices | std::views::values)
                 {
                     const auto* server = entry.get_internal_device<named_pipe>();
-                    if (server && server->server && !server->anonymous && windows_path(server->name) == wanted)
+                    if (server && server->server_end && !server->anonymous && windows_path(server->name) == wanted)
                     {
                         ++instances;
                         limit = limit.value_or(server->max_instances);
@@ -3526,7 +3678,6 @@ namespace sogen
             if (auto* pipe_device = container.get_internal_device<named_pipe>())
             {
                 pipe_device->name = normalize_named_pipe_path(pipe_name);
-                pipe_device->server = true;
                 pipe_device->anonymous = anonymous_pipe;
                 container.granted_access = desired_access;
                 pipe_device->pipe_type = named_pipe_type;
@@ -3536,12 +3687,10 @@ namespace sogen
                 pipe_device->inbound_quota = inbound_quota;
                 pipe_device->outbound_quota = outbound_quota;
                 pipe_device->create_options = create_options;
+                pipe_device->server_end = true;
                 container.inherit = (attributes.Attributes & OBJ_INHERIT) != 0;
                 pipe_device->default_timeout = default_timeout.read();
-                auto endpoints =
-                    utils::host_pipe::create_pair(named_pipe_type != 0, std::max<ULONG>({inbound_quota, outbound_quota, 4096}));
-                pipe_device->endpoint = std::move(endpoints.first);
-                pipe_device->unopened_peer = std::move(endpoints.second);
+                pipe_device->create_endpoints();
             }
             else
             {
@@ -3550,6 +3699,7 @@ namespace sogen
 
             handle pipe_handle = c.proc.devices.store(std::move(container));
             file_handle.write(pipe_handle);
+            complete_named_pipe_waits(c.win_emu, normalize_named_pipe_path(pipe_name), STATUS_SUCCESS);
 
             IO_STATUS_BLOCK<EmulatorTraits<Emu64>> iosb{};
             iosb.Status = STATUS_SUCCESS;
@@ -3645,6 +3795,29 @@ namespace sogen
             }
         }
 
+        NTSTATUS check_completion_event(const syscall_context& c, const handle event)
+        {
+            if (!event.bits || c.proc.events.get(event))
+            {
+                return STATUS_SUCCESS;
+            }
+            auto* store = c.proc.get_handle_store(event);
+            return store && store->get_object(event) ? STATUS_OBJECT_TYPE_MISMATCH : STATUS_INVALID_HANDLE;
+        }
+
+        namespace
+        {
+            // The I/O manager copies the input of every transfer method except METHOD_NEITHER into a system buffer before the
+            // driver runs, so an unreadable input fails there; a NULL input is not copied and reaches the driver.
+            bool is_control_input_readable(const syscall_context& c, const ULONG control_code, const emulator_pointer input_buffer,
+                                           const ULONG input_buffer_length)
+            {
+                constexpr ULONG method_neither = 3;
+                return (control_code & method_neither) == method_neither || !input_buffer ||
+                       is_memory_readable(c.emu, input_buffer, input_buffer_length);
+            }
+        }
+
         NTSTATUS handle_NtFsControlFile(const syscall_context& c, const handle file_handle, const handle event,
                                         const emulator_pointer apc_routine, const emulator_pointer apc_context,
                                         const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
@@ -3680,9 +3853,24 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
+            if (const auto block = io_status_block.try_read(); !block || !io_status_block.try_write(*block))
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            if (const auto status = check_completion_event(c, event); status != STATUS_SUCCESS)
+            {
+                return status;
+            }
+
             if (auto* e = c.proc.events.get(event))
             {
                 e->signaled = false;
+            }
+
+            if (!is_control_input_readable(c, fs_control_code, input_buffer, input_buffer_length))
+            {
+                return STATUS_ACCESS_VIOLATION;
             }
 
             io_device_context context{c.emu};

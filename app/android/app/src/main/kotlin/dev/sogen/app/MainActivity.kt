@@ -1,13 +1,20 @@
 package dev.sogen.app
 
+import android.Manifest
 import android.content.Intent
-import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
-import android.net.Uri
+import android.net.ConnectivityManager
 import android.os.Build
-import android.os.Environment
-import android.provider.Settings
+import android.os.Handler
+import android.os.Looper
+import android.content.pm.ActivityInfo
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.util.Log
 import android.view.KeyEvent
+import dev.sogen.app.download.DownloadService
+import dev.sogen.app.download.DownloadState
+import dev.sogen.app.download.Downloads
 import dev.sogen.app.runtime.RunConfig
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -15,10 +22,17 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.util.concurrent.Executors
+import kotlin.concurrent.thread
 
 class MainActivity : FlutterActivity() {
     private var events: EventChannel.EventSink? = null
     private lateinit var session: SessionController
+    private var folderPick: MethodChannel.Result? = null
+    private var storeSignIn: MethodChannel.Result? = null
+    private val secrets by lazy { SecretStore(this) }
+    private val secretChanges = Executors.newSingleThreadExecutor()
+    private var downloadListener: ((DownloadState) -> Unit)? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -71,9 +85,63 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(messenger, "dev.sogen.app/storage").setMethodCallHandler { call, result ->
             when (call.method) {
-                "hasAccess" -> result.success(hasStorageAccess())
-                "requestAccess" -> {
-                    requestStorageAccess()
+                "pickFolder" -> pickFolder(result)
+                "findExecutables" -> findExecutables(
+                    call.argument<String>("uri").orEmpty(),
+                    call.argument<Int>("maxDepth") ?: 0,
+                    result,
+                )
+
+                "persistedFolders" -> result.success(contentResolver.persistedUriPermissions.map { it.uri.toString() })
+                "releaseFolder" -> {
+                    releaseFolder(call.argument<String>("uri").orEmpty())
+                    result.success(null)
+                }
+
+                else -> result.notImplemented()
+            }
+        }
+
+        MethodChannel(messenger, "dev.sogen.app/secrets").setMethodCallHandler { call, result ->
+            handleSecretCall(call, result)
+        }
+
+        EventChannel(messenger, "dev.sogen.app/downloads/events").setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, sink: EventChannel.EventSink) {
+                val main = Handler(Looper.getMainLooper())
+                val listener: (DownloadState) -> Unit = { state -> main.post { sink.success(state.toMap()) } }
+                downloadListener?.let(Downloads::unlisten)
+                downloadListener = listener
+                Downloads.listen(listener)
+            }
+
+            override fun onCancel(arguments: Any?) {
+                downloadListener?.let(Downloads::unlisten)
+                downloadListener = null
+            }
+        })
+
+        MethodChannel(messenger, "dev.sogen.app/downloads").setMethodCallHandler { call, result ->
+            handleDownloadCall(call, result)
+        }
+
+        MethodChannel(messenger, "dev.sogen.app/gog").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "signIn" -> signIn(GogSignInActivity::class.java, call.argument<String>("url").orEmpty(), result)
+                "forgetLogin" -> {
+                    GogSignInActivity.forgetLogin()
+                    result.success(null)
+                }
+
+                else -> result.notImplemented()
+            }
+        }
+
+        MethodChannel(messenger, "dev.sogen.app/epic").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "signIn" -> signIn(EpicSignInActivity::class.java, call.argument<String>("url").orEmpty(), result)
+                "forgetLogin" -> {
+                    EpicSignInActivity.forgetLogin()
                     result.success(null)
                 }
 
@@ -140,7 +208,10 @@ class MainActivity : FlutterActivity() {
         application = call.argument<String>("application").orEmpty(),
         arguments = call.argument<List<String>>("arguments").orEmpty(),
         environment = call.argument<Map<String, String>>("environment").orEmpty(),
-        pathMappings = call.argument<Map<String, String>>("pathMappings").orEmpty(),
+        rootLayerDirectory = call.argument<String>("rootLayerDirectory").orEmpty(),
+        documentMounts = call.argument<Map<String, String>>("documentMounts").orEmpty(),
+        directoryMounts = call.argument<Map<String, String>>("directoryMounts").orEmpty(),
+        layerDirectory = call.argument<String>("layerDirectory").orEmpty(),
         workingDirectory = call.argument<String>("workingDirectory").orEmpty(),
         backend = call.argument<String>("backend").orEmpty(),
         liveNetwork = call.argument<Boolean>("liveNetwork") == true,
@@ -148,25 +219,199 @@ class MainActivity : FlutterActivity() {
         resumeFile = call.argument<String>("resumeFile").orEmpty(),
     )
 
-    // Games are run in place from shared storage, and native code needs plain file paths for that.
-    private fun hasStorageAccess(): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager()
-        } else {
-            checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-        }
+    /** Completes with the tree URI of the chosen folder, which stays readable across restarts, or null. */
+    private fun pickFolder(result: MethodChannel.Result) {
+        folderPick?.success(null)
+        folderPick = result
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), PICK_FOLDER_REQUEST)
+    }
 
-    private fun requestStorageAccess() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            requestPermissions(arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE), 0)
+    override fun onDestroy() {
+        downloadListener?.let(Downloads::unlisten)
+        downloadListener = null
+        super.onDestroy()
+    }
+
+    private fun handleDownloadCall(call: MethodCall, result: MethodChannel.Result) {
+        val installId = call.argument<String>("installId").orEmpty()
+        when (call.method) {
+            "status" -> result.success(Downloads.current?.toMap())
+            "isMetered" -> result.success(getSystemService(ConnectivityManager::class.java).isActiveNetworkMetered)
+            "start" -> {
+                if (!Downloads.reserve(installId)) {
+                    result.error("busy", "Another download is running", null)
+                    return
+                }
+
+                requestNotificationPermission()
+                try {
+                    startForegroundService(
+                        Intent(this, DownloadService::class.java)
+                            .setAction(DownloadService.ACTION_START)
+                            .putExtra(DownloadService.EXTRA_INSTALL_ID, installId)
+                            .putExtra(DownloadService.EXTRA_ALLOW_METERED, call.argument<Boolean>("allowMetered") == true),
+                    )
+                } catch (e: RuntimeException) {
+                    // Android 12 and later refuse to start a foreground service while the app is in the background.
+                    Downloads.release(installId)
+                    result.error("start_failed", e.javaClass.simpleName, null)
+                    return
+                }
+                result.success(null)
+            }
+
+            "pause" -> {
+                if (Downloads.isRunning) {
+                    startService(Intent(this, DownloadService::class.java).setAction(DownloadService.ACTION_PAUSE))
+                }
+                result.success(null)
+            }
+
+            "cancel" -> {
+                if (Downloads.holds(installId)) {
+                    startService(Intent(this, DownloadService::class.java).setAction(DownloadService.ACTION_CANCEL))
+                    result.success(null)
+                } else {
+                    val staging = try {
+                        Downloads.stagingOf(this, installId)
+                    } catch (e: IllegalArgumentException) {
+                        result.error("invalid", "Not an install id", null)
+                        return
+                    }
+                    thread(name = "discard-download") {
+                        Downloads.notify(Downloads.discard(installId, staging))
+                        runOnUiThread { result.success(null) }
+                    }
+                }
+            }
+
+            else -> result.notImplemented()
+        }
+    }
+
+    /** The download notification shows progress and its controls, but the download runs without it. */
+    private fun requestNotificationPermission() {
+        val missing = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (missing) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST)
+        }
+    }
+
+    /** Keystore operations can block, so they run off the UI thread, one at a time and in the order requested. */
+    private fun handleSecretCall(call: MethodCall, result: MethodChannel.Result) {
+        val name = call.argument<String>("name").orEmpty()
+        secretChanges.execute {
+            try {
+                val value = when (call.method) {
+                    "read" -> secrets.read(name)
+                    "write" -> secrets.write(name, call.argument<String>("value").orEmpty())
+                    "delete" -> secrets.delete(name)
+                    else -> {
+                        runOnUiThread { result.notImplemented() }
+                        return@execute
+                    }
+                }
+                runOnUiThread { result.success(value as? String) }
+            } catch (e: Exception) {
+                runOnUiThread { result.error("secrets", e.javaClass.simpleName, null) }
+            }
+        }
+    }
+
+    /** Completes with what the store's sign-in ended on, or null when the user went back. */
+    private fun signIn(activity: Class<out StoreSignInActivity>, url: String, result: MethodChannel.Result) {
+        if (storeSignIn != null) {
+            result.error("busy", "A sign-in is already open", null)
             return
         }
 
-        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))
-        startActivity(intent)
+        storeSignIn = result
+        @Suppress("DEPRECATION")
+        startActivityForResult(Intent(this, activity).putExtra(StoreSignInActivity.EXTRA_URL, url), STORE_SIGN_IN_REQUEST)
+    }
+
+    @Deprecated("FlutterActivity is not a ComponentActivity, so it has no activity result API")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == STORE_SIGN_IN_REQUEST) {
+            val result = storeSignIn ?: return
+            storeSignIn = null
+            result.success(data?.getStringExtra(StoreSignInActivity.EXTRA_RESULT)?.takeIf { resultCode == RESULT_OK })
+            return
+        }
+
+        if (requestCode != PICK_FOLDER_REQUEST) {
+            @Suppress("DEPRECATION")
+            super.onActivityResult(requestCode, resultCode, data)
+            return
+        }
+
+        val result = folderPick ?: return
+        folderPick = null
+
+        val tree = data?.data
+        if (resultCode != RESULT_OK || tree == null) {
+            result.success(null)
+            return
+        }
+
+        contentResolver.takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        result.success(tree.toString())
+    }
+
+    private fun releaseFolder(uri: String) {
+        try {
+            contentResolver.releasePersistableUriPermission(Uri.parse(uri), Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "No access to release for $uri", e)
+        }
+    }
+
+    /** Relative paths of the executables up to [maxDepth] folders below the tree, shallowest first. */
+    private fun findExecutables(uri: String, maxDepth: Int, result: MethodChannel.Result) {
+        thread(name = "find-executables") {
+            val executables = ArrayList<String>()
+            try {
+                val tree = Uri.parse(uri)
+                val pending = ArrayDeque<Triple<String, String, Int>>()
+                pending.add(Triple(DocumentsContract.getTreeDocumentId(tree), "", 0))
+                while (pending.isNotEmpty()) {
+                    val (parent, prefix, depth) = pending.removeFirst()
+                    val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parent)
+                    contentResolver.query(children, executableColumns, null, null, null)?.use { cursor ->
+                        while (cursor.moveToNext()) {
+                            val path = prefix + cursor.getString(1)
+                            if (cursor.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR) {
+                                if (depth < maxDepth) {
+                                    pending.add(Triple(cursor.getString(0), "$path/", depth + 1))
+                                }
+                            } else if (path.endsWith(".exe", ignoreCase = true)) {
+                                executables.add(path)
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // An unreadable folder offers what was found before it.
+                Log.w(TAG, "Could not search $uri", e)
+            }
+
+            runOnUiThread { result.success(executables) }
+        }
     }
 
     private companion object {
+        const val TAG = "MainActivity"
+        const val PICK_FOLDER_REQUEST = 1
+        const val STORE_SIGN_IN_REQUEST = 2
+        const val NOTIFICATION_PERMISSION_REQUEST = 3
+
         val systemKeys = setOf(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_VOLUME_MUTE)
+
+        val executableColumns = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+        )
     }
 }

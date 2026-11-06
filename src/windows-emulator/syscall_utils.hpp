@@ -121,6 +121,38 @@ namespace sogen
         return highest_address + 1 == lowest_allocation_end ? STATUS_CONFLICTING_ADDRESSES : STATUS_SUCCESS;
     }
 
+    inline bool is_accessible_range(memory_manager& memory, const uint64_t address, const uint64_t size, const memory_permission required)
+    {
+        const auto end = address + size;
+        if (address == 0 || end < address)
+        {
+            return false;
+        }
+
+        for (auto current = address; current < end;)
+        {
+            const auto region = memory.get_region_info(current);
+            if (!region.is_committed || region.permissions.is_guarded() || (region.permissions.common & required) != required)
+            {
+                return false;
+            }
+
+            current = region.start + region.length;
+        }
+
+        return true;
+    }
+
+    inline bool is_readable_range(memory_manager& memory, const uint64_t address, const uint64_t size)
+    {
+        return is_accessible_range(memory, address, size, memory_permission::read);
+    }
+
+    inline bool is_writable_range(memory_manager& memory, const uint64_t address, const uint64_t size)
+    {
+        return is_accessible_range(memory, address, size, memory_permission::write);
+    }
+
     inline NTSTATUS check_handle_type(const handle h, const handle_types::type expected_type)
     {
         if (h.value.type == expected_type)
@@ -136,6 +168,13 @@ namespace sogen
         return context.win_emu.abi().syscall_argument(context.emu, index);
     }
 
+    inline void set_guest_last_error(const syscall_context& c, uint32_t last_error)
+    {
+        c.vcpu.active_thread->teb64->access([&](TEB64& teb) {
+            teb.LastErrorValue = static_cast<ULONG>(last_error); //
+        });
+    }
+
     inline bool is_uppercase(const char character)
     {
         return toupper(character) == character;
@@ -146,10 +185,14 @@ namespace sogen
         return name.starts_with("Nt") && name.size() > 3 && is_uppercase(name[2]);
     }
 
+    constexpr std::array<std::u16string_view, 2> dos_named_pipe_prefixes{u"\\??\\Pipe\\", u"\\DosDevices\\Pipe\\"};
+
     inline bool is_named_pipe_path(const std::u16string_view& filename)
     {
         return utils::string::starts_with_ignore_case(filename, {u"\\Device\\NamedPipe\\"}) ||
-               utils::string::starts_with_ignore_case(filename, {u"\\??\\Pipe\\"});
+               std::ranges::any_of(dos_named_pipe_prefixes, [&](const std::u16string_view prefix) {
+                   return utils::string::starts_with_ignore_case(filename, prefix);
+               });
     }
 
     inline std::optional<uint32_t> extract_syscall_id(const exported_symbol& symbol, std::span<const std::byte> data)

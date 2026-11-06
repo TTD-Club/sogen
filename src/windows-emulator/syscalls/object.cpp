@@ -1,4 +1,5 @@
 #include "../std_include.hpp"
+#include "../debug_object.hpp"
 #include "../emulator_utils.hpp"
 #include "../io_completion_wait.hpp"
 #include "../low_level_hooks.hpp"
@@ -124,6 +125,15 @@ namespace sogen
                 }
             }
 
+            if (value.type == handle_types::debug_object)
+            {
+                auto* debug = c.proc.debug_objects.get(h);
+                if (debug && debug->ref_count == 1)
+                {
+                    release_debug_object(c.win_emu, *debug);
+                }
+            }
+
             if (value.type == handle_types::worker_factory)
             {
                 auto* factory = c.proc.worker_factories.get(h);
@@ -138,9 +148,11 @@ namespace sogen
                 auto* device = c.proc.devices.get(h);
                 if (device && device->ref_count == 1)
                 {
-                    if (device->is_last_file_reference() && device->get_internal_device<named_pipe>())
+                    const auto* pipe = device->is_last_file_reference() ? device->get_internal_device<named_pipe>() : nullptr;
+                    if (pipe)
                     {
                         device->cancel_io(c.win_emu, 0);
+                        pipe->complete_waits_if_last_server_end(c.win_emu);
                     }
                     device->release_references(c.proc);
                 }
@@ -170,6 +182,8 @@ namespace sogen
                 auto* file = c.proc.files.get(h);
                 if (file && file->ref_count == 1)
                 {
+                    release_completion_association(c.proc, file->completion_association);
+
                     for (auto it = c.proc.file_locks.begin(); it != c.proc.file_locks.end();)
                     {
                         auto& locks = it->second.locks;
@@ -183,6 +197,15 @@ namespace sogen
 
                         ++it;
                     }
+                }
+            }
+
+            if (value.type == handle_types::registry)
+            {
+                auto* key = c.proc.registry_keys.get(h);
+                if (key && key->ref_count == 1)
+                {
+                    registry_notification::close(c, *key);
                 }
             }
 
@@ -357,6 +380,12 @@ namespace sogen
                                       const OBJECT_INFORMATION_CLASS object_information_class, const emulator_pointer object_information,
                                       const ULONG object_information_length, const emulator_object<ULONG> return_length)
         {
+            if (static_cast<uint32_t>(object_information_class) >= MaxObjectInfoClass)
+            {
+                c.win_emu.log.error("Unsupported NtQueryObject info class: 0x%X\n", static_cast<uint32_t>(object_information_class));
+                return STATUS_INVALID_INFO_CLASS;
+            }
+
             const auto effective_handle = c.proc.resolve_object_pseudo_handle(handle, c.vcpu.active_thread);
 
             if (object_information_class == ObjectNameInformation)

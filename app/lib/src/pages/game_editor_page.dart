@@ -1,6 +1,5 @@
 import 'dart:io';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -66,33 +65,7 @@ class _GameEditorPageState extends State<GameEditorPage> {
   }
 
   Future<void> _pickDirectory() async {
-    if (await _storage.invokeMethod<bool>('hasAccess') != true) {
-      if (!mounted) {
-        return;
-      }
-
-      final request = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Storage access'),
-          content: const Text(
-            'Sogen runs games directly from their folder, which needs access to all files. '
-            'Grant it on the next screen, then pick the folder again.',
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
-            FilledButton(onPressed: () => Navigator.of(context).pop(true), child: const Text('Continue')),
-          ],
-        ),
-      );
-
-      if (request == true) {
-        await _storage.invokeMethod('requestAccess');
-      }
-      return;
-    }
-
-    final directory = await FilePicker.getDirectoryPath(dialogTitle: 'Game folder');
+    final directory = await _storage.invokeMethod<String>('pickFolder');
     if (directory != null) {
       await _scan(directory);
     }
@@ -107,7 +80,7 @@ class _GameEditorPageState extends State<GameEditorPage> {
       _scanning = true;
     });
 
-    final executables = await _findExecutables(Directory(directory));
+    final executables = await _findExecutables(directory);
     if (!mounted || generation != _scanGeneration) {
       return;
     }
@@ -118,31 +91,32 @@ class _GameEditorPageState extends State<GameEditorPage> {
       _executables = [if (selected != null && !executables.contains(selected)) selected, ...executables];
       _executable = selected ?? _executables.firstOrNull;
       if (_name.text.isEmpty) {
-        _name.text = p.basename(directory);
+        _name.text = p.posix.basename(describeFolder(directory));
       }
     });
   }
 
-  static Future<List<String>> _findExecutables(Directory root) async {
-    final result = <String>[];
+  static Future<List<String>> _findExecutables(String directory) async {
+    final found = await _searchFolder(directory);
+    return [...found]..sort((a, b) => '/'.allMatches(a).length.compareTo('/'.allMatches(b).length));
+  }
 
-    Future<void> visit(Directory directory, int depth) async {
-      try {
-        await for (final entity in directory.list(followLinks: false)) {
-          if (entity is File && p.extension(entity.path).toLowerCase() == '.exe') {
-            result.add(p.relative(entity.path, from: root.path).replaceAll(r'\', '/'));
-          } else if (entity is Directory && depth < _maxSearchDepth) {
-            await visit(entity, depth + 1);
-          }
-        }
-      } on FileSystemException {
-        // Unreadable subfolders are skipped.
-      }
+  static Future<List<String>> _searchFolder(String directory) async {
+    final installId = installIdOf(directory);
+    if (installId != null) {
+      final games = await installedGamesDirectory();
+      return findExecutablesIn(Directory(p.join(games.path, installId)), maxDepth: _maxSearchDepth);
     }
 
-    await visit(root, 0);
-    result.sort((a, b) => '/'.allMatches(a).length.compareTo('/'.allMatches(b).length));
-    return result;
+    if (!isFolderUri(directory)) {
+      return const [];
+    }
+
+    final found = await _storage.invokeListMethod<String>('findExecutables', {
+      'uri': directory,
+      'maxDepth': _maxSearchDepth,
+    });
+    return found ?? const [];
   }
 
   static Map<String, String> _parseEnvironment(String text) {
@@ -188,7 +162,11 @@ class _GameEditorPageState extends State<GameEditorPage> {
     }
   }
 
+  /// What Sogen knows about a game it installed stays with it while it keeps its folder; GOG's working directory only
+  /// applies to the executable GOG starts.
   Future<void> _store(String directory, String executable) async {
+    final previous = widget.game;
+    final sameFolder = previous != null && previous.directory == directory;
     final game = Game(
       id: widget.game?.id ?? DateTime.now().microsecondsSinceEpoch.toString(),
       name: _name.text.trim().isEmpty ? p.basenameWithoutExtension(executable) : _name.text.trim(),
@@ -199,6 +177,9 @@ class _GameEditorPageState extends State<GameEditorPage> {
       liveNetwork: _liveNetwork,
       console: _console,
       settings: _settings,
+      workingDirectory: sameFolder && previous.executable == executable ? previous.workingDirectory : null,
+      source: sameFolder ? previous.source : null,
+      icon: sameFolder ? previous.icon : null,
     );
 
     if (!await _keepOrDiscardSuspendedState(game) || !mounted) {
@@ -286,12 +267,12 @@ class _GameEditorPageState extends State<GameEditorPage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            directory == null ? 'Choose the game folder' : p.basename(directory),
+                            directory == null ? 'Choose the game folder' : p.posix.basename(describeFolder(directory)),
                             style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            directory ?? r'Mapped to C:\game inside the emulator',
+                            directory == null ? r'Mapped to C:\game inside the emulator' : describeFolder(directory),
                             overflow: TextOverflow.ellipsis,
                             style: directory == null
                                 ? theme.textTheme.bodySmall?.copyWith(color: SogenColors.neutral400)

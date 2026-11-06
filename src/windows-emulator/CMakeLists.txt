@@ -22,6 +22,13 @@ if(NOT ANDROID)
   list(REMOVE_ITEM SRC_FILES "${CMAKE_CURRENT_LIST_DIR}/audio_backends/aaudio_audio_backend.cpp")
 endif()
 
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
+  list(REMOVE_ITEM SRC_FILES
+    "${CMAKE_CURRENT_LIST_DIR}/filesystem/document_broker.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/filesystem/document_broker.hpp"
+  )
+endif()
+
 add_library(windows-emulator ${SRC_FILES})
 
 sogen_assign_source_group(${SRC_FILES})
@@ -38,7 +45,7 @@ if(NOT SOGEN_ENABLE_CLANG_TIDY)
 endif()
 
 target_link_libraries(windows-emulator PUBLIC emulator minidump process-manager)
-target_link_libraries(windows-emulator PRIVATE gpu-bridge-protocol vulkan-headers steam-bridge-protocol sogen_mbedtls)
+target_link_libraries(windows-emulator PRIVATE gpu-bridge-protocol vulkan-headers steam-bridge-protocol sogen_mbedtls sogen-version)
 if(WIN32)
   target_link_libraries(windows-emulator PRIVATE crypt32)
 endif()

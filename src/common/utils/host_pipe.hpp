@@ -19,6 +19,7 @@ namespace sogen::utils
         pending,
         broken,
         cancelled,
+        disconnected,
         failed,
     };
 
@@ -67,6 +68,8 @@ namespace sogen::utils
         pipe_io_result peek(std::string& data, uint32_t capacity, uint32_t& available) const;
         // How many bytes a write can add before the reader's buffer is full; unknown for a pipe to another process.
         std::optional<uint32_t> write_capacity() const;
+        void disconnect() const;
+        bool is_disconnected() const;
         void serialize(buffer_serializer& buffer) const;
         static std::shared_ptr<host_pipe> deserialize(buffer_deserializer& buffer);
 

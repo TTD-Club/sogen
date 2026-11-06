@@ -813,6 +813,7 @@ namespace sogen
                     return STATUS_SUCCESS;
                 }
                 default:
+                    win_emu.log.warn("Unimplemented console API: 0x%08X\n", static_cast<unsigned>(message.api_number));
                     break;
                 }
 

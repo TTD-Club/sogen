@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -130,6 +131,34 @@ class GameSettings {
   };
 }
 
+/// The store a game was installed from, kept to tell which owned games are installed and which build they run.
+@immutable
+class GameSource {
+  const GameSource({required this.store, required this.productId, required this.buildId, required this.language});
+
+  static GameSource? fromJson(Object? json) {
+    if (json is! Map<String, dynamic>) {
+      return null;
+    }
+
+    final store = json['store'];
+    final productId = json['productId'];
+    final buildId = json['buildId'];
+    final language = json['language'];
+    if (store is! String || productId is! String || buildId is! String || language is! String) {
+      return null;
+    }
+    return GameSource(store: store, productId: productId, buildId: buildId, language: language);
+  }
+
+  final String store;
+  final String productId;
+  final String buildId;
+  final String language;
+
+  Map<String, dynamic> toJson() => {'store': store, 'productId': productId, 'buildId': buildId, 'language': language};
+}
+
 @immutable
 class Game {
   const Game({
@@ -142,6 +171,9 @@ class Game {
     this.liveNetwork = false,
     this.console = false,
     this.settings = const GameSettings(),
+    this.workingDirectory,
+    this.source,
+    this.icon,
   });
 
   factory Game.fromJson(Map<String, dynamic> json) => Game(
@@ -154,12 +186,16 @@ class Game {
     liveNetwork: json['liveNetwork'] as bool? ?? false,
     console: json['console'] as bool? ?? false,
     settings: GameSettings.fromJson(json['settings'] as Map<String, dynamic>? ?? const {}),
+    workingDirectory: json['workingDirectory'] as String?,
+    source: GameSource.fromJson(json['source']),
+    icon: json['icon'] as String?,
   );
 
   final String id;
   final String name;
 
-  /// Host folder that is mapped to [guestGameDirectory].
+  /// Storage Access Framework tree URI of the folder that is mapped to [guestGameDirectory]. Games added before Sogen
+  /// read folders through the Storage Access Framework hold a plain host path instead, which it can no longer read.
   final String directory;
 
   /// Executable path relative to [directory], using `/` separators.
@@ -174,11 +210,19 @@ class Game {
 
   final GameSettings settings;
 
+  /// Working directory relative to [directory], using `/` separators, or null for the folder of [executable].
+  final String? workingDirectory;
+
+  final GameSource? source;
+
+  /// The game's icon, relative to the app's support directory.
+  final String? icon;
+
   String get guestExecutable => _toGuestPath(executable);
 
-  String get hostExecutable => p.join(directory, executable);
+  bool get hasFolderAccess => isFolderUri(directory) || installIdOf(directory) != null;
 
-  String get guestWorkingDirectory => _toGuestPath(p.posix.dirname(executable));
+  String get guestWorkingDirectory => _toGuestPath(workingDirectory ?? p.posix.dirname(executable));
 
   String _toGuestPath(String relative) {
     if (relative == '.' || relative.isEmpty) {
@@ -197,6 +241,9 @@ class Game {
     bool? console,
     GameSettings? settings,
   }) => Game(
+    workingDirectory: workingDirectory,
+    source: source,
+    icon: icon,
     id: id,
     name: name ?? this.name,
     directory: directory ?? this.directory,
@@ -218,7 +265,103 @@ class Game {
     'liveNetwork': liveNetwork,
     'console': console,
     'settings': settings.toJson(),
+    'workingDirectory': ?workingDirectory,
+    'source': ?source?.toJson(),
+    'icon': ?icon,
   };
+}
+
+bool isFolderUri(String directory) => directory.startsWith('content://');
+
+const _installedFolderScheme = 'installed:';
+final _installId = RegExp(r'^[0-9a-f]{32}$');
+
+/// The folder of a game Sogen installed itself, named by its install id rather than by its path, so that the game
+/// list can never point the emulator at any other folder.
+String installedFolder(String installId) {
+  if (!_installId.hasMatch(installId)) {
+    throw ArgumentError.value(installId, 'installId', 'Not an install id');
+  }
+  return '$_installedFolderScheme$installId';
+}
+
+String? installIdOf(String directory) {
+  if (!directory.startsWith(_installedFolderScheme)) {
+    return null;
+  }
+  final installId = directory.substring(_installedFolderScheme.length);
+  return _installId.hasMatch(installId) ? installId : null;
+}
+
+/// Where Sogen installs games, one folder per install id. GAMES_DIRECTORY in SogenService.kt only mounts folders in it.
+Future<Directory> installedGamesDirectory() async {
+  final support = await getApplicationSupportDirectory();
+  return Directory(p.join(support.path, 'games'));
+}
+
+/// The `.exe` files in [directory] and in its folders up to [maxDepth] levels down, as paths relative to it.
+Future<List<String>> findExecutablesIn(Directory directory, {required int maxDepth}) async {
+  final executables = <String>[];
+  final pending = [(directory, '', 0)];
+  try {
+    while (pending.isNotEmpty) {
+      final (folder, prefix, depth) = pending.removeAt(0);
+      await for (final entity in folder.list(followLinks: false)) {
+        final path = '$prefix${p.basename(entity.path)}';
+        if (entity is Directory) {
+          if (depth < maxDepth) {
+            pending.add((entity, '$path/', depth + 1));
+          }
+        } else if (entity is File && path.toLowerCase().endsWith('.exe')) {
+          executables.add(path);
+        }
+      }
+    }
+  } on FileSystemException {
+    // An unreadable folder offers what was found before it.
+  }
+  return executables;
+}
+
+/// A readable form of a folder URI, e.g. `Games/Skyrim` for the tree of `primary:Games/Skyrim`.
+String describeFolder(String directory) {
+  if (installIdOf(directory) != null) {
+    return 'Installed by Sogen';
+  }
+  if (!isFolderUri(directory)) {
+    return directory;
+  }
+
+  final segments = Uri.parse(directory).pathSegments;
+  final tree = segments.length >= 2 && segments[0] == 'tree' ? segments[1] : segments.lastOrNull ?? directory;
+  final separator = tree.indexOf(':');
+  return separator < 0 ? tree : tree.substring(separator + 1);
+}
+
+/// Where the changes a game makes to its folder are kept, since the folder itself is only read. Choosing another
+/// folder for the game starts with no changes instead of applying the old folder's to it.
+Future<Directory> layerDirectory(Game game) async {
+  return Directory(p.join((await _gameLayers(game)).path, _fnv1a(game.directory).toRadixString(16)));
+}
+
+/// Where the changes a game makes to the emulation root are kept, so that every game sees the root as it was
+/// downloaded. They outlive choosing another folder for the game.
+Future<Directory> rootLayerDirectory(Game game) async {
+  return Directory(p.join((await _gameLayers(game)).path, 'root'));
+}
+
+/// Everything that is kept for the game besides its folder.
+Future<Directory> _gameLayers(Game game) async {
+  final support = await getApplicationSupportDirectory();
+  return Directory(p.join(support.path, 'layers', game.id));
+}
+
+int _fnv1a(String text) {
+  var hash = 0x811c9dc5;
+  for (final unit in utf8.encode(text)) {
+    hash = ((hash ^ unit) * 0x01000193) & 0xffffffff;
+  }
+  return hash;
 }
 
 /// Where a suspended game is saved, to continue from there when it is started again.
@@ -228,13 +371,24 @@ Future<File> savedStateFile(Game game) async {
 }
 
 class GameLibrary extends ChangeNotifier {
+  static const _storage = MethodChannel('dev.sogen.app/storage');
+
   GameLibrary._(this._file, this._games);
+
+  @visibleForTesting
+  GameLibrary.at(this._file, this._games);
 
   final File _file;
   final List<Game> _games;
   Future<void> _writes = Future.value();
 
   List<Game> get games => List.unmodifiable(_games);
+
+  /// The icon file of [game], if it has one.
+  File? iconOf(Game game) {
+    final icon = game.icon;
+    return icon == null ? null : File(p.join(_file.parent.path, icon));
+  }
 
   static Future<GameLibrary> load() async {
     final support = await getApplicationSupportDirectory();
@@ -246,20 +400,60 @@ class GameLibrary extends ChangeNotifier {
       games = decoded.map((entry) => Game.fromJson(entry as Map<String, dynamic>)).toList();
     }
 
-    return GameLibrary._(file, games);
+    final library = GameLibrary._(file, games);
+    await library._recoverRemovals();
+    return library;
   }
 
+  /// Folders of installed games move here while their removal is stored, so a failed or interrupted removal can be
+  /// undone.
+  Directory get _removing => Directory(p.join(_file.parent.path, 'removing'));
+
+  /// Puts back folders whose game is still listed, and deletes those whose removal was stored.
+  Future<void> _recoverRemovals() async {
+    final removing = _removing;
+    if (!removing.existsSync()) {
+      return;
+    }
+
+    final installed = Directory(p.join(_file.parent.path, 'games'));
+    for (final folder in removing.listSync().whereType<Directory>()) {
+      final installId = p.basename(folder.path);
+      final listed = _games.any((game) => installIdOf(game.directory) == installId);
+      final target = Directory(p.join(installed.path, installId));
+      if (listed && !target.existsSync()) {
+        await folder.rename(target.path);
+      } else {
+        await folder.delete(recursive: true);
+      }
+    }
+  }
+
+  /// Leaves the library as it was when the game cannot be stored.
   Future<void> add(Game game) async {
     _games.add(game);
-    await _save();
+    try {
+      await _save();
+    } catch (_) {
+      _games.removeWhere((entry) => identical(entry, game));
+      notifyListeners();
+      rethrow;
+    }
   }
 
   /// Replaces the game with the same id, which keeps its suspended state attached to it.
   Future<void> update(Game game) async {
     final index = _games.indexWhere((entry) => entry.id == game.id);
-    if (index >= 0) {
-      _games[index] = game;
-      await _save();
+    if (index < 0) {
+      return;
+    }
+
+    final previous = _games[index];
+    _games[index] = game;
+    await _save();
+
+    if (previous.directory != game.directory) {
+      await _deleteIfPresent(await layerDirectory(previous));
     }
   }
 
@@ -271,9 +465,61 @@ class GameLibrary extends ChangeNotifier {
     }
   }
 
+  /// Also deletes the changes the game made to its folder and to the emulation root, and the folder itself when Sogen
+  /// installed it. Folders the user picked are kept.
   Future<void> remove(Game game) async {
-    _games.removeWhere((entry) => entry.id == game.id);
-    await _save();
+    final index = _games.indexWhere((entry) => entry.id == game.id);
+    if (index < 0) {
+      return;
+    }
+
+    final installId = installIdOf(game.directory);
+    final folder = installId == null ? null : Directory(p.join(_file.parent.path, 'games', installId));
+    final removed = installId == null ? null : Directory(p.join(_removing.path, installId));
+    if (folder != null && folder.existsSync()) {
+      await _removing.create(recursive: true);
+      await folder.rename(removed!.path);
+    }
+
+    _games.removeAt(index);
+    try {
+      await _save();
+    } catch (_) {
+      _games.insert(index, game);
+      notifyListeners();
+      if (removed != null && removed.existsSync()) {
+        await removed.rename(folder!.path);
+      }
+      rethrow;
+    }
+
+    await _deleteIfPresent(await _gameLayers(game));
+    if (removed != null) {
+      await _deleteIfPresent(removed);
+    }
+    final icon = game.icon;
+    if (icon != null) {
+      final file = File(p.join((await getApplicationSupportDirectory()).path, icon));
+      if (file.existsSync()) {
+        await file.delete();
+      }
+    }
+  }
+
+  /// Android limits how many folder grants an app may keep, so the ones no game uses are given back, e.g. folders
+  /// picked in an editor that was cancelled, or the previous folder of an edited game.
+  Future<void> releaseUnusedFolders() async {
+    final granted = await _storage.invokeListMethod<String>('persistedFolders') ?? const [];
+    final used = _games.map((game) => game.directory).toSet();
+    for (final folder in granted.where((folder) => !used.contains(folder))) {
+      await _storage.invokeMethod('releaseFolder', {'uri': folder});
+    }
+  }
+
+  static Future<void> _deleteIfPresent(Directory directory) async {
+    if (directory.existsSync()) {
+      await directory.delete(recursive: true);
+    }
   }
 
   /// Writes a temporary file and renames it over the library, so that dying mid-write never truncates it. Writes run

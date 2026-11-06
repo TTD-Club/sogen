@@ -615,10 +615,14 @@ namespace sogen
         this->zw_callback_return = ntdll.find_export("ZwCallbackReturn");
         this->gdi_default_dc_handle = 0;
         this->gdi_memory_dc_default_bitmap_handle = 0;
+        this->gdi_objects_peak = 0;
+        this->user_objects_peak = 0;
         this->gdi_dc_states.clear();
         this->gdi_dc_save_states.clear();
         this->gdi_bitmap_surfaces.clear();
         this->gdi_fonts.clear();
+        this->gdi_regions.clear();
+        this->gdi_palettes.clear();
         this->gdi_window_surfaces.clear();
         this->dxgk = {};
         this->etw_notification_event.reset();
@@ -732,6 +736,8 @@ namespace sogen
             display_info.pPrimaryMonitor = monitor_obj.value();
         });
 
+        this->cursor_x = static_cast<int32_t>(this->display_width / 2);
+        this->cursor_y = static_cast<int32_t>(this->display_height / 2);
         this->set_display_mode(win_emu, this->display_width, this->display_height);
     }
 
@@ -854,11 +860,15 @@ namespace sogen
         buffer.write(this->dispatch_client_message);
         buffer.write(this->gdi_default_dc_handle);
         buffer.write(this->gdi_memory_dc_default_bitmap_handle);
+        buffer.write(this->gdi_objects_peak);
+        buffer.write(this->user_objects_peak);
         buffer.write_map(this->pending_alpc_reply_views);
         buffer.write_map(this->gdi_dc_states);
         buffer.write_map(this->gdi_dc_save_states);
         buffer.write_map(this->gdi_bitmap_surfaces);
         buffer.write_map(this->gdi_fonts);
+        buffer.write_map(this->gdi_regions);
+        buffer.write_map(this->gdi_palettes);
         buffer.write_map(this->gdi_window_surfaces);
         buffer.write(this->dxgk);
         buffer.write_optional(this->etw_notification_event);
@@ -873,10 +883,7 @@ namespace sogen
         buffer.write(this->cursor_shape_visible);
         buffer.write(this->key_state);
         buffer.write(this->async_key_state);
-        buffer.write(this->raw_mouse_registered);
-        buffer.write(this->raw_mouse_target);
-        buffer.write(this->raw_keyboard_registered);
-        buffer.write(this->raw_keyboard_target);
+        buffer.write_vector(this->raw_input_registrations);
         buffer.write_vector(this->pending_low_level_input);
         buffer.write(this->next_low_level_input_id);
         buffer.write(this->next_hook_handle);
@@ -924,6 +931,7 @@ namespace sogen
         buffer.write(this->private_namespaces);
         buffer.write(this->processes);
         buffer.write(this->managed_threads);
+        buffer.write(this->debug_objects);
         buffer.write_map(this->atoms);
         buffer.write_map(this->classes);
 
@@ -987,11 +995,15 @@ namespace sogen
         buffer.read(this->dispatch_client_message);
         buffer.read(this->gdi_default_dc_handle);
         buffer.read(this->gdi_memory_dc_default_bitmap_handle);
+        buffer.read(this->gdi_objects_peak);
+        buffer.read(this->user_objects_peak);
         buffer.read_map(this->pending_alpc_reply_views);
         buffer.read_map(this->gdi_dc_states);
         buffer.read_map(this->gdi_dc_save_states);
         buffer.read_map(this->gdi_bitmap_surfaces);
         buffer.read_map(this->gdi_fonts);
+        buffer.read_map(this->gdi_regions);
+        buffer.read_map(this->gdi_palettes);
         buffer.read_map(this->gdi_window_surfaces);
         buffer.read(this->dxgk);
         buffer.read_optional(this->etw_notification_event);
@@ -1006,10 +1018,7 @@ namespace sogen
         buffer.read(this->cursor_shape_visible);
         buffer.read(this->key_state);
         buffer.read(this->async_key_state);
-        buffer.read(this->raw_mouse_registered);
-        buffer.read(this->raw_mouse_target);
-        buffer.read(this->raw_keyboard_registered);
-        buffer.read(this->raw_keyboard_target);
+        buffer.read_vector(this->raw_input_registrations);
         buffer.read_vector(this->pending_low_level_input);
         buffer.read(this->next_low_level_input_id);
         buffer.read(this->next_hook_handle);
@@ -1057,6 +1066,7 @@ namespace sogen
         buffer.read(this->private_namespaces);
         buffer.read(this->processes);
         buffer.read(this->managed_threads);
+        buffer.read(this->debug_objects);
         buffer.read_map(this->atoms);
         buffer.read_map(this->classes);
 
@@ -1220,14 +1230,7 @@ namespace sogen
                 continue;
             }
 
-            const auto& restored = surface->second;
-            win_emu.ui().present_surface(win.handle, ui_surface_desc{
-                                                         .width = static_cast<int>(restored.width),
-                                                         .height = static_cast<int>(restored.height),
-                                                         .stride = static_cast<int>(restored.width * sizeof(uint32_t)),
-                                                         .format = ui_surface_format::bgra8,
-                                                         .pixels = restored.pixels.data(),
-                                                     });
+            win_emu.ui().present_surface(win.handle, make_window_surface_desc(surface->second, &win));
         }
     }
 
@@ -1239,6 +1242,8 @@ namespace sogen
             return &this->processes;
         case handle_types::managed_thread:
             return &this->managed_threads;
+        case handle_types::debug_object:
+            return &this->debug_objects;
         case handle_types::thread:
             return &threads;
         case handle_types::event:
@@ -1809,6 +1814,29 @@ namespace sogen
         {
             knowndlls64_sections[lname] = section;
         }
+    }
+
+    const process_context::raw_input_registration* process_context::find_raw_input_registration(const uint16_t usage_page,
+                                                                                                const uint16_t usage) const
+    {
+        const auto registration = std::ranges::find_if(this->raw_input_registrations, [&](const raw_input_registration& entry) {
+            return entry.usage_page == usage_page && entry.usage == usage;
+        });
+        return registration == this->raw_input_registrations.end() ? nullptr : &*registration;
+    }
+
+    const process_context::raw_input_registration* process_context::raw_mouse_registration() const
+    {
+        constexpr uint16_t hid_usage_page_generic = 0x01;
+        constexpr uint16_t hid_usage_generic_mouse = 0x02;
+        return this->find_raw_input_registration(hid_usage_page_generic, hid_usage_generic_mouse);
+    }
+
+    const process_context::raw_input_registration* process_context::raw_keyboard_registration() const
+    {
+        constexpr uint16_t hid_usage_page_generic = 0x01;
+        constexpr uint16_t hid_usage_generic_keyboard = 0x06;
+        return this->find_raw_input_registration(hid_usage_page_generic, hid_usage_generic_keyboard);
     }
 
 } // namespace sogen
