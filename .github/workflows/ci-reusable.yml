@@ -1652,7 +1652,9 @@ jobs:
 
       - name: Run Python Linux Unicorn Test Script
         if: ${{ startsWith(matrix.runner, 'ubuntu') }}
-        run: python src/python-bindings/test_linux.py
+        run: |
+          python src/python-bindings/test_linux.py
+          python src/python-bindings/test_linux_gc.py
         env:
           LINUX_PYTHON_TEST_BINARY: /bin/true
           LINUX_PYTHON_TEST_ROOT: /
@@ -1667,7 +1669,9 @@ jobs:
 
       - name: Run Python Linux KVM Test Script
         if: ${{ startsWith(matrix.runner, 'ubuntu') }}
-        run: python src/python-bindings/test_linux.py
+        run: |
+          python src/python-bindings/test_linux.py
+          python src/python-bindings/test_linux_gc.py
         env:
           LINUX_PYTHON_TEST_BINARY: /bin/true
           LINUX_PYTHON_TEST_ROOT: /

@@ -13,6 +13,7 @@
 #include "exception_dispatch.hpp"
 #include "apiset/apiset.hpp"
 #include "syscall_dispatcher.hpp"
+#include "io_completion_wait.hpp"
 
 #include "memory_permission_ext.hpp"
 #include "worker_factory_support.hpp"
@@ -78,6 +79,19 @@ namespace sogen
             int y{};
         };
 
+        // Static controls without SS_NOTIFY and group boxes answer WM_NCHITTEST with HTTRANSPARENT, so the mouse reaches
+        // the window beneath them: dialogs handle clicks on image statics, and controls inside a group box get theirs.
+        bool is_transparent_to_mouse(const window& win)
+        {
+            constexpr uint32_t ss_notify = 0x100;
+            constexpr uint32_t bs_type_mask = 0xF;
+            constexpr uint32_t bs_groupbox = 0x7;
+
+            const auto class_name = normalize_builtin_window_class_name(win.class_name);
+            return (class_name == u"Static" && (win.style & ss_notify) == 0) ||
+                   (class_name == u"Button" && (win.style & bs_type_mask) == bs_groupbox);
+        }
+
         std::optional<child_hit_test_result> find_child_window_at(const process_context& process, const hwnd parent, const int x,
                                                                   const int y)
         {
@@ -98,7 +112,7 @@ namespace sogen
                     {
                         result = descendant;
                     }
-                    else
+                    else if (!is_transparent_to_mouse(child))
                     {
                         result = child_hit_test_result{.win = &child, .x = child_x, .y = child_y};
                     }
@@ -389,19 +403,6 @@ namespace sogen
             return {.window = top_level, .x = x, .y = y};
         }
 
-        bool has_pending_host_wait(const process_context& process)
-        {
-            for (const auto& thread_entry : process.threads)
-            {
-                if (thread_entry.second.await_host_condition)
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
         // The earliest time after `now` at which a waiting thread, a waitable timer, or a window timer becomes due, if
         // any does. Deadlines already past are left out: whatever they could wake would not be idle.
         std::optional<std::chrono::steady_clock::time_point> next_deadline(const process_context& process,
@@ -447,23 +448,34 @@ namespace sogen
             win_emu.apply_pending_guest_event_signals();
 
             auto& threads = win_emu.process.threads;
+            auto& terminated = win_emu.process.terminated_thread_count;
 
-            for (auto it = threads.begin(); it != threads.end();)
+            if (terminated != 0)
             {
-                auto& thread = it->second;
-                if (!thread.can_be_deleted(&vcpu))
+                size_t kept = 0;
+                for (auto it = threads.begin(); it != threads.end();)
                 {
-                    ++it;
-                    continue;
+                    auto& thread = it->second;
+                    if (!thread.can_be_deleted(&vcpu))
+                    {
+                        kept += thread.is_terminated() ? 1 : 0;
+                        ++it;
+                        continue;
+                    }
+
+                    if (vcpu.active_thread == &thread)
+                    {
+                        vcpu.active_thread = nullptr;
+                    }
+
+                    it = threads.erase(it).first;
                 }
 
-                if (vcpu.active_thread == &thread)
-                {
-                    vcpu.active_thread = nullptr;
-                }
-
-                it = threads.erase(it).first;
+                terminated = kept;
             }
+
+            // Wait packets whose target got signaled go to their port, and so to a thread waiting there.
+            io_completion_wait::materialize_all_signaled_wait_packets(win_emu);
 
             auto& devices = win_emu.process.devices;
 
@@ -475,8 +487,6 @@ namespace sogen
             {
                 dev.work(win_emu);
             }
-
-            worker_factory_support::start_workers_for_queued_work(win_emu);
         }
 
         emulator_thread* get_thread_by_id(process_context& process, const uint32_t id)
@@ -543,7 +553,9 @@ namespace sogen
                 arm64_layout.context.ContextFlags = arm64_context_all;
                 cpu_context::save(*arm64, arm64_layout.context);
 
-                const auto new_sp = align_down(arm64->read_stack_pointer() - sizeof(arm64_layout), 0x10);
+                const auto initial_sp = arm64->read_stack_pointer();
+                const auto new_sp = align_down(initial_sp - sizeof(arm64_layout), 0x10);
+                thread.grow_stack_for_frame(new_sp, initial_sp);
                 arm64->write_memory(new_sp, arm64_layout);
                 arm64->reg(arm64_register::sp, new_sp);
                 arm64->reg(arm64_register::pc, win_emu.process.ki_user_apc_dispatcher);
@@ -575,6 +587,7 @@ namespace sogen
             const auto initial_sp = emu.reg(x86_register::rsp);
             const auto new_sp = align_down(initial_sp - sizeof(stack_layout), 0x100);
 
+            thread.grow_stack_for_frame(new_sp, initial_sp);
             emu.write_memory(new_sp, stack_layout);
 
             emu.reg(x86_register::rsp, new_sp);
@@ -879,7 +892,18 @@ namespace sogen
                        ? registry_manager{emulation_root.empty() ? settings.registry_directory : emulation_root / "registry"}
                        : registry_manager{}),
           mod_manager(memory, file_sys, this->callbacks, guest_architecture_of(*this->emu_)),
-          process(*this->emu_, memory, *this->clock_, this->callbacks, settings.intercept_kusd, guest_architecture_of(*this->emu_)),
+          process(*this->emu_, memory, *this->clock_, this->callbacks, settings.intercept_kusd, guest_architecture_of(*this->emu_),
+                  [this]() -> std::optional<native_tsc> {
+                      // vCPUs share one TSC; the guest reads it natively only without RDTSC interception.
+                      const auto frequency = this->native_timestamp_counter_frequency();
+                      const auto value = frequency ? this->emu_->get_guest_cpu(0).read_native_timestamp_counter() : std::nullopt;
+                      if (!value)
+                      {
+                          return std::nullopt;
+                      }
+
+                      return native_tsc{.value = *value, .frequency = *frequency};
+                  }),
           use_relative_time_(settings.use_relative_time),
           // Instruction precision runs through a global execution hook; backends that only count instructions
           // (single-stepping) cannot provide it.
@@ -889,6 +913,7 @@ namespace sogen
           intercept_kusd_(settings.intercept_kusd),
           spoof_gpu_features_(settings.spoof_gpu_features),
           elevated_(settings.elevated),
+          max_display_mode_(settings.max_display_mode),
           vcpu_count_(static_cast<uint32_t>(this->emu_->vcpu_count()))
     {
         if (this->vcpu_count_ == 0)
@@ -897,6 +922,12 @@ namespace sogen
         }
 
         this->memory.set_execute_implies_read(guest_architecture_of(*this->emu_) == windows_guest_architecture::x86_64);
+        this->thread_stacks_committed_in_full_ = !this->memory.supports_guarded_stack_growth();
+
+        if (this->max_display_mode_ && std::ranges::find(display_modes, *this->max_display_mode_) == display_modes.end())
+        {
+            throw std::invalid_argument("The maximum display mode must be one of the display's modes");
+        }
 
         if (this->vcpu_count_ > 1 && !this->emu_->supports_multiple_vcpus())
         {
@@ -989,7 +1020,8 @@ namespace sogen
 
         const auto initial_argument = this->process.is_wow64_process ? this->process.peb32->value() : this->process.peb64.value();
         const auto main_thread_id = context.create_thread(this->memory, this->mod_manager.executable->entry_point, initial_argument,
-                                                          this->mod_manager.executable->size_of_stack_reserve, 0, true);
+                                                          this->mod_manager.executable->size_of_stack_reserve, 0, true,
+                                                          this->mod_manager.executable->size_of_stack_commit);
 
         const std::scoped_lock lock(this->kernel_lock_);
         switch_to_thread(*this, this->vcpu(0), main_thread_id);
@@ -1010,9 +1042,29 @@ namespace sogen
         return this->perform_thread_switch(vcpu, lock);
     }
 
+    // Stacks created while the backend could fault on single pages keep their guard pages; once it no longer can (a
+    // debugger took the watchpoints), those guard pages would never fault and the stacks would run into reserved
+    // memory, so they are committed in full like the stacks created afterwards. A restored process can bring guarded
+    // stacks to a backend that cannot grow them at all.
+    void windows_emulator::commit_thread_stacks_without_guarded_growth()
+    {
+        if (this->thread_stacks_committed_in_full_ || this->memory.supports_guarded_stack_growth())
+        {
+            return;
+        }
+
+        this->thread_stacks_committed_in_full_ = true;
+        this->process.commit_thread_stacks_in_full();
+    }
+
     bool windows_emulator::perform_thread_switch(vcpu_context& vcpu, std::unique_lock<kernel_lock>& lock)
     {
         this->kernel_lock_.assert_held();
+
+        if (this->page_protection_check_due_.exchange(false))
+        {
+            this->commit_thread_stacks_without_guarded_growth();
+        }
 
         const auto needed_switch = vcpu.switch_thread.exchange(false);
         bool woken_by_signal = false;
@@ -1030,13 +1082,26 @@ namespace sogen
             if (this->vcpu_count_ > 1 && vcpu.active_thread)
             {
                 // Nothing runnable for this vCPU: detach the stale thread so another
-                // vCPU can pick it up once it becomes ready.
-                vcpu.active_thread->save(vcpu.cpu);
-                vcpu.active_thread = nullptr;
+                // vCPU can pick it up once it becomes ready. As in a switch's register
+                // transfer, its registers are saved with the kernel lock released. The
+                // vCPU counts as idle meanwhile, so a thread readied during the save
+                // credits it a wakeup.
+                auto& detached = *std::exchange(vcpu.active_thread, nullptr);
+                detached.registers_in_transit = true;
+                ++this->idle_vcpus_;
+                lock.unlock();
+                detached.save(vcpu.cpu);
+                lock.lock();
+                --this->idle_vcpus_;
+                detached.registers_in_transit = false;
                 this->thread_registers_saved_.notify_all();
-            }
 
-            const auto host_wait_pending = has_pending_host_wait(this->process);
+                // A pass that ran during the save skipped it.
+                if (detached.is_thread_ready(*this))
+                {
+                    continue;
+                }
+            }
 
             // Under relative time, idling skips to the next deadline (at most a time slice ahead), so that waits and
             // timers wake in the order of their due times. The relative clock ticks once per millisecond.
@@ -1068,11 +1133,6 @@ namespace sogen
             if (this->use_relative_time_)
             {
                 this->idle_ticks_ += idle_advance;
-            }
-            else if (host_wait_pending)
-            {
-                // A host wait (e.g. a GPU semaphore) is parked - re-poll immediately to wake it promptly.
-                std::this_thread::yield();
             }
             else
             {
@@ -1171,6 +1231,11 @@ namespace sogen
         }
         incoming.registers_in_transit = true;
 
+        // Nothing changes the incoming thread's wait status while it is in transit, so it is written with its
+        // registers. A thread that is not set up yet gets it from setup_if_necessary, after its initial registers.
+        const std::optional<NTSTATUS> wait_status =
+            incoming.setup_done ? std::exchange(incoming.pending_status, std::nullopt) : std::nullopt;
+
         {
             this->kernel_lock_.unlock();
             const auto _ = utils::finally([&] {
@@ -1189,9 +1254,23 @@ namespace sogen
             }
 
             incoming.load_registers(vcpu.cpu);
+
+            // A WOW64 thread's refresh also writes this vCPU's GDT in guest memory, which needs the kernel lock.
+            if (!incoming.teb32.has_value())
+            {
+                incoming.refresh_execution_context(vcpu.cpu, this->process.gdt_base);
+            }
+
+            if (wait_status.has_value())
+            {
+                this->abi().return_value(vcpu.cpu, static_cast<uint64_t>(*wait_status));
+            }
         }
 
-        incoming.refresh_execution_context(vcpu.cpu, this->process.gdt_base);
+        if (incoming.teb32.has_value())
+        {
+            incoming.refresh_execution_context(vcpu.cpu, this->process.gdt_base);
+        }
     }
 
     bool windows_emulator::wait_for_thread_registers(vcpu_context& vcpu, emulator_thread& thread)
@@ -1491,9 +1570,18 @@ namespace sogen
 
             if (const auto guarded_address = this->memory.find_guard_page_violation_address(address, size, operation))
             {
-                // Unset the GUARD_PAGE flag and dispatch a STATUS_GUARD_PAGE_VIOLATION
                 this->memory.release_guard_page(*guarded_address);
-                dispatch_guard_page_violation(*this, vcpu, *guarded_address, operation);
+                switch (vcpu.thread().handle_stack_guard_fault(*guarded_address))
+                {
+                case stack_guard_fault::grown:
+                    return memory_violation_continuation::restart;
+                case stack_guard_fault::overflow:
+                    dispatch_stack_overflow(*this, vcpu, *guarded_address, operation);
+                    break;
+                case stack_guard_fault::outside_stack:
+                    dispatch_guard_page_violation(*this, vcpu, *guarded_address, operation);
+                    break;
+                }
             }
             else
             {
@@ -1745,6 +1833,10 @@ namespace sogen
                 this->callbacks.on_suspicious_activity("Illegal instruction");
                 dispatch_illegal_instruction_violation(*this, vcpu);
                 return;
+            case 13:
+                this->callbacks.on_suspicious_activity("General protection fault");
+                dispatch_general_protection_fault(*this, vcpu);
+                return;
             case 41:
                 this->callbacks.on_fast_fail(acting.reg<uint32_t>(x86_register::ecx));
                 this->process.exit_status = STATUS_FAIL_FAST_EXCEPTION;
@@ -1972,6 +2064,8 @@ namespace sogen
                         break;
                     }
 
+                    this->page_protection_check_due_ = true;
+
                     if (refresh_kusd)
                     {
                         const std::scoped_lock kernel_lock(this->kernel_lock_);
@@ -2175,6 +2269,18 @@ namespace sogen
                 owner->set_active_window(window);
             }
         }
+
+        // Mirror the foreground window into the shared SERVERINFO so the guest's client-side
+        // GetForegroundWindow (which reads gpsi directly, never syscalling) returns the active window.
+        // Fall back to the desktop window when no app window is active: real Windows always has a
+        // foreground window, and code that needs a valid HWND (e.g. DirectSound's SetCooperativeLevel,
+        // which Miles feeds from GetForegroundWindow) breaks on a null one.
+        const auto foreground = window != 0 ? window : this->process.default_desktop_window_handle.bits;
+        this->process.user_handles.get_server_info().access([&](USER_SERVERINFO& server_info) {
+            server_info.foregroundWindow = foreground; //
+        });
+
+        this->apply_cursor_capture();
     }
 
     void windows_emulator::handle_ui_event(const ui_event& event)
@@ -2487,6 +2593,9 @@ namespace sogen
                 this->process.key_state[generic] = any_down ? 0x80 : 0;
             }
         }
+
+        // Every caller changes the key state here, injected input without a window to receive it included.
+        this->process.key_state_changed();
     }
 
     ui_event windows_emulator::resolve_injected_event(const ui_event& event) const
@@ -2569,8 +2678,6 @@ namespace sogen
             return;
         }
 
-        const auto previous_foreground = this->process.foreground_window;
-
         msg m{};
         m.window = event.window;
         m.message = event.message;
@@ -2651,17 +2758,6 @@ namespace sogen
             this->set_foreground_window(0);
         }
 
-        // Mirror the foreground window into the shared SERVERINFO so the guest's client-side
-        // GetForegroundWindow (which reads gpsi directly, never syscalling) returns the active window.
-        // Fall back to the desktop window when no app window is active: real Windows always has a
-        // foreground window, and code that needs a valid HWND (e.g. DirectSound's SetCooperativeLevel,
-        // which Miles feeds from GetForegroundWindow) breaks on a null one.
-        const auto foreground =
-            this->process.foreground_window != 0 ? this->process.foreground_window : this->process.default_desktop_window_handle.bits;
-        this->process.user_handles.get_server_info().access([&](USER_SERVERINFO& server_info) {
-            server_info.foregroundWindow = foreground; //
-        });
-
         // Maintain the polled key state from key and mouse-button transitions. GetKeyState reports the high
         // down bit; GetAsyncKeyState also reports a low edge bit that is set once when a key transitions from
         // up to down and cleared by the next GetAsyncKeyState query for that virtual key.
@@ -2688,6 +2784,7 @@ namespace sogen
                 {
                     this->process.key_state[virtual_key] = 0;
                 }
+                this->process.key_state_changed();
             }
             break;
         }
@@ -2727,11 +2824,6 @@ namespace sogen
         {
             this->wake_thread(*thread);
         }
-
-        if (this->process.foreground_window != previous_foreground)
-        {
-            this->apply_cursor_capture();
-        }
     }
 
     void windows_emulator::move_window_from_host(const hwnd window_handle, const int32_t x, const int32_t y)
@@ -2750,7 +2842,7 @@ namespace sogen
 
         win->x = x;
         win->y = y;
-        win->sync_guest_rects();
+        this->process.sync_guest_window_rects(*win);
 
         msg m{};
         m.window = window_handle;
@@ -2786,7 +2878,7 @@ namespace sogen
         win->height = client_height + insets.top + insets.bottom;
         win->style = maximized ? (win->style | WS_MAXIMIZE) : (win->style & ~WS_MAXIMIZE);
         win->guest.access([&](USER_WINDOW& guest_win) { guest_win.dwStyle = win->style; });
-        win->sync_guest_rects();
+        this->process.sync_guest_window_rects(*win);
 
         win->update_rect = RECT{.left = 0, .top = 0, .right = win->client_width(), .bottom = win->client_height()};
         win->update_pending = true;
@@ -2993,6 +3085,7 @@ namespace sogen
 
         buffer.register_factory<menu>([this] { return menu{this->emu()}; });
         buffer.register_factory<accelerator_table>([this] { return accelerator_table{this->emu()}; });
+        buffer.register_factory<cursor_icon>([this] { return cursor_icon{this->emu()}; });
     }
 
     void windows_emulator::request_suspend()
@@ -3036,6 +3129,68 @@ namespace sogen
         {
             device.prepare_serialization(*this);
         }
+
+        // A snapshot keeps one running thread, vCPU 0's, whose registers the backend saves. The threads the other vCPUs
+        // run go back into their thread objects with their live registers, as when a vCPU drops a thread; restored, the
+        // scheduler hands them out again.
+        emulator_thread* running_elsewhere{};
+        for (uint32_t i = 1; i < this->vcpu_count_; ++i)
+        {
+            auto& vcpu = *this->vcpus_[i];
+            if (vcpu.active_thread && !vcpu.active_thread_saved)
+            {
+                vcpu.active_thread->save(vcpu.cpu);
+            }
+            if (!running_elsewhere && vcpu.active_thread && !vcpu.active_thread->is_terminated())
+            {
+                running_elsewhere = vcpu.active_thread;
+            }
+        }
+        this->idle_secondary_vcpus();
+        this->occupy_idle_first_vcpu(running_elsewhere);
+    }
+
+    // A snapshot keeps a running thread on vCPU 0, as one taken with a single vCPU always does, but with several vCPUs, vCPU
+    // 0 may be idle when the process stops. It then gets a thread the way a switch hands it one: the preferred one (a
+    // thread another vCPU was running), else the first that has not ended.
+    void windows_emulator::occupy_idle_first_vcpu(emulator_thread* preferred)
+    {
+        auto& first = *this->vcpus_[0];
+        if (first.active_thread)
+        {
+            return;
+        }
+
+        auto* thread = preferred;
+        for (auto& candidate : this->process.threads | std::views::values)
+        {
+            if (thread)
+            {
+                break;
+            }
+            if (!candidate.is_terminated())
+            {
+                thread = &candidate;
+            }
+        }
+
+        if (thread)
+        {
+            first.set_active_thread(thread);
+            thread->restore(first.cpu, this->process.gdt_base);
+            thread->setup_if_necessary(first.cpu, this->process);
+        }
+    }
+
+    void windows_emulator::idle_secondary_vcpus()
+    {
+        for (uint32_t i = 1; i < this->vcpu_count_; ++i)
+        {
+            auto& vcpu = *this->vcpus_[i];
+            vcpu.set_active_thread(nullptr);
+            vcpu.active_thread_saved = false;
+            vcpu.switch_thread = false;
+        }
     }
 
     void windows_emulator::serialize(utils::buffer_serializer& buffer) const
@@ -3066,6 +3221,13 @@ namespace sogen
     void windows_emulator::serialize_state(utils::buffer_serializer& buffer, const bool memory_contents, size_t* memory_offset) const
     {
         this->ensure_serialization_support();
+        for (uint32_t i = 1; i < this->vcpu_count_; ++i)
+        {
+            if (this->vcpus_[i]->active_thread)
+            {
+                throw std::runtime_error("A snapshot keeps only vCPU 0's thread running; call prepare_serialization first");
+            }
+        }
 
         buffer.write(this->application_settings_);
         buffer.write(this->setup_completed_);
@@ -3126,8 +3288,14 @@ namespace sogen
         emulator_thread* restored_thread{};
         this->process.deserialize(buffer, restored_thread);
         this->vcpus_[0]->set_active_thread(restored_thread);
+        this->idle_secondary_vcpus();
         this->process.section_views.deserialize(buffer);
         this->process.restore_after_state_restore(*this);
+        this->thread_stacks_committed_in_full_ = false;
+        this->commit_thread_stacks_without_guarded_growth();
+        // A state saved while vCPU 0 was idle, without prepare_serialization, has no running thread.
+        this->occupy_idle_first_vcpu(nullptr);
+        this->apply_cursor_shape();
         this->ui().set_cursor_visibility(this->process.cursor_show_count >= 0 && this->process.cursor_shape_visible);
         this->apply_cursor_capture();
         this->release_held_input();
@@ -3137,6 +3305,7 @@ namespace sogen
     // would have seen it happen.
     void windows_emulator::release_held_input()
     {
+        bool released = false;
         for (uint32_t key = 0; key < this->process.key_state.size(); ++key)
         {
             if ((this->process.key_state[key] & 0x80) == 0)
@@ -3144,6 +3313,7 @@ namespace sogen
                 continue;
             }
 
+            released = true;
             if (key == VK_LBUTTON || key == VK_RBUTTON || key == VK_MBUTTON || key == VK_XBUTTON1 || key == VK_XBUTTON2)
             {
                 this->process.key_state[key] = 0;
@@ -3162,6 +3332,13 @@ namespace sogen
             // Delivering the release does not clear the key when there is no window to deliver it to.
             this->process.key_state[key] &= 0x01;
         }
+
+        // The buttons and the keys that could not be delivered were cleared here directly. The CLIENTINFO caches and the
+        // generation are restored with guest memory, so a cache stamped before the save would still pass for current.
+        if (released)
+        {
+            this->process.key_state_changed();
+        }
     }
 
     uint64_t windows_emulator::highest_user_address() const
@@ -3172,6 +3349,26 @@ namespace sogen
         }
         const auto* executable = this->mod_manager.executable;
         return (executable && (executable->characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE)) ? 0xFFFEFFFF : 0x7FFEFFFF;
+    }
+
+    void windows_emulator::apply_cursor_shape()
+    {
+        if (this->process.current_cursor == 0)
+        {
+            return;
+        }
+        uint32_t idc = 32512;
+        const auto* cursor = this->process.cursor_icons.get(this->process.current_cursor);
+        if (cursor && cursor->type == 1 && cursor->resource_name.empty() &&
+            utils::string::equals_ignore_case(cursor->module_name, std::u16string{u"USER32"}) &&
+            ((cursor->resource_id >= 32512 && cursor->resource_id <= 32516) ||
+             (cursor->resource_id >= 32642 && cursor->resource_id <= 32646) ||
+             (cursor->resource_id >= 32648 && cursor->resource_id <= 32652) || cursor->resource_id == 32671 ||
+             cursor->resource_id == 32672))
+        {
+            idc = cursor->resource_id;
+        }
+        this->ui().set_system_cursor(idc);
     }
 
     // The guest's ClipCursor is process-wide; the host confines whichever window is in the foreground, in relative mode while
@@ -3250,8 +3447,12 @@ namespace sogen
         emulator_thread* restored_thread{};
         this->process.deserialize(buffer, restored_thread);
         this->vcpus_[0]->set_active_thread(restored_thread);
+        this->idle_secondary_vcpus();
         this->process.section_views.deserialize(buffer);
         this->process.restore_after_state_restore(*this);
+        this->thread_stacks_committed_in_full_ = false;
+        this->commit_thread_stacks_without_guarded_growth();
+        this->apply_cursor_shape();
         this->ui().set_cursor_visibility(this->process.cursor_show_count >= 0 && this->process.cursor_shape_visible);
         this->apply_cursor_capture();
     }

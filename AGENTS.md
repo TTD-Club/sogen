@@ -96,3 +96,7 @@ These apply whenever GitHub tooling (e.g. the `gh` CLI or a GitHub integration) 
   commit or conflict resolution goes through a PR too.
 - A PR description names every issue it resolves with a closing keyword (`Fixes #12`, `Closes #34`) so the issue
   closes on merge, and links issues it only touches (`Related to #56`).
+- Keep PR descriptions and commit messages concise: say what changes and why, in a few sentences or short bullets,
+  at the length of a normal PR description.
+- Do not add a Test, Testing or Validation section, or lists of test runs and results. The changed files and touched
+  tests already show that.

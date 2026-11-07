@@ -306,6 +306,28 @@ namespace sogen
         }
     };
 
+    struct window_style_change_state : completion_state
+    {
+        emulator_stack_allocation style_alloc{};
+        uint32_t old_style{};
+        bool style_applied{};
+
+      private:
+        void serialize_object(utils::buffer_serializer& buffer) const override
+        {
+            buffer.write(this->style_alloc);
+            buffer.write(this->old_style);
+            buffer.write(this->style_applied);
+        }
+
+        void deserialize_object(utils::buffer_deserializer& buffer) override
+        {
+            buffer.read(this->style_alloc);
+            buffer.read(this->old_style);
+            buffer.read(this->style_applied);
+        }
+    };
+
     struct message_call_state : completion_state
     {
         hwnd window{};
@@ -334,6 +356,31 @@ namespace sogen
             buffer.read(this->dispatching_result_callback);
             buffer.read(this->destroying_window);
             this->destruction.deserialize(buffer);
+        }
+    };
+
+    struct focus_change_state : completion_state
+    {
+        uint64_t previous{};
+        uint64_t next{};
+        bool kill_focus_sent{};
+        bool set_focus_sent{};
+
+      private:
+        void serialize_object(utils::buffer_serializer& buffer) const override
+        {
+            buffer.write(this->previous);
+            buffer.write(this->next);
+            buffer.write(this->kill_focus_sent);
+            buffer.write(this->set_focus_sent);
+        }
+
+        void deserialize_object(utils::buffer_deserializer& buffer) override
+        {
+            buffer.read(this->previous);
+            buffer.read(this->next);
+            buffer.read(this->kill_focus_sent);
+            buffer.read(this->set_focus_sent);
         }
     };
 

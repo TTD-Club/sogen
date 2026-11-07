@@ -545,7 +545,8 @@ namespace sogen
                     break;
                 }
                 case handle_types::process: {
-                    if (!c.proc.processes.get(effective_handle))
+                    if (effective_handle != STEAM_PROCESS_HANDLE && effective_handle != PARENT_PROCESS_HANDLE &&
+                        !c.proc.processes.get(effective_handle))
                     {
                         return STATUS_INVALID_HANDLE;
                     }
@@ -856,8 +857,9 @@ namespace sogen
             }
             case handle_types::process:
                 // The synthetic Steam process never signals, so a liveness wait times out ("alive").
-                return (h == STEAM_PROCESS_HANDLE || find_system_process(h) || c.proc.processes.get(h)) ? STATUS_SUCCESS
-                                                                                                        : STATUS_INVALID_HANDLE;
+                return (h == STEAM_PROCESS_HANDLE || h == PARENT_PROCESS_HANDLE || find_system_process(h) || c.proc.processes.get(h))
+                           ? STATUS_SUCCESS
+                           : STATUS_INVALID_HANDLE;
 
             case handle_types::managed_thread:
                 return validate_handle_in_store(c.proc.managed_threads);

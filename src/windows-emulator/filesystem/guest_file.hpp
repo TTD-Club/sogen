@@ -2,6 +2,7 @@
 
 #include "mount_provider.hpp"
 #include "../windows_path.hpp"
+#include "../file_system.hpp"
 
 namespace sogen
 {
@@ -49,6 +50,9 @@ namespace sogen
 
         void defer_rename(const windows_path& new_path, std::u16string spelled = {});
         void set_delete_on_close(bool delete_on_close);
+        void mark_delete_pending(bool posix_semantics);
+        void cancel_delete();
+        [[nodiscard]] bool is_delete_pending() const;
 
         void serialize(utils::buffer_serializer& buffer) const;
         void deserialize(utils::buffer_deserializer& buffer);
@@ -63,8 +67,11 @@ namespace sogen
         bool delete_on_close_{false};
         // Opened as the host reparse point itself (compat_open_reparse_point), which the host cannot follow.
         bool host_reparse_point_{false};
+        std::shared_ptr<file_state> state_{};
+        uint64_t posix_owner_{0};
 
         std::unique_ptr<i_file> reopen() const;
+        [[nodiscard]] bool owns_posix_unlink() const;
         void release();
     };
 

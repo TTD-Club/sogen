@@ -832,6 +832,7 @@ namespace sogen::unicorn
             this->violation_ip_ = std::nullopt;
             const detail::uc_context_serializer serializer(this->uc_, is_snapshot);
             serializer.deserialize(buffer);
+            this->violation_ip_.reset();
         }
 
         std::optional<uint64_t> get_memory_generation() const override
@@ -874,6 +875,7 @@ namespace sogen::unicorn
             this->violation_ip_ = std::nullopt;
             const detail::uc_context_serializer serializer(this->uc_, false);
             serializer.deserialize(buffer);
+            this->violation_ip_.reset();
         }
 
         bool has_violation() const override

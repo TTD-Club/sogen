@@ -334,6 +334,12 @@ namespace sogen
         this->initial_thread_id = app_settings.thread_id;
         this->processes.get(GUEST_PROCESS_HANDLE)->id = this->process_id;
 
+        const auto initial_mode = win_emu.max_display_mode().value_or(default_display_mode);
+        this->display_width = initial_mode.width;
+        this->display_height = initial_mode.height;
+        this->registry_display_width = initial_mode.width;
+        this->registry_display_height = initial_mode.height;
+
         auto& emu = win_emu.emu();
         const auto& version = win_emu.version;
         const auto& fake_env = win_emu.fake_env;
@@ -348,7 +354,7 @@ namespace sogen
             this->gdt_base = setup_gdt(win_emu.x64_emu(), win_emu.memory);
         }
 
-        this->kusd.setup(version, fake_env);
+        this->kusd.setup(version, fake_env, win_emu.native_timestamp_counter_frequency());
 
         if (auto* arm64 = dynamic_cast<arm64_cpu*>(&emu.get_guest_cpu(0)))
         {
@@ -798,12 +804,21 @@ namespace sogen
         }
     }
 
-    emulator_pointer process_context::allocate_user_class(memory_manager& memory, const std::u16string_view class_name)
+    emulator_pointer process_context::allocate_user_class(memory_manager& memory, const std::u16string_view class_name,
+                                                          const uint32_t class_extra)
     {
+        // The zeroed extra bytes start at user_class_extra_offset, inside USER_CLASS's padding for small ones; the ANSI name
+        // comes after both.
         const auto ansi_class_name = u16_to_cp1252(class_name);
-        const auto cls_size = static_cast<size_t>(page_align_up(sizeof(USER_CLASS) + ansi_class_name.size() + 1));
+        const auto name_offset = std::max<uint64_t>(sizeof(USER_CLASS), user_class_extra_offset + class_extra);
+        const auto cls_size = static_cast<size_t>(page_align_up(name_offset + ansi_class_name.size() + 1));
         const auto cls_ptr = memory.allocate_memory(cls_size, memory_permission::read);
-        const auto ansi_class_name_ptr = cls_ptr + sizeof(USER_CLASS);
+        if (!cls_ptr)
+        {
+            return 0;
+        }
+
+        const auto ansi_class_name_ptr = cls_ptr + name_offset;
 
         memory.write_memory(ansi_class_name_ptr, ansi_class_name.c_str(), ansi_class_name.size() + 1);
 
@@ -817,6 +832,11 @@ namespace sogen
     {
         this->mouse_capture_window = window;
         this->user_handles.get_server_info().access([&](USER_SERVERINFO& server_info) { server_info.captureCount = window != 0 ? 1 : 0; });
+    }
+
+    void process_context::key_state_changed() const
+    {
+        this->user_handles.get_server_info().access([](USER_SERVERINFO& server_info) { ++server_info.keyStateGeneration; });
     }
 
     void process_context::release_mouse_capture(const hwnd window)
@@ -896,6 +916,8 @@ namespace sogen
         buffer.write_map(this->audio_render_events_by_stream);
         buffer.write_map(this->pending_audio_render_events);
         buffer.write(this->next_audio_stream_id);
+        buffer.write_map(this->wnf_states);
+        buffer.write_map(this->service_status_state_names);
 
         buffer.write(this->user_handles);
         buffer.write(this->default_monitor_handle);
@@ -926,6 +948,7 @@ namespace sogen
         buffer.write(this->menus);
         buffer.write(this->timers);
         buffer.write(this->accelerator_tables);
+        buffer.write(this->cursor_icons);
         buffer.write(this->deferred_window_position_batches);
         buffer.write(this->registry_keys);
         buffer.write(this->private_namespaces);
@@ -950,6 +973,7 @@ namespace sogen
 
         buffer.write_vector(this->default_register_set);
         buffer.write(this->process_id);
+        buffer.write(this->parent_process_id);
         buffer.write(this->initial_thread_id);
         buffer.write(this->spawned_thread_count);
         buffer.write(this->threads);
@@ -1031,6 +1055,8 @@ namespace sogen
         buffer.read_map(this->audio_render_events_by_stream);
         buffer.read_map(this->pending_audio_render_events);
         buffer.read(this->next_audio_stream_id);
+        buffer.read_map(this->wnf_states);
+        buffer.read_map(this->service_status_state_names);
 
         buffer.read(this->user_handles);
         buffer.read(this->default_monitor_handle);
@@ -1061,6 +1087,7 @@ namespace sogen
         buffer.read(this->menus);
         buffer.read(this->timers);
         buffer.read(this->accelerator_tables);
+        buffer.read(this->cursor_icons);
         buffer.read(this->deferred_window_position_batches);
         buffer.read(this->registry_keys);
         buffer.read(this->private_namespaces);
@@ -1085,6 +1112,7 @@ namespace sogen
 
         buffer.read_vector(this->default_register_set);
         buffer.read(this->process_id);
+        buffer.read(this->parent_process_id);
         buffer.read(this->initial_thread_id);
         buffer.read(this->spawned_thread_count);
 
@@ -1095,9 +1123,11 @@ namespace sogen
 
         buffer.read(this->threads);
         this->thread_handles_by_id.clear();
+        this->terminated_thread_count = 0;
         for (const auto& [index, thread] : this->threads)
         {
             this->thread_handles_by_id[thread.id] = this->threads.make_handle(index);
+            this->terminated_thread_count += thread.is_terminated() ? 1 : 0;
         }
 
         active_thread = this->threads.get(buffer.read<uint64_t>());
@@ -1162,7 +1192,7 @@ namespace sogen
         };
 
         const auto create_window = [&](const window& win) {
-            const auto child = (win.style & WS_CHILD) != 0;
+            const auto child = !this->is_surface_root(win);
             uint32_t control_id = 0;
             if (child)
             {
@@ -1218,7 +1248,7 @@ namespace sogen
         for (const auto& [index, win] : this->windows)
         {
             (void)index;
-            if (!win.host_surface_window || (win.style & WS_CHILD) != 0)
+            if (!win.host_surface_window || !this->is_surface_root(win))
             {
                 continue;
             }
@@ -1342,7 +1372,7 @@ namespace sogen
         }
     }
 
-    uint32_t process_context::count_handles() const
+    size_t process_context::handle_count() const
     {
         // Every open handle holds a reference on its object (some objects also hold internal ones).
         uint64_t count = 0;
@@ -1356,6 +1386,7 @@ namespace sogen
         add(this->processes);
         add(this->managed_threads);
         add(this->threads);
+        add(this->debug_objects);
         add(this->events);
         add(this->files);
         add(this->devices);
@@ -1364,16 +1395,18 @@ namespace sogen
         add(this->wait_completion_packets);
         add(this->worker_factories);
         add(this->jobs);
+        add(this->thread_state_changes);
         add(this->registry_keys);
         add(this->mutants);
         add(this->timers);
         add(this->desktops);
+        add(this->window_stations);
         add(this->ports);
         add(this->sections);
         add(this->private_namespaces);
         add(this->deferred_window_position_batches);
 
-        return static_cast<uint32_t>(std::min<uint64_t>(count, UINT32_MAX));
+        return static_cast<size_t>(std::min<uint64_t>(count, UINT32_MAX));
     }
 
     emulator_thread* process_context::find_thread_by_id(const uint32_t thread_id)
@@ -1414,6 +1447,58 @@ namespace sogen
         }
 
         return nullptr;
+    }
+
+    bool process_context::is_surface_root(const window& win) const
+    {
+        const bool child_style = (win.style & WS_CHILD) != 0 && (win.style & WS_POPUP) == 0;
+        return !child_style || win.parent_handle == 0 || win.parent_handle == this->default_desktop_window_handle.bits;
+    }
+
+    POINT process_context::window_screen_origin(const window& win) const
+    {
+        POINT origin{.x = win.x, .y = win.y};
+        const auto* current = &win;
+        for (size_t depth = 0; depth < this->windows.size() && !this->is_surface_root(*current); ++depth)
+        {
+            const auto* parent = this->windows.get(current->parent_handle);
+            if (!parent)
+            {
+                break;
+            }
+
+            origin.x += parent->client_x();
+            origin.y += parent->client_y();
+            current = parent;
+        }
+        return origin;
+    }
+
+    void process_context::sync_guest_window_rects(window& win)
+    {
+        win.sync_guest_rects(this->window_screen_origin(win));
+
+        const auto descends_from_win = [&](const window& candidate) {
+            const auto* current = &candidate;
+            for (size_t depth = 0; current && depth < this->windows.size(); ++depth)
+            {
+                if (current->parent_handle == win.handle)
+                {
+                    return true;
+                }
+                current = this->windows.get(current->parent_handle);
+            }
+            return false;
+        };
+
+        for (auto& [index, candidate] : this->windows)
+        {
+            (void)index;
+            if (&candidate != &win && descends_from_win(candidate))
+            {
+                candidate.sync_guest_rects(this->window_screen_origin(candidate));
+            }
+        }
     }
 
     bool process_context::is_window_effectively_visible(const hwnd window) const
@@ -1480,11 +1565,23 @@ namespace sogen
         return std::count_if(threads.begin(), threads.end(), [](auto& item) { return !item.second.is_terminated(); });
     }
 
+    void process_context::commit_thread_stacks_in_full() const
+    {
+        for (const auto& thread : this->threads | std::views::values)
+        {
+            if (!thread.is_terminated())
+            {
+                thread.commit_stacks_in_full();
+            }
+        }
+    }
+
     handle process_context::create_thread(memory_manager& memory, const uint64_t start_address, const uint64_t argument,
-                                          const uint64_t stack_size, const uint32_t create_flags, const bool initial_thread)
+                                          const uint64_t stack_size, const uint32_t create_flags, const bool initial_thread,
+                                          const uint64_t stack_commit_size)
     {
         const uint32_t thread_id = this->initial_thread_id + this->spawned_thread_count++ * 4;
-        emulator_thread t{memory, *this, start_address, argument, stack_size, create_flags, thread_id, initial_thread};
+        emulator_thread t{memory, *this, start_address, argument, stack_size, create_flags, thread_id, initial_thread, stack_commit_size};
         auto [h, thr] = this->threads.store_and_get(std::move(t));
         this->thread_handles_by_id[thr->id] = h;
 
@@ -1507,6 +1604,11 @@ namespace sogen
 
     void process_context::terminate_thread(emulator_thread& thread, const NTSTATUS thread_exit_status)
     {
+        if (!thread.is_terminated())
+        {
+            ++this->terminated_thread_count;
+        }
+
         thread.exit_status = thread_exit_status;
 
         for (auto& mutant : this->mutants | std::views::values)
