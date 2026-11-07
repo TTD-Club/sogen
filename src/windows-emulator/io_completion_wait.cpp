@@ -2,10 +2,10 @@
 #include "io_completion_wait.hpp"
 #include "windows_emulator.hpp"
 #include "worker_factory_support.hpp"
+#include "syscall_utils.hpp"
 
 namespace sogen
 {
-
     namespace io_completion_wait
     {
         namespace
@@ -125,16 +125,83 @@ namespace sogen
                 }
             }
 
+            // Every scheduler pass checks the armed packets, so a packet keeps its target's object and looks it up in the store
+            // again only once the store's generation has moved.
+            template <handle_types::type Type, typename T>
+            T* wait_packet_target(handle_store<Type, T>& store, wait_completion_packet& wait_packet)
+            {
+                if (!wait_packet.target_object || wait_packet.target_generation != store.generation())
+                {
+                    wait_packet.target_object = store.get(wait_packet.target_object_handle);
+                    wait_packet.target_generation = store.generation();
+                }
+
+                // The object came from this store, so it is a T (a dynamic_cast would cost more than the lookup this saves).
+                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+                return static_cast<T*>(wait_packet.target_object);
+            }
+
+            bool is_wait_packet_target_signaled(windows_emulator& win_emu, wait_completion_packet& wait_packet)
+            {
+                auto& process = win_emu.process;
+                switch (wait_packet.target_object_handle.value.type)
+                {
+                case handle_types::event:
+                    if (const auto* target = wait_packet_target(process.events, wait_packet))
+                    {
+                        return target->signaled;
+                    }
+                    break;
+                case handle_types::semaphore:
+                    if (const auto* target = wait_packet_target(process.semaphores, wait_packet))
+                    {
+                        return target->current_count > 0;
+                    }
+                    break;
+                case handle_types::mutant:
+                    if (const auto* target = wait_packet_target(process.mutants, wait_packet))
+                    {
+                        return target->locked_count == 0;
+                    }
+                    break;
+                case handle_types::timer:
+                    // Only the scheduler expires timers (expire_timers), so a TTD replay sees the same expiries.
+                    if (const auto* target = wait_packet_target(process.timers, wait_packet))
+                    {
+                        return target->signaled;
+                    }
+                    break;
+                case handle_types::thread:
+                    if (const auto* target = wait_packet_target(process.threads, wait_packet))
+                    {
+                        return target->is_terminated();
+                    }
+                    break;
+                default:
+                    break;
+                }
+
+                return is_wait_completion_target_signaled(win_emu, wait_packet.target_object_handle);
+            }
+
             void release_wait_packet_association(process_context& process, wait_completion_packet& wait_packet)
             {
                 release_handle_reference(process, wait_packet.io_completion_handle);
                 release_handle_reference(process, wait_packet.target_object_handle);
+                wait_packet.target_object = nullptr;
                 wait_packet.associated = false;
             }
 
-            void enqueue_wait_packet_completion(process_context& process, io_completion& completion, const handle wait_packet_handle,
+            void enqueue_wait_packet_completion(windows_emulator& win_emu, const handle wait_packet_handle,
                                                 const wait_completion_packet& wait_packet)
             {
+                auto& process = win_emu.process;
+                auto* completion = process.io_completions.get(wait_packet.io_completion_handle);
+                if (!completion)
+                {
+                    return;
+                }
+
                 io_completion_message message{};
                 message.key_context = wait_packet.key_context;
                 message.apc_context = wait_packet.apc_context;
@@ -149,8 +216,159 @@ namespace sogen
                     }
                 }
 
-                completion.enqueue(message);
+                insert(win_emu, wait_packet.io_completion_handle, *completion, message);
             }
+
+            // Queues the completion of each signaled wait packet on the port, or on any port without one.
+            void queue_signaled_wait_packets(windows_emulator& win_emu, const std::optional<handle> io_completion_handle)
+            {
+                auto& process = win_emu.process;
+                std::vector<handle> signaled{};
+
+                for (auto& [packet_id, wait_packet] : process.wait_completion_packets)
+                {
+                    if (!wait_packet.associated || wait_packet.queued_completion)
+                    {
+                        continue;
+                    }
+
+                    if (io_completion_handle && wait_packet.io_completion_handle != *io_completion_handle)
+                    {
+                        continue;
+                    }
+
+                    if (!is_wait_packet_target_signaled(win_emu, wait_packet))
+                    {
+                        continue;
+                    }
+
+                    consume_wait_completion_target(process, wait_packet.target_object_handle);
+                    wait_packet.queued_completion = true;
+                    signaled.push_back(process.wait_completion_packets.make_handle(packet_id));
+                }
+
+                // Queued once the walk is done: a completion handed to a waiter can release its packet.
+                for (const auto wait_packet_handle : signaled)
+                {
+                    if (const auto* wait_packet = process.wait_completion_packets.get(wait_packet_handle))
+                    {
+                        enqueue_wait_packet_completion(win_emu, wait_packet_handle, *wait_packet);
+                    }
+                }
+            }
+
+            // KiWakeQueueWaiter: the packet is the result of the waiter's wait, written where its syscall asked for it. The
+            // buffers were probed before the wait but can have been freed or reprotected since, and the kernel copies the
+            // packet out after taking it off the queue (write_message, write_entries).
+            void deliver(windows_emulator& win_emu, emulator_thread& thread, const io_completion_message& message)
+            {
+                const auto wait = *thread.await_io_completion;
+                thread.mark_as_ready(
+                    wait.type == io_completion_wait_type::remove_single
+                        ? write_message(win_emu.memory, wait.key_context_ptr, wait.apc_context_ptr, wait.io_status_block_ptr, message)
+                        : write_entries(win_emu.memory, wait.completion_entries_ptr, wait.entries_removed_ptr, {&message, 1}));
+                worker_factory_support::on_io_completion_message_dequeued(win_emu, message);
+
+                // NtWaitForWorkViaWorkerFactory checks for more work after its wait, and a packet handed straight to its worker
+                // does not go back through that syscall.
+                worker_factory_support::check_create_worker(win_emu, wait.worker_factory_handle);
+                clear_wait_packet_completion_state(win_emu.process, message.wait_packet_handle);
+                win_emu.wake_idle_vcpu();
+            }
+        }
+
+        void add_waiter(io_completion& completion, const uint32_t thread_id)
+        {
+            std::erase(completion.waiters, thread_id);
+            completion.waiters.push_back(thread_id);
+        }
+
+        void insert(windows_emulator& win_emu, const handle io_completion_handle, io_completion& completion,
+                    const io_completion_message& message)
+        {
+            // With packets queued, a later one waits behind them: a waiter that resumed from a suspension is not back in the
+            // wait list until its KeRemoveQueueEx runs again, and that takes the queue's first packet.
+            for (auto i = completion.waiters.size(); completion.queue.empty() && i-- > 0;)
+            {
+                auto* thread = win_emu.process.find_thread_by_id(completion.waiters[i]);
+                const auto waits_here = thread && !thread->is_terminated() && thread->await_io_completion &&
+                                        thread->await_io_completion->io_completion_handle == io_completion_handle;
+
+                // A suspended waiter is out of the wait list until it resumes; one whose wait ended is gone.
+                if (waits_here && thread->suspended != 0)
+                {
+                    continue;
+                }
+
+                completion.waiters.erase(completion.waiters.begin() + static_cast<ptrdiff_t>(i));
+                if (waits_here)
+                {
+                    deliver(win_emu, *thread, message);
+                    return;
+                }
+            }
+
+            completion.enqueue(message);
+        }
+
+        NTSTATUS probe_completion_entries(memory_manager& memory, const uint64_t entries, const ULONG count, const uint64_t entries_removed)
+        {
+            constexpr auto entry_size = sizeof(FILE_IO_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>);
+            if (entries % 8 != 0)
+            {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+
+            if (!is_writable_range(memory, entries, entry_size * count) || !is_writable_range(memory, entries_removed, sizeof(ULONG)))
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS write_message(memory_manager& memory, const uint64_t key_context, const uint64_t apc_context,
+                               const uint64_t io_status_block, const io_completion_message& message)
+        {
+            const auto store = [&]<typename T>(const uint64_t address, const T& value) {
+                if (!is_writable_range(memory, address, sizeof(T)))
+                {
+                    return false;
+                }
+
+                emulator_object<T>{memory, address}.write(value);
+                return true;
+            };
+
+            return store(key_context, message.key_context) && store(apc_context, message.apc_context) &&
+                           store(io_status_block, message.io_status_block)
+                       ? STATUS_SUCCESS
+                       : STATUS_ACCESS_VIOLATION;
+        }
+
+        NTSTATUS write_entries(memory_manager& memory, const uint64_t entries, const uint64_t entries_removed,
+                               const std::span<const io_completion_message> messages)
+        {
+            using entry_type = FILE_IO_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>;
+
+            auto status = STATUS_SUCCESS;
+            for (size_t i = 0; i < messages.size(); ++i)
+            {
+                const auto entry = entries + i * sizeof(entry_type);
+                if (write_message(memory, entry + offsetof(entry_type, KeyContext), entry + offsetof(entry_type, ApcContext),
+                                  entry + offsetof(entry_type, IoStatusBlock), messages[i]) != STATUS_SUCCESS)
+                {
+                    status = STATUS_ACCESS_VIOLATION;
+                }
+            }
+
+            if (status != STATUS_SUCCESS || !is_writable_range(memory, entries_removed, sizeof(ULONG)))
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            emulator_object<ULONG>{memory, entries_removed}.write(static_cast<ULONG>(messages.size()));
+            return STATUS_SUCCESS;
         }
 
         bool is_wait_completion_target_type(const handle target_object_handle)
@@ -279,35 +497,15 @@ namespace sogen
 
         void materialize_signaled_wait_packets(windows_emulator& win_emu, const handle io_completion_handle)
         {
-            auto& process = win_emu.process;
-            auto* completion = process.io_completions.get(io_completion_handle);
-            if (!completion)
+            if (win_emu.process.io_completions.get(io_completion_handle))
             {
-                return;
+                queue_signaled_wait_packets(win_emu, io_completion_handle);
             }
+        }
 
-            for (auto& [packet_id, wait_packet] : process.wait_completion_packets)
-            {
-                if (!wait_packet.associated || wait_packet.queued_completion)
-                {
-                    continue;
-                }
-
-                if (wait_packet.io_completion_handle != io_completion_handle)
-                {
-                    continue;
-                }
-
-                if (!is_wait_completion_target_signaled(win_emu, wait_packet.target_object_handle))
-                {
-                    continue;
-                }
-
-                consume_wait_completion_target(process, wait_packet.target_object_handle);
-
-                enqueue_wait_packet_completion(process, *completion, process.wait_completion_packets.make_handle(packet_id), wait_packet);
-                wait_packet.queued_completion = true;
-            }
+        void materialize_all_signaled_wait_packets(windows_emulator& win_emu)
+        {
+            queue_signaled_wait_packets(win_emu, std::nullopt);
         }
 
         bool dequeue_io_completion_message(windows_emulator& win_emu, const handle io_completion_handle, io_completion_message& out_message)
@@ -326,50 +524,33 @@ namespace sogen
                 return false;
             }
 
-            worker_factory_support::on_io_completion_message_dequeued(process, out_message);
+            worker_factory_support::on_io_completion_message_dequeued(win_emu, out_message);
             clear_wait_packet_completion_state(process, out_message.wait_packet_handle);
             return true;
         }
 
-        ULONG dequeue_io_completion_entries(windows_emulator& win_emu, const handle io_completion_handle,
-                                            const emulator_object<FILE_IO_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>> out_entries,
-                                            const ULONG max_count)
+        std::vector<io_completion_message> dequeue_io_completion_entries(windows_emulator& win_emu, const handle io_completion_handle,
+                                                                         const ULONG max_count)
         {
             auto& process = win_emu.process;
-            if (max_count == 0 || !out_entries)
-            {
-                return 0;
-            }
-
+            std::vector<io_completion_message> messages{};
             auto* completion = process.io_completions.get(io_completion_handle);
             if (!completion)
             {
-                return 0;
+                return messages;
             }
 
             materialize_signaled_wait_packets(win_emu, io_completion_handle);
 
-            ULONG removed = 0;
-            for (; removed < max_count; ++removed)
+            io_completion_message message{};
+            while (messages.size() < max_count && completion->dequeue(message))
             {
-                io_completion_message message{};
-                if (!completion->dequeue(message))
-                {
-                    break;
-                }
-
-                worker_factory_support::on_io_completion_message_dequeued(process, message);
-
-                FILE_IO_COMPLETION_INFORMATION<EmulatorTraits<Emu64>> entry{};
-                entry.KeyContext = message.key_context;
-                entry.ApcContext = message.apc_context;
-                entry.IoStatusBlock = message.io_status_block;
-                out_entries.write(entry, removed);
-
+                worker_factory_support::on_io_completion_message_dequeued(win_emu, message);
                 clear_wait_packet_completion_state(process, message.wait_packet_handle);
+                messages.push_back(message);
             }
 
-            return removed;
+            return messages;
         }
     }
 

@@ -103,12 +103,18 @@ def main() -> None:
             listed = run(analyzer.parent / "ttd-inspect.exe", path, "regions", str(position))
             assert len(listed.splitlines()) == len(regions) + 1, listed
 
-            # memory_at knows every byte of committed memory (from accesses, else from the checkpoint), as replayed. The
-            # bottom of the first thread's stack is never touched: only the checkpoint shows it.
+            # memory_at knows every byte of committed memory (from accesses, else from the checkpoint), as replayed. Some
+            # committed memory is never touched: only the checkpoint shows it. (Not the stack's StackLimit: stacks grow
+            # on guard-page faults, so the bottom of the committed stack is where a growing stack writes.)
             assert trace.has_checkpoint_memory
-            bottom = stacks[0].stack_limit
-            assert not trace.accesses(bottom, 0x100), position
-            assert bytes(trace.memory_at(position, bottom, 0x100)) == emulator.memory.read_memory(bottom, 0x100), position
+            readable = {0x02, 0x04, 0x20, 0x40}
+            untouched = next((address for region in regions
+                              if region.state == mem_commit and region.protection in readable
+                              for address in range(region.address, region.address + region.size, 0x1000)
+                              if not trace.accesses(address, 0x100)), None)
+            assert untouched is not None, position
+            assert bytes(trace.memory_at(position, untouched, 0x100)) == emulator.memory.read_memory(untouched, 0x100), (
+                hex(untouched), position)
             # A code page executed throughout the trace reads from the checkpoint and the writes since, as replayed.
             hot = next(m.base + e.rva for m, e in trace.find_exports("ntdll.dll!RtlAllocateHeap") if e.forwarder is None) & ~0xFFF
             assert bytes(trace.memory_at(position, hot, 0x1000)) == emulator.memory.read_memory(hot, 0x1000), position

@@ -306,9 +306,14 @@ namespace sogen
         this->path_mapping_[key] = value;
     }
 
-    utils::path_key registry_manager::get_full_key_path(const registry_key& key)
+    const utils::path_key& registry_manager::get_full_key_path(const registry_key& key)
     {
-        return utils::path_key{key.hive.get() / key.path.get()};
+        if (!key.full_path)
+        {
+            key.full_path = utils::path_key{key.hive.get() / key.path.get()};
+        }
+
+        return *key.full_path;
     }
 
     uint64_t registry_manager::get_generation(const utils::path_key& full_path) const
@@ -362,7 +367,7 @@ namespace sogen
             return true;
         }
 
-        const auto full_path = registry_manager::get_full_key_path(key);
+        const auto& full_path = registry_manager::get_full_key_path(key);
         if (key.generation != this->get_generation(full_path) || this->is_deleted_hive_key(full_path))
         {
             return false;
@@ -679,8 +684,10 @@ namespace sogen
 
     void registry_manager::deserialize_runtime_state(utils::buffer_deserializer& buffer)
     {
-        buffer.read_map(this->overlay_values_);
-        buffer.read_map(this->key_generations_);
+        auto values = buffer.read_map<decltype(this->overlay_values_)>();
+        auto generations = buffer.read_map<decltype(this->key_generations_)>();
+        this->overlay_values_ = std::move(values);
+        this->key_generations_ = std::move(generations);
     }
 
     registry_manager::hive_map::iterator registry_manager::find_hive(const utils::path_key& key)
@@ -711,13 +718,14 @@ namespace sogen
 
     std::optional<exposed_hive_key> registry_manager::get_hive_key(const registry_key& key)
     {
-        const auto iterator = this->hives_.find(key.hive);
-        if (iterator == this->hives_.end())
+        if (!key.backing_key)
         {
-            return std::nullopt;
+            const auto iterator = this->hives_.find(key.hive);
+            auto* hive = iterator == this->hives_.end() ? nullptr : iterator->second.get();
+            key.backing_key = std::pair{hive, hive ? hive->get_sub_key(key.path.get()) : nullptr};
         }
 
-        auto* hive_key = iterator->second->get_sub_key(key.path.get());
+        const auto [hive, hive_key] = *key.backing_key;
         if (!hive_key)
         {
             return std::nullopt;
@@ -725,7 +733,7 @@ namespace sogen
 
         return exposed_hive_key{
             .key = *hive_key,
-            .file = iterator->second->get_file(),
+            .file = hive->get_file(),
         };
     }
 

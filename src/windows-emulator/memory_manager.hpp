@@ -175,6 +175,10 @@ namespace sogen
         // the GPU bridge uses these to make guest writes visible to the host GPU on backends (e.g. KVM) that
         // alias host memory into the guest non-coherently.
         bool host_memory_aliasing_is_coherent() const override;
+        bool supports_page_granular_protection() const override;
+        bool supports_restartable_faults() const override;
+        // Whether a guard page below a thread stack can grow the stack: it has to fault, and the access has to run again.
+        bool supports_guarded_stack_growth() const;
         void flush_host_memory_cache(const void* host_pointer, size_t size) override;
         bool track_access(uint64_t address, size_t size) override;
         void take_written_ranges(uint64_t address, size_t size,
@@ -275,6 +279,7 @@ namespace sogen
         memory_interface* memory_{};
         reserved_region_map reserved_regions_{};
         std::atomic<std::uint64_t> layout_version_{0};
+        mutable std::atomic_bool page_granular_protection_lost_{false};
         std::uint64_t default_allocation_address_{0x100000000ULL};
         bool dep_enabled_{true};
         bool execute_implies_read_{false};

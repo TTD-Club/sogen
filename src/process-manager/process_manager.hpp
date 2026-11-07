@@ -110,6 +110,8 @@ namespace sogen
         uint64_t standard_error{};
         std::vector<process_inherited_pipe> inherited_pipes{};
         bool debugged{};
+        uint32_t parent_process_id{};
+        std::vector<uint8_t> registry_state{};
     };
 
     struct process_create_result
@@ -269,6 +271,12 @@ namespace sogen
                                                      memory_permission permission) = 0;
         virtual process_memory_read_result read_memory(managed_process process, uint64_t address, uint64_t size) const = 0;
         virtual process_memory_result write_memory(managed_process process, uint64_t address, std::span<const uint8_t> data) = 0;
+
+        // On Windows a child outlives the process that created it, so a host process that ends with its guest stays behind
+        // as the broker of the children it started until they have exited.
+        virtual void wait_for_processes()
+        {
+        }
 
         virtual process_debug_event_result next_debug_event(managed_process /*process*/)
         {

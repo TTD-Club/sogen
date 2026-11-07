@@ -85,11 +85,12 @@ namespace sogen
         {
             static_assert(std::is_base_of_v<observation_event, Event>);
 
-            Event event{};
+            analysis_event wrapped{std::in_place_type<Event>};
+            auto& event = std::get<Event>(wrapped);
             initialize(event);
             event.header = this->make_event_header();
             event.execution = std::move(context);
-            this->emit_event(event);
+            this->emit_event(wrapped);
         }
 
         template <typename Event>
@@ -109,10 +110,11 @@ namespace sogen
         {
             static_assert(std::is_base_of_v<summary_event, Event>);
 
-            Event event{};
+            analysis_event wrapped{std::in_place_type<Event>};
+            auto& event = std::get<Event>(wrapped);
             initialize(event);
             event.header = this->make_event_header();
-            this->emit_event(event);
+            this->emit_event(wrapped);
         }
 
         template <typename Event>
