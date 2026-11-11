@@ -372,6 +372,11 @@ namespace sogen
                     return {};
                 }
 
+                bool is_host_timed() const override
+                {
+                    return false;
+                }
+
                 int poll_sockets(std::span<poll_entry> entries) override
                 {
                     int ready_count = 0;
