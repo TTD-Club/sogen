@@ -147,6 +147,17 @@ namespace sogen::test
         EXPECT_FALSE(this->thread->await_host_condition);
     }
 
+    TEST_F(IdleSchedulerTest, RelativeTimeWakesAWaitDueNowAfterOneTick)
+    {
+        this->create(true);
+        const auto deadline = this->emu->clock().steady_now();
+        this->thread->await_time = deadline;
+        EXPECT_TRUE(this->emu->perform_thread_switch(this->emu->vcpu(0)));
+        EXPECT_FALSE(this->thread->await_time.has_value());
+        EXPECT_GT(this->emu->clock().steady_now(), deadline);
+        EXPECT_LT(this->emu->clock().steady_now() - deadline, std::chrono::seconds(1));
+    }
+
     TEST_F(IdleSchedulerTest, StopEndsParkedFileWait)
     {
 #ifdef __EMSCRIPTEN__
