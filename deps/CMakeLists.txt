@@ -163,4 +163,7 @@ set(ENABLE_TESTING OFF)
 set(GEN_FILES OFF)
 set(USE_STATIC_MBEDTLS_LIBRARY ON)
 set(USE_SHARED_MBEDTLS_LIBRARY OFF)
+# A normal variable over Mbed TLS's cache option (CMP0126 NEW), so that it holds for every build directory.
+set(CMAKE_POLICY_DEFAULT_CMP0126 NEW)
+set(MBEDTLS_USER_CONFIG_FILE "${CMAKE_CURRENT_LIST_DIR}/mbedtls_user_config.h")
 add_subdirectory(mbedtls EXCLUDE_FROM_ALL)

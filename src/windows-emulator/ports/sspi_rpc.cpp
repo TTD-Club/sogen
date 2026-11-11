@@ -203,16 +203,31 @@ namespace sogen
                 std::string target{};
                 std::unique_ptr<sspi::tls_client> tls{};
                 bool finalized{};
+                // A reproducible handshake's seed and the tokens it has processed: a load makes the same handshake
+                // again from them, as mbedTLS's own state cannot be saved.
+                std::optional<sspi::tls_client::reproducible> seed{};
+                std::vector<std::vector<uint8_t>> inputs{};
 
                 void serialize(utils::buffer_serializer& buffer) const
                 {
-                    if (this->tls)
+                    if (this->tls && !this->seed)
                     {
                         throw std::runtime_error("Cannot snapshot an active SSPI TLS handshake");
                     }
                     buffer.write(this->handle);
                     buffer.write_string(this->target);
                     buffer.write(this->finalized);
+                    buffer.write(this->tls != nullptr);
+                    if (this->tls)
+                    {
+                        buffer.write(this->seed->seed);
+                        buffer.write(this->seed->time);
+                        buffer.write(static_cast<uint64_t>(this->inputs.size()));
+                        for (const auto& input : this->inputs)
+                        {
+                            buffer.write_vector(input);
+                        }
+                    }
                 }
 
                 void deserialize(utils::buffer_deserializer& buffer)
@@ -221,6 +236,30 @@ namespace sogen
                     buffer.read_string(this->target);
                     buffer.read(this->finalized);
                     this->tls.reset();
+                    this->seed.reset();
+                    this->inputs.clear();
+                    if (!buffer.read<bool>())
+                    {
+                        return;
+                    }
+
+                    this->seed.emplace();
+                    buffer.read(this->seed->seed);
+                    buffer.read(this->seed->time);
+                    this->inputs.resize(static_cast<size_t>(buffer.read<uint64_t>()));
+                    for (auto& input : this->inputs)
+                    {
+                        buffer.read_vector(input);
+                    }
+                    this->tls = sspi::tls_client::create(this->target, this->seed);
+                    if (!this->tls)
+                    {
+                        throw std::runtime_error("Cannot restore an SSPI TLS handshake");
+                    }
+                    for (const auto& input : this->inputs)
+                    {
+                        (void)this->tls->process(input);
+                    }
                 }
             };
 
@@ -944,7 +983,19 @@ namespace sogen
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
-                    auto tls = sspi::tls_client::create(request.target);
+                    // A reproducible run makes the same handshake again, after a restore too.
+                    std::optional<sspi::tls_client::reproducible> seed{};
+                    if (win_emu.uses_relative_time())
+                    {
+                        seed.emplace();
+                        const auto instructions = win_emu.get_executed_instructions();
+                        const auto context_upper = this->next_context_upper_;
+                        std::memcpy(seed->seed.data(), &instructions, sizeof(instructions));
+                        std::memcpy(seed->seed.data() + sizeof(instructions), &context_upper, sizeof(context_upper));
+                        seed->time =
+                            std::chrono::duration_cast<std::chrono::seconds>(win_emu.clock().system_now().time_since_epoch()).count();
+                    }
+                    auto tls = sspi::tls_client::create(request.target, seed);
                     if (!tls)
                     {
                         return write_context_reply(writer, 0, {}, 0, 0, {}, k_illegal_message, 0) ? STATUS_SUCCESS
@@ -957,6 +1008,7 @@ namespace sogen
                                                   .handle = {.lower = k_context_lower, .upper = context_upper},
                                                   .target = request.target,
                                                   .tls = std::move(tls),
+                                                  .seed = seed,
                                               })
                                      .first;
                     context = &entry->second;
@@ -979,6 +1031,10 @@ namespace sogen
                     input = buffer_payload(request, request.buffers[0]);
                 }
 
+                if (context->seed)
+                {
+                    context->inputs.emplace_back(input.begin(), input.end());
+                }
                 auto result = context->tls->process(input);
                 if (result.output_token.size() > std::numeric_limits<uint32_t>::max() ||
                     result.missing_size > std::numeric_limits<uint32_t>::max() || result.extra_size > std::numeric_limits<uint32_t>::max())
@@ -989,6 +1045,7 @@ namespace sogen
                 if (result.status == sspi::handshake_status::failed)
                 {
                     context->tls.reset();
+                    context->inputs.clear();
                     context->finalized = true;
                     return write_context_reply(writer, 0, result.output_token, 0, 0, context->handle, k_illegal_message, 0)
                                ? STATUS_SUCCESS
@@ -1027,6 +1084,7 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
                 context->tls.reset();
+                context->inputs.clear();
                 context->finalized = true;
                 return STATUS_SUCCESS;
             }

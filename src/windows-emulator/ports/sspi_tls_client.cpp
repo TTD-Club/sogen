@@ -2,11 +2,29 @@
 #include "sspi_tls_client.hpp"
 
 #include <mbedtls/ctr_drbg.h>
+#include <mbedtls/platform_time.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ssl.h>
 
 namespace sogen::sspi
 {
+    namespace
+    {
+        // The time a handshake step of a reproducible client takes instead of the host's.
+        thread_local std::optional<int64_t> handshake_time{};
+
+        mbedtls_time_t current_time(mbedtls_time_t* timer)
+        {
+            const auto now =
+                handshake_time ? static_cast<mbedtls_time_t>(*handshake_time) : static_cast<mbedtls_time_t>(std::time(nullptr));
+            if (timer)
+            {
+                *timer = now;
+            }
+            return now;
+        }
+    }
+
     struct tls_client::impl
     {
         mbedtls_ssl_context ssl{};
@@ -22,6 +40,7 @@ namespace sogen::sspi
         std::array<uint8_t, 32> client_random{};
         std::array<uint8_t, 32> server_random{};
         mbedtls_tls_prf_types prf{MBEDTLS_SSL_TLS_PRF_NONE};
+        std::optional<reproducible> fixed{};
         bool exported{};
         bool complete{};
         bool handoff_taken{};
@@ -124,7 +143,9 @@ namespace sogen::sspi
         {
             const size_t output_start = output_bytes.size();
             output = &output_bytes;
+            handshake_time = fixed ? std::optional<int64_t>(fixed->time) : std::nullopt;
             const int status = mbedtls_ssl_handshake(&ssl);
+            handshake_time.reset();
             output = nullptr;
             if (!count_outbound(std::span<const uint8_t>{output_bytes}.subspan(output_start)))
             {
@@ -190,8 +211,9 @@ namespace sogen::sspi
         }
     };
 
-    std::unique_ptr<tls_client> tls_client::create(const std::string_view target)
+    std::unique_ptr<tls_client> tls_client::create(const std::string_view target, const std::optional<reproducible>& fixed)
     {
+        mbedtls_platform_set_time(current_time);
         if (target.empty() || target.find('\0') != std::string_view::npos)
         {
             return nullptr;
@@ -201,10 +223,23 @@ namespace sogen::sspi
         constexpr std::string_view personalization = "sogen-sspi-tls-client";
         static constexpr std::array cipher_suites{MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
                                                   MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, 0};
-        if (mbedtls_ctr_drbg_seed(&state->random, mbedtls_entropy_func, &state->entropy,
-                                  reinterpret_cast<const unsigned char*>(personalization.data()), personalization.size()) != 0 ||
-            mbedtls_ssl_config_defaults(&state->config, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) !=
-                0)
+        state->fixed = fixed;
+        const auto fixed_entropy = [](void* context, unsigned char* output, const size_t size) {
+            const auto& bytes = *static_cast<std::array<uint8_t, 48>*>(context);
+            if (size > bytes.size())
+            {
+                return MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
+            }
+            std::memcpy(output, bytes.data(), size);
+            return 0;
+        };
+        const auto seeded =
+            state->fixed ? mbedtls_ctr_drbg_seed(&state->random, fixed_entropy, &state->fixed->seed,
+                                                 reinterpret_cast<const unsigned char*>(personalization.data()), personalization.size())
+                         : mbedtls_ctr_drbg_seed(&state->random, mbedtls_entropy_func, &state->entropy,
+                                                 reinterpret_cast<const unsigned char*>(personalization.data()), personalization.size());
+        if (seeded != 0 || mbedtls_ssl_config_defaults(&state->config, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
+                                                       MBEDTLS_SSL_PRESET_DEFAULT) != 0)
         {
             return nullptr;
         }
