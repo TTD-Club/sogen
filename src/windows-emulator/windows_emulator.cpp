@@ -410,7 +410,7 @@ namespace sogen
         {
             std::optional<std::chrono::steady_clock::time_point> deadline{};
             const auto consider = [&](const std::optional<std::chrono::steady_clock::time_point>& time) {
-                if (time.has_value() && *time > now && (!deadline || *time < *deadline))
+                if (time.has_value() && *time >= now && (!deadline || *time < *deadline))
                 {
                     deadline = *time;
                 }
