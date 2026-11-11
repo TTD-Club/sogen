@@ -282,6 +282,11 @@ namespace sogen::ttd
     std::vector<std::byte> encode_registry_hives(std::span<const recorded_hive_file> hives);
     std::vector<recorded_hive_file> decode_registry_hives(std::span<const std::byte> compressed);
 
+    // The network_inputs section: zstd over the first position and the input count, then per input its call (one
+    // byte), stream, argument, zigzagged value and data size as varints, and the data.
+    std::vector<std::byte> encode_network_inputs(const network_inputs& inputs);
+    network_inputs decode_network_inputs(std::span<const std::byte> compressed);
+
     // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
     // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.
     // The register snapshots section is a zstd frame of varints: the entry count, then per entry the step and

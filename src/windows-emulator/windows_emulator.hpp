@@ -370,6 +370,18 @@ namespace sogen
             return *this->socket_factory_;
         }
 
+        // Puts a socket factory and DNS lookup in place of the current ones and returns those, for a front end that
+        // records or replays the host network (a TTD trace). Sockets the old factory made stay as they are.
+        std::pair<std::unique_ptr<network::socket_factory>, std::unique_ptr<network::dns_lookup>> exchange_network(
+            std::unique_ptr<network::socket_factory> factory, std::unique_ptr<network::dns_lookup> lookup)
+        {
+            if (!factory || !lookup)
+            {
+                throw std::invalid_argument("A network needs a socket factory and a DNS lookup");
+            }
+            return {std::exchange(this->socket_factory_, std::move(factory)), std::exchange(this->dns_lookup_, std::move(lookup))};
+        }
+
         ui_backend& ui()
         {
             return *this->ui_backend_;

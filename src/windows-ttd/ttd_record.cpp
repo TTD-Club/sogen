@@ -342,6 +342,9 @@ namespace sogen::ttd
         // This also makes the initial process/thread state explicit in the snapshot.
         emu_.setup_process_if_necessary();
         instruction_ip_ = emu_.active_cpu().read_instruction_pointer();
+        // Before the first checkpoint, whose sockets are then recorded ones.
+        network_recording_.tap = install_network_tap(emu_);
+        network_recording_.tap->start_recording(network_inputs_);
         write_checkpoint(emu_.get_executed_instructions());
 
         auto& cpu = emu_.emu();
@@ -997,6 +1000,11 @@ namespace sogen::ttd
             return;
         }
         finished_ = true;
+        if (network_recording_.tap)
+        {
+            network_recording_.tap->stop_recording();
+            network_recording_.tap.reset();
+        }
         syscall_enter_.reset();
         syscall_exit_.reset();
         module_load_.reset();
@@ -1077,6 +1085,8 @@ namespace sogen::ttd
         }
         const auto hives = encode_registry_hives(hive_files);
         hive_files.clear();
+        const auto network = encode_network_inputs(network_inputs_);
+        network_inputs_ = {};
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -1098,6 +1108,7 @@ namespace sogen::ttd
             section_entry{.type = section_type::memory_regions, .offset = append_to_file(regions), .size = regions.size()},
             section_entry{.type = section_type::checkpoint_memory, .offset = append_to_file(memory_offsets), .size = memory_offsets.size()},
             section_entry{.type = section_type::registry_hives, .offset = append_to_file(hives), .size = hives.size()},
+            section_entry{.type = section_type::network_inputs, .offset = append_to_file(network), .size = network.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -1530,6 +1541,11 @@ namespace sogen::ttd
         execute_hook_.remove();
         instruction_callback_.reset();
         host_write_hook_.remove();
+        // A network replay that asked something else is why any later difference arose.
+        if (const auto tap = find_network_tap(emu_); tap && tap->error())
+        {
+            throw divergence_error(*tap->error());
+        }
         if (error_)
         {
             throw divergence_error(*error_);

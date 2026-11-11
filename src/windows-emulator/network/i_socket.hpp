@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <optional>
 #include <span>
 #include <network/socket.hpp>
 
@@ -39,6 +41,14 @@ namespace sogen
             {
                 (void)data;
                 return -1;
+            }
+
+            // The recorded stream of a socket whose host side is recorded or replayed (a TTD trace's network input).
+            // A saved state keeps only this of it: the host is not asked about the connection, and a load continues
+            // the stream through socket_factory::restore_socket instead of setting up a host socket again.
+            virtual std::optional<uint64_t> recorded_stream() const
+            {
+                return std::nullopt;
             }
         };
     }

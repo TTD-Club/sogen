@@ -513,6 +513,14 @@ namespace sogen::ttd
                 }
                 registry_hives_ = read_bytes(section.offset, section.size);
             }
+            else if (section.type == section_type::network_inputs)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                network_inputs_ = std::make_shared<const network_inputs>(decode_network_inputs(read_bytes(section.offset, section.size)));
+            }
             else if (section.type == section_type::modules || section.type == section_type::threads ||
                      section.type == section_type::exports || section.type == section_type::export_forwarders ||
                      section.type == section_type::module_machines)

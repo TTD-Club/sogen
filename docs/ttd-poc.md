@@ -215,8 +215,8 @@ environment's input to the guest. The trace stores every host write's bytes
 and, for every dispatched syscall, the events its handler produced and the
 value it left in RAX (the `syscalls` section). A replay checks each syscall as
 one unit when its handler returns. If its live events or result differ from the
-recording (a live DNS answer, a host-assigned UDP port, a file that no longer
-exists), the replay undoes the handler's live host writes (newest first,
+recording (a file that no longer exists; a live DNS answer or a host-assigned
+UDP port in traces without network inputs), the replay undoes the handler's live host writes (newest first,
 restoring the bytes each replaced), applies the recorded ones, and sets RAX to
 the recorded result, so the guest continues with what it saw while recording.
 A host write outside a syscall (exception dispatch, window messages) that
@@ -614,6 +614,24 @@ found through the section table (24-byte entries `type, offset, size`):
   it read. Size: ttd-step-sample 87 KB (1% of the trace), test-sample 208 KB
   (0.5%). SAM and SECURITY contribute only their signature and root key
   block (340 bytes each) unless the guest opens them. `Trace.has_registry_hives`.
+- Network inputs (type 20, size = compressed bytes; absent in traces recorded
+  before 2026-11-11): every answer the host network gave the emulator while
+  recording, in the order it was asked: socket creation, polls (with how long
+  a live socket was given to become ready), connects, sends and receives with
+  the received bytes, addresses, the local address list, and DNS lookups. A
+  zstd frame: the first input position and the input count as varints, then
+  per input its call (one byte), the socket's stream, the argument (a size,
+  flag or hash of what was asked), the zigzagged answer, and the data size as
+  varints, followed by the data. The recorder puts a tap (`ttd_network.hpp`) in
+  place of the emulator's socket factory and DNS lookup; seeks and replays
+  (`ttd::use_recorded_network`) give the recorded answers instead of asking
+  the host, and stop when the replay asks something else. The emulator's
+  state keeps its input position, and a socket keeps its stream instead of
+  its host connection, so a checkpoint or keyframe continues the streams. A
+  replay therefore needs no network, and `--network` does not matter for it.
+  After a seek, sockets the replay made have no host socket: a fork's guest
+  sees them as reset connections and makes new ones live.
+  `tools/ttd_format.py`: `Trace.network_inputs`.
 
 Unknown section types are ignored, so sections can be added without a new
 version. The library reads versions 1-4 and 7-9 (`ttd::is_supported_trace_version`;

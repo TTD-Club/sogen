@@ -1670,6 +1670,52 @@ namespace sogen::ttd
         return hives;
     }
 
+    std::vector<std::byte> encode_network_inputs(const network_inputs& inputs)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, inputs.first_position);
+        put_varint(raw, inputs.inputs.size());
+        for (const auto& input : inputs.inputs)
+        {
+            raw.push_back(static_cast<std::byte>(input.call));
+            put_varint(raw, input.stream);
+            put_varint(raw, input.argument);
+            put_varint(raw, zigzag(static_cast<uint64_t>(input.value)));
+            put_varint(raw, input.data.size());
+            raw.insert(raw.end(), input.data.begin(), input.data.end());
+        }
+        return compress_table(raw, "network inputs");
+    }
+
+    network_inputs decode_network_inputs(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        network_inputs result{};
+        result.first_position = reader.varint();
+        const auto count = reader.varint();
+        if (count > raw.size())
+        {
+            throw std::runtime_error("Invalid TTD network inputs");
+        }
+        result.inputs.resize(static_cast<size_t>(count));
+        for (auto& input : result.inputs)
+        {
+            const auto call = reader.bytes(1);
+            input.call = static_cast<network_call>(call[0]);
+            input.stream = reader.varint();
+            input.argument = reader.varint();
+            input.value = static_cast<int64_t>(unzigzag(reader.varint()));
+            const auto data = reader.bytes(reader.varint());
+            input.data.assign(data.begin(), data.end());
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD network inputs");
+        }
+        return result;
+    }
+
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)
     {
         std::vector<std::byte> filtered(data.begin(), data.end());
