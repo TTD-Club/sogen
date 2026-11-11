@@ -25,6 +25,12 @@ namespace sogen
             virtual std::unique_ptr<i_socket> create_socket(int af, int type, int protocol);
             virtual int poll_sockets(std::span<poll_entry> entries);
             virtual std::vector<address> get_local_addresses(int family);
+
+            // Whether a socket becomes ready on the host's time, not only through what the guest does.
+            virtual bool is_host_timed() const
+            {
+                return true;
+            }
         };
 
         std::unique_ptr<socket_factory> create_socket_factory(network_mode mode);

@@ -501,11 +501,13 @@ namespace sogen
             std::optional<io_device_context> delayed_ioctl_{};
             handle retained_completion_port_{};
             std::optional<std::chrono::steady_clock::time_point> timeout_{};
+            std::optional<std::chrono::steady_clock::time_point> host_deadline_{};
             std::optional<std::function<void(windows_emulator&, const io_device_context&)>> timeout_callback_{};
 
             std::unordered_map<LONG, pending_connection> pending_connections_{};
             LONG next_sequence_{0};
 
+            static constexpr auto host_wait_budget = std::chrono::seconds(10);
             static constexpr ULONG max_stream_buffer_count = 1024;
 
             // Stream operations may complete partially, so cap staging allocations instead of trusting guest-provided WSABUF lengths.
@@ -531,6 +533,7 @@ namespace sogen
                 io_device_context context;
                 std::optional<std::chrono::steady_clock::time_point> timeout{};
                 handle retained_completion_port{};
+                std::optional<std::chrono::steady_clock::time_point> host_deadline{};
 
                 pending_poll(memory_interface& emu)
                     : context(emu)
@@ -666,6 +669,39 @@ namespace sogen
                 return STATUS_PENDING;
             }
 
+            // The relative clock runs on executed instructions, so a live socket's latency would pass as far more guest time
+            // than it takes, and the guest's timeouts would expire before the host has answered. Without guest time
+            // passing, a pending request waits for the host for up to a budget of real time (and no longer than its own
+            // timeout). Whether this returns true decides whether to look again.
+            static bool wait_for_host(windows_emulator& win_emu, std::optional<std::chrono::steady_clock::time_point>& deadline,
+                                      const std::optional<std::chrono::steady_clock::time_point>& guest_timeout)
+            {
+                if (!win_emu.uses_relative_time() || !win_emu.socket_factory().is_host_timed())
+                {
+                    return false;
+                }
+
+                const auto now = std::chrono::steady_clock::now();
+                if (!deadline)
+                {
+                    auto budget = std::chrono::duration_cast<std::chrono::steady_clock::duration>(host_wait_budget);
+                    if (guest_timeout)
+                    {
+                        budget =
+                            std::clamp(*guest_timeout - win_emu.clock().steady_now(), std::chrono::steady_clock::duration::zero(), budget);
+                    }
+                    deadline = now + budget;
+                }
+
+                if (now >= *deadline)
+                {
+                    return false;
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                return true;
+            }
+
             // Completes the pending polls whose sockets are ready or whose time is up.
             void work_polls(windows_emulator& win_emu)
             {
@@ -674,6 +710,10 @@ namespace sogen
                     const auto [info, handles] = get_poll_info<Traits>(win_emu, it->context);
                     const auto endpoints = resolve_endpoints(win_emu, handles);
                     auto status = perform_poll(win_emu, it->context, endpoints, handles);
+                    while (status == STATUS_PENDING && wait_for_host(win_emu, it->host_deadline, it->timeout))
+                    {
+                        status = perform_poll(win_emu, it->context, endpoints, handles);
+                    }
 
                     if (status == STATUS_PENDING)
                     {
@@ -760,6 +800,7 @@ namespace sogen
                 io_completion_wait::release_handle_reference(win_emu.process, this->retained_completion_port_);
                 this->timeout_callback_ = {};
                 this->timeout_ = {};
+                this->host_deadline_ = {};
                 this->require_poll_ = {};
                 this->delayed_ioctl_ = {};
                 this->delayed_request_ = {};
@@ -903,11 +944,19 @@ namespace sogen
                 {
                     pfd.events = static_cast<int16_t>(pfd.events | map_afd_request_events_to_socket(this->event_select_mask_));
                 }
-                pfd.revents = pfd.events;
+                const auto requested_events = pfd.events;
+                const auto delayed_events = static_cast<int16_t>(
+                    this->delayed_ioctl_ && this->require_poll_ ? (*this->require_poll_ ? POLLIN : POLLOUT) | POLLHUP | POLLERR : 0);
 
-                if (pfd.events != 0)
+                while (requested_events != 0)
                 {
+                    pfd.revents = requested_events;
                     win_emu.socket_factory().poll_sockets(std::span{&pfd, 1});
+                    if (!delayed_events || (pfd.revents & delayed_events) || this->connect_failed_ ||
+                        !wait_for_host(win_emu, this->host_deadline_, this->timeout_))
+                    {
+                        break;
+                    }
                 }
 
                 const auto socket_events = static_cast<int16_t>(pfd.revents | (this->connect_failed_ ? POLLERR : 0));
