@@ -21,6 +21,11 @@
 namespace sogen
 {
     constexpr auto MAX_INSTRUCTIONS_PER_TIME_SLICE = 0x20000;
+
+    // The relative clock ticks once per instruction (and per idle tick). At a rate near what the emulator runs, the guest's
+    // timeouts last about as long as they do in real time: work another thread does meanwhile doesn't use them up.
+    constexpr uint64_t RELATIVE_TICKS_PER_SECOND = 100'000'000;
+    using relative_tick = std::chrono::duration<int64_t, std::ratio<1, RELATIVE_TICKS_PER_SECOND>>;
     constexpr auto MAX_BASIC_BLOCKS_PER_TIME_SLICE = 0x8000;
 
     namespace
@@ -721,7 +726,7 @@ namespace sogen
             const system_time_point* system_start_{};
 
             instruction_tick_clock(const uint64_t& instructions, const uint64_t& idle_ticks, const system_time_point& system_start)
-                : tick_clock(1000),
+                : tick_clock(RELATIVE_TICKS_PER_SECOND),
                   instructions_(&instructions),
                   idle_ticks_(&idle_ticks),
                   system_start_(&system_start)
@@ -1110,17 +1115,18 @@ namespace sogen
                 }
             }
 
-            // Under relative time, idling skips to the next deadline (at most a time slice ahead), so that waits and
-            // timers wake in the order of their due times. The relative clock ticks once per millisecond.
-            uint64_t idle_advance = MAX_INSTRUCTIONS_PER_TIME_SLICE;
+            // Under relative time, idling skips to the next deadline (at most about two minutes ahead), so that waits and
+            // timers wake in the order of their due times.
+            constexpr auto max_idle_advance = static_cast<uint64_t>(std::chrono::ceil<relative_tick>(std::chrono::seconds(131)).count());
+            uint64_t idle_advance = max_idle_advance;
             if (this->use_relative_time_)
             {
                 const auto now = this->clock_->steady_now();
                 if (const auto deadline = next_deadline(this->process, now))
                 {
                     // One tick past it: timed-out waits compare strictly.
-                    const auto until = std::chrono::ceil<std::chrono::milliseconds>(*deadline - now).count();
-                    idle_advance = std::clamp<uint64_t>(static_cast<uint64_t>(until) + 1, 1, MAX_INSTRUCTIONS_PER_TIME_SLICE);
+                    const auto until = std::chrono::ceil<relative_tick>(*deadline - now).count();
+                    idle_advance = std::clamp<uint64_t>(static_cast<uint64_t>(until) + 1, 1, max_idle_advance);
                 }
             }
 
