@@ -1,4 +1,5 @@
 #include "../windows-emulator/ports/sspi_context.hpp"
+#include "../windows-emulator/ports/sspi_tls_client.hpp"
 
 #include <gtest/gtest.h>
 
@@ -155,4 +156,30 @@ TEST(sspi_context, counts_only_post_ccs_owned_records)
     ASSERT_EQ(framing.complete_size, finished_and_extra.size());
     ASSERT_FALSE(inbound.observe(finished_and_extra));
     EXPECT_EQ(inbound.value(), 1);
+}
+
+// A reproducible run must make the same handshake again (a TTD replay checks the client's tokens against the recorded
+// ones), so a fixed seed and time decide the ClientHello, random and key share included.
+TEST(sspi_context, reproducible_client_hello_depends_only_on_seed_and_time)
+{
+    const auto client_hello = [](const sogen::sspi::tls_client::reproducible& fixed) {
+        auto client = sogen::sspi::tls_client::create("example.com", fixed);
+        const auto result = client->process({});
+        EXPECT_EQ(sogen::sspi::handshake_status::continue_needed, result.status);
+        return result.output_token;
+    };
+
+    sogen::sspi::tls_client::reproducible fixed{.time = 0x6a000000};
+    fixed.seed[0] = 1;
+    const auto first = client_hello(fixed);
+    EXPECT_FALSE(first.empty());
+    EXPECT_EQ(first, client_hello(fixed));
+
+    auto other_seed = fixed;
+    other_seed.seed[0] = 2;
+    EXPECT_NE(first, client_hello(other_seed));
+
+    auto other_time = fixed;
+    other_time.time += 1;
+    EXPECT_NE(first, client_hello(other_time));
 }
