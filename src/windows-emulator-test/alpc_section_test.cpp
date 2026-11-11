@@ -73,7 +73,7 @@ namespace sogen::test
 
             template <typename Traits>
             NTSTATUS send_view(const ALPC_DATA_VIEW_ATTR<Traits>& view, ULONG allocated = ALPC_MESSAGE_VIEW_ATTRIBUTE,
-                               ULONG valid = ALPC_MESSAGE_VIEW_ATTRIBUTE)
+                               ULONG valid = ALPC_MESSAGE_VIEW_ATTRIBUTE, bool receive_attributes = false)
             {
                 emulator_object<ALPC_MESSAGE_ATTRIBUTES>{this->emu->memory, this->storage + 0x200}.write(
                     {.AllocatedAttributes = allocated, .ValidAttributes = valid});
@@ -92,7 +92,10 @@ namespace sogen::test
                 return syscalls::handle_NtAlpcSendWaitReceivePort(
                     this->context(), this->port_handle, 0, {this->emu->memory, this->storage + 0x400},
                     {this->emu->memory, this->storage + 0x200}, {this->emu->memory, this->storage + 0x800},
-                    {this->emu->memory, this->storage + 0x300}, {this->emu->memory}, {this->emu->memory});
+                    {this->emu->memory, this->storage + 0x300},
+                    receive_attributes ? emulator_object<ALPC_MESSAGE_ATTRIBUTES>{this->emu->memory, this->storage + 0x200}
+                                       : emulator_object<ALPC_MESSAGE_ATTRIBUTES>{this->emu->memory},
+                    {this->emu->memory});
             }
         };
     }
@@ -326,6 +329,18 @@ namespace sogen::test
         EXPECT_EQ(STATUS_SUCCESS, this->send_view(invalid, ALPC_MESSAGE_VIEW_ATTRIBUTE, 0));
         ASSERT_EQ(STATUS_SUCCESS, this->delete_view(view.ViewBase));
         EXPECT_EQ(STATUS_INVALID_PARAMETER, this->send_view(view));
+    }
+
+    // rpcrt4 receives the reply into the attributes it sent with; one without a view must not look like it has one.
+    TEST_F(AlpcSectionTest, ReplyWithoutViewClearsTheViewTheSendDescribed)
+    {
+        ASSERT_EQ(STATUS_SUCCESS, this->create_section(0x10000));
+        view_attributes view{};
+        ASSERT_EQ(STATUS_SUCCESS, this->create_view(1, view));
+        ASSERT_EQ(STATUS_SUCCESS, this->send_view(view, ALPC_MESSAGE_VIEW_ATTRIBUTE, ALPC_MESSAGE_VIEW_ATTRIBUTE, true));
+        const auto attributes = emulator_object<ALPC_MESSAGE_ATTRIBUTES>{this->emu->memory, this->storage + 0x200}.read();
+        EXPECT_EQ(ALPC_MESSAGE_VIEW_ATTRIBUTE, attributes.AllocatedAttributes);
+        EXPECT_EQ(0u, attributes.ValidAttributes & ALPC_MESSAGE_VIEW_ATTRIBUTE);
     }
 
     TEST_F(AlpcSectionTest, SendReadsWow64ViewAttributesAtWow64SecurityOffset)
