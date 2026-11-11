@@ -177,9 +177,6 @@ CALL :collect pdh.dll
 CALL :collect powrprof.dll
 CALL :collect profapi.dll
 CALL :collect propsys.dll
-CALL :collect_file "%WINDIR%\SystemResources", propsys.dll.mun, %EMU_SYSTEMRESOURCESDIR%
-CALL :collect_file "%WINDIR%\SystemResources", imageres.dll.mun, %EMU_SYSTEMRESOURCESDIR%
-CALL :collect_file "%WINDIR%\SystemResources", shell32.dll.mun, %EMU_SYSTEMRESOURCESDIR%
 CALL :collect_file "%WINDIR%", WindowsShell.Manifest, %EMU_WINDIR%
 CALL :collect psapi.dll
 CALL :collect rasadhlp.dll
@@ -332,6 +329,7 @@ EXIT /B
 :collect
 CALL :collect_file %SYSDIR%, %~1, %EMU_SYSDIR%
 CALL :collect_file %SYSDIR_WOW64%, %~1, %EMU_SYSDIR_WOW64%
+CALL :collect_file "%WINDIR%\SystemResources", %~1.mun, %EMU_SYSTEMRESOURCESDIR%
 EXIT /B
 
 :collect_matching
