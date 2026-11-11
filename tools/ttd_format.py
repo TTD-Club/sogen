@@ -15,8 +15,10 @@ CODE = struct.Struct("<2Q16s")
 CHUNK_HEADER = struct.Struct("<9Q")
 BULK = struct.Struct("<2Q")
 BULK_REFERENCE = struct.Struct("<2Q")
-MAGIC = b"SOGTTD9\0"
-# Version 8 differs only in how checkpoint states store strings, which this module does not read.
+MAGIC = b"SOGTTD10"
+# Version 9 differs only in having no page checkpoints, and version 8 also in how checkpoint states store strings;
+# this module reads neither.
+MAGIC_V9 = b"SOGTTD9\0"
 MAGIC_V8 = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
 CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS, SYSCALLS = 1, 2, 3, 4, 5, 6, 7, 8
@@ -457,8 +459,8 @@ class Trace:
         with open(path, "rb") as file:
             self.bytes = file.read()
         magic, self.instruction_count, self.event_count, self.access_mask, count, table = HEADER.unpack_from(self.bytes)
-        if magic not in (MAGIC, MAGIC_V8, MAGIC_V7):
-            raise ValueError("not a v7, v8 or v9 TTD trace")
+        if magic not in (MAGIC, MAGIC_V9, MAGIC_V8, MAGIC_V7):
+            raise ValueError("not a v7 to v10 TTD trace")
         self.magic = magic
         if not table:
             raise ValueError("TTD trace was not finalized")

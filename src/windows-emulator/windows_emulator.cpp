@@ -3221,6 +3221,11 @@ namespace sogen
         this->serialize_state(buffer, false);
     }
 
+    void windows_emulator::serialize_without_memory_contents(utils::buffer_serializer& buffer, size_t& memory_offset) const
+    {
+        this->serialize_state(buffer, false, &memory_offset);
+    }
+
     void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
     {
         this->deserialize_state(buffer, [&] { this->memory.deserialize_memory_state(buffer, false); });

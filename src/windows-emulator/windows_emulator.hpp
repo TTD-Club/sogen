@@ -674,6 +674,7 @@ namespace sogen
 
         // The same state without the contents of committed guest memory, which a restore takes from `pages`.
         void serialize_without_memory_contents(utils::buffer_serializer& buffer) const;
+        void serialize_without_memory_contents(utils::buffer_serializer& buffer, size_t& memory_offset) const;
         void deserialize_without_memory_contents(utils::buffer_deserializer& buffer, const restored_page_source& pages);
 
         void save_snapshot();

@@ -56,14 +56,15 @@ namespace sogen::ttd
 
     constexpr size_t inline_data_limit = sizeof(access_event::payload);
 
-    // Version 9 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
+    // Version 10 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
     // section table points to. Unknown section types are ignored, so sections can be added without a new version.
-    // Version 8 differs only in its checkpoint states storing each character of a string as a field of its own, and
-    // version 7 also in storing bulk blocks without the x86-64 filter.
+    // Version 9 differs only in having no page checkpoints (section page_checkpoints), version 8 also in its checkpoint
+    // states storing each character of a string as a field of its own, and version 7 also in storing bulk blocks
+    // without the x86-64 filter.
     struct file_header
     {
         // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '9', '\0'};
+        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '1', '0'};
         uint64_t instruction_count{};
         uint64_t event_count{};
         uint64_t access_mask{};
@@ -122,6 +123,9 @@ namespace sogen::ttd
         // What the host network answered the emulator (see network_inputs), encoded as described at
         // encode_network_inputs; size = compressed bytes. A replay takes the answers from it instead of the host.
         network_inputs = 20,
+        // The checkpoints stored as page checkpoints (see checkpoint_entry), encoded as described at
+        // encode_page_checkpoint_indices; size = compressed bytes. Requires the checkpoint memory section.
+        page_checkpoints = 21,
     };
 
     // A question the emulator asked the host network: its socket factory, one of its sockets, or its DNS lookup.
@@ -313,7 +317,8 @@ namespace sogen::ttd
     constexpr uint64_t bulk_reference_span = 16;
 
     // Checkpoint 0 is the initial state; its step is the first position of the trace, which is not zero for a trace
-    // recorded from a forked replay. A checkpoint with a base is a zstd delta against the base's state.
+    // recorded from a forked replay. A checkpoint with a base is a zstd delta against the base's state or, if the page
+    // checkpoints section lists it, a page checkpoint: what changed since the base (see encode_page_checkpoint).
     struct checkpoint_entry
     {
         uint64_t step{};
