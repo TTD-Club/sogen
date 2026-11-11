@@ -718,13 +718,19 @@ namespace sogen
         {
             const uint64_t* instructions_{};
             const uint64_t* idle_ticks_{};
+            const system_time_point* system_start_{};
 
-            instruction_tick_clock(const uint64_t& instructions, const uint64_t& idle_ticks, const system_time_point system_start = {},
-                                   const steady_time_point steady_start = {})
-                : tick_clock(1000, system_start, steady_start),
+            instruction_tick_clock(const uint64_t& instructions, const uint64_t& idle_ticks, const system_time_point& system_start)
+                : tick_clock(1000),
                   instructions_(&instructions),
-                  idle_ticks_(&idle_ticks)
+                  idle_ticks_(&idle_ticks),
+                  system_start_(&system_start)
             {
+            }
+
+            system_time_point system_now() override
+            {
+                return *this->system_start_ + tick_clock::system_now().time_since_epoch();
             }
 
             uint64_t ticks() override
@@ -734,7 +740,7 @@ namespace sogen
         };
 
         std::unique_ptr<utils::clock> get_clock(emulator_interfaces& interfaces, const uint64_t& instructions, const uint64_t& idle_ticks,
-                                                const bool use_relative_time)
+                                                const utils::clock::system_time_point& relative_time_start, const bool use_relative_time)
         {
             if (interfaces.clock)
             {
@@ -743,7 +749,7 @@ namespace sogen
 
             if (use_relative_time)
             {
-                return std::make_unique<instruction_tick_clock>(instructions, idle_ticks);
+                return std::make_unique<instruction_tick_clock>(instructions, idle_ticks, relative_time_start);
             }
 
             return std::make_unique<utils::clock>();
@@ -869,11 +875,12 @@ namespace sogen
 
     windows_emulator::windows_emulator(std::unique_ptr<guest_machine> emu, const emulator_settings& settings, emulator_callbacks callbacks,
                                        emulator_interfaces interfaces)
-        : emu_(std::move(emu)),
+        : relative_time_start_(settings.relative_time_start),
+          emu_(std::move(emu)),
           use_native_timestamp_counter_(!interfaces.clock && !settings.use_relative_time &&
                                         this->emu_->supports_native_timestamp_counter()),
-          clock_(std::make_unique<scheduler_clock>(
-              get_clock(interfaces, this->executed_instructions_, this->idle_ticks_, settings.use_relative_time))),
+          clock_(std::make_unique<scheduler_clock>(get_clock(interfaces, this->executed_instructions_, this->idle_ticks_,
+                                                             this->relative_time_start_, settings.use_relative_time))),
           network_mode_(settings.network),
           dns_lookup_(get_dns_lookup(interfaces, settings.network)),
           socket_factory_(get_socket_factory(interfaces, settings.network)),
@@ -3235,6 +3242,7 @@ namespace sogen
         buffer.write(this->idle_ticks_);
         buffer.write_atomic(this->vcpus_[0]->switch_thread);
         buffer.write(this->use_relative_time_);
+        buffer.write(this->relative_time_start_);
 
         this->version.serialize(buffer);
         this->registry.serialize_runtime_state(buffer);
@@ -3269,6 +3277,8 @@ namespace sogen
         {
             throw std::runtime_error("Can not deserialize emulator with different time dimensions");
         }
+
+        buffer.read(this->relative_time_start_);
 
         this->version.deserialize(buffer);
         this->registry.deserialize_runtime_state(buffer);
