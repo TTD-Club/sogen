@@ -52,6 +52,25 @@ namespace sogen::test
         EXPECT_NE(0, info.BootTime.QuadPart);
     }
 
+    TEST(TimeTest, RelativeTimeStartsAtTheConfiguredSystemTimeAndARestoreKeepsIt)
+    {
+        constexpr std::chrono::sys_days start{std::chrono::year{2026} / std::chrono::November / std::chrono::day{11}};
+
+        auto emu = create_emulator(emulator_settings{.use_relative_time = true, .relative_time_start = start});
+        const auto elapsed = emu.clock().system_now() - start;
+        EXPECT_GE(elapsed, std::chrono::system_clock::duration::zero());
+        EXPECT_EQ(elapsed, emu.clock().steady_now().time_since_epoch());
+
+        utils::buffer_serializer serializer{};
+        emu.serialize(serializer);
+
+        auto restored = create_empty_emulator();
+        utils::buffer_deserializer deserializer{serializer};
+        restored.deserialize(deserializer);
+
+        EXPECT_EQ(emu.clock().system_now(), restored.clock().system_now());
+    }
+
     TEST(TimeTest, SystemTimeIsAccurate)
     {
         std::string output_buffer{};
