@@ -501,6 +501,25 @@ namespace sogen
             return {c.emu, address};
         }
 
+        // The received message's attributes say what it carries: a reply without a view must not keep the view the
+        // same attribute buffer described when it was sent.
+        void clear_received_view_attribute(const emulator_object<ALPC_MESSAGE_ATTRIBUTES>& attributes)
+        {
+            if (!attributes)
+            {
+                return;
+            }
+
+            auto header = attributes.try_read();
+            if (!header || (header->ValidAttributes & ALPC_MESSAGE_VIEW_ATTRIBUTE) == 0)
+            {
+                return;
+            }
+
+            header->ValidAttributes &= ~ALPC_MESSAGE_VIEW_ATTRIBUTE;
+            attributes.try_write(*header);
+        }
+
         bool write_reply_view_attribute(const syscall_context& c, const emulator_object<ALPC_MESSAGE_ATTRIBUTES>& attributes,
                                         const uint64_t view_base, const uint64_t view_size)
         {
@@ -726,7 +745,11 @@ namespace sogen
                     throw std::runtime_error("Unexpected success result returned by port handler");
                 }
 
-                if (!result.view_payload.empty())
+                if (result.view_payload.empty())
+                {
+                    clear_received_view_attribute(receive_message_attributes);
+                }
+                else
                 {
                     const auto allocation_start = c.proc.is_wow64_process ? DEFAULT_ALLOCATION_ADDRESS_32BIT : 0;
                     const auto aligned_view_size = page_align_up(static_cast<uint64_t>(result.view_payload.size()));
