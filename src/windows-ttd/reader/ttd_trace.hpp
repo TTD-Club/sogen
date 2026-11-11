@@ -217,6 +217,13 @@ namespace sogen::ttd
         // What the recording read of each registry hive file (decoded on each call; empty without has_registry_hives).
         std::vector<recorded_hive_file> registry_hives() const;
 
+        // What the host network answered while recording, for traces that recorded it (since 2026-11-11); a replay takes
+        // its answers from them instead of the host. Null for older traces, whose replays use the host network.
+        const std::shared_ptr<const network_inputs>& recorded_network() const
+        {
+            return network_inputs_;
+        }
+
         // Identifies this recording: ASCII that differs between any two recordings (also of the same program) and stays
         // with the file when it is moved or copied, at most 33 characters. Recordings store a random id of 32 hex digits
         // (manifest key "trace_id"); for older ones it is "h" and 32 hex digits of a hash of the file's header and
@@ -495,6 +502,8 @@ namespace sogen::ttd
         std::vector<uint64_t> checkpoint_memory_offsets_{};
         // The registry hives section as stored (compressed); empty for traces without it.
         std::vector<std::byte> registry_hives_{};
+        // The network inputs section, decoded; null for traces without it.
+        std::shared_ptr<const network_inputs> network_inputs_{};
 
         // memory_at from the accesses to the memory, then the checkpoint for bytes they don't show.
         std::vector<std::optional<uint8_t>> memory_from_accesses(uint64_t position, uint64_t address, uint64_t size,

@@ -979,8 +979,10 @@ jobs:
           name: Windows 2025 Emulation Root
           path: build/release/artifacts/root
 
-      - name: Copy TTD Sample
-        run: cp build/release/artifacts/ttd-step-sample.exe build/release/artifacts/root/filesys/c/
+      - name: Copy TTD Samples
+        run: |
+          cp build/release/artifacts/ttd-step-sample.exe build/release/artifacts/root/filesys/c/
+          cp build/release/artifacts/test-sample.exe build/release/artifacts/root/filesys/c/
 
       - name: Install Python Dependencies
         run: python -m pip install "capstone>=5,<6" zstandard
@@ -991,7 +993,9 @@ jobs:
           python test/ttd_taint_test.py build/release/artifacts/analyzer.exe
 
       - name: Recorded Trace Tests
-        run: python test/ttd_step_test.py build/release/artifacts/analyzer.exe c:/ttd-step-sample.exe -e root
+        run: |
+          python test/ttd_step_test.py build/release/artifacts/analyzer.exe c:/ttd-step-sample.exe -e root
+          python test/ttd_network_test.py build/release/artifacts/analyzer.exe c:/test-sample.exe -e root
 
   smoke-test-icicle:
     name: Smoke Test Icicle x86_64

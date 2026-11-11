@@ -22,6 +22,7 @@
 #include <emulator/scoped_hook.hpp>
 
 #include "ttd_compressor.hpp"
+#include "ttd_network.hpp"
 #include "ttd_keyframes.hpp"
 #include "ttd_trace.hpp"
 #include "ttd_ui.hpp"
@@ -184,6 +185,24 @@ namespace sogen::ttd
         // Host window events, when the emulator has a recordable UI backend.
         recordable_ui_backend* ui_{};
         std::vector<ui_input_entry> ui_inputs_{};
+        network_inputs network_inputs_{};
+
+        // Stops the tap logging into network_inputs_ before that goes away.
+        struct network_recording
+        {
+            std::optional<network_tap> tap{};
+            network_recording() = default;
+            network_recording(const network_recording&) = delete;
+            network_recording& operator=(const network_recording&) = delete;
+
+            ~network_recording()
+            {
+                if (tap)
+                {
+                    tap->stop_recording();
+                }
+            }
+        } network_recording_{};
 
         syscall_table syscalls_{};
         // The syscall whose handler is running: its step and the event count when the handler started.
@@ -287,7 +306,8 @@ namespace sogen::ttd
         // Whether the replay differed from the recording; finish() then throws.
         bool diverged() const
         {
-            return error_.has_value();
+            const auto tap = find_network_tap(emu_);
+            return error_.has_value() || (tap && tap->error());
         }
 
         // Whether `observe_writes` sees every change to guest memory: the trace records guest and host writes.

@@ -361,6 +361,7 @@ namespace sogen::ttd
         {
             trace recorded(options.replay);
             use_recorded_registry(win_emu, recorded);
+            use_recorded_network(win_emu, recorded);
             size_t mismatches = 0;
             for (const auto& target : recorded.checkpoints())
             {
@@ -628,6 +629,7 @@ namespace sogen::ttd
         // Before anything sets up the process, which reads the registry.
         trace recorded(options.replay);
         use_recorded_registry(win_emu, recorded);
+        use_recorded_network(win_emu, recorded);
         // A plain seek and the string scan restore their checkpoint themselves; the other scans start from the setup.
         if (options.scan_selfmod || !options.buffers.empty() || !options.strings.empty() || options.is_plain_seek())
         {

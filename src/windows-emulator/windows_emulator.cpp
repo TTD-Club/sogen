@@ -3249,6 +3249,7 @@ namespace sogen
         buffer.write_atomic(this->vcpus_[0]->switch_thread);
         buffer.write(this->use_relative_time_);
         buffer.write(this->relative_time_start_);
+        buffer.write(this->socket_factory().input_position());
 
         this->version.serialize(buffer);
         this->registry.serialize_runtime_state(buffer);
@@ -3285,6 +3286,7 @@ namespace sogen
         }
 
         buffer.read(this->relative_time_start_);
+        this->socket_factory().restore_input_position(buffer.read<uint64_t>());
 
         this->version.deserialize(buffer);
         this->registry.deserialize_runtime_state(buffer);

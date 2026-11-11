@@ -8,6 +8,57 @@ namespace sogen
 
     namespace network
     {
+        namespace
+        {
+            int poll_host_sockets(const std::span<poll_entry> entries, const std::chrono::milliseconds timeout)
+            {
+                std::vector<pollfd> poll_data{};
+                poll_data.reserve(entries.size());
+
+                for (const auto& entry : entries)
+                {
+                    if (!entry.s)
+                    {
+                        throw std::runtime_error("Bad socket given!");
+                    }
+
+                    const auto* wrapper = dynamic_cast<socket_wrapper*>(entry.s);
+                    if (!wrapper)
+                    {
+                        throw std::runtime_error("Socket was not created using the given factory");
+                    }
+
+                    pollfd fd{};
+                    fd.fd = wrapper->get().get_socket();
+                    fd.events = entry.events;
+                    fd.revents = entry.revents;
+
+                    poll_data.push_back(fd);
+                }
+
+                const auto res = poll(poll_data.data(), static_cast<uint32_t>(poll_data.size()), static_cast<int>(timeout.count()));
+
+                for (size_t i = 0; i < poll_data.size() && i < entries.size(); ++i)
+                {
+                    auto& entry = entries[i];
+                    const auto& fd = poll_data[i];
+
+                    entry.events = fd.events;
+                    entry.revents = fd.revents;
+                }
+
+                return res;
+            }
+
+            struct live_socket_factory : socket_factory
+            {
+                int wait_for_sockets(const std::span<poll_entry> entries, const std::chrono::milliseconds wait) override
+                {
+                    return poll_host_sockets(entries, wait);
+                }
+            };
+        }
+
         socket_factory::socket_factory()
         {
             initialize_wsa();
@@ -20,42 +71,7 @@ namespace sogen
 
         int socket_factory::poll_sockets(const std::span<poll_entry> entries)
         {
-            std::vector<pollfd> poll_data{};
-            poll_data.reserve(entries.size());
-
-            for (const auto& entry : entries)
-            {
-                if (!entry.s)
-                {
-                    throw std::runtime_error("Bad socket given!");
-                }
-
-                const auto* wrapper = dynamic_cast<socket_wrapper*>(entry.s);
-                if (!wrapper)
-                {
-                    throw std::runtime_error("Socket was not created using the given factory");
-                }
-
-                pollfd fd{};
-                fd.fd = wrapper->get().get_socket();
-                fd.events = entry.events;
-                fd.revents = entry.revents;
-
-                poll_data.push_back(fd);
-            }
-
-            const auto res = poll(poll_data.data(), static_cast<uint32_t>(poll_data.size()), 0);
-
-            for (size_t i = 0; i < poll_data.size() && i < entries.size(); ++i)
-            {
-                auto& entry = entries[i];
-                const auto& fd = poll_data[i];
-
-                entry.events = fd.events;
-                entry.revents = fd.revents;
-            }
-
-            return res;
+            return poll_host_sockets(entries, std::chrono::milliseconds(0));
         }
 
         std::vector<address> socket_factory::get_local_addresses(const int family)
@@ -71,7 +87,7 @@ namespace sogen
                 // No TCP in a browser, so live networking is forwarded over fetch() instead.
                 return create_emscripten_http_socket_factory();
 #else
-                return std::make_unique<socket_factory>();
+                return std::make_unique<live_socket_factory>();
 #endif
             }
 
