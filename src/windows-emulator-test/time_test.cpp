@@ -71,6 +71,24 @@ namespace sogen::test
         EXPECT_EQ(emu.clock().system_now(), restored.clock().system_now());
     }
 
+    TEST(TimeTest, TickClockConvertsTicksPastTheMultiplicationRange)
+    {
+        struct fixed_tick_clock : utils::tick_clock
+        {
+            using tick_clock::tick_clock;
+            uint64_t value{};
+
+            uint64_t ticks() override
+            {
+                return this->value;
+            }
+        };
+
+        fixed_tick_clock clock{100'000'000};
+        clock.value = (uint64_t{1} << 40) + 3;
+        EXPECT_EQ(std::chrono::nanoseconds((uint64_t{1} << 40) * 10 + 30), clock.steady_now().time_since_epoch());
+    }
+
     TEST(TimeTest, SystemTimeIsAccurate)
     {
         std::string output_buffer{};
