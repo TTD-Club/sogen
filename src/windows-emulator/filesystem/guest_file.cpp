@@ -28,6 +28,24 @@ namespace sogen
                 throw std::runtime_error(path.string() + " was saved " + std::string(saved_state) + ", but its mount is not writable now");
             }
         }
+
+        void recreate_folder(file_system& file_sys, const windows_path& folder)
+        {
+            const auto parent = folder.parent();
+            if (parent == folder || file_sys.stat(folder))
+            {
+                return;
+            }
+
+            recreate_folder(file_sys, parent);
+            (void)file_sys.create_directory(folder);
+        }
+
+        bool recreate_file(file_system& file_sys, const windows_path& path)
+        {
+            recreate_folder(file_sys, path.parent());
+            return file_sys.open(path, u"ab").file != nullptr;
+        }
     }
 
     guest_file::guest_file(file_system& file_sys, const windows_path& path, std::u16string mode, std::unique_ptr<i_file> io,
@@ -249,9 +267,10 @@ namespace sogen
 
         auto result = this->file_sys_->open(this->path_, mode);
 
-        // A later part of the run may have deleted the file (a replay seeking backwards); the handle then sees the
-        // host file as it is now.
-        if (!result.file && result.status == STATUS_OBJECT_NAME_NOT_FOUND && this->file_sys_->open(this->path_, u"ab").file)
+        // A later part of the run may have deleted the file or its folders (a replay seeking backwards); the handle then
+        // sees the host file as it is now.
+        const auto missing = result.status == STATUS_OBJECT_NAME_NOT_FOUND || result.status == STATUS_OBJECT_PATH_NOT_FOUND;
+        if (!result.file && missing && recreate_file(*this->file_sys_, this->path_))
         {
             result = this->file_sys_->open(this->path_, mode);
         }
