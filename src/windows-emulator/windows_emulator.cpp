@@ -921,6 +921,7 @@ namespace sogen
           // (single-stepping) cannot provide it.
           instruction_precision_(settings.use_instruction_precision && this->emu_->get_guest_cpu(0).supports_instruction_counting() &&
                                  this->emu_->supports_global_memory_execution_hooks()),
+          keep_kernel_lock_between_instructions_(settings.keep_kernel_lock_between_instructions),
           intercept_rdtsc_(settings.intercept_rdtsc),
           intercept_kusd_(settings.intercept_kusd),
           spoof_gpu_features_(settings.spoof_gpu_features),
@@ -1626,10 +1627,23 @@ namespace sogen
         if (this->uses_instruction_precision())
         {
             const auto on_instruction = [&](cpu_interface& cpu, const uint64_t address, const size_t size) {
-                const std::scoped_lock lock(this->kernel_lock_);
-                auto& vcpu = this->vcpu(cpu.index());
-                const scoped_dispatch dispatch(*this, vcpu);
-                this->on_instruction_execution(vcpu, address, size); //
+                const auto execute = [&] {
+                    auto& vcpu = this->vcpu(cpu.index());
+                    const scoped_dispatch dispatch(*this, vcpu);
+                    this->on_instruction_execution(vcpu, address, size);
+                };
+
+                if (!this->keeping_kernel_lock_)
+                {
+                    const std::scoped_lock lock(this->kernel_lock_);
+                    execute();
+                    return;
+                }
+
+                // A throwing hook leaves the lock kept too; the run loop releases it.
+                this->kernel_lock_.lock_kept();
+                const auto keep = utils::finally([this] { this->kernel_lock_.keep(); });
+                execute();
             };
             // The metadata hook also gives instruction sizes to on_instruction_executed; backends without one report 0.
             try
@@ -2178,8 +2192,15 @@ namespace sogen
 
             // Guest code executes with the kernel lock released; hook callbacks
             // (syscalls, exceptions, exec hooks) re-acquire it on VM exit.
+            this->keeping_kernel_lock_ = this->keep_kernel_lock_between_instructions_ && this->uses_instruction_precision();
             lock.unlock();
-            vcpu.cpu.start(count);
+            {
+                const auto release = utils::finally([this] {
+                    this->kernel_lock_.release_kept();
+                    this->keeping_kernel_lock_ = false;
+                });
+                vcpu.cpu.start(count);
+            }
             lock.lock();
 
             // A run that continues past the budget would switch threads before its next instruction, either because the

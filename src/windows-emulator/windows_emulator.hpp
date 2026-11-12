@@ -125,6 +125,11 @@ namespace sogen
         std::chrono::system_clock::time_point relative_time_start{};
         bool use_instruction_precision{true};
 
+        // With instruction precision and one vCPU, the instruction hook keeps the kernel lock between instructions
+        // until another thread waits for it. Only for hosts whose hooks never wait, while guest code runs, for another
+        // thread that takes the lock: a debugger's break loop or a hook that takes a Python GIL can.
+        bool keep_kernel_lock_between_instructions{false};
+
         // Timing fidelity vs. speed. With interception on (the default, used by the analyzer) rdtsc reads
         // and KUSER_SHARED_DATA accesses trap so the emulated clock stays exact and deterministic. Turning
         // them off (as the sandbox does) lets the guest read the host TSC natively and KUSD from a plain
@@ -804,6 +809,8 @@ namespace sogen
 
         bool use_relative_time_{false}; // TODO: Get rid of that
         bool instruction_precision_{true};
+        bool keep_kernel_lock_between_instructions_{false};
+        bool keeping_kernel_lock_{false};
         bool intercept_rdtsc_{true};
         bool intercept_kusd_{true};
         bool spoof_gpu_features_{false};
