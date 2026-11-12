@@ -238,6 +238,28 @@ instruction-budgeted `start()` calls, when emulator state is quiescent.
 `--ttd-max-instructions` bounds recording and finalizes the trace at the limit.
 A guest failure before the limit can also leave a finalized trace.
 
+Recording runs the guest several times slower than a plain run, which a peer
+can notice. A WinINet HTTPS request verifies the server's certificate between
+the TLS handshake and the request; under recording that took 23 s against
+`example.com` (15 s without the root list update), and its server closed the
+idle connection after 13 to 17 s (`ERROR_HTTP_INVALID_SERVER_RESPONSE`, 12152).
+About half of the guest's certificate work is crypt32's automatic root list
+update, which decodes and verifies the cached `authroot.stl`.
+`create-root.bat no-root-auto-update` turns it off in a new root (policy
+`DisableRootAutoUpdate`), and `--reg-file` with this file does the same for an
+existing one:
+
+```
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\SystemCertificates\AuthRoot]
+"DisableRootAutoUpdate"=dword:00000001
+```
+
+Both change the guest's environment, so they are not the default. Plain
+analyzer runs skip most of that work: outside observe-only mode, which TTD
+uses, the analyzer stubs `WinVerifyTrust`.
+
 `--ttd-replay T --ttd-verify-checkpoints` checks replay determinism, including
 written values: for every checkpoint it restores the previous checkpoint (or
 the initial snapshot), replays the interval with event verification, and

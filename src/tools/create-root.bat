@@ -1,5 +1,11 @@
 @ECHO OFF
 
+REM Usage: create-root.bat [no-root-auto-update]
+REM no-root-auto-update sets the DisableRootAutoUpdate policy in the guest's SOFTWARE hive. Otherwise crypt32 decodes
+REM and verifies the cached root list (authroot.stl) in every certificate chain check, about half of a TLS client's
+REM certificate work; under TTD recording, that is long enough for some servers to close the idle connection before
+REM the client sends its request. Off by default, since it changes the guest's environment.
+
 NET SESSIONS > NUL 2>&1
 IF %ERRORLEVEL% NEQ 0 (
 	ECHO Error: This script requires administrative privileges.
@@ -49,6 +55,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0create-profile-dirs.ps
 REM Capture this machine's registry hives and seed the Steam-bridge keys. Shared with grab-registry.bat
 REM (which writes SYSTEM/SECURITY/SOFTWARE/HARDWARE/SAM + NTUSER.DAT into the given dir) to avoid duplication.
 CALL "%~dp0grab-registry.bat" "%EMU_REGDIR%"
+IF /I "%~1"=="no-root-auto-update" CALL :disable_root_auto_update
 
 CALL :collect advapi32.dll
 CALL :collect apisetschema.dll
@@ -314,6 +321,13 @@ EXIT /B 0
 
 :normpath
 SET %1=%~dpfn2
+EXIT /B
+
+:disable_root_auto_update
+REG UNLOAD HKLM\SogenRootSeed >NUL 2>&1
+REG LOAD HKLM\SogenRootSeed "%EMU_REGDIR%\SOFTWARE"
+REG ADD HKLM\SogenRootSeed\Policies\Microsoft\SystemCertificates\AuthRoot /v DisableRootAutoUpdate /t REG_DWORD /d 1 /f
+REG UNLOAD HKLM\SogenRootSeed
 EXIT /B
 
 :collect_file
