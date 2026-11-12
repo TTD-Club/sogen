@@ -795,12 +795,20 @@ namespace sogen
         constexpr bool kusd_needs_intercept = false;
 #endif
 
+        // The browser debugger's break loop runs in an instruction hook.
+#if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
+        constexpr bool keeps_kernel_lock = false;
+#else
+        constexpr bool keeps_kernel_lock = true;
+#endif
+
         emulator_settings create_emulator_settings(const analysis_options& options)
         {
             return {
                 .use_relative_time = options.reproducible,
                 .relative_time_start = options.start_time,
                 .use_instruction_precision = !options.disable_instruction_precision,
+                .keep_kernel_lock_between_instructions = keeps_kernel_lock && !options.use_gdb,
                 .intercept_rdtsc = !options.native_timing,
                 .intercept_kusd = kusd_needs_intercept || !options.native_timing,
                 .emulation_root = options.emulation_root,

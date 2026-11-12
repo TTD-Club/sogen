@@ -1,6 +1,8 @@
 #include "emulation_test_utils.hpp"
 
 #include <array>
+#include <atomic>
+#include <thread>
 
 namespace sogen::test
 {
@@ -64,6 +66,38 @@ namespace sogen::test
         emu.start();
 
         ASSERT_TERMINATED_SUCCESSFULLY(emu);
+    }
+
+    TEST(EmulationTest, EmulationWorksWhileKeepingTheKernelLock)
+    {
+        auto emu = create_sample_emulator(emulator_settings{.use_relative_time = true, .keep_kernel_lock_between_instructions = true});
+
+        std::atomic<bool> done{false};
+        std::atomic<uint64_t> entries{0};
+        std::thread host([&] {
+            while (!done)
+            {
+                emu.synchronize([&] { ++entries; });
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+        emu.start();
+        done = true;
+        host.join();
+
+        ASSERT_TERMINATED_SUCCESSFULLY(emu);
+        EXPECT_GT(entries.load(), 10u);
+    }
+
+    TEST(EmulationTest, CountedEmulationIsAccurateWhileKeepingTheKernelLock)
+    {
+        constexpr auto count = 200000;
+
+        auto emu = create_sample_emulator(emulator_settings{.use_relative_time = true, .keep_kernel_lock_between_instructions = true});
+        emu.start(count);
+
+        ASSERT_EQ(emu.get_executed_instructions(), count);
     }
 
     TEST(EmulationTest, CountedEmulationWorks)
