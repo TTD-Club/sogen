@@ -32,16 +32,28 @@ namespace sogen::ttd
         constexpr size_t cached_chunks = 4;
         constexpr size_t cached_bulk_blocks = bulk_reference_span + 1;
 
-        // "SOGTTD<digit>\0" at the start of every trace file, the digit being the format version.
+        // "SOGTTD" and the format version at the start of every trace file: one digit and a zero byte, or two digits.
         std::optional<uint32_t> version_from_magic(const std::array<char, 8>& magic)
         {
             const std::string_view name(magic.data(), magic.size());
-            if (!name.starts_with("SOGTTD") || magic[7] != '\0' || magic[6] < '1' || magic[6] > '9')
+            const auto is_digit = [](const char c) { return c >= '0' && c <= '9'; };
+            if (!name.starts_with("SOGTTD") || magic[6] < '1' || magic[6] > '9' || (magic[7] != '\0' && !is_digit(magic[7])))
             {
                 return std::nullopt;
             }
-            return static_cast<uint32_t>(magic[6] - '0');
+            const auto first = static_cast<uint32_t>(magic[6] - '0');
+            return magic[7] == '\0' ? first : (first * 10) + static_cast<uint32_t>(magic[7] - '0');
         }
+
+        // Consecutive page checkpoints applied to a full state (`base`, which must outlive it, with the memory manager's
+        // state at `base_memory_offset`). Each one decodes only its objects and pages; the state is built once, at the end.
+        struct page_chain;
+        std::shared_ptr<page_chain> start_page_chain(std::span<const std::byte> base, size_t base_memory_offset);
+        // Applies the next page checkpoint (`encoded`, whose objects hold the memory manager's state at `memory_offset`).
+        void apply_page_checkpoint(page_chain& chain, std::span<const std::byte> encoded, size_t memory_offset,
+                                   std::span<const std::byte> bulk_reference);
+        // The state of the last applied checkpoint, into `state`, whose allocation it reuses.
+        void finish_page_chain(const page_chain& chain, std::vector<std::byte>& state);
 
         // What an instruction does to control flow, from its bytes alone.
         struct branch_info
@@ -348,6 +360,7 @@ namespace sogen::ttd
         std::optional<std::vector<std::byte>> exports{};
         std::optional<std::vector<std::byte>> forwarders{};
         std::optional<std::vector<std::byte>> machines{};
+        std::vector<uint64_t> page_checkpoint_indices{};
         for (const auto& section : sections)
         {
             if (section.type == section_type::chunk_table)
@@ -505,6 +518,14 @@ namespace sogen::ttd
                 }
                 checkpoint_memory_offsets_ = decode_checkpoint_memory_offsets(read_bytes(section.offset, section.size));
             }
+            else if (section.type == section_type::page_checkpoints)
+            {
+                if (!fits(section.offset, section.size, 1))
+                {
+                    throw std::runtime_error("Invalid TTD trace offsets");
+                }
+                page_checkpoint_indices = decode_page_checkpoint_indices(read_bytes(section.offset, section.size));
+            }
             else if (section.type == section_type::registry_hives)
             {
                 if (!fits(section.offset, section.size, 1))
@@ -567,6 +588,22 @@ namespace sogen::ttd
         if (!checkpoint_memory_offsets_.empty() && checkpoint_memory_offsets_.size() != checkpoints_.size())
         {
             throw std::runtime_error("Invalid TTD checkpoint memory offsets");
+        }
+        if (!page_checkpoint_indices.empty())
+        {
+            if (checkpoint_memory_offsets_.empty())
+            {
+                throw std::runtime_error("TTD page checkpoints need the checkpoint memory section");
+            }
+            page_checkpoints_.resize(checkpoints_.size());
+            for (const auto index : page_checkpoint_indices)
+            {
+                if (index >= checkpoints_.size() || checkpoints_[static_cast<size_t>(index)].base == no_base_checkpoint)
+                {
+                    throw std::runtime_error("Invalid TTD page checkpoint index");
+                }
+                page_checkpoints_[static_cast<size_t>(index)] = true;
+            }
         }
 
         uint64_t next_event = 0;
@@ -927,6 +964,13 @@ namespace sogen::ttd
             }
             return blocks;
         };
+        const auto is_page_checkpoint = [this](const uint64_t current) {
+            return !page_checkpoints_.empty() && page_checkpoints_[static_cast<size_t>(current)];
+        };
+        // A page checkpoint takes its blocks as a reference of their own.
+        const auto appended_blocks = [&](const uint64_t current) {
+            return is_page_checkpoint(current) ? std::vector<bulk_block>{} : blocks_between(current);
+        };
         const auto total_size = [](const std::span<const bulk_block> blocks) {
             size_t size = 0;
             for (const auto& block : blocks)
@@ -949,13 +993,15 @@ namespace sogen::ttd
         std::vector<std::byte> state{};
         std::vector<std::byte> next{};
         std::vector<bulk_block> between{};
+        // Consecutive page checkpoints build the state once, after the last.
+        std::shared_ptr<page_chain> pages{};
         if (from_cache)
         {
             chain.pop_back();
             const auto& cached = *cached_base;
             if (!chain.empty())
             {
-                between = blocks_between(chain.back());
+                between = appended_blocks(chain.back());
             }
             reserve(state, cached.size() + total_size(between));
             state.assign(cached.begin(), cached.end());
@@ -966,6 +1012,28 @@ namespace sogen::ttd
             const auto& entry = checkpoints_.at(static_cast<size_t>(current));
             const auto compressed = read_bytes(entry.offset, entry.size);
             chain.pop_back();
+            if (is_page_checkpoint(current))
+            {
+                std::vector<std::byte> reference{};
+                for (const auto& block : blocks_between(current))
+                {
+                    reference.insert(reference.end(), block->begin(), block->end());
+                }
+                if (!pages)
+                {
+                    pages = start_page_chain(state, static_cast<size_t>(checkpoint_memory_offsets_.at(static_cast<size_t>(entry.base))));
+                }
+                apply_page_checkpoint(*pages, compressed, static_cast<size_t>(checkpoint_memory_offsets_.at(static_cast<size_t>(current))),
+                                      reference);
+                if (chain.empty() || !is_page_checkpoint(chain.back()))
+                {
+                    finish_page_chain(*pages, next);
+                    pages.reset();
+                    std::swap(state, next);
+                }
+                between = chain.empty() ? std::vector<bulk_block>{} : appended_blocks(chain.back());
+                continue;
+            }
             const auto size = utils::compression::zstd::decompressed_size(compressed);
             if (!size)
             {
@@ -979,7 +1047,7 @@ namespace sogen::ttd
             {
                 state.insert(state.end(), block->begin(), block->end());
             }
-            between = chain.empty() ? std::vector<bulk_block>{} : blocks_between(chain.back());
+            between = chain.empty() ? std::vector<bulk_block>{} : appended_blocks(chain.back());
             reserve(next, *size + total_size(between));
             if (!utils::compression::zstd::decompress_with_reference(compressed, state, next))
             {
@@ -2058,17 +2126,40 @@ namespace sogen::ttd
             }
         };
 
-        // The committed memory in the memory manager's part of a checkpoint state (memory_manager::serialize_memory_state):
-        // its layout version, default allocation address and DEP flag, the reservations (base, kind, mapped file name,
-        // initial protection, length, and committed ranges with their protection), then the contents of the committed
-        // ranges of every reservation but MMIO, in that order. By address: each range's length and its offset in `data`,
-        // SIZE_MAX (trace::checkpoint_memory::no_contents) for MMIO. Before version 9, each character of a mapped file
-        // name is a field of its own; since then the name is one field.
-        std::map<uint64_t, std::pair<uint64_t, size_t>> parse_checkpoint_memory(const std::span<const std::byte> data, const size_t offset,
-                                                                                const bool whole_strings)
+        // The memory manager's part of a checkpoint state (memory_manager::serialize_memory_state): its layout version,
+        // default allocation address and DEP flag, the reservations (base, kind, mapped file name, initial protection,
+        // length, and committed ranges with their protection), then, unless the state was serialized without memory
+        // contents, the contents of the committed ranges of every reservation but MMIO, in that order. Before version 9,
+        // each character of a mapped file name is a field of its own; since then the name is one field.
+        struct memory_layout
+        {
+            struct committed_range
+            {
+                uint64_t address{};
+                uint64_t length{};
+                bool mmio{};
+            };
+
+            // In the order of their contents.
+            std::vector<committed_range> committed{};
+            // Where the contents begin.
+            size_t end{};
+
+            // The size of the contents, each range's a field.
+            size_t contents_size() const
+            {
+                size_t size = 0;
+                for (const auto& range : committed)
+                {
+                    size += range.mmio ? 0 : 1 + static_cast<size_t>(range.length);
+                }
+                return size;
+            }
+        };
+
+        memory_layout parse_memory_layout(const std::span<const std::byte> data, const size_t offset, const bool whole_strings)
         {
             constexpr uint8_t mmio_kind = 5;
-            constexpr size_t no_contents = SIZE_MAX;
             constexpr uint64_t nt_permission_size = 2;
             constexpr uint64_t name_char_size = 2;
 
@@ -2077,17 +2168,11 @@ namespace sogen::ttd
             (void)fields.u64();
             (void)fields.u8();
 
-            struct reservation
-            {
-                uint8_t kind{};
-                std::vector<std::pair<uint64_t, uint64_t>> committed{};
-            };
-
-            std::vector<reservation> reservations(static_cast<size_t>(std::min<uint64_t>(fields.u64(), data.size())));
-            for (auto& reserved : reservations)
+            memory_layout layout{};
+            for (auto reservations = std::min<uint64_t>(fields.u64(), data.size()); reservations; --reservations)
             {
                 (void)fields.u64();
-                reserved.kind = fields.u8();
+                const auto mmio = fields.u8() == mmio_kind;
                 const auto name_length = fields.u64();
                 if (whole_strings)
                 {
@@ -2111,25 +2196,189 @@ namespace sogen::ttd
                     const auto address = fields.u64();
                     const auto length = fields.u64();
                     (void)fields.field(nt_permission_size);
-                    reserved.committed.emplace_back(address, length);
+                    layout.committed.push_back({.address = address, .length = length, .mmio = mmio});
                 }
             }
+            layout.end = fields.offset;
+            return layout;
+        }
 
+        // The committed memory of a checkpoint state, by address: each range's length and its offset in `data`, SIZE_MAX
+        // (trace::checkpoint_memory::no_contents) for MMIO.
+        std::map<uint64_t, std::pair<uint64_t, size_t>> parse_checkpoint_memory(const std::span<const std::byte> data, const size_t offset,
+                                                                                const bool whole_strings)
+        {
+            constexpr size_t no_contents = SIZE_MAX;
+            const auto layout = parse_memory_layout(data, offset, whole_strings);
+            state_fields fields{.data = data, .offset = layout.end};
             std::map<uint64_t, std::pair<uint64_t, size_t>> ranges{};
-            for (const auto& reserved : reservations)
+            for (const auto& range : layout.committed)
             {
-                for (const auto& [address, length] : reserved.committed)
+                if (range.mmio)
                 {
-                    if (reserved.kind == mmio_kind)
-                    {
-                        ranges.emplace(address, std::pair{length, no_contents});
-                        continue;
-                    }
-                    const auto contents = fields.field(length);
-                    ranges.emplace(address, std::pair{length, static_cast<size_t>(contents.data() - data.data())});
+                    ranges.emplace(range.address, std::pair{range.length, no_contents});
+                    continue;
                 }
+                const auto contents = fields.field(range.length);
+                ranges.emplace(range.address, std::pair{range.length, static_cast<size_t>(contents.data() - data.data())});
             }
             return ranges;
+        }
+
+        struct page_chain
+        {
+            std::span<const std::byte> base{};
+            std::map<uint64_t, std::pair<uint64_t, size_t>> base_ranges{};
+            // The last applied checkpoint's state without memory contents, and its memory layout.
+            std::vector<std::byte> objects{};
+            memory_layout layout{};
+            // The applied checkpoints' page contents.
+            std::vector<std::vector<std::byte>> contents{};
+            // The pages that differ from the base: their contents, or null for a page of zeros.
+            std::unordered_map<uint64_t, const std::byte*> pages{};
+        };
+
+        std::shared_ptr<page_chain> start_page_chain(const std::span<const std::byte> base, const size_t base_memory_offset)
+        {
+            auto chain = std::make_shared<page_chain>();
+            chain->base = base;
+            chain->layout = parse_memory_layout(base, base_memory_offset, true);
+            chain->base_ranges = parse_checkpoint_memory(base, base_memory_offset, true);
+            const auto contents_end = chain->layout.end + chain->layout.contents_size();
+            chain->objects.assign(base.begin(), base.begin() + static_cast<ptrdiff_t>(chain->layout.end));
+            chain->objects.insert(chain->objects.end(), base.begin() + static_cast<ptrdiff_t>(contents_end), base.end());
+            return chain;
+        }
+
+        // The committed memory with contents (not MMIO) in `after` but not in `before`, as sorted [start, end) ranges.
+        std::vector<std::pair<uint64_t, uint64_t>> newly_committed(const memory_layout& before, const memory_layout& after)
+        {
+            const auto ranges = [](const memory_layout& layout) {
+                std::vector<std::pair<uint64_t, uint64_t>> result{};
+                for (const auto& range : layout.committed)
+                {
+                    if (!range.mmio && range.length)
+                    {
+                        result.emplace_back(range.address, range.address + range.length);
+                    }
+                }
+                std::ranges::sort(result);
+                return result;
+            };
+            const auto old_ranges = ranges(before);
+            std::vector<std::pair<uint64_t, uint64_t>> result{};
+            size_t first_old = 0;
+            for (const auto& [start, end] : ranges(after))
+            {
+                while (first_old < old_ranges.size() && old_ranges[first_old].second <= start)
+                {
+                    ++first_old;
+                }
+                auto cursor = start;
+                for (auto old = first_old; old < old_ranges.size() && old_ranges[old].first < end; ++old)
+                {
+                    if (old_ranges[old].first > cursor)
+                    {
+                        result.emplace_back(cursor, old_ranges[old].first);
+                    }
+                    cursor = std::max(cursor, old_ranges[old].second);
+                }
+                if (cursor < end)
+                {
+                    result.emplace_back(cursor, end);
+                }
+            }
+            return result;
+        }
+
+        void apply_page_checkpoint(page_chain& chain, const std::span<const std::byte> encoded, const size_t memory_offset,
+                                   const std::span<const std::byte> bulk_reference)
+        {
+            auto checkpoint = decode_page_checkpoint(encoded, chain.objects, bulk_reference);
+            auto layout = parse_memory_layout(checkpoint.objects, memory_offset, true);
+            // A page committed since the previous checkpoint holds zeros unless the checkpoint stores it.
+            for (const auto& [start, end] : newly_committed(chain.layout, layout))
+            {
+                for (auto page = start; page < end; page += page_size)
+                {
+                    chain.pages[page] = nullptr;
+                }
+            }
+            const auto& contents = chain.contents.emplace_back(std::move(checkpoint.contents));
+            for (size_t index = 0; index < checkpoint.pages.size(); ++index)
+            {
+                chain.pages[checkpoint.pages[index]] = contents.data() + (index * page_size);
+            }
+            chain.objects = std::move(checkpoint.objects);
+            chain.layout = std::move(layout);
+        }
+
+        void finish_page_chain(const page_chain& chain, std::vector<std::byte>& state)
+        {
+            constexpr size_t no_contents = SIZE_MAX;
+            const auto& objects = chain.objects;
+            const auto& layout = chain.layout;
+            // Every byte is written below, so a reused allocation's old contents do not matter; a new one has slack for
+            // slowly growing states.
+            const auto state_size = objects.size() + layout.contents_size();
+            if (state.capacity() < state_size)
+            {
+                state = {};
+                state.reserve(state_size + state_size / 16);
+            }
+            state.resize(state_size);
+            memcpy(state.data(), objects.data(), layout.end);
+            auto* out = state.data() + layout.end;
+
+            // Committed ranges are page-aligned, so a page lies in a single range of the base. A page that never
+            // differed from the base stayed committed throughout, so the base has it.
+            const auto base_page = [&](const uint64_t address) -> const std::byte* {
+                auto range = chain.base_ranges.upper_bound(address);
+                if (range == chain.base_ranges.begin())
+                {
+                    return nullptr;
+                }
+                --range;
+                const auto& [length, offset] = range->second;
+                if (offset == no_contents || address - range->first >= length)
+                {
+                    return nullptr;
+                }
+                return chain.base.data() + offset + static_cast<size_t>(address - range->first);
+            };
+
+            for (const auto& range : layout.committed)
+            {
+                if (range.mmio)
+                {
+                    continue;
+                }
+                *out++ = static_cast<std::byte>(static_cast<uint8_t>(range.length));
+                for (uint64_t offset = 0; offset < range.length; offset += page_size)
+                {
+                    const auto address = range.address + offset;
+                    const auto size = static_cast<size_t>(std::min(page_size, range.length - offset));
+                    const std::byte* source = nullptr;
+                    if (const auto changed = chain.pages.find(address); changed != chain.pages.end())
+                    {
+                        source = changed->second;
+                    }
+                    else
+                    {
+                        source = base_page(address);
+                    }
+                    if (source)
+                    {
+                        memcpy(out, source, size);
+                    }
+                    else
+                    {
+                        memset(out, 0, size);
+                    }
+                    out += size;
+                }
+            }
+            memcpy(out, objects.data() + layout.end, objects.size() - layout.end);
         }
     }
 

@@ -120,7 +120,7 @@ namespace sogen::ttd
     // added later are optional (readers ignore section types they do not know), so newer files of a supported version
     // open, and the accessors for sections a file lacks report that (has_syscalls, has_mapping_changes, ...).
     constexpr uint32_t oldest_trace_version = 1;
-    constexpr uint32_t newest_trace_version = 9;
+    constexpr uint32_t newest_trace_version = 10;
 
     // Whether the file starts like a Sogen TTD trace of any version, readable or not; reads only its first 8 bytes.
     bool is_trace_file(const std::filesystem::path& path);
@@ -500,6 +500,8 @@ namespace sogen::ttd
         bool has_memory_regions_{};
         // Per checkpoint, where the memory manager's state begins in its decoded state; empty for traces without it.
         std::vector<uint64_t> checkpoint_memory_offsets_{};
+        // Per checkpoint, whether it is a page checkpoint; empty for traces without any.
+        std::vector<bool> page_checkpoints_{};
         // The registry hives section as stored (compressed); empty for traces without it.
         std::vector<std::byte> registry_hives_{};
         // The network inputs section, decoded; null for traces without it.

@@ -107,7 +107,7 @@ namespace sogen::ttd
         static constexpr size_t chunk_workers = 4;
         static constexpr size_t bulk_workers = 4;
         static constexpr size_t max_pending_compressions = 16;
-        // A checkpoint delta takes about 120 ms at full size, longer than recording the 500,000 instructions between
+        // A state delta takes about 120 ms at full size, longer than recording the 500,000 instructions between
         // checkpoints once events are cheap, so several compress at once. Each pending one holds a full emulator state.
         static constexpr size_t checkpoint_workers = 4;
         static constexpr size_t max_pending_checkpoints = 2;
@@ -242,6 +242,28 @@ namespace sogen::ttd
         void forget_instructions(uint64_t address, uint64_t size);
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
+
+        // Checkpoints after the first are page checkpoints when the trace records every change to guest memory (guest
+        // and host writes, and mapping changes). Compressing a full state at every checkpoint, even on other threads,
+        // made recording about 30% slower; a page checkpoint holds only the pages changed since its base.
+        bool page_checkpoints_{};
+        std::vector<uint64_t> page_checkpoint_indices_{};
+
+        // A checkpoint that page checkpoints are based on: its state without memory contents, and the sizes of pages_
+        // and mapping_changes_ when it was taken.
+        struct page_checkpoint_base
+        {
+            std::shared_ptr<const std::vector<std::byte>> objects{};
+            size_t pages{};
+            size_t mapping_changes{};
+        };
+
+        // Entry k: as base_states_.
+        std::vector<page_checkpoint_base> page_bases_{};
+        page_checkpoint_base current_page_base(size_t& memory_offset) const;
+        // The addresses of the committed pages that guest or host writes or mapping changes touched since `base`.
+        std::vector<uint64_t> changed_pages(const page_checkpoint_base& base) const;
+        void write_page_checkpoint(uint64_t step);
 
         // Allocations of released checkpoint states, reused for later ones: a fresh allocation of a whole state costs
         // a page fault per page while serializing.

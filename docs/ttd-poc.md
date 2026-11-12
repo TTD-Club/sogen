@@ -392,10 +392,10 @@ thread-specific register state, MMIO, and data from the initial snapshot other
 than selected source ranges are not fully modeled. A gap means the reported
 taint flow may be incomplete.
 
-## Format v8
+## Format v10
 
 All fields are little-endian; `tools/ttd_format.py` is a reference reader and
-writer. The 48-byte header is `SOGTTD8\0` plus five `uint64_t` values:
+writer. The 48-byte header is `SOGTTD10` plus five `uint64_t` values:
 instruction count, event count, recorded access kinds (a nonzero mask of the
 kind values below), section count, and section-table offset. A section-table
 offset of zero marks a recording that was never finalized. Event chunks,
@@ -417,6 +417,21 @@ found through the section table (24-byte entries `type, offset, size`):
   When `i - base` is at most 16, the delta's reference is the base state
   followed by bulk blocks `base` to `i - 1`, so memory filled by large host
   writes (mapped images, file reads) is not stored again in the checkpoint.
+  A checkpoint the page checkpoints section lists is instead a page
+  checkpoint, with the same bases: the size of its objects frame as a
+  `uint64_t`, the objects frame (the state serialized without memory
+  contents, `serialize_without_memory_contents`, as a zstd delta against the
+  base's state without its memory contents), then a zstd frame of the page
+  count, varint page-number deltas, and 4 KiB of contents per page. That frame
+  is a delta against bulk blocks `base` to `i - 1` under the same condition,
+  unless they are empty. The pages are every committed page a write, a host
+  write, or a mapping change touched since the base; every other committed
+  page holds the base's bytes (zeros where the base had none). The reader
+  rebuilds the full state, byte for byte what `create_emulator_state` gives,
+  so restores and `memory_at` see no difference. Recordings use page
+  checkpoints whenever they record writes and host writes: compressing a full
+  state at every checkpoint slowed recording by about 30%, even on other
+  threads.
 - Page index (type 3, size = block count): 32-byte block entries
   `first_page, entry_count, offset, size`. Each block is a zstd frame of up to
   4,096 consecutive page entries `(page, chunk, kinds)`, sorted by page and
@@ -632,9 +647,12 @@ found through the section table (24-byte entries `type, offset, size`):
   After a seek, sockets the replay made have no host socket: a fork's guest
   sees them as reset connections and makes new ones live.
   `tools/ttd_format.py`: `Trace.network_inputs`.
+- Page checkpoints (type 21, size = compressed bytes; absent before version
+  10): the indices of the page checkpoints, as a zstd frame of varints: the
+  count, then the index deltas. Requires the checkpoint memory section.
 
 Unknown section types are ignored, so sections can be added without a new
-version. The library reads versions 1-4 and 7-9 (`ttd::is_supported_trace_version`;
+version. The library reads versions 1-4 and 7-10 (`ttd::is_supported_trace_version`;
 5 and 6 were development formats) and refuses others; `ttd::is_trace_file` and
 `ttd::trace_file_version` recognize any version from the first 8 bytes. A file of a
 supported version with sections this build does not know opens without them.
@@ -674,10 +692,11 @@ blocks it refers to:
 Decoded accesses up to 16 bytes carry their data inline; larger ones carry
 their bulk offset (payload bytes 0-7) and block (bytes 8-15).
 
-Version 8 is identical except that its checkpoint states store each character of
+Version 9 is identical except that it has no page checkpoints. Version 8 is
+also identical except that its checkpoint states store each character of
 a string as a field of its own, where version 9 stores the string as one field
 (the memory part's mapped file names are read either way). Version 7 is also
-identical except that bulk blocks are stored without the x86-64 filter. Both
+identical except that bulk blocks are stored without the x86-64 filter. All
 remain readable. Versions 1 to 4 stored fixed-size event records
 with full checkpoint snapshots and a per-event page index; they remain readable
 (1 and 2 as write-only traces, 3 without instruction bytes, 4 without access
