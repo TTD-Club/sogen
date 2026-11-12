@@ -52,6 +52,43 @@ namespace sogen::test
         EXPECT_NE(0, info.BootTime.QuadPart);
     }
 
+    TEST(TimeTest, RelativeTimeStartsAtTheConfiguredSystemTimeAndARestoreKeepsIt)
+    {
+        constexpr std::chrono::sys_days start{std::chrono::year{2026} / std::chrono::November / std::chrono::day{11}};
+
+        auto emu = create_emulator(emulator_settings{.use_relative_time = true, .relative_time_start = start});
+        const auto elapsed = emu.clock().system_now() - start;
+        EXPECT_GE(elapsed, std::chrono::system_clock::duration::zero());
+        EXPECT_EQ(elapsed, emu.clock().steady_now().time_since_epoch());
+
+        utils::buffer_serializer serializer{};
+        emu.serialize(serializer);
+
+        auto restored = create_empty_emulator();
+        utils::buffer_deserializer deserializer{serializer};
+        restored.deserialize(deserializer);
+
+        EXPECT_EQ(emu.clock().system_now(), restored.clock().system_now());
+    }
+
+    TEST(TimeTest, TickClockConvertsTicksPastTheMultiplicationRange)
+    {
+        struct fixed_tick_clock : utils::tick_clock
+        {
+            using tick_clock::tick_clock;
+            uint64_t value{};
+
+            uint64_t ticks() override
+            {
+                return this->value;
+            }
+        };
+
+        fixed_tick_clock clock{100'000'000};
+        clock.value = (uint64_t{1} << 40) + 3;
+        EXPECT_EQ(std::chrono::nanoseconds((uint64_t{1} << 40) * 10 + 30), clock.steady_now().time_since_epoch());
+    }
+
     TEST(TimeTest, SystemTimeIsAccurate)
     {
         std::string output_buffer{};

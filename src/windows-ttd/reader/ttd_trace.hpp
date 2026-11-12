@@ -120,7 +120,7 @@ namespace sogen::ttd
     // added later are optional (readers ignore section types they do not know), so newer files of a supported version
     // open, and the accessors for sections a file lacks report that (has_syscalls, has_mapping_changes, ...).
     constexpr uint32_t oldest_trace_version = 1;
-    constexpr uint32_t newest_trace_version = 9;
+    constexpr uint32_t newest_trace_version = 10;
 
     // Whether the file starts like a Sogen TTD trace of any version, readable or not; reads only its first 8 bytes.
     bool is_trace_file(const std::filesystem::path& path);
@@ -216,6 +216,13 @@ namespace sogen::ttd
 
         // What the recording read of each registry hive file (decoded on each call; empty without has_registry_hives).
         std::vector<recorded_hive_file> registry_hives() const;
+
+        // What the host network answered while recording, for traces that recorded it (since 2026-11-11); a replay takes
+        // its answers from them instead of the host. Null for older traces, whose replays use the host network.
+        const std::shared_ptr<const network_inputs>& recorded_network() const
+        {
+            return network_inputs_;
+        }
 
         // Identifies this recording: ASCII that differs between any two recordings (also of the same program) and stays
         // with the file when it is moved or copied, at most 33 characters. Recordings store a random id of 32 hex digits
@@ -493,8 +500,12 @@ namespace sogen::ttd
         bool has_memory_regions_{};
         // Per checkpoint, where the memory manager's state begins in its decoded state; empty for traces without it.
         std::vector<uint64_t> checkpoint_memory_offsets_{};
+        // Per checkpoint, whether it is a page checkpoint; empty for traces without any.
+        std::vector<bool> page_checkpoints_{};
         // The registry hives section as stored (compressed); empty for traces without it.
         std::vector<std::byte> registry_hives_{};
+        // The network inputs section, decoded; null for traces without it.
+        std::shared_ptr<const network_inputs> network_inputs_{};
 
         // memory_at from the accesses to the memory, then the checkpoint for bytes they don't show.
         std::vector<std::optional<uint8_t>> memory_from_accesses(uint64_t position, uint64_t address, uint64_t size,

@@ -98,8 +98,11 @@ namespace sogen
             {
                 using duration = TimePoint::duration;
 
+                // Whole seconds first, so that a high frequency doesn't overflow the multiplication.
                 const auto passed_ticks = this->ticks();
-                const auto passed_time = duration(passed_ticks * duration::period::den / this->frequency_);
+                constexpr auto den = static_cast<uint64_t>(duration::period::den);
+                const auto passed_time = duration(static_cast<duration::rep>(
+                    (passed_ticks / this->frequency_) * den + (passed_ticks % this->frequency_) * den / this->frequency_));
 
                 return start + passed_time;
             }

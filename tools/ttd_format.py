@@ -15,13 +15,16 @@ CODE = struct.Struct("<2Q16s")
 CHUNK_HEADER = struct.Struct("<9Q")
 BULK = struct.Struct("<2Q")
 BULK_REFERENCE = struct.Struct("<2Q")
-MAGIC = b"SOGTTD9\0"
-# Version 8 differs only in how checkpoint states store strings, which this module does not read.
+MAGIC = b"SOGTTD10"
+# Version 9 differs only in having no page checkpoints, and version 8 also in how checkpoint states store strings;
+# this module reads neither.
+MAGIC_V9 = b"SOGTTD9\0"
 MAGIC_V8 = b"SOGTTD8\0"
 MAGIC_V7 = b"SOGTTD7\0"
 CHUNK_TABLE, CHECKPOINT_TABLE, PAGE_INDEX, CODE_TABLE, BULK_TABLE, MANIFEST, UI_INPUTS, SYSCALLS = 1, 2, 3, 4, 5, 6, 7, 8
 MODULES, THREADS, EXPORTS, EXPORT_FORWARDERS = 9, 10, 11, 12
 REGISTER_SNAPSHOTS, MAPPING_CHANGES = 13, 14
+NETWORK_INPUTS = 20
 SYSCALL_HEADER = struct.Struct("<8Q")
 # checkpoint, event_number, step, window, message, reserved, wparam, lparam
 UI_INPUT = struct.Struct("<4QII2Q")
@@ -425,14 +428,39 @@ def decode_mapping_changes(compressed):
     return changes
 
 
+class NetworkInput:
+    """One answer of the host network while recording (see network_input in ttd_format.hpp)."""
+
+    def __init__(self, call, stream, argument, value, data):
+        self.call, self.stream, self.argument, self.value, self.data = call, stream, argument, value, data
+
+
+def decode_network_inputs(compressed):
+    """The network inputs section: (first position, [NetworkInput])."""
+    raw = zstandard.ZstdDecompressor().decompress(compressed)
+    stream = _Stream(raw)
+    first_position = stream.varint()
+    inputs = []
+    for _ in range(stream.varint()):
+        call = raw[stream.offset]
+        stream.offset += 1
+        stream_id, argument = stream.varint(), stream.varint()
+        value = _unzigzag(stream.varint())
+        value = value - (1 << 64) if value >> 63 else value
+        size = stream.varint()
+        inputs.append(NetworkInput(call, stream_id, argument, value, bytes(raw[stream.offset:stream.offset + size])))
+        stream.offset += size
+    return first_position, inputs
+
+
 class Trace:
     def __init__(self, path):
         self.path = path
         with open(path, "rb") as file:
             self.bytes = file.read()
         magic, self.instruction_count, self.event_count, self.access_mask, count, table = HEADER.unpack_from(self.bytes)
-        if magic not in (MAGIC, MAGIC_V8, MAGIC_V7):
-            raise ValueError("not a v7, v8 or v9 TTD trace")
+        if magic not in (MAGIC, MAGIC_V9, MAGIC_V8, MAGIC_V7):
+            raise ValueError("not a v7 to v10 TTD trace")
         self.magic = magic
         if not table:
             raise ValueError("TTD trace was not finalized")
@@ -470,6 +498,9 @@ class Trace:
                                    if REGISTER_SNAPSHOTS in self.sections else [])
         offset, size = self.sections.get(MAPPING_CHANGES, (0, 0))
         self.mapping_changes = decode_mapping_changes(self.bytes[offset:offset + size]) if MAPPING_CHANGES in self.sections else []
+        offset, size = self.sections.get(NETWORK_INPUTS, (0, 0))
+        self.network_inputs = (decode_network_inputs(self.bytes[offset:offset + size])
+                               if NETWORK_INPUTS in self.sections else None)
         self._bulk_cache = {}
 
     def bulk(self, index):

@@ -67,6 +67,10 @@ namespace sogen::ttd
         // prefix the backend raises #UD.
         void run_random_instruction(windows_emulator& emu, const uint64_t address, const std::span<const uint8_t> instruction)
         {
+            if (instruction.size() < 3 || instruction[instruction.size() - 3] != 0x0F || instruction[instruction.size() - 2] != 0xC7)
+            {
+                return;
+            }
             constexpr std::array<uint8_t, 6> segment_prefixes{0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65};
             size_t offset = 0;
             size_t operand_size = 4;
@@ -338,26 +342,35 @@ namespace sogen::ttd
         constexpr auto code_changes = static_cast<uint64_t>(access_kind::execute) | static_cast<uint64_t>(access_kind::write) |
                                       static_cast<uint64_t>(access_kind::host_write);
         caches_instructions_ = (access_mask & code_changes) == code_changes;
+        constexpr auto memory_changes = static_cast<uint64_t>(access_kind::write) | static_cast<uint64_t>(access_kind::host_write);
+        page_checkpoints_ = (access_mask & memory_changes) == memory_changes;
 
         // This also makes the initial process/thread state explicit in the snapshot.
         emu_.setup_process_if_necessary();
         instruction_ip_ = emu_.active_cpu().read_instruction_pointer();
+        // Before the first checkpoint, whose sockets are then recorded ones.
+        network_recording_.tap = install_network_tap(emu_);
+        network_recording_.tap->start_recording(network_inputs_);
         write_checkpoint(emu_.get_executed_instructions());
 
         auto& cpu = emu_.emu();
         if (access_mask & static_cast<uint64_t>(access_kind::write))
         {
-            write_hook_ = scoped_hook(
-                cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+            auto* hook =
+                cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
                     append_data_event(access_kind::write, address, data);
-                }));
+                });
+            write_hook_ = scoped_hook(cpu, hook);
+            cpu.hook_reads_no_cpu_state(hook);
         }
         if (access_mask & static_cast<uint64_t>(access_kind::read))
         {
-            read_hook_ = scoped_hook(
-                cpu, cpu.hook_memory_read_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+            auto* hook =
+                cpu.hook_memory_read_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
                     append_data_event(access_kind::read, address, data);
-                }));
+                });
+            read_hook_ = scoped_hook(cpu, hook);
+            cpu.hook_reads_no_cpu_state(hook);
         }
         // Without execute events, instructions are still looked at for RDRAND and RDSEED.
         const auto record_execute = [this](const uint64_t address, const size_t size) {
@@ -653,6 +666,10 @@ namespace sogen::ttd
                     const auto last = last_byte(address, size);
                     for (auto page = address / page_size; page <= last / page_size; ++page)
                     {
+                        if (page == code_free_page_)
+                        {
+                            code_free_page_ = no_recent_page;
+                        }
                         const auto* list = cached_instructions_by_page_.find(page);
                         if (!list)
                         {
@@ -682,9 +699,14 @@ namespace sogen::ttd
         const auto last = last_byte(address, size);
         for (auto page = address / page_size; page <= last / page_size; ++page)
         {
+            if (page == code_free_page_)
+            {
+                continue;
+            }
             const auto* list = cached_instructions_by_page_.find(page);
             if (!list)
             {
+                code_free_page_ = page;
                 continue;
             }
             auto& instructions = cached_pages_[static_cast<size_t>(*list)];
@@ -696,6 +718,7 @@ namespace sogen::ttd
                 }
             }
             instructions.clear();
+            code_free_page_ = page;
         }
     }
 
@@ -902,8 +925,136 @@ namespace sogen::ttd
         }
     }
 
+    namespace
+    {
+        // Checkpoint i is based on i - p, where p is the largest power of checkpoints_per_level dividing i (at most
+        // checkpoints_per_level^(levels - 1)), so restoring any checkpoint applies fewer than checkpoints_per_level
+        // deltas per level. Returns the exponent and p.
+        std::pair<size_t, uint64_t> checkpoint_level(const uint64_t index, const size_t per_level, const size_t levels)
+        {
+            size_t level = 0;
+            uint64_t distance = 1;
+            while (level + 1 < levels && index % (distance * per_level) == 0)
+            {
+                ++level;
+                distance *= per_level;
+            }
+            return {level, distance};
+        }
+    }
+
+    recorder::page_checkpoint_base recorder::current_page_base(size_t& memory_offset) const
+    {
+        utils::buffer_serializer serializer{};
+        emu_.serialize_without_memory_contents(serializer, memory_offset);
+        return {.objects = std::make_shared<const std::vector<std::byte>>(serializer.move_buffer()),
+                .pages = pages_.size(),
+                .mapping_changes = mapping_changes_.size()};
+    }
+
+    std::vector<uint64_t> recorder::changed_pages(const page_checkpoint_base& base) const
+    {
+        constexpr auto writes = static_cast<uint32_t>(access_kind::write) | static_cast<uint32_t>(access_kind::host_write);
+        std::vector<uint64_t> written{};
+        for (const auto& entry : std::span(pages_).subspan(base.pages))
+        {
+            if (entry.kinds & writes)
+            {
+                written.push_back(entry.page * page_size);
+            }
+        }
+        std::ranges::sort(written);
+        written.erase(std::ranges::unique(written).begin(), written.end());
+
+        // Sorted, disjoint [begin, end) ranges of whole pages.
+        std::vector<std::pair<uint64_t, uint64_t>> remapped{};
+        for (const auto& change : std::span(mapping_changes_).subspan(base.mapping_changes))
+        {
+            remapped.emplace_back(change.address & ~(page_size - 1), (change.address + change.size + page_size - 1) & ~(page_size - 1));
+        }
+        std::ranges::sort(remapped);
+        std::vector<std::pair<uint64_t, uint64_t>> merged{};
+        for (const auto& range : remapped)
+        {
+            if (!merged.empty() && range.first <= merged.back().second)
+            {
+                merged.back().second = std::max(merged.back().second, range.second);
+            }
+            else
+            {
+                merged.push_back(range);
+            }
+        }
+
+        std::vector<uint64_t> pages{};
+        std::vector<uint64_t> remapped_pages{};
+        for (const auto& reserved : emu_.memory.get_reserved_regions() | std::views::values)
+        {
+            if (reserved.kind == memory_region_kind::mmio)
+            {
+                continue;
+            }
+            for (const auto& [address, committed] : reserved.committed_regions)
+            {
+                const auto end = address + committed.length;
+                remapped_pages.clear();
+                for (auto range = std::ranges::upper_bound(merged, address, {}, &std::pair<uint64_t, uint64_t>::second);
+                     range != merged.end() && range->first < end; ++range)
+                {
+                    for (auto page = std::max(range->first, address); page < std::min(range->second, end); page += page_size)
+                    {
+                        remapped_pages.push_back(page);
+                    }
+                }
+                const auto first_written = std::ranges::lower_bound(written, address);
+                const auto last_written = std::lower_bound(first_written, written.end(), end);
+                std::set_union(remapped_pages.begin(), remapped_pages.end(), first_written, last_written, std::back_inserter(pages));
+            }
+        }
+        return pages;
+    }
+
+    void recorder::write_page_checkpoint(const uint64_t step)
+    {
+        const auto index = static_cast<uint64_t>(checkpoints_.size());
+        const auto [level, distance] = checkpoint_level(index, checkpoints_per_level, checkpoint_levels);
+        auto pages = changed_pages(page_bases_[level]);
+        size_t memory_offset{};
+        auto current = current_page_base(memory_offset);
+        checkpoint_memory_offsets_.push_back(memory_offset);
+        std::vector<std::byte> contents(pages.size() * page_size);
+        for (size_t i = 0; i < pages.size(); ++i)
+        {
+            emu_.memory.read_memory(pages[i], contents.data() + (i * page_size), page_size);
+        }
+
+        std::vector<bulk_block> between{};
+        if (distance <= bulk_reference_span)
+        {
+            between.assign(recent_bulk_.end() - static_cast<ptrdiff_t>(distance), recent_bulk_.end());
+        }
+        checkpoints_.push_back({.step = step, .base = index - distance});
+        page_checkpoint_indices_.push_back(index);
+        checkpoint_compressor_.submit_job(index, [objects = current.objects, base = page_bases_[level].objects, pages = std::move(pages),
+                                                  contents = std::move(contents), between = std::move(between)] {
+            std::vector<std::byte> reference{};
+            for (const auto& block : between)
+            {
+                reference.insert(reference.end(), block->begin(), block->end());
+            }
+            return encode_page_checkpoint(*objects, pages, contents, *base, reference, checkpoint_compression_level);
+        });
+        std::fill_n(page_bases_.begin(), level + 1, current);
+        write_compressed(false);
+    }
+
     void recorder::write_checkpoint(const uint64_t step)
     {
+        if (page_checkpoints_ && !checkpoints_.empty())
+        {
+            write_page_checkpoint(step);
+            return;
+        }
         // A little headroom over the previous state covers ordinary growth without a reallocation.
         const auto expected_size = base_states_.empty() ? 0 : base_states_.front()->size() + base_states_.front()->size() / 16;
         std::vector<std::byte> storage{};
@@ -935,20 +1086,20 @@ namespace sogen::ttd
             checkpoints_.push_back({.step = step});
             checkpoint_compressor_.submit_job(index,
                                               [state] { return utils::compression::zstd::compress(*state, checkpoint_compression_level); });
-            base_states_.assign(checkpoint_levels, state);
+            if (page_checkpoints_)
+            {
+                size_t objects_memory_offset{};
+                page_bases_.assign(checkpoint_levels, current_page_base(objects_memory_offset));
+            }
+            else
+            {
+                base_states_.assign(checkpoint_levels, state);
+            }
             write_compressed(false);
             return;
         }
 
-        // Checkpoint i is a delta against i - p, where p is the largest power of checkpoints_per_level dividing i, so
-        // restoring any checkpoint applies fewer than checkpoints_per_level deltas per level.
-        size_t level = 0;
-        uint64_t distance = 1;
-        while (level + 1 < checkpoint_levels && index % (distance * checkpoints_per_level) == 0)
-        {
-            ++level;
-            distance *= checkpoints_per_level;
-        }
+        const auto [level, distance] = checkpoint_level(index, checkpoints_per_level, checkpoint_levels);
         std::vector<bulk_block> between{};
         if (distance <= bulk_reference_span)
         {
@@ -997,6 +1148,11 @@ namespace sogen::ttd
             return;
         }
         finished_ = true;
+        if (network_recording_.tap)
+        {
+            network_recording_.tap->stop_recording();
+            network_recording_.tap.reset();
+        }
         syscall_enter_.reset();
         syscall_exit_.reset();
         module_load_.reset();
@@ -1031,6 +1187,7 @@ namespace sogen::ttd
         write_compressed(true);
         register_base_.reset();
         base_states_.clear();
+        page_bases_.clear();
         recent_bulk_.clear();
         header_.instruction_count = emu_.get_executed_instructions();
 
@@ -1064,6 +1221,7 @@ namespace sogen::ttd
         const auto stacks = encode_thread_stacks(thread_stacks_);
         const auto regions = encode_memory_regions(memory_regions_);
         const auto memory_offsets = encode_checkpoint_memory_offsets(checkpoint_memory_offsets_);
+        const auto page_checkpoints = encode_page_checkpoint_indices(page_checkpoint_indices_);
         // Everything this emulator read of its hives since it was created, which covers what a replay from any
         // checkpoint reads, even where this run found the data cached.
         std::vector<recorded_hive_file> hive_files{};
@@ -1077,6 +1235,8 @@ namespace sogen::ttd
         }
         const auto hives = encode_registry_hives(hive_files);
         hive_files.clear();
+        const auto network = encode_network_inputs(network_inputs_);
+        network_inputs_ = {};
         const std::array sections{
             section_entry{.type = section_type::chunk_table, .offset = append_to_file(bytes_of(chunks_)), .size = chunks_.size()},
             section_entry{
@@ -1098,6 +1258,9 @@ namespace sogen::ttd
             section_entry{.type = section_type::memory_regions, .offset = append_to_file(regions), .size = regions.size()},
             section_entry{.type = section_type::checkpoint_memory, .offset = append_to_file(memory_offsets), .size = memory_offsets.size()},
             section_entry{.type = section_type::registry_hives, .offset = append_to_file(hives), .size = hives.size()},
+            section_entry{.type = section_type::network_inputs, .offset = append_to_file(network), .size = network.size()},
+            section_entry{
+                .type = section_type::page_checkpoints, .offset = append_to_file(page_checkpoints), .size = page_checkpoints.size()},
         };
         header_.section_count = sections.size();
         header_.section_table_offset = append_to_file(std::as_bytes(std::span(sections)));
@@ -1530,6 +1693,11 @@ namespace sogen::ttd
         execute_hook_.remove();
         instruction_callback_.reset();
         host_write_hook_.remove();
+        // A network replay that asked something else is why any later difference arose.
+        if (const auto tap = find_network_tap(emu_); tap && tap->error())
+        {
+            throw divergence_error(*tap->error());
+        }
         if (error_)
         {
             throw divergence_error(*error_);

@@ -2,6 +2,7 @@
 
 #include "sspi_context.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -31,7 +32,15 @@ namespace sogen::sspi
     class tls_client
     {
       public:
-        static std::unique_ptr<tls_client> create(std::string_view target);
+        // What a reproducible run makes a handshake from instead of the host: the randomness (client random, key share)
+        // and the time (which a TLS 1.2 client random starts with), so that it makes the same handshake again.
+        struct reproducible
+        {
+            std::array<uint8_t, 48> seed{};
+            int64_t time{};
+        };
+
+        static std::unique_ptr<tls_client> create(std::string_view target, const std::optional<reproducible>& fixed = std::nullopt);
 
         ~tls_client();
         tls_client(const tls_client&) = delete;

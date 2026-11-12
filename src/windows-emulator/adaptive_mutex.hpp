@@ -49,6 +49,11 @@ namespace sogen
             return this->state_.compare_exchange_strong(expected, held, std::memory_order_acquire, std::memory_order_relaxed);
         }
 
+        bool is_locked() const
+        {
+            return this->state_.load(std::memory_order_relaxed) != free;
+        }
+
         void unlock()
         {
             if (this->state_.exchange(free, std::memory_order_release) == held_with_waiters)

@@ -104,6 +104,15 @@ namespace sogen::unicorn
                 }
             }
 
+            template <typename F>
+            void for_each_hook(const F& callback) const
+            {
+                for (const auto& entry : this->hooks_)
+                {
+                    callback(entry.hook.get());
+                }
+            }
+
           private:
             struct hook_entry
             {
@@ -769,6 +778,20 @@ namespace sogen::unicorn
             auto* result = this->add_hook(std::move(wrapper), std::move(hook));
             this->code_hook_ranges_[result] = {0, std::numeric_limits<uint64_t>::max()};
             return result;
+        }
+
+        // Unicorn restores the precise instruction pointer before every read and write hook: about a quarter of a
+        // recording's emulation time.
+        void hook_reads_no_cpu_state(emulator_hook* hook) override
+        {
+            const auto entry = std::ranges::find_if(
+                this->hooks_, [&](const std::unique_ptr<detail::hook_object>& hook_ptr) { return hook_ptr->as_opaque_hook() == hook; });
+            auto* container = entry == this->hooks_.end() ? nullptr : dynamic_cast<detail::hook_container*>(entry->get());
+            if (!container)
+            {
+                throw std::runtime_error("Unknown Unicorn hook");
+            }
+            container->for_each_hook([&](const uc_hook handle) { uce(uc_ctl_hook_no_sync(*this, handle, 1)); });
         }
 
         void delete_hook(emulator_hook* hook) override

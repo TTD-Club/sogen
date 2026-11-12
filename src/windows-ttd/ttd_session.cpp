@@ -185,6 +185,7 @@ namespace sogen::ttd
                                          std::string(cpuid_scheme));
             }
             use_recorded_registry(win_emu, recorded);
+            use_recorded_network(win_emu, recorded);
         }
 
         std::string difference_suffix(const std::vector<std::string>& differences)
@@ -241,6 +242,19 @@ namespace sogen::ttd
         const auto own_files =
             !fingerprint.empty() && !registry.get_hive_path().empty() && ttd::registry_fingerprint(registry.get_hive_path()) == fingerprint;
         registry.use_recorded_hives(to_registry_hives(recorded.registry_hives()), identity, own_files);
+    }
+
+    void use_recorded_network(windows_emulator& win_emu, const trace& recorded)
+    {
+        auto tap = install_network_tap(win_emu);
+        if (const auto& inputs = recorded.recorded_network())
+        {
+            tap.start_replay(inputs);
+        }
+        else
+        {
+            tap.go_live();
+        }
     }
 
     namespace

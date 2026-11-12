@@ -215,8 +215,8 @@ environment's input to the guest. The trace stores every host write's bytes
 and, for every dispatched syscall, the events its handler produced and the
 value it left in RAX (the `syscalls` section). A replay checks each syscall as
 one unit when its handler returns. If its live events or result differ from the
-recording (a live DNS answer, a host-assigned UDP port, a file that no longer
-exists), the replay undoes the handler's live host writes (newest first,
+recording (a file that no longer exists; a live DNS answer or a host-assigned
+UDP port in traces without network inputs), the replay undoes the handler's live host writes (newest first,
 restoring the bytes each replaced), applies the recorded ones, and sets RAX to
 the recorded result, so the guest continues with what it saw while recording.
 A host write outside a syscall (exception dispatch, window messages) that
@@ -237,6 +237,28 @@ default interval is 500,000 instructions. Checkpoints are taken only between
 instruction-budgeted `start()` calls, when emulator state is quiescent.
 `--ttd-max-instructions` bounds recording and finalizes the trace at the limit.
 A guest failure before the limit can also leave a finalized trace.
+
+Recording runs the guest several times slower than a plain run, which a peer
+can notice. A WinINet HTTPS request verifies the server's certificate between
+the TLS handshake and the request; under recording that took 23 s against
+`example.com` (15 s without the root list update), and its server closed the
+idle connection after 13 to 17 s (`ERROR_HTTP_INVALID_SERVER_RESPONSE`, 12152).
+About half of the guest's certificate work is crypt32's automatic root list
+update, which decodes and verifies the cached `authroot.stl`.
+`create-root.bat no-root-auto-update` turns it off in a new root (policy
+`DisableRootAutoUpdate`), and `--reg-file` with this file does the same for an
+existing one:
+
+```
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\SystemCertificates\AuthRoot]
+"DisableRootAutoUpdate"=dword:00000001
+```
+
+Both change the guest's environment, so they are not the default. Plain
+analyzer runs skip most of that work: outside observe-only mode, which TTD
+uses, the analyzer stubs `WinVerifyTrust`.
 
 `--ttd-replay T --ttd-verify-checkpoints` checks replay determinism, including
 written values: for every checkpoint it restores the previous checkpoint (or
@@ -392,10 +414,10 @@ thread-specific register state, MMIO, and data from the initial snapshot other
 than selected source ranges are not fully modeled. A gap means the reported
 taint flow may be incomplete.
 
-## Format v8
+## Format v10
 
 All fields are little-endian; `tools/ttd_format.py` is a reference reader and
-writer. The 48-byte header is `SOGTTD8\0` plus five `uint64_t` values:
+writer. The 48-byte header is `SOGTTD10` plus five `uint64_t` values:
 instruction count, event count, recorded access kinds (a nonzero mask of the
 kind values below), section count, and section-table offset. A section-table
 offset of zero marks a recording that was never finalized. Event chunks,
@@ -417,6 +439,21 @@ found through the section table (24-byte entries `type, offset, size`):
   When `i - base` is at most 16, the delta's reference is the base state
   followed by bulk blocks `base` to `i - 1`, so memory filled by large host
   writes (mapped images, file reads) is not stored again in the checkpoint.
+  A checkpoint the page checkpoints section lists is instead a page
+  checkpoint, with the same bases: the size of its objects frame as a
+  `uint64_t`, the objects frame (the state serialized without memory
+  contents, `serialize_without_memory_contents`, as a zstd delta against the
+  base's state without its memory contents), then a zstd frame of the page
+  count, varint page-number deltas, and 4 KiB of contents per page. That frame
+  is a delta against bulk blocks `base` to `i - 1` under the same condition,
+  unless they are empty. The pages are every committed page a write, a host
+  write, or a mapping change touched since the base; every other committed
+  page holds the base's bytes (zeros where the base had none). The reader
+  rebuilds the full state, byte for byte what `create_emulator_state` gives,
+  so restores and `memory_at` see no difference. Recordings use page
+  checkpoints whenever they record writes and host writes: compressing a full
+  state at every checkpoint slowed recording by about 30%, even on other
+  threads.
 - Page index (type 3, size = block count): 32-byte block entries
   `first_page, entry_count, offset, size`. Each block is a zstd frame of up to
   4,096 consecutive page entries `(page, chunk, kinds)`, sorted by page and
@@ -614,9 +651,30 @@ found through the section table (24-byte entries `type, offset, size`):
   it read. Size: ttd-step-sample 87 KB (1% of the trace), test-sample 208 KB
   (0.5%). SAM and SECURITY contribute only their signature and root key
   block (340 bytes each) unless the guest opens them. `Trace.has_registry_hives`.
+- Network inputs (type 20, size = compressed bytes; absent in traces recorded
+  before 2026-11-11): every answer the host network gave the emulator while
+  recording, in the order it was asked: socket creation, polls (with how long
+  a live socket was given to become ready), connects, sends and receives with
+  the received bytes, addresses, the local address list, and DNS lookups. A
+  zstd frame: the first input position and the input count as varints, then
+  per input its call (one byte), the socket's stream, the argument (a size,
+  flag or hash of what was asked), the zigzagged answer, and the data size as
+  varints, followed by the data. The recorder puts a tap (`ttd_network.hpp`) in
+  place of the emulator's socket factory and DNS lookup; seeks and replays
+  (`ttd::use_recorded_network`) give the recorded answers instead of asking
+  the host, and stop when the replay asks something else. The emulator's
+  state keeps its input position, and a socket keeps its stream instead of
+  its host connection, so a checkpoint or keyframe continues the streams. A
+  replay therefore needs no network, and `--network` does not matter for it.
+  After a seek, sockets the replay made have no host socket: a fork's guest
+  sees them as reset connections and makes new ones live.
+  `tools/ttd_format.py`: `Trace.network_inputs`.
+- Page checkpoints (type 21, size = compressed bytes; absent before version
+  10): the indices of the page checkpoints, as a zstd frame of varints: the
+  count, then the index deltas. Requires the checkpoint memory section.
 
 Unknown section types are ignored, so sections can be added without a new
-version. The library reads versions 1-4 and 7-9 (`ttd::is_supported_trace_version`;
+version. The library reads versions 1-4 and 7-10 (`ttd::is_supported_trace_version`;
 5 and 6 were development formats) and refuses others; `ttd::is_trace_file` and
 `ttd::trace_file_version` recognize any version from the first 8 bytes. A file of a
 supported version with sections this build does not know opens without them.
@@ -656,10 +714,11 @@ blocks it refers to:
 Decoded accesses up to 16 bytes carry their data inline; larger ones carry
 their bulk offset (payload bytes 0-7) and block (bytes 8-15).
 
-Version 8 is identical except that its checkpoint states store each character of
+Version 9 is identical except that it has no page checkpoints. Version 8 is
+also identical except that its checkpoint states store each character of
 a string as a field of its own, where version 9 stores the string as one field
 (the memory part's mapped file names are read either way). Version 7 is also
-identical except that bulk blocks are stored without the x86-64 filter. Both
+identical except that bulk blocks are stored without the x86-64 filter. All
 remain readable. Versions 1 to 4 stored fixed-size event records
 with full checkpoint snapshots and a per-event page index; they remain readable
 (1 and 2 as write-only traces, 3 without instruction bytes, 4 without access
@@ -678,9 +737,12 @@ bulk blocks 17.6 MiB
 1.4 MiB, three 16-apart deltas 0.7 MiB, 57 adjacent deltas 1.6 MiB), the
 code table 1.3 MiB (243,348 instructions), and the page index 0.06 MiB.
 Without bulk data in the delta references the checkpoints took 46.4 MiB.
-Chunks (on four threads) and bulk blocks (on one) are compressed at zstd
-level 19 in the background (level 6 bulk blocks would take 22.5 MiB
-unfiltered). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take
+These sizes are for level 19 chunks (level 6 bulk blocks would take
+22.5 MiB unfiltered). Chunks now compress at zstd level 3 and bulk blocks at
+level 19, each on four background threads. Background compression still
+slows the emulation thread: on a 12-core Ryzen, a beacon recording's traces
+were 9% smaller with level 19 chunks, but its emulation ran about 25% slower.
+Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take
 0.02 s for a next-access lookup and about 2 s for a scan of every chunk.
 Address queries decode their candidate chunks on all cores, and queries for
 execute events only (`Trace.calls`) skip the chunks' data: the calls of a hot

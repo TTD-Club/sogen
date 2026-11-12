@@ -35,12 +35,17 @@ namespace sogen
 
             lpc_request_result handle_request(windows_emulator& win_emu, const lpc_request_context&) override
             {
-                (void)win_emu;
-                // win_emu.log.error("!!! BAD PORT: %s\n", u16_to_u8(name_).c_str());
+                if (!this->rejection_reported_)
+                {
+                    this->rejection_reported_ = true;
+                    win_emu.callbacks.on_generic_access("Rejecting message to unknown port", this->name_);
+                }
+
                 return STATUS_NOT_SUPPORTED;
             }
 
             std::u16string name_;
+            bool rejection_reported_{false};
         };
 
         struct noop_port : port

@@ -403,6 +403,33 @@ namespace sogen::test
         EXPECT_EQ(contents, read_host_file(this->root / "c" / "new.bin"));
     }
 
+    TEST_F(FileSystemTest, SnapshotRestoreRecreatesAFileWhoseFoldersWereDeletedLater)
+    {
+        file_system fs{this->root, filesystem_mode::read_write};
+        std::filesystem::create_directories(this->root / "c" / "gone" / "deeper");
+        write_host_file(this->root / "c" / "gone" / "deeper" / "x.txt", "saved");
+        const windows_path path{'c', {u"gone", u"deeper", u"x.txt"}};
+
+        utils::buffer_serializer serializer{};
+
+        {
+            const guest_file file{fs, path, u"rb", fs.open(path, u"rb").file};
+            ASSERT_TRUE(file);
+            serializer.write(file);
+        }
+
+        std::filesystem::remove_all(this->root / "c" / "gone");
+
+        utils::buffer_deserializer deserializer{serializer};
+        deserializer.register_factory<file_system_wrapper>([&] { return file_system_wrapper{fs}; });
+
+        guest_file restored{};
+        deserializer.read(restored);
+
+        EXPECT_TRUE(restored);
+        EXPECT_TRUE(std::filesystem::is_regular_file(this->root / "c" / "gone" / "deeper" / "x.txt"));
+    }
+
     TEST_F(FileSystemTest, SnapshotRestoreKeepsDeletePendingAndItsPosixOwner)
     {
         file_system saved_fs{this->root, filesystem_mode::read_write};

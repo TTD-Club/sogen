@@ -57,6 +57,57 @@ namespace sogen
         }
 #endif
 
+        std::optional<int> parse_time_field(const std::string_view text, const size_t offset, const size_t length)
+        {
+            int value{};
+            const auto* const begin = text.data() + offset;
+            const auto* const end = begin + length;
+            const auto [ptr, error] = std::from_chars(begin, end, value);
+            if (error != std::errc{} || ptr != end)
+            {
+                return std::nullopt;
+            }
+
+            return value;
+        }
+
+        std::chrono::system_clock::time_point parse_start_time(const std::string_view text)
+        {
+            if (text == "now")
+            {
+                return std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+            }
+
+            const auto utc = text.ends_with('Z') ? text.substr(0, text.size() - 1) : text;
+            const auto has_layout =
+                utc.size() == 19 && utc[4] == '-' && utc[7] == '-' && utc[10] == 'T' && utc[13] == ':' && utc[16] == ':';
+            if (!has_layout)
+            {
+                throw std::runtime_error("--start-time takes now or a UTC time as YYYY-MM-DDTHH:MM:SS");
+            }
+
+            const auto year = parse_time_field(utc, 0, 4);
+            const auto month = parse_time_field(utc, 5, 2);
+            const auto day = parse_time_field(utc, 8, 2);
+            const auto hour = parse_time_field(utc, 11, 2);
+            const auto minute = parse_time_field(utc, 14, 2);
+            const auto second = parse_time_field(utc, 17, 2);
+
+            if (!year || !month || !day || !hour || !minute || !second)
+            {
+                throw std::runtime_error("--start-time takes now or a UTC time as YYYY-MM-DDTHH:MM:SS");
+            }
+
+            const std::chrono::year_month_day date{std::chrono::year{*year}, std::chrono::month{static_cast<unsigned>(*month)},
+                                                   std::chrono::day{static_cast<unsigned>(*day)}};
+            if (!date.ok() || *year < 1970 || *hour > 23 || *minute > 59 || *second > 59)
+            {
+                throw std::runtime_error("--start-time is not a valid time since 1970: " + std::string(text));
+            }
+
+            return std::chrono::sys_days{date} + std::chrono::hours{*hour} + std::chrono::minutes{*minute} + std::chrono::seconds{*second};
+        }
+
         // Not an aggregate: GCC 15+ reports the set members as uninitialized once
         // the value-initialization of the base is inlined.
         struct analysis_options : analysis_settings
@@ -89,6 +140,7 @@ namespace sogen
             network::network_mode network{network::network_mode::offline};
             bool disable_instruction_precision{false};
             bool native_timing{false};
+            std::chrono::system_clock::time_point start_time{};
             uint32_t vcpu_count{1};
             std::filesystem::path registry_path{get_current_binary_dir() / "registry"};
             std::vector<std::filesystem::path> registry_files{};
@@ -743,11 +795,20 @@ namespace sogen
         constexpr bool kusd_needs_intercept = false;
 #endif
 
+        // The browser debugger's break loop runs in an instruction hook.
+#if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
+        constexpr bool keeps_kernel_lock = false;
+#else
+        constexpr bool keeps_kernel_lock = true;
+#endif
+
         emulator_settings create_emulator_settings(const analysis_options& options)
         {
             return {
                 .use_relative_time = options.reproducible,
+                .relative_time_start = options.start_time,
                 .use_instruction_precision = !options.disable_instruction_precision,
+                .keep_kernel_lock_between_instructions = keeps_kernel_lock && !options.use_gdb,
                 .intercept_rdtsc = !options.native_timing,
                 .intercept_kusd = kusd_needs_intercept || !options.native_timing,
                 .emulation_root = options.emulation_root,
@@ -1351,6 +1412,11 @@ namespace sogen
                 ->capture_default_str()
                 ->check(CLI::IsMember({"offline", "live"}));
 
+            std::string start_time{};
+            app.add_option("--start-time", start_time,
+                           "System time a reproducible run starts at: now, or a UTC time as YYYY-MM-DDTHH:MM:SS (default "
+                           "1970-01-01T00:00:00). A TTD replay starts at the recording's");
+
             std::string backend_name{};
             app.add_option("--backend", backend_name, "Select CPU backend: unicorn, icicle, whp, kvm, fex or hvf (overrides env)")
                 ->check(CLI::IsMember({"unicorn", "icicle", "whp", "kvm", "fex", "hvf"}));
@@ -1415,6 +1481,16 @@ namespace sogen
                 }
 
                 options.network = network::parse_network_mode(network_name);
+
+                if (!start_time.empty())
+                {
+                    if (!options.reproducible)
+                    {
+                        throw std::runtime_error("--start-time needs --reproducible");
+                    }
+
+                    options.start_time = parse_start_time(start_time);
+                }
 
                 if (!backend_name.empty())
                 {

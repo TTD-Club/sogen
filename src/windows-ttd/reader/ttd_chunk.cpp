@@ -1604,6 +1604,123 @@ namespace sogen::ttd
         return offsets;
     }
 
+    std::vector<std::byte> encode_page_checkpoint(const std::span<const std::byte> objects, const std::span<const uint64_t> pages,
+                                                  const std::span<const std::byte> contents, const std::span<const std::byte> base_objects,
+                                                  const std::span<const std::byte> bulk_reference, const int level)
+    {
+        constexpr size_t checkpoint_page_size = 4096;
+        if (contents.size() != pages.size() * checkpoint_page_size)
+        {
+            throw std::invalid_argument("A TTD page checkpoint needs one page of contents per page");
+        }
+        const auto objects_frame = utils::compression::zstd::compress_with_reference(objects, base_objects, level);
+
+        std::vector<std::byte> raw{};
+        put_varint(raw, pages.size());
+        uint64_t previous = 0;
+        for (const auto page : pages)
+        {
+            put_varint(raw, (page - previous) / checkpoint_page_size);
+            previous = page;
+        }
+        raw.insert(raw.end(), contents.begin(), contents.end());
+        const auto pages_frame = bulk_reference.empty() ? utils::compression::zstd::compress(raw, level)
+                                                        : utils::compression::zstd::compress_with_reference(raw, bulk_reference, level);
+        if (objects_frame.empty() || pages_frame.empty())
+        {
+            return {};
+        }
+
+        const uint64_t objects_size = objects_frame.size();
+        std::vector<std::byte> encoded(sizeof(objects_size) + objects_frame.size() + pages_frame.size());
+        memcpy(encoded.data(), &objects_size, sizeof(objects_size));
+        memcpy(encoded.data() + sizeof(objects_size), objects_frame.data(), objects_frame.size());
+        memcpy(encoded.data() + sizeof(objects_size) + objects_frame.size(), pages_frame.data(), pages_frame.size());
+        return encoded;
+    }
+
+    page_checkpoint decode_page_checkpoint(const std::span<const std::byte> encoded, const std::span<const std::byte> base_objects,
+                                           const std::span<const std::byte> bulk_reference)
+    {
+        constexpr size_t checkpoint_page_size = 4096;
+        uint64_t objects_size{};
+        if (encoded.size() < sizeof(objects_size))
+        {
+            throw std::runtime_error("Invalid TTD page checkpoint");
+        }
+        memcpy(&objects_size, encoded.data(), sizeof(objects_size));
+        if (objects_size > encoded.size() - sizeof(objects_size))
+        {
+            throw std::runtime_error("Invalid TTD page checkpoint");
+        }
+        const auto objects = encoded.subspan(sizeof(objects_size), static_cast<size_t>(objects_size));
+        const auto pages = encoded.subspan(sizeof(objects_size) + static_cast<size_t>(objects_size));
+
+        page_checkpoint checkpoint{.objects = utils::compression::zstd::decompress_with_reference(objects, base_objects)};
+        const auto raw = bulk_reference.empty() ? utils::compression::zstd::decompress(pages)
+                                                : utils::compression::zstd::decompress_with_reference(pages, bulk_reference);
+        if (checkpoint.objects.empty() || raw.empty())
+        {
+            throw std::runtime_error("Cannot decompress TTD page checkpoint");
+        }
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        if (count > raw.size() / checkpoint_page_size)
+        {
+            throw std::runtime_error("Invalid TTD page checkpoint");
+        }
+        checkpoint.pages.resize(static_cast<size_t>(count));
+        uint64_t previous = 0;
+        for (auto& page : checkpoint.pages)
+        {
+            page = previous + (reader.varint() * checkpoint_page_size);
+            previous = page;
+        }
+        const auto contents = reader.bytes(count * checkpoint_page_size);
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD page checkpoint");
+        }
+        checkpoint.contents.assign(contents.begin(), contents.end());
+        return checkpoint;
+    }
+
+    std::vector<std::byte> encode_page_checkpoint_indices(const std::span<const uint64_t> indices)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, indices.size());
+        uint64_t previous = 0;
+        for (const auto index : indices)
+        {
+            put_varint(raw, index - previous);
+            previous = index;
+        }
+        return compress_table(raw, "page checkpoints");
+    }
+
+    std::vector<uint64_t> decode_page_checkpoint_indices(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        const auto count = reader.varint();
+        if (count > raw.size())
+        {
+            throw std::runtime_error("Invalid TTD page checkpoints");
+        }
+        std::vector<uint64_t> indices(static_cast<size_t>(count));
+        uint64_t previous = 0;
+        for (auto& index : indices)
+        {
+            index = previous + reader.varint();
+            previous = index;
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD page checkpoints");
+        }
+        return indices;
+    }
+
     std::vector<std::byte> encode_registry_hives(const std::span<const recorded_hive_file> hives)
     {
         std::vector<std::byte> raw{};
@@ -1668,6 +1785,52 @@ namespace sogen::ttd
             throw invalid();
         }
         return hives;
+    }
+
+    std::vector<std::byte> encode_network_inputs(const network_inputs& inputs)
+    {
+        std::vector<std::byte> raw{};
+        put_varint(raw, inputs.first_position);
+        put_varint(raw, inputs.inputs.size());
+        for (const auto& input : inputs.inputs)
+        {
+            raw.push_back(static_cast<std::byte>(input.call));
+            put_varint(raw, input.stream);
+            put_varint(raw, input.argument);
+            put_varint(raw, zigzag(static_cast<uint64_t>(input.value)));
+            put_varint(raw, input.data.size());
+            raw.insert(raw.end(), input.data.begin(), input.data.end());
+        }
+        return compress_table(raw, "network inputs");
+    }
+
+    network_inputs decode_network_inputs(const std::span<const std::byte> compressed)
+    {
+        const auto raw = utils::compression::zstd::decompress(compressed);
+        stream_reader reader(raw);
+        network_inputs result{};
+        result.first_position = reader.varint();
+        const auto count = reader.varint();
+        if (count > raw.size())
+        {
+            throw std::runtime_error("Invalid TTD network inputs");
+        }
+        result.inputs.resize(static_cast<size_t>(count));
+        for (auto& input : result.inputs)
+        {
+            const auto call = reader.bytes(1);
+            input.call = static_cast<network_call>(call[0]);
+            input.stream = reader.varint();
+            input.argument = reader.varint();
+            input.value = static_cast<int64_t>(unzigzag(reader.varint()));
+            const auto data = reader.bytes(reader.varint());
+            input.data.assign(data.begin(), data.end());
+        }
+        if (!reader.done())
+        {
+            throw std::runtime_error("Invalid TTD network inputs");
+        }
+        return result;
     }
 
     std::vector<std::byte> encode_bulk_block(const std::span<const std::byte> data, const int level)

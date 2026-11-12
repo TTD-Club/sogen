@@ -121,7 +121,14 @@ namespace sogen
     {
         bool disable_logging{false};
         bool use_relative_time{false};
+        // The system time a relative-time run starts at. A restored snapshot keeps the one it was saved with.
+        std::chrono::system_clock::time_point relative_time_start{};
         bool use_instruction_precision{true};
+
+        // With instruction precision and one vCPU, the instruction hook keeps the kernel lock between instructions
+        // until another thread waits for it. Only for hosts whose hooks never wait, while guest code runs, for another
+        // thread that takes the lock: a debugger's break loop or a hook that takes a Python GIL can.
+        bool keep_kernel_lock_between_instructions{false};
 
         // Timing fidelity vs. speed. With interception on (the default, used by the analyzer) rdtsc reads
         // and KUSER_SHARED_DATA accesses trap so the emulated clock stays exact and deterministic. Turning
@@ -249,6 +256,7 @@ namespace sogen
     {
         uint64_t executed_instructions_{0};
         uint64_t idle_ticks_{0};
+        std::chrono::system_clock::time_point relative_time_start_{};
         application_settings application_settings_{};
 
         std::unique_ptr<guest_machine> emu_{};
@@ -365,6 +373,18 @@ namespace sogen
         const network::socket_factory& socket_factory() const
         {
             return *this->socket_factory_;
+        }
+
+        // Puts a socket factory and DNS lookup in place of the current ones and returns those, for a front end that
+        // records or replays the host network (a TTD trace). Sockets the old factory made stay as they are.
+        std::pair<std::unique_ptr<network::socket_factory>, std::unique_ptr<network::dns_lookup>> exchange_network(
+            std::unique_ptr<network::socket_factory> factory, std::unique_ptr<network::dns_lookup> lookup)
+        {
+            if (!factory || !lookup)
+            {
+                throw std::invalid_argument("A network needs a socket factory and a DNS lookup");
+            }
+            return {std::exchange(this->socket_factory_, std::move(factory)), std::exchange(this->dns_lookup_, std::move(lookup))};
         }
 
         ui_backend& ui()
@@ -659,6 +679,7 @@ namespace sogen
 
         // The same state without the contents of committed guest memory, which a restore takes from `pages`.
         void serialize_without_memory_contents(utils::buffer_serializer& buffer) const;
+        void serialize_without_memory_contents(utils::buffer_serializer& buffer, size_t& memory_offset) const;
         void deserialize_without_memory_contents(utils::buffer_deserializer& buffer, const restored_page_source& pages);
 
         void save_snapshot();
@@ -788,6 +809,8 @@ namespace sogen
 
         bool use_relative_time_{false}; // TODO: Get rid of that
         bool instruction_precision_{true};
+        bool keep_kernel_lock_between_instructions_{false};
+        bool keeping_kernel_lock_{false};
         bool intercept_rdtsc_{true};
         bool intercept_kusd_{true};
         bool spoof_gpu_features_{false};

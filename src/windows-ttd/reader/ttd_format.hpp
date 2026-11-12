@@ -56,14 +56,15 @@ namespace sogen::ttd
 
     constexpr size_t inline_data_limit = sizeof(access_event::payload);
 
-    // Version 9 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
+    // Version 10 layout: a fixed header, then event chunks and checkpoints in recording order, then the tables the
     // section table points to. Unknown section types are ignored, so sections can be added without a new version.
-    // Version 8 differs only in its checkpoint states storing each character of a string as a field of its own, and
-    // version 7 also in storing bulk blocks without the x86-64 filter.
+    // Version 9 differs only in having no page checkpoints (section page_checkpoints), version 8 also in its checkpoint
+    // states storing each character of a string as a field of its own, and version 7 also in storing bulk blocks
+    // without the x86-64 filter.
     struct file_header
     {
         // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
-        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '9', '\0'};
+        char magic[8]{'S', 'O', 'G', 'T', 'T', 'D', '1', '0'};
         uint64_t instruction_count{};
         uint64_t event_count{};
         uint64_t access_mask{};
@@ -119,6 +120,59 @@ namespace sogen::ttd
         // The parts of the registry hive files the recording read (see recorded_hive_file), encoded as described at
         // encode_registry_hives; size = compressed bytes. A replay serves the registry from them instead of from files.
         registry_hives = 19,
+        // What the host network answered the emulator (see network_inputs), encoded as described at
+        // encode_network_inputs; size = compressed bytes. A replay takes the answers from it instead of the host.
+        network_inputs = 20,
+        // The checkpoints stored as page checkpoints (see checkpoint_entry), encoded as described at
+        // encode_page_checkpoint_indices; size = compressed bytes. Requires the checkpoint memory section.
+        page_checkpoints = 21,
+    };
+
+    // A question the emulator asked the host network: its socket factory, one of its sockets, or its DNS lookup.
+    enum class network_call : uint8_t
+    {
+        create_socket = 1,
+        poll = 2,
+        local_addresses = 3,
+        resolve_host = 4,
+        last_error = 5,
+        socket_error = 6,
+        is_ready = 7,
+        is_listening = 8,
+        local_address = 9,
+        remote_address = 10,
+        bind = 11,
+        connect = 12,
+        listen = 13,
+        accept = 14,
+        send = 15,
+        sendto = 16,
+        recv = 17,
+        recvfrom = 18,
+        peek = 19,
+    };
+
+    // One answer of the host network, in the order the emulator asked for them.
+    struct network_input
+    {
+        // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
+        network_call call{};
+        // The socket asked (its stream: the input position at which it was made); 0 for the factory and the DNS lookup.
+        uint64_t stream{};
+        // What was asked, so that a replay asking something else stops (a size, a flag, or a hash of an address).
+        uint64_t argument{};
+        // The answer: a count, a size, a flag, an error, or -1.
+        int64_t value{};
+        // Received bytes, addresses, or poll results.
+        std::vector<std::byte> data{};
+    };
+
+    // The host network's answers to one recording. The emulator's input position counts them, together with the sockets
+    // it made while nothing recorded them; `first_position` is the position at which the recording began.
+    struct network_inputs
+    {
+        uint64_t first_position{};
+        std::vector<network_input> inputs{};
     };
 
     // What a recording read of one registry hive file, from the emulator's start: every byte a replay of the recording
@@ -263,7 +317,8 @@ namespace sogen::ttd
     constexpr uint64_t bulk_reference_span = 16;
 
     // Checkpoint 0 is the initial state; its step is the first position of the trace, which is not zero for a trace
-    // recorded from a forked replay. A checkpoint with a base is a zstd delta against the base's state.
+    // recorded from a forked replay. A checkpoint with a base is a zstd delta against the base's state or, if the page
+    // checkpoints section lists it, a page checkpoint: what changed since the base (see encode_page_checkpoint).
     struct checkpoint_entry
     {
         uint64_t step{};

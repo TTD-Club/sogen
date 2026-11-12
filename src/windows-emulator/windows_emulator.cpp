@@ -21,6 +21,11 @@
 namespace sogen
 {
     constexpr auto MAX_INSTRUCTIONS_PER_TIME_SLICE = 0x20000;
+
+    // The relative clock ticks once per instruction (and per idle tick). At a rate near what the emulator runs, the guest's
+    // timeouts last about as long as they do in real time: work another thread does meanwhile doesn't use them up.
+    constexpr uint64_t RELATIVE_TICKS_PER_SECOND = 100'000'000;
+    using relative_tick = std::chrono::duration<int64_t, std::ratio<1, RELATIVE_TICKS_PER_SECOND>>;
     constexpr auto MAX_BASIC_BLOCKS_PER_TIME_SLICE = 0x8000;
 
     namespace
@@ -410,7 +415,7 @@ namespace sogen
         {
             std::optional<std::chrono::steady_clock::time_point> deadline{};
             const auto consider = [&](const std::optional<std::chrono::steady_clock::time_point>& time) {
-                if (time.has_value() && *time > now && (!deadline || *time < *deadline))
+                if (time.has_value() && *time >= now && (!deadline || *time < *deadline))
                 {
                     deadline = *time;
                 }
@@ -718,13 +723,19 @@ namespace sogen
         {
             const uint64_t* instructions_{};
             const uint64_t* idle_ticks_{};
+            const system_time_point* system_start_{};
 
-            instruction_tick_clock(const uint64_t& instructions, const uint64_t& idle_ticks, const system_time_point system_start = {},
-                                   const steady_time_point steady_start = {})
-                : tick_clock(1000, system_start, steady_start),
+            instruction_tick_clock(const uint64_t& instructions, const uint64_t& idle_ticks, const system_time_point& system_start)
+                : tick_clock(RELATIVE_TICKS_PER_SECOND),
                   instructions_(&instructions),
-                  idle_ticks_(&idle_ticks)
+                  idle_ticks_(&idle_ticks),
+                  system_start_(&system_start)
             {
+            }
+
+            system_time_point system_now() override
+            {
+                return *this->system_start_ + tick_clock::system_now().time_since_epoch();
             }
 
             uint64_t ticks() override
@@ -734,7 +745,7 @@ namespace sogen
         };
 
         std::unique_ptr<utils::clock> get_clock(emulator_interfaces& interfaces, const uint64_t& instructions, const uint64_t& idle_ticks,
-                                                const bool use_relative_time)
+                                                const utils::clock::system_time_point& relative_time_start, const bool use_relative_time)
         {
             if (interfaces.clock)
             {
@@ -743,7 +754,7 @@ namespace sogen
 
             if (use_relative_time)
             {
-                return std::make_unique<instruction_tick_clock>(instructions, idle_ticks);
+                return std::make_unique<instruction_tick_clock>(instructions, idle_ticks, relative_time_start);
             }
 
             return std::make_unique<utils::clock>();
@@ -869,11 +880,12 @@ namespace sogen
 
     windows_emulator::windows_emulator(std::unique_ptr<guest_machine> emu, const emulator_settings& settings, emulator_callbacks callbacks,
                                        emulator_interfaces interfaces)
-        : emu_(std::move(emu)),
+        : relative_time_start_(settings.relative_time_start),
+          emu_(std::move(emu)),
           use_native_timestamp_counter_(!interfaces.clock && !settings.use_relative_time &&
                                         this->emu_->supports_native_timestamp_counter()),
-          clock_(std::make_unique<scheduler_clock>(
-              get_clock(interfaces, this->executed_instructions_, this->idle_ticks_, settings.use_relative_time))),
+          clock_(std::make_unique<scheduler_clock>(get_clock(interfaces, this->executed_instructions_, this->idle_ticks_,
+                                                             this->relative_time_start_, settings.use_relative_time))),
           network_mode_(settings.network),
           dns_lookup_(get_dns_lookup(interfaces, settings.network)),
           socket_factory_(get_socket_factory(interfaces, settings.network)),
@@ -909,6 +921,7 @@ namespace sogen
           // (single-stepping) cannot provide it.
           instruction_precision_(settings.use_instruction_precision && this->emu_->get_guest_cpu(0).supports_instruction_counting() &&
                                  this->emu_->supports_global_memory_execution_hooks()),
+          keep_kernel_lock_between_instructions_(settings.keep_kernel_lock_between_instructions),
           intercept_rdtsc_(settings.intercept_rdtsc),
           intercept_kusd_(settings.intercept_kusd),
           spoof_gpu_features_(settings.spoof_gpu_features),
@@ -1103,17 +1116,18 @@ namespace sogen
                 }
             }
 
-            // Under relative time, idling skips to the next deadline (at most a time slice ahead), so that waits and
-            // timers wake in the order of their due times. The relative clock ticks once per millisecond.
-            uint64_t idle_advance = MAX_INSTRUCTIONS_PER_TIME_SLICE;
+            // Under relative time, idling skips to the next deadline (at most about two minutes ahead), so that waits and
+            // timers wake in the order of their due times.
+            constexpr auto max_idle_advance = static_cast<uint64_t>(std::chrono::ceil<relative_tick>(std::chrono::seconds(131)).count());
+            uint64_t idle_advance = max_idle_advance;
             if (this->use_relative_time_)
             {
                 const auto now = this->clock_->steady_now();
                 if (const auto deadline = next_deadline(this->process, now))
                 {
                     // One tick past it: timed-out waits compare strictly.
-                    const auto until = std::chrono::ceil<std::chrono::milliseconds>(*deadline - now).count();
-                    idle_advance = std::clamp<uint64_t>(static_cast<uint64_t>(until) + 1, 1, MAX_INSTRUCTIONS_PER_TIME_SLICE);
+                    const auto until = std::chrono::ceil<relative_tick>(*deadline - now).count();
+                    idle_advance = std::clamp<uint64_t>(static_cast<uint64_t>(until) + 1, 1, max_idle_advance);
                 }
             }
 
@@ -1613,10 +1627,23 @@ namespace sogen
         if (this->uses_instruction_precision())
         {
             const auto on_instruction = [&](cpu_interface& cpu, const uint64_t address, const size_t size) {
-                const std::scoped_lock lock(this->kernel_lock_);
-                auto& vcpu = this->vcpu(cpu.index());
-                const scoped_dispatch dispatch(*this, vcpu);
-                this->on_instruction_execution(vcpu, address, size); //
+                const auto execute = [&] {
+                    auto& vcpu = this->vcpu(cpu.index());
+                    const scoped_dispatch dispatch(*this, vcpu);
+                    this->on_instruction_execution(vcpu, address, size);
+                };
+
+                if (!this->keeping_kernel_lock_)
+                {
+                    const std::scoped_lock lock(this->kernel_lock_);
+                    execute();
+                    return;
+                }
+
+                // A throwing hook leaves the lock kept too; the run loop releases it.
+                this->kernel_lock_.lock_kept();
+                const auto keep = utils::finally([this] { this->kernel_lock_.keep(); });
+                execute();
             };
             // The metadata hook also gives instruction sizes to on_instruction_executed; backends without one report 0.
             try
@@ -2165,8 +2192,15 @@ namespace sogen
 
             // Guest code executes with the kernel lock released; hook callbacks
             // (syscalls, exceptions, exec hooks) re-acquire it on VM exit.
+            this->keeping_kernel_lock_ = this->keep_kernel_lock_between_instructions_ && this->uses_instruction_precision();
             lock.unlock();
-            vcpu.cpu.start(count);
+            {
+                const auto release = utils::finally([this] {
+                    this->kernel_lock_.release_kept();
+                    this->keeping_kernel_lock_ = false;
+                });
+                vcpu.cpu.start(count);
+            }
             lock.lock();
 
             // A run that continues past the budget would switch threads before its next instruction, either because the
@@ -2974,7 +3008,7 @@ namespace sogen
 
     void windows_emulator::dump_lock_profile()
     {
-        if (!kernel_lock::profiling_enabled())
+        if (!this->kernel_lock_.profiling_enabled())
         {
             return;
         }
@@ -3208,6 +3242,11 @@ namespace sogen
         this->serialize_state(buffer, false);
     }
 
+    void windows_emulator::serialize_without_memory_contents(utils::buffer_serializer& buffer, size_t& memory_offset) const
+    {
+        this->serialize_state(buffer, false, &memory_offset);
+    }
+
     void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
     {
         this->deserialize_state(buffer, [&] { this->memory.deserialize_memory_state(buffer, false); });
@@ -3235,6 +3274,8 @@ namespace sogen
         buffer.write(this->idle_ticks_);
         buffer.write_atomic(this->vcpus_[0]->switch_thread);
         buffer.write(this->use_relative_time_);
+        buffer.write(this->relative_time_start_);
+        buffer.write(this->socket_factory().input_position());
 
         this->version.serialize(buffer);
         this->registry.serialize_runtime_state(buffer);
@@ -3269,6 +3310,9 @@ namespace sogen
         {
             throw std::runtime_error("Can not deserialize emulator with different time dimensions");
         }
+
+        buffer.read(this->relative_time_start_);
+        this->socket_factory().restore_input_position(buffer.read<uint64_t>());
 
         this->version.deserialize(buffer);
         this->registry.deserialize_runtime_state(buffer);

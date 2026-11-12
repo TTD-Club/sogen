@@ -276,11 +276,42 @@ namespace sogen::ttd
     std::vector<std::byte> encode_checkpoint_memory_offsets(std::span<const uint64_t> offsets);
     std::vector<uint64_t> decode_checkpoint_memory_offsets(std::span<const std::byte> compressed);
 
+    // A checkpoint's state relative to its base's: `objects`, the state without guest memory contents
+    // (windows_emulator::serialize_without_memory_contents), and the contents of each committed page that may differ
+    // from the base's, by ascending address. Every other committed page holds the base's bytes, or zeros where the base
+    // had none.
+    struct page_checkpoint
+    {
+        std::vector<std::byte> objects{};
+        std::vector<uint64_t> pages{};
+        // 4096 bytes per page.
+        std::vector<std::byte> contents{};
+    };
+
+    // A page checkpoint is the size of its objects frame as a little-endian uint64, the objects as a zstd delta against
+    // the base's objects, then a zstd frame of the page count and the page number deltas as varints followed by the
+    // contents. That frame is a delta against `bulk_reference`, the bulk blocks recorded between the base and the
+    // checkpoint (as for state deltas: when the base is at most bulk_reference_span back), unless they are empty.
+    std::vector<std::byte> encode_page_checkpoint(std::span<const std::byte> objects, std::span<const uint64_t> pages,
+                                                  std::span<const std::byte> contents, std::span<const std::byte> base_objects,
+                                                  std::span<const std::byte> bulk_reference, int level);
+    page_checkpoint decode_page_checkpoint(std::span<const std::byte> encoded, std::span<const std::byte> base_objects,
+                                           std::span<const std::byte> bulk_reference);
+
+    // The page checkpoints section is a zstd frame of varints: the count, then the checkpoint index deltas.
+    std::vector<std::byte> encode_page_checkpoint_indices(std::span<const uint64_t> indices);
+    std::vector<uint64_t> decode_page_checkpoint_indices(std::span<const std::byte> compressed);
+
     // The registry hives section is a zstd frame: the hive count as a varint, then per hive its name as a varint length
     // and UTF-8 bytes, the file size and the range count as varints, and per range the gap from the end of the previous
     // range (from 0 for the first), the length, and the bytes.
     std::vector<std::byte> encode_registry_hives(std::span<const recorded_hive_file> hives);
     std::vector<recorded_hive_file> decode_registry_hives(std::span<const std::byte> compressed);
+
+    // The network_inputs section: zstd over the first position and the input count, then per input its call (one
+    // byte), stream, argument, zigzagged value and data size as varints, and the data.
+    std::vector<std::byte> encode_network_inputs(const network_inputs& inputs);
+    network_inputs decode_network_inputs(std::span<const std::byte> compressed);
 
     // The threads section is a zstd frame of varints: the switch count, per switch the step and event number deltas
     // and the thread id; then the name count, per name the thread id and the name as a length and UTF-8 bytes.

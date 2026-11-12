@@ -69,6 +69,11 @@ namespace sogen::unicorn
             }
         }
 
+        uc_hook get() const
+        {
+            return this->hook_;
+        }
+
       private:
         uc_engine* uc_{};
         uc_hook hook_{};

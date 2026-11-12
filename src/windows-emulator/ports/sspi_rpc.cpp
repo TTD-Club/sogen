@@ -37,7 +37,6 @@ namespace sogen
             {
                 rpc_port::serialize_object(buffer);
                 buffer.write(this->connected_);
-                buffer.write(this->package_strings_);
                 buffer.write(this->credential_.acquisitions);
                 buffer.write_map(this->contexts_);
                 buffer.write(this->next_context_upper_);
@@ -47,7 +46,6 @@ namespace sogen
             {
                 rpc_port::deserialize_object(buffer);
                 buffer.read(this->connected_);
-                buffer.read(this->package_strings_);
                 buffer.read(this->credential_.acquisitions);
                 buffer.read_map(this->contexts_);
                 buffer.read(this->next_context_upper_);
@@ -205,16 +203,31 @@ namespace sogen
                 std::string target{};
                 std::unique_ptr<sspi::tls_client> tls{};
                 bool finalized{};
+                // A reproducible handshake's seed and the tokens it has processed: a load makes the same handshake
+                // again from them, as mbedTLS's own state cannot be saved.
+                std::optional<sspi::tls_client::reproducible> seed{};
+                std::vector<std::vector<uint8_t>> inputs{};
 
                 void serialize(utils::buffer_serializer& buffer) const
                 {
-                    if (this->tls)
+                    if (this->tls && !this->seed)
                     {
                         throw std::runtime_error("Cannot snapshot an active SSPI TLS handshake");
                     }
                     buffer.write(this->handle);
                     buffer.write_string(this->target);
                     buffer.write(this->finalized);
+                    buffer.write(this->tls != nullptr);
+                    if (this->tls)
+                    {
+                        buffer.write(this->seed->seed);
+                        buffer.write(this->seed->time);
+                        buffer.write(static_cast<uint64_t>(this->inputs.size()));
+                        for (const auto& input : this->inputs)
+                        {
+                            buffer.write_vector(input);
+                        }
+                    }
                 }
 
                 void deserialize(utils::buffer_deserializer& buffer)
@@ -223,6 +236,30 @@ namespace sogen
                     buffer.read_string(this->target);
                     buffer.read(this->finalized);
                     this->tls.reset();
+                    this->seed.reset();
+                    this->inputs.clear();
+                    if (!buffer.read<bool>())
+                    {
+                        return;
+                    }
+
+                    this->seed.emplace();
+                    buffer.read(this->seed->seed);
+                    buffer.read(this->seed->time);
+                    this->inputs.resize(static_cast<size_t>(buffer.read<uint64_t>()));
+                    for (auto& input : this->inputs)
+                    {
+                        buffer.read_vector(input);
+                    }
+                    this->tls = sspi::tls_client::create(this->target, this->seed);
+                    if (!this->tls)
+                    {
+                        throw std::runtime_error("Cannot restore an SSPI TLS handshake");
+                    }
+                    for (const auto& input : this->inputs)
+                    {
+                        (void)this->tls->process(input);
+                    }
                 }
             };
 
@@ -270,6 +307,13 @@ namespace sogen
                 return value.upper == expected.upper && (value.lower == 0 || value.lower == expected.lower);
             }
 
+            // The client puts the index of the package it bound in the lower half: any of Schannel's names.
+            bool matches_credential(const security_handle value) const
+            {
+                return matches_marshaled_handle(value, this->credential_.handle) ||
+                       (value.upper == this->credential_.handle.upper && value.lower < tls_package_names.size());
+            }
+
             static bool finish_reply(utils::aligned_binary_writer& writer, const uint64_t start, const size_t expected_size)
             {
                 const auto size = writer.offset() - start;
@@ -299,43 +343,61 @@ namespace sogen
             static bool decode_context_request(windows_emulator& win_emu, const lpc_request_context& c, context_request& result)
             {
                 auto request = read_request(win_emu, c);
-                if (!request || request->size() < 0x60 || !has_port_context(*request))
+                if (!request || request->size() < 0x38 || !has_port_context(*request))
                 {
                     return false;
                 }
 
                 result.bytes = std::move(*request);
                 const std::span<const uint8_t> bytes{result.bytes};
-                uint16_t target_length{};
-                uint16_t target_maximum_length{};
                 uint64_t target_referent{};
-                uint64_t target_buffer_referent{};
-                uint64_t target_maximum_count{};
-                uint64_t target_offset{};
-                uint64_t target_count{};
-                if (!read_value(bytes, 0x30, target_referent) || !read_value(bytes, 0x38, target_length) ||
-                    !read_value(bytes, 0x3a, target_maximum_length) || !read_value(bytes, 0x40, target_buffer_referent) ||
-                    !read_value(bytes, 0x48, target_maximum_count) || !read_value(bytes, 0x50, target_offset) ||
-                    !read_value(bytes, 0x58, target_count) || target_referent == 0 || target_buffer_referent == 0 ||
-                    target_length % 2 != 0 || target_maximum_length % 2 != 0 || target_length > target_maximum_length ||
-                    target_offset != 0 || target_maximum_count != target_maximum_length / 2 || target_count != target_length / 2 ||
-                    target_count > (bytes.size() - 0x60) / sizeof(char16_t))
+                if (!read_value(bytes, 0x30, target_referent))
                 {
                     return false;
                 }
 
-                result.target.reserve(static_cast<size_t>(target_count));
-                for (size_t index = 0; index < target_count; ++index)
+                // The target name is optional: a client may leave it out (or empty) after the first call.
+                size_t arguments = 0x38;
+                if (target_referent != 0)
                 {
-                    uint16_t character{};
-                    if (!read_value(bytes, 0x60 + index * sizeof(character), character) || character > 0x7f)
+                    uint16_t target_length{};
+                    uint16_t target_maximum_length{};
+                    uint64_t target_buffer_referent{};
+                    if (!read_value(bytes, 0x38, target_length) || !read_value(bytes, 0x3a, target_maximum_length) ||
+                        !read_value(bytes, 0x40, target_buffer_referent) || target_length % 2 != 0 || target_maximum_length % 2 != 0 ||
+                        target_length > target_maximum_length || (target_buffer_referent == 0 && target_length != 0))
                     {
                         return false;
                     }
-                    result.target.push_back(static_cast<char>(character));
-                }
 
-                const size_t arguments = align_up(0x60 + static_cast<size_t>(target_count) * sizeof(char16_t), 8);
+                    arguments = 0x48;
+                    if (target_buffer_referent != 0)
+                    {
+                        uint64_t target_maximum_count{};
+                        uint64_t target_offset{};
+                        uint64_t target_count{};
+                        if (!read_value(bytes, 0x48, target_maximum_count) || !read_value(bytes, 0x50, target_offset) ||
+                            !read_value(bytes, 0x58, target_count) || target_offset != 0 ||
+                            target_maximum_count != target_maximum_length / 2 || target_count != target_length / 2 ||
+                            target_count > (bytes.size() - 0x60) / sizeof(char16_t))
+                        {
+                            return false;
+                        }
+
+                        result.target.reserve(static_cast<size_t>(target_count));
+                        for (size_t index = 0; index < target_count; ++index)
+                        {
+                            uint16_t character{};
+                            if (!read_value(bytes, 0x60 + index * sizeof(character), character) || character > 0x7f)
+                            {
+                                return false;
+                            }
+                            result.target.push_back(static_cast<char>(character));
+                        }
+
+                        arguments = align_up(0x60 + static_cast<size_t>(target_count) * sizeof(char16_t), 8);
+                    }
+                }
                 uint64_t input_ip_referent{};
                 uint64_t arg_9_referent{};
                 uint32_t arg_10_version{};
@@ -454,6 +516,13 @@ namespace sogen
             static constexpr uint32_t spm_lookup_package = 0;
             static constexpr uint32_t spm_call_package = 1;
             static constexpr uint32_t spm_enumerate_packages = 4;
+
+            // Schannel's names, as Windows 11 lists them: a client may ask for any of them.
+            static constexpr std::array<std::u16string_view, 3> tls_package_names{
+                u"Microsoft Unified Security Protocol Provider",
+                u"Schannel",
+                u"Default TLS SSP",
+            };
 
             // `message_offset`: where the message starts in the request, 0x20 in NDR64 and 0x1c from 32-bit clients.
             static std::optional<uint32_t> spm_api(const std::span<const uint8_t> request, const size_t message_offset = 0x20)
@@ -647,7 +716,7 @@ namespace sogen
                                                                                                           : STATUS_INVALID_PARAMETER;
             }
 
-            NTSTATUS handle_call_rpc(windows_emulator& win_emu, const lpc_request_context& c, utils::aligned_binary_writer& writer)
+            static NTSTATUS handle_call_rpc(windows_emulator& win_emu, const lpc_request_context& c, utils::aligned_binary_writer& writer)
             {
                 auto request = read_request(win_emu, c);
                 if (const auto api = request ? spm_api(*request) : std::nullopt; api && *api != spm_enumerate_packages)
@@ -671,21 +740,22 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
 
-                constexpr std::u16string_view package_name = u"Microsoft Unified Security Protocol Provider";
+                // Every binding is Schannel's, under the name the package id has among its three.
+                const auto tls_package = package_id < tls_package_names.size() ? static_cast<size_t>(package_id) : 0;
+                const auto package_name = tls_package_names[tls_package];
                 constexpr std::u16string_view package_comment = u"Schannel Security Package";
                 constexpr std::u16string_view module_name = u"C:\\Windows\\system32\\schannel.DLL";
-                if (this->package_strings_ == 0)
+
+                // As lsass does, the strings go in a buffer of the client's, which it frees with LsaFreeReturnBuffer.
+                const auto package_strings = win_emu.memory.allocate_memory(0x1000, nt_memory_permission{memory_permission::read_write});
+                if (package_strings == 0)
                 {
-                    this->package_strings_ = win_emu.memory.allocate_memory(0x1000, nt_memory_permission{memory_permission::read_write});
-                    if (this->package_strings_ == 0)
-                    {
-                        return STATUS_NO_MEMORY;
-                    }
-                    win_emu.emu().write_memory(this->package_strings_, package_name.data(), package_name.size() * sizeof(char16_t));
-                    win_emu.emu().write_memory(this->package_strings_ + 0x5a, package_comment.data(),
-                                               package_comment.size() * sizeof(char16_t));
-                    win_emu.emu().write_memory(this->package_strings_ + 0x8e, module_name.data(), module_name.size() * sizeof(char16_t));
+                    return STATUS_NO_MEMORY;
                 }
+                win_emu.emu().write_memory(package_strings, package_name.data(), package_name.size() * sizeof(char16_t));
+                win_emu.emu().write_memory(package_strings + 0x5a, package_comment.data(), package_comment.size() * sizeof(char16_t));
+                win_emu.emu().write_memory(package_strings + 0x8e, module_name.data(), module_name.size() * sizeof(char16_t));
+                const auto name_size = static_cast<uint16_t>(package_name.size() * sizeof(char16_t));
 
                 const auto start = writer.offset();
                 writer.write<int32_t>(0xd8);
@@ -703,18 +773,18 @@ namespace sogen
                 writer.write<uint64_t>(0);
                 writer.write<uint64_t>(package_id);
                 writer.write<uint64_t>(0);
-                writer.write<uint16_t>(0x58);
-                writer.write<uint16_t>(0x5a);
+                writer.write<uint16_t>(name_size);
+                writer.write<uint16_t>(static_cast<uint16_t>(name_size + sizeof(char16_t)));
                 writer.align_to(8);
-                writer.write<uint64_t>(this->package_strings_);
+                writer.write<uint64_t>(package_strings);
                 writer.write<uint16_t>(0x32);
                 writer.write<uint16_t>(0x34);
                 writer.align_to(8);
-                writer.write<uint64_t>(this->package_strings_ + 0x5a);
+                writer.write<uint64_t>(package_strings + 0x5a);
                 writer.write<uint16_t>(0x40);
                 writer.write<uint16_t>(0x42);
                 writer.align_to(8);
-                writer.write<uint64_t>(this->package_strings_ + 0x8e);
+                writer.write<uint64_t>(package_strings + 0x8e);
                 writer.write<uint32_t>(1);
                 writer.write<uint32_t>(0x004107b3);
                 writer.write<uint32_t>(0);
@@ -756,18 +826,22 @@ namespace sogen
                 uint64_t package_referent{};
                 uint64_t package_count{};
                 uint32_t credential_use{};
-                if (writer.pointer_size() != utils::aligned_binary_writer::pointer_size_64 || !request || request->size() < 0xc4 ||
-                    !has_port_context(*request) || !read_value(*request, 0x40, package_length) ||
-                    !read_value(*request, 0x42, package_maximum_length) || !read_value(*request, 0x48, package_referent) ||
-                    !read_value(*request, 0x60, package_count) || !read_value(*request, 0xc0, credential_use) || package_length != 0x58 ||
-                    package_maximum_length != 0x5a || package_referent == 0 || package_count != 44 || credential_use != 2 ||
-                    writer.offset() != 0x18)
+                constexpr size_t package_name_offset = 0x68;
+                if (writer.pointer_size() != utils::aligned_binary_writer::pointer_size_64 || !request || !has_port_context(*request) ||
+                    !read_value(*request, 0x40, package_length) || !read_value(*request, 0x42, package_maximum_length) ||
+                    !read_value(*request, 0x48, package_referent) || !read_value(*request, 0x60, package_count) ||
+                    package_maximum_length != package_length + sizeof(char16_t) || package_referent == 0 ||
+                    package_count != package_maximum_length / sizeof(char16_t) - 1 || writer.offset() != 0x18 ||
+                    !read_value(*request, (package_name_offset + package_length + 3) & ~size_t{3}, credential_use) || credential_use != 2)
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
 
-                constexpr std::u16string_view package_name = u"Microsoft Unified Security Protocol Provider";
-                if (std::memcmp(request->data() + 0x68, package_name.data(), package_name.size() * sizeof(char16_t)) != 0)
+                const auto* name = request->data() + package_name_offset;
+                if (std::ranges::none_of(tls_package_names, [&](const std::u16string_view package_name) {
+                        return package_name.size() * sizeof(char16_t) == package_length &&
+                               std::memcmp(name, package_name.data(), package_length) == 0;
+                    }))
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
@@ -889,11 +963,13 @@ namespace sogen
             NTSTATUS handle_process_security_context(windows_emulator& win_emu, const lpc_request_context& c,
                                                      utils::aligned_binary_writer& writer)
             {
+                // ISC_REQ_CONFIDENTIALITY and ISC_REQ_ALLOCATE_MEMORY: an encrypted stream whose tokens lsass allocates.
+                constexpr uint32_t required_attributes = 0x110;
                 context_request request{};
                 const bool decoded = decode_context_request(win_emu, c, request);
                 if (writer.pointer_size() != utils::aligned_binary_writer::pointer_size_64 || writer.offset() != 0x18 || !decoded ||
-                    !matches_marshaled_handle(request.credential, this->credential_.handle) || request.target.empty() ||
-                    (request.requested_attributes != 0x0000c11c && request.requested_attributes != 0x0009819c) ||
+                    !matches_credential(request.credential) ||
+                    (request.requested_attributes & required_attributes) != required_attributes ||
                     (request.representation != 0x10 && request.representation != 0))
                 {
                     return STATUS_INVALID_PARAMETER;
@@ -903,11 +979,23 @@ namespace sogen
                 context_record* context{};
                 if (request.context == security_handle{})
                 {
-                    if (this->credential_.acquisitions == 0 || !request.buffers.empty())
+                    if (this->credential_.acquisitions == 0 || !request.buffers.empty() || request.target.empty())
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
-                    auto tls = sspi::tls_client::create(request.target);
+                    // A reproducible run makes the same handshake again, after a restore too.
+                    std::optional<sspi::tls_client::reproducible> seed{};
+                    if (win_emu.uses_relative_time())
+                    {
+                        seed.emplace();
+                        const auto instructions = win_emu.get_executed_instructions();
+                        const auto context_upper = this->next_context_upper_;
+                        std::memcpy(seed->seed.data(), &instructions, sizeof(instructions));
+                        std::memcpy(seed->seed.data() + sizeof(instructions), &context_upper, sizeof(context_upper));
+                        seed->time =
+                            std::chrono::duration_cast<std::chrono::seconds>(win_emu.clock().system_now().time_since_epoch()).count();
+                    }
+                    auto tls = sspi::tls_client::create(request.target, seed);
                     if (!tls)
                     {
                         return write_context_reply(writer, 0, {}, 0, 0, {}, k_illegal_message, 0) ? STATUS_SUCCESS
@@ -920,6 +1008,7 @@ namespace sogen
                                                   .handle = {.lower = k_context_lower, .upper = context_upper},
                                                   .target = request.target,
                                                   .tls = std::move(tls),
+                                                  .seed = seed,
                                               })
                                      .first;
                     context = &entry->second;
@@ -932,7 +1021,7 @@ namespace sogen
                         return STATUS_INVALID_PARAMETER;
                     }
                     context = &entry->second;
-                    if (context->finalized || request.target != context->target ||
+                    if (context->finalized || (!request.target.empty() && request.target != context->target) ||
                         !matches_marshaled_handle(request.context, context->handle) || request.buffers.size() != 2 ||
                         request.buffers[0].type != 2 || request.buffers[0].referent == 0 || request.buffers[1].size != 0 ||
                         request.buffers[1].type != 0 || request.buffers[1].referent != 0)
@@ -942,6 +1031,10 @@ namespace sogen
                     input = buffer_payload(request, request.buffers[0]);
                 }
 
+                if (context->seed)
+                {
+                    context->inputs.emplace_back(input.begin(), input.end());
+                }
                 auto result = context->tls->process(input);
                 if (result.output_token.size() > std::numeric_limits<uint32_t>::max() ||
                     result.missing_size > std::numeric_limits<uint32_t>::max() || result.extra_size > std::numeric_limits<uint32_t>::max())
@@ -952,6 +1045,7 @@ namespace sogen
                 if (result.status == sspi::handshake_status::failed)
                 {
                     context->tls.reset();
+                    context->inputs.clear();
                     context->finalized = true;
                     return write_context_reply(writer, 0, result.output_token, 0, 0, context->handle, k_illegal_message, 0)
                                ? STATUS_SUCCESS
@@ -990,6 +1084,7 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
                 context->tls.reset();
+                context->inputs.clear();
                 context->finalized = true;
                 return STATUS_SUCCESS;
             }
@@ -1034,9 +1129,7 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
 
-                const uint32_t status = this->credential_.acquisitions != 0 && matches_marshaled_handle(handle, this->credential_.handle)
-                                            ? 0
-                                            : k_invalid_handle;
+                const uint32_t status = this->credential_.acquisitions != 0 && this->matches_credential(handle) ? 0 : k_invalid_handle;
                 if (status == 0)
                 {
                     --this->credential_.acquisitions;
@@ -1069,7 +1162,7 @@ namespace sogen
                 }
 
                 writer.write<int32_t>(0);
-                writer.write<int32_t>(mode == 0 ? 0xd : 1);
+                writer.write<int32_t>(mode == 0 ? 0xd : static_cast<int32_t>(tls_package_names.size()));
                 writer.write<uint32_t>(0);
                 writer.write(k_sspi_context_uuid.data(), k_sspi_context_uuid.size(), 1);
                 writer.align_to(sizeof(uint32_t));
@@ -1096,7 +1189,6 @@ namespace sogen
             }
 
             bool connected_{};
-            uint64_t package_strings_{};
             credential_record credential_{};
             std::map<uint64_t, context_record> contexts_{};
             uint64_t next_context_upper_{k_context_upper};

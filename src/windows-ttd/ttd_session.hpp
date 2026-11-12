@@ -77,6 +77,12 @@ namespace sogen::ttd
     // checkpoint any other way.
     void use_recorded_registry(windows_emulator& win_emu, const trace& recorded);
 
+    // For a trace that recorded the host network (trace::recorded_network): has the emulator's network tap answer from
+    // the recording instead of the host, so a replay neither needs nor uses the network; for an older trace, the host
+    // network answers. seek, run_to, replay_to_end and prepare_keyframes call it; call it before restoring a checkpoint
+    // any other way, so that its sockets continue their recorded streams.
+    void use_recorded_network(windows_emulator& win_emu, const trace& recorded);
+
     // The same check before building an emulator: what an emulator built with `settings` would read differently from
     // the recording, without the cost of an emulator. The system root comes from the hives, as at setup (system_dlls
     // reads empty when they name none); manifest_differences takes it from the restored checkpoint instead.

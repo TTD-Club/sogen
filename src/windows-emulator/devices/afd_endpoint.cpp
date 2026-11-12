@@ -501,11 +501,13 @@ namespace sogen
             std::optional<io_device_context> delayed_ioctl_{};
             handle retained_completion_port_{};
             std::optional<std::chrono::steady_clock::time_point> timeout_{};
+            std::optional<std::chrono::steady_clock::time_point> host_deadline_{};
             std::optional<std::function<void(windows_emulator&, const io_device_context&)>> timeout_callback_{};
 
             std::unordered_map<LONG, pending_connection> pending_connections_{};
             LONG next_sequence_{0};
 
+            static constexpr auto host_wait_budget = std::chrono::seconds(10);
             static constexpr ULONG max_stream_buffer_count = 1024;
 
             // Stream operations may complete partially, so cap staging allocations instead of trusting guest-provided WSABUF lengths.
@@ -531,6 +533,7 @@ namespace sogen
                 io_device_context context;
                 std::optional<std::chrono::steady_clock::time_point> timeout{};
                 handle retained_completion_port{};
+                std::optional<std::chrono::steady_clock::time_point> host_deadline{};
 
                 pending_poll(memory_interface& emu)
                     : context(emu)
@@ -666,6 +669,35 @@ namespace sogen
                 return STATUS_PENDING;
             }
 
+            // The relative clock runs on executed instructions, so a live socket's latency would pass as far more guest time
+            // than it takes, and the guest's timeouts would expire before the host has answered. Without guest time
+            // passing, a pending request waits for the host for up to a budget of real time (and no longer than its own
+            // timeout): this is how much of that is left. The socket factory does the waiting, so that a recording of
+            // the host network keeps only what the wait found.
+            static std::chrono::milliseconds host_wait(windows_emulator& win_emu,
+                                                       std::optional<std::chrono::steady_clock::time_point>& deadline,
+                                                       const std::optional<std::chrono::steady_clock::time_point>& guest_timeout)
+            {
+                if (!win_emu.uses_relative_time())
+                {
+                    return {};
+                }
+
+                const auto now = std::chrono::steady_clock::now();
+                if (!deadline)
+                {
+                    auto budget = std::chrono::duration_cast<std::chrono::steady_clock::duration>(host_wait_budget);
+                    if (guest_timeout)
+                    {
+                        budget =
+                            std::clamp(*guest_timeout - win_emu.clock().steady_now(), std::chrono::steady_clock::duration::zero(), budget);
+                    }
+                    deadline = now + budget;
+                }
+
+                return now >= *deadline ? std::chrono::milliseconds{} : std::chrono::ceil<std::chrono::milliseconds>(*deadline - now);
+            }
+
             // Completes the pending polls whose sockets are ready or whose time is up.
             void work_polls(windows_emulator& win_emu)
             {
@@ -673,7 +705,8 @@ namespace sogen
                 {
                     const auto [info, handles] = get_poll_info<Traits>(win_emu, it->context);
                     const auto endpoints = resolve_endpoints(win_emu, handles);
-                    auto status = perform_poll(win_emu, it->context, endpoints, handles);
+                    auto status =
+                        perform_poll(win_emu, it->context, endpoints, handles, host_wait(win_emu, it->host_deadline, it->timeout));
 
                     if (status == STATUS_PENDING)
                     {
@@ -760,6 +793,7 @@ namespace sogen
                 io_completion_wait::release_handle_reference(win_emu.process, this->retained_completion_port_);
                 this->timeout_callback_ = {};
                 this->timeout_ = {};
+                this->host_deadline_ = {};
                 this->require_poll_ = {};
                 this->delayed_ioctl_ = {};
                 this->delayed_request_ = {};
@@ -903,11 +937,16 @@ namespace sogen
                 {
                     pfd.events = static_cast<int16_t>(pfd.events | map_afd_request_events_to_socket(this->event_select_mask_));
                 }
-                pfd.revents = pfd.events;
+                const auto requested_events = pfd.events;
+                const auto delayed_events = static_cast<int16_t>(
+                    this->delayed_ioctl_ && this->require_poll_ ? (*this->require_poll_ ? POLLIN : POLLOUT) | POLLHUP | POLLERR : 0);
 
-                if (pfd.events != 0)
+                if (requested_events != 0)
                 {
-                    win_emu.socket_factory().poll_sockets(std::span{&pfd, 1});
+                    pfd.revents = requested_events;
+                    const auto wait = delayed_events && !this->connect_failed_ ? host_wait(win_emu, this->host_deadline_, this->timeout_)
+                                                                               : std::chrono::milliseconds{};
+                    win_emu.socket_factory().wait_for_sockets(std::span{&pfd, 1}, wait);
                 }
 
                 const auto socket_events = static_cast<int16_t>(pfd.revents | (this->connect_failed_ ? POLLERR : 0));
@@ -966,7 +1005,20 @@ namespace sogen
             void deserialize_object(utils::buffer_deserializer& buffer) override
             {
                 buffer.read_optional(this->creation_data);
-                this->setup(buffer.read<socket_factory_wrapper>());
+                std::optional<uint64_t> stream{};
+                buffer.read_optional(stream);
+                auto& factory = buffer.read<socket_factory_wrapper>().get();
+                if (this->creation_data)
+                {
+                    const auto& data = *this->creation_data;
+                    this->set_socket(factory.restore_socket(stream, translate_win_to_host_address_family(data.address_family),
+                                                            translate_win_to_host_type(data.type),
+                                                            translate_win_to_host_protocol(data.protocol)));
+                    if (!this->s_)
+                    {
+                        throw std::runtime_error("Failed to create socket!");
+                    }
+                }
 
                 buffer.read_optional(this->require_poll_);
                 buffer.read_optional(this->delayed_ioctl_);
@@ -981,6 +1033,12 @@ namespace sogen
                 buffer.read_optional(this->connect_data_sent_);
                 buffer.read(this->shared_context_);
                 buffer.read_vector(this->pending_polls_);
+
+                // A recorded socket continues its stream, which holds what the host did with it.
+                if (this->s_ && this->s_->recorded_stream())
+                {
+                    return;
+                }
 
                 // A connected socket is bound in restore_after_state_restore: by its connect, or here as well when it
                 // stays unconnected.
@@ -998,6 +1056,7 @@ namespace sogen
             void serialize_object(utils::buffer_serializer& buffer) const override
             {
                 buffer.write_optional(this->creation_data);
+                buffer.write_optional(this->s_ ? this->s_->recorded_stream() : std::nullopt);
                 buffer.write_optional(this->require_poll_);
                 buffer.write_optional(this->delayed_ioctl_);
                 buffer.write_optional(this->delayed_request_);
@@ -1018,7 +1077,8 @@ namespace sogen
             // 2 runs its server inside the guest); a peer outside it lost its state, so then the socket stays unconnected.
             std::optional<saved_connection> connection_to_save() const
             {
-                if (!this->s_ || !this->creation_data || translate_win_to_host_type(this->creation_data->type) != SOCK_STREAM)
+                if (!this->s_ || !this->creation_data || translate_win_to_host_type(this->creation_data->type) != SOCK_STREAM ||
+                    this->s_->recorded_stream())
                 {
                     return std::nullopt;
                 }
@@ -1799,7 +1859,8 @@ namespace sogen
 
             static NTSTATUS perform_poll(windows_emulator& win_emu, const io_device_context& c,
                                          const std::span<const afd_endpoint* const> endpoints,
-                                         const std::span<const AFD_POLL_HANDLE_INFO<Traits>> handles)
+                                         const std::span<const AFD_POLL_HANDLE_INFO<Traits>> handles,
+                                         const std::chrono::milliseconds wait = {})
             {
                 const auto entry_count = std::min(endpoints.size(), handles.size());
 
@@ -1822,7 +1883,7 @@ namespace sogen
 
                 if (!poll_data.empty())
                 {
-                    win_emu.socket_factory().poll_sockets(poll_data);
+                    win_emu.socket_factory().wait_for_sockets(poll_data, wait);
                 }
 
                 std::vector<ULONG> afd_events(entry_count);

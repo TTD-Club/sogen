@@ -1,8 +1,8 @@
 [submodule "deps/unicorn"]
 	path = deps/unicorn
-	url = https://github.com/momo5502/unicorn.git
+	url = https://github.com/TTD-Club/unicorn.git
 	shallow = true
-	branch = dev
+	branch = ttd
 [submodule "deps/reflect"]
 	path = deps/reflect
 	url = https://github.com/qlibs/reflect.git

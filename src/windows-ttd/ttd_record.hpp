@@ -22,6 +22,7 @@
 #include <emulator/scoped_hook.hpp>
 
 #include "ttd_compressor.hpp"
+#include "ttd_network.hpp"
 #include "ttd_keyframes.hpp"
 #include "ttd_trace.hpp"
 #include "ttd_ui.hpp"
@@ -98,15 +99,15 @@ namespace sogen::ttd
         static constexpr size_t events_per_chunk = 65536;
         static constexpr size_t checkpoints_per_level = 16;
         static constexpr size_t checkpoint_levels = 8;
-        // Chunks and bulk blocks compress on background threads, so these slow, strong levels do not slow recording
-        // down. Level 19 takes about as long per chunk as recording it; two chunk workers still slowed a test-sample
-        // recording by 10%, four did not.
-        static constexpr int chunk_compression_level = 19;
+        // Chunks and bulk blocks compress on background threads, yet those still slow the emulation thread down. Level
+        // 19 chunks made a beacon recording's emulation about 25% slower than level 3, for traces 9% smaller; the bulk
+        // block level made no measurable difference.
+        static constexpr int chunk_compression_level = 3;
         static constexpr int bulk_compression_level = 19;
         static constexpr size_t chunk_workers = 4;
         static constexpr size_t bulk_workers = 4;
         static constexpr size_t max_pending_compressions = 16;
-        // A checkpoint delta takes about 120 ms at full size, longer than recording the 500,000 instructions between
+        // A state delta takes about 120 ms at full size, longer than recording the 500,000 instructions between
         // checkpoints once events are cheap, so several compress at once. Each pending one holds a full emulator state.
         static constexpr size_t checkpoint_workers = 4;
         static constexpr size_t max_pending_checkpoints = 2;
@@ -184,6 +185,24 @@ namespace sogen::ttd
         // Host window events, when the emulator has a recordable UI backend.
         recordable_ui_backend* ui_{};
         std::vector<ui_input_entry> ui_inputs_{};
+        network_inputs network_inputs_{};
+
+        // Stops the tap logging into network_inputs_ before that goes away.
+        struct network_recording
+        {
+            std::optional<network_tap> tap{};
+            network_recording() = default;
+            network_recording(const network_recording&) = delete;
+            network_recording& operator=(const network_recording&) = delete;
+
+            ~network_recording()
+            {
+                if (tap)
+                {
+                    tap->stop_recording();
+                }
+            }
+        } network_recording_{};
 
         syscall_table syscalls_{};
         // The syscall whose handler is running: its step and the event count when the handler started.
@@ -220,9 +239,33 @@ namespace sogen::ttd
         // Index in cached_pages_ by page number: the cached instruction addresses in each page.
         flat_map cached_instructions_by_page_{};
         std::vector<std::vector<uint64_t>> cached_pages_{};
+        // The last page a write found without cached instructions, so writes to it skip the lookup.
+        uint64_t code_free_page_{no_recent_page};
         void forget_instructions(uint64_t address, uint64_t size);
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
+
+        // Checkpoints after the first are page checkpoints when the trace records every change to guest memory (guest
+        // and host writes, and mapping changes). Compressing a full state at every checkpoint, even on other threads,
+        // made recording about 30% slower; a page checkpoint holds only the pages changed since its base.
+        bool page_checkpoints_{};
+        std::vector<uint64_t> page_checkpoint_indices_{};
+
+        // A checkpoint that page checkpoints are based on: its state without memory contents, and the sizes of pages_
+        // and mapping_changes_ when it was taken.
+        struct page_checkpoint_base
+        {
+            std::shared_ptr<const std::vector<std::byte>> objects{};
+            size_t pages{};
+            size_t mapping_changes{};
+        };
+
+        // Entry k: as base_states_.
+        std::vector<page_checkpoint_base> page_bases_{};
+        page_checkpoint_base current_page_base(size_t& memory_offset) const;
+        // The addresses of the committed pages that guest or host writes or mapping changes touched since `base`.
+        std::vector<uint64_t> changed_pages(const page_checkpoint_base& base) const;
+        void write_page_checkpoint(uint64_t step);
 
         // Allocations of released checkpoint states, reused for later ones: a fresh allocation of a whole state costs
         // a page fault per page while serializing.
@@ -287,7 +330,8 @@ namespace sogen::ttd
         // Whether the replay differed from the recording; finish() then throws.
         bool diverged() const
         {
-            return error_.has_value();
+            const auto tap = find_network_tap(emu_);
+            return error_.has_value() || (tap && tap->error());
         }
 
         // Whether `observe_writes` sees every change to guest memory: the trace records guest and host writes.
