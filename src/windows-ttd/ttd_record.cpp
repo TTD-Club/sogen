@@ -356,17 +356,21 @@ namespace sogen::ttd
         auto& cpu = emu_.emu();
         if (access_mask & static_cast<uint64_t>(access_kind::write))
         {
-            write_hook_ = scoped_hook(
-                cpu, cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+            auto* hook =
+                cpu.hook_memory_write_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
                     append_data_event(access_kind::write, address, data);
-                }));
+                });
+            write_hook_ = scoped_hook(cpu, hook);
+            cpu.hook_reads_no_cpu_state(hook);
         }
         if (access_mask & static_cast<uint64_t>(access_kind::read))
         {
-            read_hook_ = scoped_hook(
-                cpu, cpu.hook_memory_read_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
+            auto* hook =
+                cpu.hook_memory_read_data(0, UINT64_MAX, [this](cpu_interface&, uint64_t address, std::span<const std::byte> data) {
                     append_data_event(access_kind::read, address, data);
-                }));
+                });
+            read_hook_ = scoped_hook(cpu, hook);
+            cpu.hook_reads_no_cpu_state(hook);
         }
         // Without execute events, instructions are still looked at for RDRAND and RDSEED.
         const auto record_execute = [this](const uint64_t address, const size_t size) {
