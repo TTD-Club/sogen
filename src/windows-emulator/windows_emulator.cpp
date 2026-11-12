@@ -2987,7 +2987,7 @@ namespace sogen
 
     void windows_emulator::dump_lock_profile()
     {
-        if (!kernel_lock::profiling_enabled())
+        if (!this->kernel_lock_.profiling_enabled())
         {
             return;
         }

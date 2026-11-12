@@ -30,11 +30,12 @@ namespace sogen
         };
 
         // Env-gated so a normal run pays nothing: the instrumented path (a try_lock plus two
-        // steady_clock reads per acquisition) only runs when SOGEN_LOCK_PROFILE is set.
-        static bool profiling_enabled()
+        // steady_clock reads per acquisition) only runs when SOGEN_LOCK_PROFILE is set. It is read once
+        // per lock: a function-local static checks its initialization on every call, about 1% of a run
+        // with instruction precision, which takes the lock for every instruction.
+        bool profiling_enabled() const
         {
-            static const bool enabled = std::getenv("SOGEN_LOCK_PROFILE") != nullptr;
-            return enabled;
+            return this->profiling_;
         }
 
         void lock()
@@ -141,6 +142,8 @@ namespace sogen
         std::atomic<uint64_t> contended_{};
         std::atomic<uint64_t> wait_nanos_{};
         std::atomic<uint64_t> held_nanos_{};
+
+        bool profiling_{std::getenv("SOGEN_LOCK_PROFILE") != nullptr};
     };
 
 } // namespace sogen
