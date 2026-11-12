@@ -249,6 +249,10 @@ namespace sogen
                     return handle_update_descriptor_sets_batch(win_emu, context);
                 case gpu_bridge::ioctl_allocate_descriptor_sets_with_updates:
                     return handle_allocate_descriptor_sets_with_updates(win_emu, context);
+                case gpu_bridge::ioctl_get_device_image_memory_requirements:
+                    return handle_get_device_image_memory_requirements(win_emu, context);
+                case gpu_bridge::ioctl_create_image_after_destroy:
+                    return handle_create_image_after_destroy(win_emu, context);
                 case gpu_bridge::ioctl_create_sampler:
                     return handle_create_sampler(win_emu, context);
                 case gpu_bridge::ioctl_destroy_sampler:
@@ -341,6 +345,8 @@ namespace sogen
                     buffer.write(observed.device);
                     buffer.write(observed.value);
                 }
+
+                buffer.write_map(this->pending_semaphore_waits_);
             }
 
             void deserialize_object(utils::buffer_deserializer& buffer) override
@@ -385,6 +391,8 @@ namespace sogen
                     buffer.read(observed.device);
                     buffer.read(observed.value);
                 }
+
+                buffer.read_map(this->pending_semaphore_waits_);
             }
 
             // The Vulkan objects are re-created only once the guest memory imported memory aliases is back, and the
@@ -473,6 +481,15 @@ namespace sogen
 
                     mapping.host_ptr = host_ptr;
                 }
+
+                std::erase_if(this->pending_semaphore_waits_, [&](const auto& entry) {
+                    const auto* thread = win_emu.process.find_thread_by_id(entry.first);
+                    return !thread || !thread->awaits_restored_host_condition;
+                });
+                for (const auto thread_id : this->pending_semaphore_waits_ | std::views::keys)
+                {
+                    this->start_semaphore_wait(win_emu, *win_emu.process.find_thread_by_id(thread_id));
+                }
             }
 
           private:
@@ -515,6 +532,89 @@ namespace sogen
             std::unordered_map<uint64_t, observed_semaphore> observed_semaphores_{};
 
             std::vector<std::byte> restored_vulkan_state_{};
+
+            // A guest thread parked in vkWaitSemaphores while a host thread waits in the driver. A snapshot keeps the wait
+            // with the time it had left, and restore_after_state_restore starts it again for the same thread.
+            struct pending_semaphore_wait
+            {
+                io_device_context context;
+                uint64_t device{};
+                uint32_t flags{};
+                std::vector<gpu_bridge::wait_semaphore_entry> entries{};
+                uint64_t timeout{};
+                std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
+
+                explicit pending_semaphore_wait(const io_device_context& wait_context)
+                    : context(wait_context)
+                {
+                }
+
+                explicit pending_semaphore_wait(utils::buffer_deserializer& buffer)
+                    : context(buffer)
+                {
+                }
+
+                uint64_t remaining_timeout() const
+                {
+                    if (this->timeout == UINT64_MAX)
+                    {
+                        return UINT64_MAX;
+                    }
+
+                    const auto elapsed =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - this->started);
+                    return this->timeout - std::min(this->timeout, static_cast<uint64_t>(std::max<int64_t>(elapsed.count(), 0)));
+                }
+
+                void serialize(utils::buffer_serializer& buffer) const
+                {
+                    buffer.write(this->context);
+                    buffer.write(this->device);
+                    buffer.write(this->flags);
+                    buffer.write_vector(this->entries);
+                    buffer.write(this->remaining_timeout());
+                }
+
+                void deserialize(utils::buffer_deserializer& buffer)
+                {
+                    buffer.read(this->context);
+                    buffer.read(this->device);
+                    buffer.read(this->flags);
+                    buffer.read_vector(this->entries);
+                    buffer.read(this->timeout);
+                }
+            };
+
+            // Keyed by the waiting thread's id.
+            std::unordered_map<uint32_t, pending_semaphore_wait> pending_semaphore_waits_{};
+
+            void start_semaphore_wait(windows_emulator& win_emu, emulator_thread& thread)
+            {
+                // The time the wait has left counts from here: the guest does not run while a snapshot is loaded.
+                auto& pending = this->pending_semaphore_waits_.at(thread.id);
+                pending.started = std::chrono::steady_clock::now();
+                const auto wait = this->vulkan_.wait_semaphores_async(pending.device, pending.flags, pending.entries.data(),
+                                                                      static_cast<uint32_t>(pending.entries.size()), pending.timeout,
+                                                                      [&win_emu] { win_emu.credit_idle_wakeup(); });
+                thread.await_host_condition = [this, &win_emu, thread_id = thread.id, wait]() {
+                    const int32_t result = wait->load(std::memory_order_acquire);
+                    if (result == vulkan_host::semaphore_wait_pending)
+                    {
+                        return false;
+                    }
+                    if (result == vk_success)
+                    {
+                        this->invalidate_imported_memory(win_emu);
+                    }
+
+                    // Propagate the real result so an error (e.g. device loss) reaches the guest instead of hanging.
+                    if (const auto finished = this->pending_semaphore_waits_.extract(thread_id); !finished.empty())
+                    {
+                        write_output(win_emu, finished.mapped().context, gpu_bridge::result_response{.vk_result = result, .reserved = 0});
+                    }
+                    return true;
+                };
+            }
 
             int32_t flush_imported_memory(windows_emulator& win_emu)
             {
@@ -1444,44 +1544,34 @@ namespace sogen
 
                 const int32_t poll = this->vulkan_.wait_semaphores(device, flags, entries.data(), count, 0);
 
-                // Signaled, errored, or a finite-timeout wait: handle inline. The hot path is DXVK's infinite
-                // frame waits, parked cooperatively below.
-                if (poll != vk_timeout || request.timeout != UINT64_MAX)
+                // Signaled, errored, or a poll with no time to wait: answer now.
+                if (poll != vk_timeout || request.timeout == 0)
                 {
-                    const int32_t result =
-                        (poll == vk_timeout) ? this->vulkan_.wait_semaphores(device, flags, entries.data(), count, request.timeout) : poll;
-                    if (result == vk_success)
+                    if (poll == vk_success)
                     {
                         this->invalidate_imported_memory(win_emu);
                     }
-                    return write_output(win_emu, context, gpu_bridge::result_response{.vk_result = result, .reserved = 0});
+                    return write_output(win_emu, context, gpu_bridge::result_response{.vk_result = poll, .reserved = 0});
                 }
 
-                // Infinite wait, not yet signaled: blocking would freeze the single VP and every guest thread.
-                // A host thread waits in the driver instead, and wakes an idle vCPU to run this one again once the
-                // GPU signals. The kernel lock stays free meanwhile.
+                // Not signaled yet: waiting here would hold the kernel lock and freeze every vCPU until the GPU is done.
+                // A host thread waits in the driver instead, up to the timeout, and wakes an idle vCPU to run this one
+                // again once the wait ends.
                 const auto out_status = write_output(win_emu, context, gpu_bridge::result_response{.vk_result = vk_success, .reserved = 0});
                 if (out_status != STATUS_SUCCESS)
                 {
                     return out_status;
                 }
 
-                const auto wait =
-                    this->vulkan_.wait_semaphores_async(device, flags, entries.data(), count, [&win_emu] { win_emu.credit_idle_wakeup(); });
-                context.thread().await_host_condition = [this, &win_emu, context, wait]() {
-                    const int32_t result = wait->load(std::memory_order_acquire);
-                    if (result == vk_timeout)
-                    {
-                        return false;
-                    }
-                    if (result == vk_success)
-                    {
-                        this->invalidate_imported_memory(win_emu);
-                    }
-                    // Propagate the real result so an error (e.g. device loss) reaches the guest instead of hanging.
-                    write_output(win_emu, context, gpu_bridge::result_response{.vk_result = result, .reserved = 0});
-                    return true;
-                };
+                pending_semaphore_wait pending{context};
+                pending.device = device;
+                pending.flags = flags;
+                pending.entries = std::move(entries);
+                pending.timeout = request.timeout;
+
+                auto& thread = context.thread();
+                this->pending_semaphore_waits_.insert_or_assign(thread.id, std::move(pending));
+                this->start_semaphore_wait(win_emu, thread);
                 win_emu.yield_thread(*context.vcpu, false);
                 return STATUS_SUCCESS;
             }
@@ -2248,6 +2338,24 @@ namespace sogen
                 };
             }
 
+            gpu_bridge::create_image_response create_image(const gpu_bridge::create_image_request& request)
+            {
+                gpu_bridge::create_image_response response{};
+                response.vk_result = this->vulkan_.create_image(
+                    request.device, request.format, request.width, request.height, request.usage, request.tiling, request.samples,
+                    request.image_type, request.depth, request.mip_levels, request.array_layers, request.flags, response.image);
+                // vkGetImageMemoryRequirements is invalid usage for a disjoint image (VUID-vkGetImageMemoryRequirements-image-01588),
+                // so such an image keeps memory_type_bits 0, which makes the shim ask the host when the guest queries it.
+                constexpr uint32_t vk_image_create_disjoint_bit = 0x00000200; // VK_IMAGE_CREATE_DISJOINT_BIT (no vulkan.h here)
+                if (response.vk_result == vk_success && (request.flags & vk_image_create_disjoint_bit) == 0)
+                {
+                    this->vulkan_.get_image_memory_requirements(request.device, response.image, response.size, response.alignment,
+                                                                response.memory_type_bits);
+                }
+
+                return response;
+            }
+
             NTSTATUS handle_create_image(windows_emulator& win_emu, const io_device_context& context)
             {
                 gpu_bridge::create_image_request request{};
@@ -2256,12 +2364,19 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
 
-                uint64_t image = gpu_bridge::null_object;
-                const int32_t result = this->vulkan_.create_image(
-                    request.device, request.format, request.width, request.height, request.usage, request.tiling, request.samples,
-                    request.image_type, request.depth, request.mip_levels, request.array_layers, request.flags, image);
-                return write_output(win_emu, context,
-                                    gpu_bridge::create_image_response{.vk_result = result, .reserved = 0, .image = image});
+                return write_output(win_emu, context, this->create_image(request));
+            }
+
+            NTSTATUS handle_create_image_after_destroy(windows_emulator& win_emu, const io_device_context& context)
+            {
+                gpu_bridge::create_image_after_destroy_request request{};
+                if (!read_input(win_emu, context, request))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                this->vulkan_.destroy_image(request.destroy.device, request.destroy.image);
+                return write_output(win_emu, context, this->create_image(request.create));
             }
 
             NTSTATUS handle_get_physical_device_image_format_properties(windows_emulator& win_emu, const io_device_context& context)
@@ -2313,6 +2428,28 @@ namespace sogen
                 uint32_t memory_type_bits = 0;
                 const int32_t result =
                     this->vulkan_.get_image_memory_requirements(request.device, request.image, size, alignment, memory_type_bits);
+                return write_output(win_emu, context,
+                                    gpu_bridge::memory_requirements_response{
+                                        .vk_result = result, .memory_type_bits = memory_type_bits, .size = size, .alignment = alignment});
+            }
+
+            // vkGetDeviceImageMemoryRequirements: the requirements of the image handle_create_image would make from the same
+            // request.
+            NTSTATUS handle_get_device_image_memory_requirements(windows_emulator& win_emu, const io_device_context& context)
+            {
+                gpu_bridge::create_image_request request{};
+                if (!read_input(win_emu, context, request))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                uint64_t size = 0;
+                uint64_t alignment = 0;
+                uint32_t memory_type_bits = 0;
+                const int32_t result = this->vulkan_.get_device_image_memory_requirements(
+                    request.device, request.format, request.width, request.height, request.usage, request.tiling, request.samples,
+                    request.image_type, request.depth, request.mip_levels, request.array_layers, request.flags, size, alignment,
+                    memory_type_bits);
                 return write_output(win_emu, context,
                                     gpu_bridge::memory_requirements_response{
                                         .vk_result = result, .memory_type_bits = memory_type_bits, .size = size, .alignment = alignment});

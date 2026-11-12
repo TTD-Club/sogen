@@ -41,7 +41,7 @@ namespace sogen::ttd
         void create_window(const ui_window_desc& desc) override;
         void destroy_window(hwnd window) override;
         void set_window_rect(hwnd window, const RECT& rect) override;
-        void set_window_visible(hwnd window, bool visible) override;
+        void set_window_visible(hwnd window, bool visible, bool activate = true) override;
         void set_window_enabled(hwnd window, bool enabled) override;
         void set_window_title(hwnd window, std::u16string_view title) override;
         void invalidate(hwnd window, const std::optional<RECT>& rect) override;

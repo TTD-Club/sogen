@@ -69,6 +69,8 @@ namespace sogen
         bool notification{};
         bool signaled{};
         std::optional<std::chrono::steady_clock::time_point> due_time{};
+        // The due time was an absolute system time; a periodic timer's later expirations are intervals.
+        bool absolute{};
         std::chrono::steady_clock::duration period{};
 
         // The APC goes to the thread that set the timer, once per expiry.
@@ -89,6 +91,8 @@ namespace sogen
 
             if (this->period.count() > 0)
             {
+                this->absolute = false;
+
                 // A periodic timer that fell behind expires once and resumes its schedule; one too far out to
                 // represent never comes due again.
                 const auto missed = (now - *this->due_time) / this->period;
@@ -126,6 +130,7 @@ namespace sogen
             buffer.write(this->notification);
             buffer.write(this->signaled);
             buffer.write_optional(this->due_time);
+            buffer.write(this->absolute);
             buffer.write(static_cast<int64_t>(this->period.count()));
             buffer.write(this->apc_routine);
             buffer.write(this->apc_context);
@@ -139,6 +144,7 @@ namespace sogen
             buffer.read(this->notification);
             buffer.read(this->signaled);
             buffer.read_optional(this->due_time);
+            buffer.read(this->absolute);
             this->period = std::chrono::steady_clock::duration{buffer.read<int64_t>()};
             buffer.read(this->apc_routine);
             buffer.read(this->apc_context);

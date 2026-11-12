@@ -121,9 +121,9 @@ namespace sogen::ttd
         this->inner_->set_window_rect(window, rect);
     }
 
-    void recordable_ui_backend::set_window_visible(const hwnd window, const bool visible)
+    void recordable_ui_backend::set_window_visible(const hwnd window, const bool visible, const bool activate)
     {
-        this->inner_->set_window_visible(window, visible);
+        this->inner_->set_window_visible(window, visible, activate);
     }
 
     void recordable_ui_backend::set_window_enabled(const hwnd window, const bool enabled)

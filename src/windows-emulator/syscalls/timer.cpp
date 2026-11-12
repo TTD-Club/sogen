@@ -153,6 +153,7 @@ namespace sogen
 
                 t.signaled = false;
                 t.due_time = timer_deadline(c.win_emu.clock(), due_time);
+                t.absolute = utils::is_absolute_due_time(due_time);
                 t.period = period;
                 t.apc_routine = apc_routine;
                 t.apc_context = apc_context;
