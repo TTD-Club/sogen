@@ -67,6 +67,10 @@ namespace sogen::ttd
         // prefix the backend raises #UD.
         void run_random_instruction(windows_emulator& emu, const uint64_t address, const std::span<const uint8_t> instruction)
         {
+            if (instruction.size() < 3 || instruction[instruction.size() - 3] != 0x0F || instruction[instruction.size() - 2] != 0xC7)
+            {
+                return;
+            }
             constexpr std::array<uint8_t, 6> segment_prefixes{0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65};
             size_t offset = 0;
             size_t operand_size = 4;
@@ -656,6 +660,10 @@ namespace sogen::ttd
                     const auto last = last_byte(address, size);
                     for (auto page = address / page_size; page <= last / page_size; ++page)
                     {
+                        if (page == code_free_page_)
+                        {
+                            code_free_page_ = no_recent_page;
+                        }
                         const auto* list = cached_instructions_by_page_.find(page);
                         if (!list)
                         {
@@ -685,9 +693,14 @@ namespace sogen::ttd
         const auto last = last_byte(address, size);
         for (auto page = address / page_size; page <= last / page_size; ++page)
         {
+            if (page == code_free_page_)
+            {
+                continue;
+            }
             const auto* list = cached_instructions_by_page_.find(page);
             if (!list)
             {
+                code_free_page_ = page;
                 continue;
             }
             auto& instructions = cached_pages_[static_cast<size_t>(*list)];
@@ -699,6 +712,7 @@ namespace sogen::ttd
                 }
             }
             instructions.clear();
+            code_free_page_ = page;
         }
     }
 

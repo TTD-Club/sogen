@@ -99,10 +99,10 @@ namespace sogen::ttd
         static constexpr size_t events_per_chunk = 65536;
         static constexpr size_t checkpoints_per_level = 16;
         static constexpr size_t checkpoint_levels = 8;
-        // Chunks and bulk blocks compress on background threads, so these slow, strong levels do not slow recording
-        // down. Level 19 takes about as long per chunk as recording it; two chunk workers still slowed a test-sample
-        // recording by 10%, four did not.
-        static constexpr int chunk_compression_level = 19;
+        // Chunks and bulk blocks compress on background threads, yet those still slow the emulation thread down. Level
+        // 19 chunks made a beacon recording's emulation about 25% slower than level 3, for traces 9% smaller; the bulk
+        // block level made no measurable difference.
+        static constexpr int chunk_compression_level = 3;
         static constexpr int bulk_compression_level = 19;
         static constexpr size_t chunk_workers = 4;
         static constexpr size_t bulk_workers = 4;
@@ -239,6 +239,8 @@ namespace sogen::ttd
         // Index in cached_pages_ by page number: the cached instruction addresses in each page.
         flat_map cached_instructions_by_page_{};
         std::vector<std::vector<uint64_t>> cached_pages_{};
+        // The last page a write found without cached instructions, so writes to it skip the lookup.
+        uint64_t code_free_page_{no_recent_page};
         void forget_instructions(uint64_t address, uint64_t size);
         // Entry k: the state of the latest checkpoint whose index is a multiple of checkpoints_per_level^k.
         std::vector<std::shared_ptr<const std::vector<std::byte>>> base_states_{};
