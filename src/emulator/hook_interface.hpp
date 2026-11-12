@@ -113,6 +113,13 @@ namespace sogen
             throw std::runtime_error("This backend cannot report instruction execution metadata");
         }
 
+        // Promises that the callback of `hook`, a data hook from above, reads no CPU state (registers or the instruction
+        // pointer) and does not stop the emulation, so the backend need not make that state precise before each call.
+        // Backends without such a cost ignore it.
+        virtual void hook_reads_no_cpu_state(emulator_hook* /*hook*/)
+        {
+        }
+
         // Called before each guest read of the range (in the same pieces hook_memory_read_data reports), so the callback
         // can still change the memory the read returns.
         virtual emulator_hook* hook_memory_read_before(uint64_t /*address*/, uint64_t /*size*/, memory_access_range_callback /*callback*/)
