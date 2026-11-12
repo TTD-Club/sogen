@@ -1,6 +1,7 @@
 #include "../std_include.hpp"
 #include "surface_alpha.hpp"
 #include "window_geometry.hpp"
+#include "../keyboard_layout.hpp"
 #include "../vulkan_handle_utils.hpp"
 #include <platform/ui_backend.hpp>
 
@@ -93,6 +94,25 @@ namespace sogen
                     flush(display);
                 }
             }
+        }
+
+        void show_window(SDL_Window* window, const bool activate)
+        {
+            if (activate)
+            {
+                SDL_ShowWindow(window);
+                return;
+            }
+
+            // TODO: SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN may not be honored on all platforms,
+            //       and hiding a host window may deactivate it even when not requested
+            //       (e.g., toggling WS_VISIBLE via SetWindowLong), causing spurious
+            //       WM_ACTIVATE/WM_KILLFOCUS messages in the guest.
+
+            constexpr auto* hint = SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN;
+            SDL_SetHintWithPriority(hint, "0", SDL_HINT_OVERRIDE);
+            SDL_ShowWindow(window);
+            SDL_ResetHint(hint);
         }
 
         std::string make_host_window_title(const std::u16string_view title)
@@ -833,9 +853,9 @@ namespace sogen
                             break;
                         }
 
-                        const auto modifiers = event.key.mod;
-                        if (event.key.key == SDLK_S && (modifiers & SDL_KMOD_CTRL) != 0 && (modifiers & SDL_KMOD_ALT) != 0 &&
-                            (modifiers & SDL_KMOD_SHIFT) != 0 && this->snapshot_request_sink_)
+                        const auto keymod = event.key.mod;
+                        if (event.key.key == SDLK_S && (keymod & SDL_KMOD_CTRL) != 0 && (keymod & SDL_KMOD_ALT) != 0 &&
+                            (keymod & SDL_KMOD_SHIFT) != 0 && this->snapshot_request_sink_)
                         {
                             if (!event.key.repeat)
                             {
@@ -879,8 +899,20 @@ namespace sogen
                         }
 
                         const uint32_t message = (is_alt || vk == VK_F10 || alt_context) ? WM_SYSKEYDOWN : WM_KEYDOWN;
-
                         this->post_event(guest, message, vk, scan);
+
+                        if (message == WM_KEYDOWN)
+                        {
+                            const key_modifiers modifiers{.shift = (event.key.mod & SDL_KMOD_SHIFT) != 0,
+                                                          .control = (event.key.mod & SDL_KMOD_CTRL) != 0,
+                                                          .alt = (event.key.mod & SDL_KMOD_ALT) != 0,
+                                                          .caps_lock = (event.key.mod & SDL_KMOD_CAPS) != 0};
+                            const auto character = key_character(static_cast<uint32_t>(vk), modifiers);
+                            if (character != 0 && (character < 0x20 || character == 0x7f))
+                            {
+                                this->post_event(guest, WM_CHAR, character, scan);
+                            }
+                        }
                         break;
                     }
 
@@ -1515,9 +1547,9 @@ namespace sogen
                 });
             }
 
-            void set_window_visible(const hwnd window, const bool visible) override
+            void set_window_visible(const hwnd window, const bool visible, const bool activate) override
             {
-                this->queue_or_run([this, window, visible] {
+                this->queue_or_run([this, window, visible, activate] {
                     if (auto* state = this->resolve_window(window))
                     {
                         state->desc.visible = visible;
@@ -1525,7 +1557,7 @@ namespace sogen
                         {
                             if (visible)
                             {
-                                SDL_ShowWindow(state->window);
+                                show_window(state->window, activate);
                             }
                             else
                             {
@@ -1536,12 +1568,15 @@ namespace sogen
                         {
                             if (visible)
                             {
-                                place_host_window(state->window, state->placed_position, [&] { SDL_ShowWindow(state->window); });
-                                apply_x11_focus_fallback(state->window);
+                                place_host_window(state->window, state->placed_position, [&] { show_window(state->window, activate); });
+                                if (activate)
+                                {
+                                    apply_x11_focus_fallback(state->window);
+                                }
                             }
                             else
                             {
-                                auto* focus_fallback = this->find_focus_fallback(*state);
+                                auto* focus_fallback = activate ? this->find_focus_fallback(*state) : nullptr;
                                 SDL_HideWindow(state->window);
                                 if (focus_fallback)
                                 {

@@ -532,6 +532,7 @@ namespace sogen
             {
                 io_device_context context;
                 std::optional<std::chrono::steady_clock::time_point> timeout{};
+                bool timeout_absolute{};
                 handle retained_completion_port{};
                 std::optional<std::chrono::steady_clock::time_point> host_deadline{};
 
@@ -540,9 +541,11 @@ namespace sogen
                 {
                 }
 
-                pending_poll(const io_device_context& context, const std::optional<std::chrono::steady_clock::time_point> timeout)
+                pending_poll(const io_device_context& context, const std::optional<std::chrono::steady_clock::time_point> timeout,
+                             const bool timeout_absolute)
                     : context(context),
-                      timeout(timeout)
+                      timeout(timeout),
+                      timeout_absolute(timeout_absolute)
                 {
                 }
 
@@ -555,6 +558,7 @@ namespace sogen
                 {
                     this->context.serialize(buffer);
                     buffer.write_optional(this->timeout);
+                    buffer.write(this->timeout_absolute);
                     buffer.write(this->retained_completion_port);
                 }
 
@@ -562,6 +566,7 @@ namespace sogen
                 {
                     this->context.deserialize(buffer);
                     buffer.read_optional(this->timeout);
+                    buffer.read(this->timeout_absolute);
                     buffer.read(this->retained_completion_port);
                 }
             };
@@ -590,6 +595,14 @@ namespace sogen
                 if (this->s_)
                 {
                     this->s_->set_blocking(false);
+                }
+            }
+
+            void move_absolute_deadlines(const std::chrono::steady_clock::duration system_time_ahead) override
+            {
+                for (auto& poll : this->pending_polls_)
+                {
+                    utils::follow_system_time(poll.timeout, poll.timeout_absolute, system_time_ahead);
                 }
             }
 
@@ -653,7 +666,7 @@ namespace sogen
             }
 
             NTSTATUS queue_poll(windows_emulator& win_emu, const io_device_context& c,
-                                const std::optional<std::chrono::steady_clock::time_point> timeout)
+                                const std::optional<std::chrono::steady_clock::time_point> timeout, const bool timeout_absolute)
             {
                 handle retained_port{};
                 const auto* active_thread = c.vcpu ? &c.thread() : nullptr;
@@ -664,7 +677,7 @@ namespace sogen
 
                 auto request = c;
                 request.completion_port = retained_port;
-                this->pending_polls_.emplace_back(request, timeout);
+                this->pending_polls_.emplace_back(request, timeout, timeout_absolute);
                 this->pending_polls_.back().retained_completion_port = retained_port;
                 return STATUS_PENDING;
             }
@@ -1984,7 +1997,7 @@ namespace sogen
                                                                           {.QuadPart = std::numeric_limits<int64_t>::max()});
                 }
 
-                return this->queue_poll(win_emu, c, timeout);
+                return this->queue_poll(win_emu, c, timeout, timeout && utils::is_absolute_due_time(info.Timeout));
             }
 
             NTSTATUS ioctl_receive_datagram(windows_emulator& win_emu, const io_device_context& c)

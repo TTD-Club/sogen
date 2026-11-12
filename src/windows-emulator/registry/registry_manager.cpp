@@ -27,13 +27,6 @@ namespace sogen
             return true;
         }
 
-        // A key's path inside its hive: empty for the hive's root (lexically_relative gives ".").
-        std::filesystem::path path_in_hive(const std::filesystem::path& key, const std::filesystem::path& hive)
-        {
-            auto path = key.lexically_relative(hive);
-            return path == "." ? std::filesystem::path{} : path;
-        }
-
         std::pair<utils::path_key, bool> perform_path_substitution(const std::map<utils::path_key, utils::path_key>& path_mapping,
                                                                    utils::path_key path)
         {
@@ -51,6 +44,12 @@ namespace sogen
             }
 
             return {std::move(path), false};
+        }
+
+        // lexically_relative names a hive's own root ".", which no sub key of the hive matches.
+        utils::path_key path_below_hive(const utils::path_key& key, const utils::path_key& hive)
+        {
+            return key == hive ? utils::path_key{} : utils::path_key{key.get().lexically_relative(hive.get())};
         }
     }
 
@@ -349,7 +348,7 @@ namespace sogen
 
         registry_key reg_key{};
         reg_key.hive = iterator->first.get();
-        reg_key.path = path_in_hive(normal_key.get(), reg_key.hive.get());
+        reg_key.path = path_below_hive(normal_key, reg_key.hive);
         reg_key.generation = this->get_generation(registry_manager::get_full_key_path(reg_key));
 
         if (!this->key_exists(reg_key))
@@ -409,7 +408,7 @@ namespace sogen
 
         registry_key reg_key{};
         reg_key.hive = iterator->first.get();
-        reg_key.path = path_in_hive(normal_key.get(), reg_key.hive.get());
+        reg_key.path = path_below_hive(normal_key, reg_key.hive);
         reg_key.generation = this->get_generation(registry_manager::get_full_key_path(reg_key));
 
         auto display_path_string = key.u16string();

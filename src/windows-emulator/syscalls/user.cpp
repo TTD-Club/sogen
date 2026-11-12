@@ -3161,6 +3161,12 @@ namespace sogen
             return c.proc.cursor_show_count;
         }
 
+        NTSTATUS handle_NtUserHideCursorNoCapture()
+        {
+            // Mouse Vanish defaults to off and is not configurable in the emulated system.
+            return STATUS_SUCCESS;
+        }
+
         hcursor handle_NtUserGetCursor(const syscall_context& c)
         {
             return c.proc.current_cursor;
@@ -6694,32 +6700,61 @@ namespace sogen
             auto& state = c.get_completion_state<window_style_change_state>();
             const auto old_style = state.old_style;
             auto* win = c.proc.windows.get(hWnd);
-            if (!win || state.style_applied)
+            if (!win)
             {
                 c.emu.pop_stack(state.style_alloc);
-                return win ? old_style : 0;
+                return 0;
             }
 
-            auto styles = c.emu.read_memory<STYLESTRUCT>(state.style_alloc.address());
-            styles.styleNew = filter_supported_window_style_change(*win, nIndex, styles.styleNew);
-            c.emu.write_memory(state.style_alloc.address(), styles);
+            if (!state.style_applied)
+            {
+                auto styles = c.emu.read_memory<STYLESTRUCT>(state.style_alloc.address());
+                styles.styleNew = filter_supported_window_style_change(*win, nIndex, styles.styleNew);
+                c.emu.write_memory(state.style_alloc.address(), styles);
+                if (nIndex == GWL_STYLE)
+                {
+                    win->style = styles.styleNew;
+                    win->guest.access([&](USER_WINDOW& guest_win) { guest_win.dwStyle = styles.styleNew; });
+                }
+                else
+                {
+                    win->ex_style = styles.styleNew;
+                    win->guest.access([&](USER_WINDOW& guest_win) { guest_win.dwExStyle = styles.styleNew; });
+                }
+                c.proc.sync_guest_window_rects(*win);
+
+                state.style_applied = true;
+                const auto address = state.style_alloc.address();
+                dispatch_window_message(c, callback, std::move(state), *win, WM_STYLECHANGED,
+                                        static_cast<uint64_t>(static_cast<int64_t>(nIndex)), address);
+                return 0;
+            }
+
             if (nIndex == GWL_STYLE)
             {
-                win->style = styles.styleNew;
-                win->guest.access([&](USER_WINDOW& guest_win) { guest_win.dwStyle = styles.styleNew; });
-            }
-            else
-            {
-                win->ex_style = styles.styleNew;
-                win->guest.access([&](USER_WINDOW& guest_win) { guest_win.dwExStyle = styles.styleNew; });
-            }
-            c.proc.sync_guest_window_rects(*win);
+                const bool was_enabled = (old_style & WS_DISABLED) == 0;
+                const bool is_enabled = (win->style & WS_DISABLED) == 0;
+                if (was_enabled != is_enabled)
+                {
+                    if (win->host_surface_window)
+                    {
+                        c.win_emu.ui().set_window_enabled(win->handle, is_enabled);
+                    }
+                }
 
-            state.style_applied = true;
-            const auto address = state.style_alloc.address();
-            dispatch_window_message(c, callback, std::move(state), *win, WM_STYLECHANGED,
-                                    static_cast<uint64_t>(static_cast<int64_t>(nIndex)), address);
-            return 0;
+                const bool was_visible = (old_style & WS_VISIBLE) != 0;
+                const bool is_visible = (win->style & WS_VISIBLE) != 0;
+                if (was_visible != is_visible)
+                {
+                    if (win->host_surface_window)
+                    {
+                        c.win_emu.ui().set_window_visible(win->handle, is_visible, false);
+                    }
+                }
+            }
+
+            c.emu.pop_stack(state.style_alloc);
+            return old_style;
         }
 
         emulator_pointer completion_NtUserSetWindowLongPtr(const syscall_context& c, const handle hWnd, const int nIndex,
@@ -7898,6 +7933,15 @@ namespace sogen
 
         BOOL handle_NtUserDestroyCaret()
         {
+            return TRUE;
+        }
+
+        BOOL handle_NtUserGetCaretPos(const syscall_context&, const emulator_object<POINT> point)
+        {
+            if (point)
+            {
+                point.write(POINT{});
+            }
             return TRUE;
         }
 
@@ -9335,7 +9379,8 @@ namespace sogen
             }
 
             const auto target_thread_id = thread_id == 0 ? c.vcpu.active_thread->id : thread_id;
-            if (c.proc.find_thread_by_id(target_thread_id) == nullptr)
+            const auto* target_thread = c.proc.find_thread_by_id(target_thread_id);
+            if (target_thread == nullptr)
             {
                 return FALSE;
             }
@@ -9363,7 +9408,7 @@ namespace sogen
             {
                 return FALSE;
             }
-            info = {.cbSize = sizeof(info), .hwndActive = active, .hwndFocus = active, .hwndCapture = capture};
+            info = {.cbSize = sizeof(info), .hwndActive = active, .hwndFocus = target_thread->focus_window, .hwndCapture = capture};
             c.emu.write_memory(info_address, info);
 
             return TRUE;

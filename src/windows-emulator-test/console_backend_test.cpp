@@ -294,6 +294,7 @@ namespace sogen::test
         font.width = 8;
         ASSERT_EQ(STATUS_SUCCESS, this->invoke(0x0300002C, font));
         utils::buffer_deserializer reader{state};
+        reader.register_factory<windows_emulator_wrapper>([&] { return windows_emulator_wrapper{*this->emu}; });
         console->deserialize(reader);
         font = {};
         ASSERT_EQ(STATUS_SUCCESS, this->invoke(0x03000004, font));
@@ -344,6 +345,7 @@ namespace sogen::test
         console->serialize(state);
         ASSERT_EQ(STATUS_SUCCESS, this->invoke_text(0x02000015, unicode, 0));
         utils::buffer_deserializer reader{state};
+        reader.register_factory<windows_emulator_wrapper>([&] { return windows_emulator_wrapper{*this->emu}; });
         console->deserialize(reader);
         console_title_request request{.unicode = 1};
         ASSERT_EQ(STATUS_SUCCESS, this->invoke_text(0x02000014, request, 8, true));
@@ -575,6 +577,7 @@ namespace sogen::test
         ASSERT_EQ(restored_console->io_control(emu, context), STATUS_SUCCESS);
 
         utils::buffer_deserializer deserializer{state};
+        deserializer.register_factory<windows_emulator_wrapper>([&] { return windows_emulator_wrapper{emu}; });
         restored_console->deserialize(deserializer);
 
         emu.console().reset();

@@ -14,13 +14,7 @@ class SteamCatalog implements StoreCatalog {
   final SteamClient _client;
   final SteamPlanner _planner;
 
-  @override
-  String get name => 'Steam';
-
-  @override
-  String get signInDescription =>
-      'Sign in to see the Windows games you own on Steam, by approving it in the Steam mobile app or with your '
-      'password, which Sogen sends only to Steam and does not keep.';
+  void close() => _planner.close();
 
   @override
   Future<List<StoreGame>> games() async {
@@ -52,6 +46,9 @@ class SteamCatalog implements StoreCatalog {
     final oslist = common?.value('oslist') ?? '';
     return common?.value('type')?.toLowerCase() == 'game' && (oslist.isEmpty || oslist.split(',').contains('windows'));
   }
+
+  @override
+  StoreGame? restore(Object? json) => StoreGame.fromJson(store, json);
 
   @override
   Future<(PlannedInstall, String)?> plan(StoreGame game, LanguageChooser chooseLanguage) =>
