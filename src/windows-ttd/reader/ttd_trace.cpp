@@ -1456,11 +1456,16 @@ namespace sogen::ttd
             }
         };
 
-        // Workers resolve bulk blocks through the trace's cache and file, one at a time; the main thread waits meanwhile.
-        std::mutex bulk_mutex{};
+        // Workers resolve bulk blocks through the trace's cache and file, one at a time. The main thread reads chunks from
+        // the same file while workers run, so it takes the lock for that too: seeks and reads from two threads interleaved.
+        std::mutex file_mutex{};
         const bulk_resolver shared_bulk = [&](const uint64_t block) {
-            const std::scoped_lock lock(bulk_mutex);
+            const std::scoped_lock lock(file_mutex);
             return bulk(block);
+        };
+        const auto read_chunk = [&](const chunk_entry& entry) {
+            const std::scoped_lock lock(file_mutex);
+            return read_bytes(entry.offset, entry.size);
         };
         const auto batch_size = static_cast<size_t>(std::max(1U, std::thread::hardware_concurrency()));
         for (size_t first = 0; first < ranges.size(); first += batch_size)
@@ -1479,17 +1484,16 @@ namespace sogen::ttd
                     continue;
                 }
                 const auto entry = chunks_[index];
-                decoding[i] =
-                    std::async(std::launch::async, [&, entry, compressed = read_bytes(entry.offset, entry.size), range = batch[i]] {
-                        const auto decoded = decode_chunk(compressed, code_, shared_bulk, with_data);
-                        if (decoded.events.size() != entry.event_count)
-                        {
-                            throw std::runtime_error("Invalid TTD event chunk");
-                        }
-                        std::vector<access_event> found{};
-                        collect(found, decoded.events, entry.first_event, range);
-                        return found;
-                    });
+                decoding[i] = std::async(std::launch::async, [&, entry, compressed = read_chunk(entry), range = batch[i]] {
+                    const auto decoded = decode_chunk(compressed, code_, shared_bulk, with_data);
+                    if (decoded.events.size() != entry.event_count)
+                    {
+                        throw std::runtime_error("Invalid TTD event chunk");
+                    }
+                    std::vector<access_event> found{};
+                    collect(found, decoded.events, entry.first_event, range);
+                    return found;
+                });
             }
             // Every worker finishes before the batch is left, also when one throws: they reference this frame.
             std::exception_ptr error{};
@@ -1510,7 +1514,11 @@ namespace sogen::ttd
                 else if (!error)
                 {
                     const auto index = chunk_of(batch[i].begin);
-                    collect(result, chunk(index).events, chunks_[index].first_event, batch[i]);
+                    const auto& cached = [&]() -> const decoded_chunk& {
+                        const std::scoped_lock lock(file_mutex);
+                        return chunk(index);
+                    }();
+                    collect(result, cached.events, chunks_[index].first_event, batch[i]);
                 }
             }
             if (error)
