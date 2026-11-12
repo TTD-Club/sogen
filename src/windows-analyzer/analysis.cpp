@@ -534,6 +534,15 @@ namespace sogen
             const auto is_main_exe = win_emu.mod_manager.executable->contains(address);
             const auto is_previous_main_exe = win_emu.mod_manager.executable->contains(previous_ip);
 
+            // The common case, decided without the lazy objects below, whose calls cost more than the lookups: without an
+            // instruction summary, verbose logging or modules of interest, only an instruction following one of the main
+            // executable, or one outside every module, is looked at.
+            if (!c.settings->instruction_summary && !c.settings->verbose_logging && c.settings->modules.empty() && !is_previous_main_exe &&
+                (current_thread.executed_instructions <= 1 || win_emu.mod_manager.find_by_address(previous_ip)))
+            {
+                return;
+            }
+
             const auto binary = utils::make_lazy([&] {
                 if (is_main_exe)
                 {
