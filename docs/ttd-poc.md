@@ -737,9 +737,12 @@ bulk blocks 17.6 MiB
 1.4 MiB, three 16-apart deltas 0.7 MiB, 57 adjacent deltas 1.6 MiB), the
 code table 1.3 MiB (243,348 instructions), and the page index 0.06 MiB.
 Without bulk data in the delta references the checkpoints took 46.4 MiB.
-Chunks (on four threads) and bulk blocks (on one) are compressed at zstd
-level 19 in the background (level 6 bulk blocks would take 22.5 MiB
-unfiltered). Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take
+These sizes are for level 19 chunks (level 6 bulk blocks would take
+22.5 MiB unfiltered). Chunks now compress at zstd level 3 and bulk blocks at
+level 19, each on four background threads. Background compression still
+slows the emulation thread: on a 12-core Ryzen, a beacon recording's traces
+were 9% smaller with level 19 chunks, but its emulation ran about 25% slower.
+Recording takes 20 s (v6: 29 s, v4-style: 61 s). Queries take
 0.02 s for a next-access lookup and about 2 s for a scan of every chunk.
 Address queries decode their candidate chunks on all cores, and queries for
 execute events only (`Trace.calls`) skip the chunks' data: the calls of a hot
