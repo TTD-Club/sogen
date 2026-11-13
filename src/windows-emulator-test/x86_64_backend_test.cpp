@@ -404,4 +404,44 @@ namespace sogen::test
             EXPECT_EQ(machine->read_memory<uint64_t>(base + 0xFFC), 57u);
         }
     }
+
+    // Unicorn used to place a block mapped after a bigger one where that bigger one starts in the space that tracks
+    // translated code, as long as nothing was unmapped yet. A store to the later block then looked like a store to the
+    // code of the bigger one, and the backend ran the storing instruction again.
+    TEST(UnicornMemoryTest, AStoreToAnotherBlockDoesNotRunItsInstructionAgain)
+    {
+        const auto machine = create_x86_64_emulator(backend_type::unicorn);
+        memory_manager memory{*machine};
+        constexpr uint64_t first_block = 0x100000;
+        constexpr uint64_t code_block = 0x200000;
+        constexpr uint64_t data_block = 0x400000;
+        ASSERT_TRUE(memory.allocate_memory(first_block, 0x1000, memory_permission::read_write));
+        ASSERT_TRUE(memory.allocate_memory(code_block, 0x3000, memory_permission::all));
+        // The backend only checks stores to executable memory for changes to translated code.
+        ASSERT_TRUE(memory.allocate_memory(data_block, 0x1000, memory_permission::all));
+
+        // mov [rip + disp32], al, storing at the code's offset in the data block; syscall
+        constexpr uint64_t store = code_block + 0x100;
+        constexpr auto displacement = static_cast<uint32_t>(data_block + 0x100 - (store + 6));
+        std::array<uint8_t, 8> code{0x88, 0x05, 0, 0, 0, 0, 0x0F, 0x05};
+        memcpy(code.data() + 2, &displacement, sizeof(displacement));
+        machine->write_memory(store, code.data(), code.size());
+
+        size_t stores = 0;
+        size_t writes = 0;
+        machine->hook_memory_execution(store, [&](cpu_interface&, uint64_t) { ++stores; });
+        machine->hook_memory_write(data_block, 0x1000, [&](cpu_interface&, uint64_t, const void*, size_t) { ++writes; });
+        machine->hook_instruction(x86_hookable_instructions::syscall, [&](cpu_interface& cpu, uint64_t) {
+            cpu.stop();
+            return instruction_hook_continuation::skip_instruction;
+        });
+        machine->reg(x86_register::rip, store);
+        machine->reg(x86_register::rax, uint64_t{0x5A});
+        machine->start();
+
+        EXPECT_EQ(stores, 1u);
+        EXPECT_EQ(writes, 1u);
+        EXPECT_EQ(machine->read_memory<uint8_t>(data_block + 0x100), 0x5A);
+        EXPECT_EQ(machine->read_memory<uint8_t>(store), 0x88);
+    }
 }
